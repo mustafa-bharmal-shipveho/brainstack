@@ -43,11 +43,23 @@ intentionally fake-looking values.
 ## Layer 2: redact-private.txt (org-aware patterns)
 
 Created by the installer at `~/.agent/redact-private.txt`. Empty stub
-by default. **As of `redact.py` ≥ 0.2.0 this file is actually loaded** —
-each non-blank, non-comment line is compiled as an additional regex and
-merged into the pattern set. Invalid regexes log a warning to stderr and
-are skipped (the redactor never crashes the pre-commit flow because of a
-malformed user pattern).
+by default. As of v0.1.1 this file is **actually loaded** — each
+non-blank, non-comment line is compiled as an additional regex and
+merged into the pattern set. Invalid regexes log a warning to stderr
+and are skipped. Patterns containing ReDoS-prone shapes
+(`(...+...)+` etc.) are rejected at load time (the redactor never
+crashes or hangs the pre-commit flow because of a malformed user
+pattern).
+
+A starter set of org-PII shapes ships at
+[`templates/redact-private.example.txt`](../templates/redact-private.example.txt).
+Copy it over to seed common patterns:
+
+```bash
+cp ~/Documents/codebase/mustafa-agentic-stack/templates/redact-private.example.txt \
+    ~/.agent/redact-private.txt
+# then edit ~/.agent/redact-private.txt
+```
 
 ```
 # Add one regex per line. Lines starting with # are ignored.
