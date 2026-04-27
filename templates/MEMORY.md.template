@@ -1,0 +1,20 @@
+# Memory Index
+
+> Auto-managed. The migrate.py importer rewrites this file; manual edits
+> outside the section markers will be preserved.
+
+## Lessons (graduated)
+
+(populated by migrate.py from feedback_*.md files)
+
+## Profile
+
+(populated by migrate.py from user_*.md files)
+
+## Notes
+
+(populated by migrate.py from project_*.md, cycle-*.md, and misc files)
+
+## References
+
+(populated by migrate.py from reference_*.md files)

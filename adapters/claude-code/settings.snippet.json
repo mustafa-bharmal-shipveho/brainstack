@@ -1,0 +1,16 @@
+{
+  "_comment_top": "Merge this snippet into your existing ~/.claude/settings.json under 'hooks'. Do NOT replace existing hooks; add this entry to the PostToolUse array. After merging, validate: python3 -m json.tool ~/.claude/settings.json > /dev/null",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash|Edit|MultiEdit|Write|Task|TodoWrite",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.agent/harness/hooks/agentic_post_tool_global.py\""
+          }
+        ]
+      }
+    ]
+  }
+}
