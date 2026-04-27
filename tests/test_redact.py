@@ -422,3 +422,32 @@ def test_sendgrid_key_blocks(tmp_path):
     f.write_text("SG.aBcDeFgHiJkLmNoPqRsTuV.aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789aBcDeFgHiJk\n")
     result = run_redact(tmp_path, "--no-entropy")
     assert result.returncode != 0
+
+
+def test_high_entropy_token_next_to_url_caught(tmp_path):
+    """A bare 40+ char high-entropy token alongside an unrelated URL on the
+    same line must still be flagged. The entropy sweep strips URL spans
+    before scanning instead of skipping the whole line (regression N1).
+    """
+    f = tmp_path / "note.md"
+    # The URL itself is innocuous; the token after it is the leak.
+    f.write_text(
+        "see PR https://github.com/x/y/pull/123 — used token "
+        "fSk3iLp7qrTuVwxYz0aBcDeFg1HiJklMnOpqrstuvwxyzAB\n"
+    )
+    result = run_redact(tmp_path)
+    assert result.returncode != 0, (
+        f"high-entropy token next to URL slipped redact.py; stdout: {result.stdout}"
+    )
+
+
+def test_url_alone_still_does_not_false_positive(tmp_path):
+    """The URL strip should not flag the URL itself."""
+    f = tmp_path / "note.md"
+    f.write_text(
+        "Notion link: https://www.notion.so/example/Knowledge-Base-Page-deadbeefcafebabedeadbeefcafebabedeadbeef\n"
+    )
+    result = run_redact(tmp_path)
+    assert result.returncode == 0, (
+        f"URL alone should pass; stdout: {result.stdout}"
+    )

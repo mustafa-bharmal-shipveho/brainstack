@@ -155,9 +155,14 @@ if [ "$MODE" = "upgrade" ]; then
         exit 2
     fi
     echo "==> Upgrading code at $BRAIN_ROOT (memory user data left untouched)"
+    # Convention: any file named `*.user.*` (e.g. tools/my_helper.user.sh) is
+    # considered user-local and preserved across upgrades. Without this,
+    # `rsync --delete` would silently remove user helpers on every upgrade.
     rsync -a --delete --exclude '__pycache__' --exclude '.pytest_cache' --exclude '*.pyc' \
+        --exclude '*.user.*' \
         "$REPO_DIR/agent/tools/"   "$BRAIN_ROOT/tools/"
     rsync -a --delete --exclude '__pycache__' --exclude '.pytest_cache' --exclude '*.pyc' \
+        --exclude '*.user.*' \
         "$REPO_DIR/agent/harness/" "$BRAIN_ROOT/harness/"
     # memory/ holds BOTH framework code (*.py) and user data (working/, episodic/,
     # candidates/, personal/, semantic/, *.md). Sync only the framework Python

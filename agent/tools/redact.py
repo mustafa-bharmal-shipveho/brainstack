@@ -296,6 +296,10 @@ def shannon_entropy(s: str) -> float:
 # paths split into multiple shorter tokens that fall below the length floor.
 # Real base64-ish secrets are caught by the prefix-aware patterns above.
 ENTROPY_TOKEN_RE = re.compile(r"[A-Za-z0-9_\-]{32,}")
+# URL span — used to strip URLs from a line before running entropy on the rest.
+# Schema-permissive (any \w+://) but tighter than greedy (.*) to keep the
+# strip surgical.
+_URL_RE = re.compile(r"\b\w+://\S+")
 ENTROPY_DEFAULT_THRESHOLD = 4.5  # bits/char; >=4.5 is empirically random-looking
 # Strings that are obviously not secrets even though they're high-entropy.
 ENTROPY_IGNORE = re.compile(
@@ -375,10 +379,15 @@ def scan_file(
             # URLs naturally contain high-entropy IDs (Notion page IDs, GitHub
             # commit hashes, S3 object keys, Google Drive file IDs). They are
             # not secrets — the URL leaks them by definition. Vendor-specific
-            # secret URLs (Slack webhooks) have explicit patterns above.
-            if "://" in line:
-                continue
-            for token in ENTROPY_TOKEN_RE.findall(line):
+            # secret URLs (Slack webhooks) and userinfo credentials have
+            # explicit patterns above.
+            #
+            # We must NOT skip the whole line: a bare high-entropy token
+            # sitting next to an unrelated URL ("see https://example.com/x
+            # token <40-char-random>") would otherwise slip the pre-commit
+            # hook. Strip URL spans first; run entropy on the rest.
+            url_stripped = _URL_RE.sub(" ", line)
+            for token in ENTROPY_TOKEN_RE.findall(url_stripped):
                 if ENTROPY_IGNORE.match(token):
                     continue
                 if shannon_entropy(token) >= entropy_threshold:

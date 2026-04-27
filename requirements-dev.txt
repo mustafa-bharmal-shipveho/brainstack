@@ -1,0 +1,4 @@
+# Dev dependencies — not required to RUN the framework, only to test/develop it.
+# Install via:  pip install -r requirements-dev.txt
+pytest>=7
+pytest-timeout>=2

@@ -117,12 +117,18 @@ if [ -x "$JSONL_SCRUBBER" ] || [ -f "$JSONL_SCRUBBER" ]; then
     fi
 
     # Best-effort: clean up stale .tmp siblings left by killed atomic writes.
-    "$PYTHON_BIN" -c "
-import sys; sys.path.insert(0, '$BRAIN_ROOT/memory')
+    # Pass BRAIN_ROOT as argv[1] (NOT shell-interpolated into the source) so
+    # an exotic BRAIN_ROOT value (containing apostrophes / quote-escapes)
+    # cannot become attacker-controlled Python.
+    "$PYTHON_BIN" -c '
+import os, sys
+brain = sys.argv[1]
+sys.path.insert(0, os.path.join(brain, "memory"))
 from _atomic import cleanup_stale_tmp
-n = cleanup_stale_tmp('$BRAIN_ROOT/memory')
-if n: print(f'sync: cleaned {n} stale .tmp file(s)')
-" 2>>"$LOG_FILE" || true
+n = cleanup_stale_tmp(os.path.join(brain, "memory"))
+if n:
+    print(f"sync: cleaned {n} stale .tmp file(s)")
+' "$BRAIN_ROOT" 2>>"$LOG_FILE" || true
 else
     echo "$(date -u +%FT%TZ) sync: WARNING redact_jsonl.py missing at $JSONL_SCRUBBER" >> "$LOG_FILE"
 fi
