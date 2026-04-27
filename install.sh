@@ -156,13 +156,17 @@ chmod +x "$BRAIN_ROOT/tools/"*.sh 2>/dev/null || true
 chmod +x "$BRAIN_ROOT/tools/"*.py 2>/dev/null || true
 chmod +x "$BRAIN_ROOT/harness/hooks/"*.py 2>/dev/null || true
 
-# Stub for private redaction patterns (lives in user's brain, not in framework)
+# Stub for private redaction patterns (lives in user's brain, not in framework).
+# Empty by default; the user can copy templates/redact-private.example.txt over
+# to seed common org-shape regexes.
 cat > "$BRAIN_ROOT/redact-private.txt" <<'EOF'
 # Private redaction allowlist + extra patterns.
 # This file is local to your brain — never committed to the public framework.
-# Add Acme-specific or org-specific token shapes here, one regex per line.
-# Example:
-# (?i)acme[_-]?api[_-]?key\s*[:=]\s*[A-Za-z0-9_-]{20,}
+# One regex per line. Patterns are merged into the public BUILTIN_PATTERNS
+# at scan time. Patterns with ReDoS-prone nested quantifiers are rejected.
+#
+# For a starting set of org-PII shapes:
+#   cp $REPO_DIR/templates/redact-private.example.txt $BRAIN_ROOT/redact-private.txt
 EOF
 
 cat <<EOF

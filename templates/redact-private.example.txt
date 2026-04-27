@@ -1,0 +1,39 @@
+# Private redaction patterns — copy this file to ~/.agent/redact-private.txt
+# and edit. The default install.sh creates an EMPTY redact-private.txt; this
+# template is a starting set of org-PII shapes to consider adding.
+#
+# IMPORTANT:
+#   - One regex per line. Lines starting with `#` are ignored.
+#   - Patterns containing `(...+...)+` or similar nested-quantifier shapes
+#     are rejected at load time (ReDoS prevention).
+#   - Test new patterns: edit, save, run `~/.agent/tools/redact.py ~/.agent/`,
+#     verify the expected hits and no surprising false positives.
+#   - Patterns here add to the public framework's BUILTIN_PATTERNS — they
+#     don't replace it.
+#
+# This file lives in YOUR brain, not the public framework. Customize freely.
+
+# ----- Org-shaped tokens -----
+# Replace `myorg` with your actual org-internal token shapes.
+# Example:
+# (?i)\bmyorg[_-]?api[_-]?key\s*[:=]\s*[A-Za-z0-9_\-]{20,}
+# (?i)\bmyorg[_-]?(?:prod|stage|dev)[_-]?secret\b
+
+# ----- Internal hostnames -----
+# Adding internal hostnames as redaction patterns surfaces them at commit
+# time so you can decide whether the surrounding context is safe to ship.
+# Example:
+# https?://[a-z0-9.-]+\.internal\.myorg\.com
+# https?://[a-z0-9.-]+\.corp\.myorg\.net
+
+# ----- Custom secret-keyword vocabulary -----
+# If your team uses non-standard names like "fingerprint", "passphrase":
+# (?i)\bfingerprint\s*[:=]\s*[A-Za-z0-9_\-]{20,}
+# (?i)\bpassphrase\s*[:=]\s*['"][^'"]{12,}['"]
+
+# ----- Identity / PII slot (optional) -----
+# WARNING: this drifts from "secret scanner" into "PII scrubber". The
+# framework's stated guarantee is credential leakage, not identity. If
+# you want PII coverage, you have to enumerate it here. Examples:
+# (?i)\b(?:colleague_name_one|colleague_name_two|colleague_name_three)\b
+# (?i)\binternal-project-codename-xyz\b
