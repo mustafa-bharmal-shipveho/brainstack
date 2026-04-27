@@ -63,7 +63,7 @@ cp ~/Documents/codebase/mustafa-agentic-stack/templates/redact-private.example.t
 
 ```
 # Add one regex per line. Lines starting with # are ignored.
-# Examples:
+# Examples (replace `acme` with your org slug):
 (?i)acme[_-]?api[_-]?key\s*[:=]\s*[A-Za-z0-9_-]{20,}
 (?i)dd_[a-z0-9]{32}
 internal-token-[a-z0-9]{20}
@@ -161,13 +161,16 @@ The PUBLIC framework repo (`mustafa-agentic-stack`) must never contain
 personal data. Before any push to that repo, run the audit checklist:
 
 ```bash
-gitleaks detect --source ~/Documents/codebase/mustafa-agentic-stack/ --redact
-trufflehog filesystem ~/Documents/codebase/mustafa-agentic-stack/
-trufflehog git file://~/Documents/codebase/mustafa-agentic-stack/
-git -C ~/Documents/codebase/mustafa-agentic-stack grep -nIi -E "<your-org>|<your-name>"
+REPO=~/Documents/codebase/mustafa-agentic-stack
+gitleaks detect --source "$REPO" --redact
+trufflehog filesystem "$REPO"
+trufflehog git file://"$REPO"
+# Substitute your org slug, your name, your colleagues' first names:
+git -C "$REPO" grep -nIi -E "<your-org>|<your-name>|<colleague-1>|<colleague-2>"
 ```
 
 The greps should find only the repo's own self-references (README install
-URLs, etc.). Any other hit is a leak — investigate before push.
+URLs, NOTICE attribution). Any other hit is a leak — investigate before
+push.
 
 See `PRIVACY_AUDIT_v0.1.0.md` for the per-release checklist.

@@ -14,8 +14,9 @@ Behavior:
     before the match, the match is suppressed.
   - Loads extra regex patterns from `<target>/redact-private.txt` (one regex
     per line, `#` starts a comment). The file lives in the user's brain, not
-    in the public framework — so org-specific shapes (your employer's hostnames, internal
-    token prefixes) can be added without leaking the regex itself.
+    in the public framework — so org-specific shapes (your employer's
+    hostnames, internal token prefixes) can be added without leaking the
+    regex itself.
   - Whole-file pass detects PEM blocks (multi-line) and Authorization headers.
   - Optional Shannon-entropy sweep flags lines with high-entropy substrings
     of length >= 32. Disable with `--no-entropy`.

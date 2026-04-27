@@ -8,8 +8,8 @@
 
 Three layers of scanning:
 
-1. **Manual `git grep`** for personal terms (`mustafa`, `acme`, `shipveho`)
-   and known secret patterns (`AKIA`, `ghp_`, `gho_`).
+1. **Manual `git grep`** for personal/org terms (your name, employer,
+   internal hostnames) and known secret patterns (`AKIA`, `ghp_`, `gho_`).
 2. **`gitleaks`** entropy + pattern scan (if installed).
 3. **`trufflehog`** filesystem + git-history scan (if installed).
 4. **Visual review** of every file in the repo.
@@ -25,28 +25,27 @@ flipping the repo from PRIVATE to PUBLIC. v0.1.0 ships PRIVATE only.
 
 ## Manual `git grep` results
 
-### `mustafa` mentions (all allowed self-references)
+### Author-name mentions (all allowed self-references)
 
 All hits are either:
-- The project's own name `mustafa-agentic-stack` (self-naming)
-- Setup paths like `~/Documents/codebase/mustafa-agentic-stack/`
-- Schema description `[mustafa-agentic-stack extension]`
-- Author attribution (`Mustafa Bharmal` in NOTICE)
+- The project's own name (self-naming)
+- Setup paths
+- Schema description
+- Author attribution in NOTICE (Apache 2.0 §4(d) — intentional)
 
 No personal hits beyond self-naming. ✓
 
-### `acme` / `shipveho` mentions (all allowed: org-aware patterns)
+### Org-name mentions (all allowed: org-aware pattern examples)
 
-All hits are documentation explaining how users add ORG-SPECIFIC
+All hits are documentation showing how users add ORG-SPECIFIC
 redaction patterns to `redact-private.txt`. Example regex shown:
 `(?i)acme[_-]?api[_-]?key\s*[:=]\s*[A-Za-z0-9_-]{20,}`
 
-This is generic *example* text demonstrating how to add a redaction
-rule. It's not a real example secret. The framework needs to teach users
-HOW to redact org-specific patterns; pretending the employer doesn't exist
-when the author works at one would be artificial.
+The framework's docs use `acme` / `Acme` as the example placeholder
+employer name. Users substitute their own org. The framework cannot
+know your employer; it teaches the *shape*.
 
-✓ Decision: keep. These are documentation, not personal data.
+✓ Decision: keep. These are documentation examples, not personal data.
 
 ### Secret-pattern scans (no hits)
 
@@ -62,7 +61,7 @@ when the author works at one would be artificial.
 
 | File | Original (commit history) | Redacted to | Reason |
 |---|---|---|---|
-| `README.md:52` | `<your-account>/private-brain-repo` | `your private GitHub remote (you configure this)` | Identifies user's personal GitHub account |
+| `README.md` | author's personal brain remote URL | `your private GitHub remote (you configure this)` | Identifies user's personal GitHub account |
 
 After this redaction, no user-identifying URLs remain. Author
 attribution in `NOTICE` is intentional (Apache 2.0 §4(d)) and

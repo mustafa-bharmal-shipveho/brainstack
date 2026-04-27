@@ -79,16 +79,16 @@ Every 60 minutes:
 
 Logs land in `~/.agent/sync.log`.
 
-## Acme-aware private redaction
+## Org-aware private redaction
 
 The framework's `redact.py` covers public token formats. For
-org-specific patterns (your org's API keys, internal hostnames, etc.), edit
-`~/.agent/redact-private.txt` (created by the installer):
+org-specific patterns (your employer's API keys, internal hostnames,
+etc.), edit `~/.agent/redact-private.txt` (created by the installer):
 
 ```
 # Private redaction patterns
 # One regex per line (Python syntax)
-# Example:
+# Example (replace `acme` with your org slug):
 # (?i)acme[_-]?api[_-]?key\s*[:=]\s*[A-Za-z0-9_-]{20,}
 ```
 

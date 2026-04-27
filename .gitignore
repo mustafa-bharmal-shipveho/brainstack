@@ -38,3 +38,11 @@ episodic/AGENT_LEARNINGS.jsonl
 
 # Live brain — never commit user data into the framework repo.
 .agent/
+
+# Personal session artifacts — these belong in your brain, not the framework:
+#   SECURITY_REVIEW.md      — security review of YOUR brain (employer/PII content)
+#   RESUME.md               — overnight session notes
+#   tmp/                    — scratch dir, persona reports, throwaway scripts
+SECURITY_REVIEW.md
+RESUME.md
+tmp/

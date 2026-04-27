@@ -221,7 +221,7 @@ def test_private_patterns_loaded(tmp_path):
     f = tmp_path / "config.txt"
     f.write_text('ACME_API_KEY=abc123def456ghi789jklmnopqrstuv\n')
     result = run_redact(tmp_path, "--no-entropy")
-    assert result.returncode != 0, f"Expected acme pattern hit. stdout: {result.stdout}"
+    assert result.returncode != 0, f"Expected private pattern hit. stdout: {result.stdout}"
     assert "private_" in result.stdout
 
 
