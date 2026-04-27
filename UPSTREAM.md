@@ -18,11 +18,11 @@ Source path on left, our path on right. Modifications listed where they exist.
 
 | Upstream | Our path | Modifications |
 |---|---|---|
-| `.agent/memory/auto_dream.py` | `agent/memory/auto_dream.py` | none (path resolution is `__file__`-relative) |
+| `.agent/memory/auto_dream.py` | `agent/memory/auto_dream.py` | **v0.1.1**: `_episodic_locked` switched from data-file flock to sentinel-file flock; `_write_entries_locked` uses atomic write helper. (Closes the lock-inversion data loss when `os.replace` swaps the data inode.) |
 | `.agent/memory/cluster.py` | `agent/memory/cluster.py` | none |
-| `.agent/memory/promote.py` | `agent/memory/promote.py` | none |
+| `.agent/memory/promote.py` | `agent/memory/promote.py` | **v0.1.1**: `write_candidates` uses `atomic_write_json` instead of in-place `open(w)`. |
 | `.agent/memory/validate.py` | `agent/memory/validate.py` | none |
-| `.agent/memory/review_state.py` | `agent/memory/review_state.py` | none |
+| `.agent/memory/review_state.py` | `agent/memory/review_state.py` | **v0.1.1**: `save_candidate` and `write_review_queue_summary` use atomic write helpers. |
 | `.agent/memory/render_lessons.py` | `agent/memory/render_lessons.py` | **modified**: `_bullet_for` extended for optional `why`/`how_to_apply` fields |
 | `.agent/memory/decay.py` | `agent/memory/decay.py` | none |
 | `.agent/memory/archive.py` | `agent/memory/archive.py` | none |
@@ -31,13 +31,29 @@ Source path on left, our path on right. Modifications listed where they exist.
 | `.agent/tools/reopen.py` | `agent/tools/reopen.py` | none |
 | `.agent/tools/list_candidates.py` | `agent/tools/list_candidates.py` | none |
 | `.agent/tools/data_layer_export.py` | `agent/tools/data_layer_export.py` | none — full vendor (presentation rewrite deferred to v0.2 if needed) |
-| `.agent/harness/hooks/claude_code_post_tool.py` | `agent/harness/hooks/claude_code_post_tool.py` | none |
-| `.agent/harness/hooks/_episodic_io.py` | `agent/harness/hooks/_episodic_io.py` | none |
+| `.agent/harness/hooks/claude_code_post_tool.py` | `agent/harness/hooks/claude_code_post_tool.py` | **v0.1.1**: added `from __future__ import annotations` so the upstream's PEP 604 (`X \| Y`) annotations don't crash callers on Python 3.9. |
+| `.agent/harness/hooks/_episodic_io.py` | `agent/harness/hooks/_episodic_io.py` | **v0.1.1**: lock identity moved to a sentinel sibling `<jsonl>.lock` (was data file directly). Wraps OSError on read-only files. |
 | `.agent/harness/hooks/_provenance.py` | `agent/harness/hooks/_provenance.py` | none |
 | `.agent/harness/hooks/on_failure.py` | `agent/harness/hooks/on_failure.py` | none |
 | `.agent/harness/hooks/post_execution.py` | `agent/harness/hooks/post_execution.py` | none |
 | `.agent/harness/salience.py` | `agent/harness/salience.py` | none |
 | `.agent/harness/text.py` | `agent/harness/text.py` | none |
+
+### Clean-room additions (not in upstream)
+
+These should be excluded from any upstream-rebase since they don't have
+upstream counterparts:
+
+| File | Purpose |
+|---|---|
+| `agent/memory/_atomic.py` | Atomic write helper (temp + fsync + os.replace) |
+| `agent/tools/redact.py` | Pre-commit secret scanner |
+| `agent/tools/redact_jsonl.py` | Sync-time JSONL secret scrubber |
+| `agent/tools/sync.sh` | Hourly git-sync script with required scanner |
+| `agent/tools/dream_runner.py` | fcntl-based launchd entry point for dream cycle |
+| `agent/tools/migrate.py` | One-shot flat-memory → structured-memory migration |
+| `agent/harness/hooks/agentic_post_tool_global.py` | Global wrapper that resolves BRAIN_ROOT, validates path, and dispatches to upstream's `claude_code_post_tool.py` |
+| `templates/brain-secret-scan.yml` | Server-side scanning GitHub Action template |
 
 ## Schema-compat status
 
