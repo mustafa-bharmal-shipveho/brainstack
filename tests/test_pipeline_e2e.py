@@ -83,10 +83,6 @@ def run(*args: str, **env: str) -> subprocess.CompletedProcess:
     )
 
 
-@pytest.mark.skipif(
-    sys.version_info < (3, 10),
-    reason="vendored hook needs Python >= 3.10",
-)
 def test_full_pipeline_scrubs_aws_key_from_bash_capture(tmp_path):
     """A Bash tool call that exfiltrates an AWS key should be scrubbed before push."""
     fake_home = tmp_path / "home"
@@ -144,10 +140,6 @@ def test_full_pipeline_scrubs_aws_key_from_bash_capture(tmp_path):
             json.loads(line)
 
 
-@pytest.mark.skipif(
-    sys.version_info < (3, 10),
-    reason="vendored hook needs Python >= 3.10",
-)
 def test_pipeline_idempotent_after_first_scrub(tmp_path):
     """Running the scrubber a second time on a clean JSONL is a no-op."""
     fake_home = tmp_path / "home"
@@ -174,10 +166,6 @@ def test_pipeline_idempotent_after_first_scrub(tmp_path):
     )
 
 
-@pytest.mark.skipif(
-    sys.version_info < (3, 10),
-    reason="vendored hook needs Python >= 3.10",
-)
 def test_pipeline_scrubs_edit_old_new_strings(tmp_path):
     """An Edit tool call where old_string/new_string contain a secret gets scrubbed."""
     fake_home = tmp_path / "home"
@@ -214,10 +202,6 @@ def test_pipeline_scrubs_edit_old_new_strings(tmp_path):
     assert "AKIA0000000000000000" not in post
 
 
-@pytest.mark.skipif(
-    sys.version_info < (3, 10),
-    reason="vendored hook needs Python >= 3.10",
-)
 def test_pipeline_handles_authorization_bearer_in_curl(tmp_path):
     """A captured curl with an Authorization: Bearer header should get scrubbed."""
     fake_home = tmp_path / "home"
