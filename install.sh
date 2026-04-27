@@ -8,6 +8,15 @@
 #   ./install.sh --migrate <flat-memory-dir>
 #                             -- run tools/migrate.py against the given dir
 #
+# Plug-in flags (work with any mode that creates a brain):
+#   --brain-remote <url>      -- after install, init the brain as a git repo
+#                                with this remote as origin (HTTPS or SSH).
+#                                Also reads $BRAIN_REMOTE_URL if set.
+#   --push-initial-commit     -- after --brain-remote, also push the first
+#                                commit to the remote (skipped by default
+#                                so the user can review locally first).
+#   --brain-root <path>       -- override $BRAIN_ROOT for this run only.
+#
 # Always prints manual-merge instructions for ~/.claude/settings.json. The
 # installer never auto-edits user settings — you copy the snippet by hand,
 # preserving any other hooks/permissions you already have.
@@ -15,6 +24,8 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BRAIN_ROOT="${BRAIN_ROOT:-$HOME/.agent}"
+BRAIN_REMOTE="${BRAIN_REMOTE_URL:-}"
+PUSH_INITIAL_COMMIT=0
 
 MODE="install"
 MIGRATE_SOURCE=""
@@ -28,8 +39,28 @@ while [ $# -gt 0 ]; do
             MIGRATE_SOURCE="${2:-}"
             shift 2 || true
             ;;
+        --brain-remote)
+            BRAIN_REMOTE="${2:-}"
+            if [ -z "$BRAIN_REMOTE" ]; then
+                echo "install: --brain-remote requires a URL" >&2
+                exit 2
+            fi
+            shift 2
+            ;;
+        --push-initial-commit)
+            PUSH_INITIAL_COMMIT=1
+            shift
+            ;;
+        --brain-root)
+            BRAIN_ROOT="${2:-}"
+            if [ -z "$BRAIN_ROOT" ]; then
+                echo "install: --brain-root requires a path" >&2
+                exit 2
+            fi
+            shift 2
+            ;;
         --help|-h)
-            sed -n '2,13p' "$0" | sed 's/^# //; s/^#//'
+            sed -n '2,22p' "$0" | sed 's/^# //; s/^#//'
             exit 0
             ;;
         *)
@@ -236,6 +267,48 @@ cat > "$BRAIN_ROOT/redact-private.txt" <<'EOF'
 #   cp $REPO_DIR/templates/redact-private.example.txt $BRAIN_ROOT/redact-private.txt
 EOF
 
+# ----- Optional: --brain-remote auto-init -----
+# If the user passed --brain-remote (or set BRAIN_REMOTE_URL), wire up the
+# brain as a git repo with that remote and make an initial commit. Push only
+# if --push-initial-commit was also passed.
+if [ -n "$BRAIN_REMOTE" ]; then
+    echo "==> Initializing brain as git repo with origin = $BRAIN_REMOTE"
+    cd "$BRAIN_ROOT"
+    if [ ! -d .git ]; then
+        git init -q
+        git branch -m main 2>/dev/null || true
+    fi
+    if git remote get-url origin >/dev/null 2>&1; then
+        git remote set-url origin "$BRAIN_REMOTE"
+    else
+        git remote add origin "$BRAIN_REMOTE"
+    fi
+    # Stage + commit if there's anything to commit
+    git add -A
+    if ! git diff --cached --quiet; then
+        git commit -q -m "Initial brain ($(date -u +%FT%TZ))"
+        echo "    Initial commit created."
+    fi
+    # Install pre-commit hook automatically (it's defense-in-depth; cheap to add)
+    if [ -f "$REPO_DIR/templates/pre-commit" ] && [ ! -f .git/hooks/pre-commit ]; then
+        cp "$REPO_DIR/templates/pre-commit" .git/hooks/pre-commit
+        chmod +x .git/hooks/pre-commit
+        echo "    Pre-commit redaction hook installed."
+    fi
+    if [ "$PUSH_INITIAL_COMMIT" -eq 1 ]; then
+        echo "==> Pushing initial commit"
+        if git push -u origin main 2>&1 | tail -3; then
+            echo "    Push complete."
+        else
+            echo "    Push failed — fix the issue and re-run \`git push -u origin main\`" >&2
+        fi
+    else
+        echo "    Skipping push (use --push-initial-commit to push, or run"
+        echo "    'cd $BRAIN_ROOT && git push -u origin main' when ready)."
+    fi
+    cd "$REPO_DIR"
+fi
+
 cat <<EOF
 
 ==> Installed. Brain is at: $BRAIN_ROOT
@@ -258,13 +331,17 @@ Next steps (manual — installer never edits ~/.claude/ for safety):
      Merge into your settings.json under "hooks.PostToolUse". Validate:
        python3 -m json.tool ~/.claude/settings.json > /dev/null
 
-  2. Initialize ~/.agent/ as a git repo and add a private remote:
+  2. Initialize the brain as a git repo and add a private remote:
 
        cd $BRAIN_ROOT
        git init && git branch -m main
        git remote add origin <your-private-repo-url>
        git add . && git commit -m "Initial brain"
        git push -u origin main
+
+     OR re-run the installer with --brain-remote to do this automatically:
+       ./install.sh --brain-remote git@github.com:<you>/<your-brain-repo>.git \\
+                    --push-initial-commit
 
   3. Set up nightly dream + hourly sync via launchd:
        cp $REPO_DIR/templates/com.user.agent-dream.plist ~/Library/LaunchAgents/
