@@ -1,0 +1,66 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/mustafa-bharmal-shipveho/mustafa-agentic-stack/schemas/lessons.schema.json",
+  "title": "lessons.jsonl row",
+  "description": "Schema for one row of semantic/lessons.jsonl. Vendored fields match upstream agentic-stack v0.11.2. Extension fields (why, how_to_apply, original_markdown_path) are mustafa-agentic-stack additions, optional and backward-compatible.",
+  "type": "object",
+  "required": ["id", "claim", "status", "accepted_at", "reviewer", "rationale"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "Stable lesson id, format `lesson_<12hex>` (1:1 with the source candidate's id when one exists)."
+    },
+    "claim": {
+      "type": "string",
+      "description": "The canonical lesson text — the rule itself."
+    },
+    "conditions": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Tag-like conditions extracted by the clustering pass. Used for retrieval relevance."
+    },
+    "evidence_ids": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Episodic timestamps that fed into this lesson's source cluster."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["accepted", "provisional", "rejected", "legacy"],
+      "description": "Lifecycle state. `legacy` is reserved for entries auto-migrated from pre-restructure LESSONS.md bullets."
+    },
+    "accepted_at": {"type": "string", "format": "date-time"},
+    "reviewer": {
+      "type": "string",
+      "description": "Who graduated this lesson (e.g., 'host-agent', 'learn.py', 'render_lessons_migration')."
+    },
+    "rationale": {
+      "type": "string",
+      "description": "Why this lesson was accepted. Required by graduate.py."
+    },
+    "cluster_size": {"type": "integer"},
+    "canonical_salience": {"type": "number"},
+    "confidence": {"type": "number"},
+    "support_count": {"type": "integer"},
+    "contradiction_count": {"type": "integer"},
+    "supersedes": {
+      "type": ["string", "null"],
+      "description": "Lesson id this entry replaces. Renders the old lesson with strikethrough."
+    },
+    "source_candidate": {"type": ["string", "null"]},
+
+    "why": {
+      "type": "string",
+      "description": "[mustafa-agentic-stack extension] The reason behind the rule — context like 'incident from 2025-01' or 'compliance requirement'. Rendered in LESSONS.md as 'Why:' under the bullet when present."
+    },
+    "how_to_apply": {
+      "type": "string",
+      "description": "[mustafa-agentic-stack extension] When/where the rule kicks in — 'in tests touching the database', 'on every PR review'. Rendered in LESSONS.md as 'How to apply:' under the bullet when present."
+    },
+    "original_markdown_path": {
+      "type": "string",
+      "description": "[mustafa-agentic-stack extension] If migrated from a flat memory dir, points to the long-form companion markdown that preserves any structure not captured in the JSONL row."
+    }
+  },
+  "additionalProperties": true
+}
