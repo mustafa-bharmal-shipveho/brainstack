@@ -47,6 +47,10 @@ install: ## Fresh install of ~/.agent
 upgrade: ## Re-sync code into ~/.agent (memory data left untouched)
 	PYTHON_BIN=$(PY) ./install.sh --upgrade
 
+.PHONY: verify
+verify: ## Self-check the brain layout
+	PYTHON_BIN=$(PY) ./install.sh --verify
+
 .PHONY: dream
 dream: ## Run the dream cycle once
 	$(PY) ~/.agent/tools/dream_runner.py

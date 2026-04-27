@@ -4,6 +4,7 @@
 # Modes:
 #   ./install.sh              -- install fresh ~/.agent/ if missing, else show status
 #   ./install.sh --upgrade    -- refresh tools + hooks; leave memory/ untouched
+#   ./install.sh --verify     -- self-check: confirm brain is healthy
 #   ./install.sh --migrate <flat-memory-dir>
 #                             -- run tools/migrate.py against the given dir
 #
@@ -21,13 +22,14 @@ MIGRATE_SOURCE=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --upgrade) MODE="upgrade"; shift ;;
+        --verify) MODE="verify"; shift ;;
         --migrate)
             MODE="migrate"
             MIGRATE_SOURCE="${2:-}"
             shift 2 || true
             ;;
         --help|-h)
-            sed -n '2,12p' "$0" | sed 's/^# //; s/^#//'
+            sed -n '2,13p' "$0" | sed 's/^# //; s/^#//'
             exit 0
             ;;
         *)
@@ -91,6 +93,59 @@ if [ "$MODE" = "migrate" ]; then
     echo "==> Migrating $MIGRATE_SOURCE -> $BRAIN_ROOT"
     "$PYTHON_BIN" "$BRAIN_ROOT/tools/migrate.py" "$MIGRATE_SOURCE" "$BRAIN_ROOT"
     exit $?
+fi
+
+# ----- Mode: verify -----
+if [ "$MODE" = "verify" ]; then
+    echo "==> Verifying brain health at $BRAIN_ROOT"
+    fail=0
+    check() {
+        local desc="$1"
+        local cmd="$2"
+        if eval "$cmd" >/dev/null 2>&1; then
+            printf "  ✓ %s\n" "$desc"
+        else
+            printf "  ✗ %s\n" "$desc"
+            fail=1
+        fi
+    }
+    check "BRAIN_ROOT exists" "test -d '$BRAIN_ROOT'"
+    check "memory/ layout present" "test -d '$BRAIN_ROOT/memory/episodic' -a -d '$BRAIN_ROOT/memory/working' -a -d '$BRAIN_ROOT/memory/candidates' -a -d '$BRAIN_ROOT/memory/semantic'"
+    check "AGENT_LEARNINGS.jsonl present" "test -f '$BRAIN_ROOT/memory/episodic/AGENT_LEARNINGS.jsonl'"
+    check "redact.py executable" "test -x '$BRAIN_ROOT/tools/redact.py' -o -f '$BRAIN_ROOT/tools/redact.py'"
+    check "redact_jsonl.py present" "test -f '$BRAIN_ROOT/tools/redact_jsonl.py'"
+    check "dream_runner.py present" "test -f '$BRAIN_ROOT/tools/dream_runner.py'"
+    check "atomic helper present" "test -f '$BRAIN_ROOT/memory/_atomic.py'"
+    check "global wrapper hook present" "test -f '$BRAIN_ROOT/harness/hooks/agentic_post_tool_global.py'"
+    check "vendored hook present" "test -f '$BRAIN_ROOT/harness/hooks/claude_code_post_tool.py'"
+    check "redact-private.txt present" "test -f '$BRAIN_ROOT/redact-private.txt'"
+
+    # Optional but informative
+    if command -v trufflehog >/dev/null 2>&1; then
+        printf "  ✓ trufflehog on PATH\n"
+    elif command -v gitleaks >/dev/null 2>&1; then
+        printf "  ✓ gitleaks on PATH\n"
+    else
+        printf "  ⚠ no secret scanner on PATH (sync.sh will refuse to push)\n"
+    fi
+
+    # Run the redactor — exit 0 means clean
+    if [ -f "$BRAIN_ROOT/tools/redact.py" ]; then
+        if "$PYTHON_BIN" "$BRAIN_ROOT/tools/redact.py" "$BRAIN_ROOT" >/dev/null 2>&1; then
+            printf "  ✓ brain scans clean\n"
+        else
+            printf "  ⚠ brain has redaction hits — run \`%s %s\` to see\n" \
+                "$PYTHON_BIN" "$BRAIN_ROOT/tools/redact.py $BRAIN_ROOT"
+        fi
+    fi
+
+    if [ "$fail" -eq 0 ]; then
+        echo "==> Verify OK"
+        exit 0
+    else
+        echo "==> Verify FAILED — see above" >&2
+        exit 1
+    fi
 fi
 
 # ----- Mode: upgrade -----
