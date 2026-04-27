@@ -143,8 +143,16 @@ def migrate_feedback(src_path: Path, target_root: Path) -> dict:
 
     # Claim is the rule itself — first paragraph of body. Description in
     # frontmatter is a summary, not the rule, so we don't use it as claim.
+    # Critical: collapse newlines and stray `- ` bullets to spaces so the
+    # rendered LESSONS.md bullet stays on one line. Multi-line claims would
+    # cause migrate_legacy_bullets() in render_lessons.py to misread inner
+    # bullets as separate top-level lessons (recursive duplication).
     body_first_para = claim.split("\n\n", 1)[0].strip()
-    claim_text = body_first_para if body_first_para else (meta.get("description") or "").strip()
+    raw = body_first_para if body_first_para else (meta.get("description") or "").strip()
+    # Replace newlines + leading bullet markers with separators
+    claim_text = re.sub(r"\s*\n+\s*-\s*", " · ", raw)  # bullet on next line → · separator
+    claim_text = re.sub(r"\s*\n+\s*", " ", claim_text)  # any remaining newlines → space
+    claim_text = re.sub(r"\s{2,}", " ", claim_text).strip()
     return {
         "id": lid,
         "claim": claim_text[:500],

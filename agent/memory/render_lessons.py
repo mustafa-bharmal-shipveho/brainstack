@@ -132,13 +132,19 @@ def _bullet_for(lesson, superseded_by):
 
     # mustafa-agentic-stack extension: render optional why/how_to_apply.
     # When absent, bullet output matches upstream exactly.
-    why = (lesson.get("why") or "").strip()
-    how_to_apply = (lesson.get("how_to_apply") or "").strip()
+    #
+    # IMPORTANT: do NOT use `- ` prefixed lines for these. migrate_legacy_bullets()
+    # below strips leading whitespace and matches any `- ` line below the
+    # sentinel as a candidate bullet for migration. Using `- ` here would
+    # cause why/how_to_apply text to get re-imported as legacy lesson rows
+    # on each render (recursive duplication). Use indented italics instead.
+    why = (lesson.get("why") or "").strip().replace("\n", " ")
+    how_to_apply = (lesson.get("how_to_apply") or "").strip().replace("\n", " ")
     extras = []
     if why:
-        extras.append(f"  - **Why:** {why}")
+        extras.append(f"   *Why:* {why}")
     if how_to_apply:
-        extras.append(f"  - **How to apply:** {how_to_apply}")
+        extras.append(f"   *How to apply:* {how_to_apply}")
     extras_block = ("\n" + "\n".join(extras)) if extras else ""
 
     sup_by = superseded_by.get(lid)
