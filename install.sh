@@ -57,6 +57,23 @@ if [ "$PY_MAJOR" -lt 3 ] || { [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 10 ]; }
     exit 1
 fi
 
+# Resolve absolute path so launchd plists / hook commands don't depend on PATH.
+PYTHON_ABS="$("$PYTHON_BIN" -c 'import sys; print(sys.executable)')"
+
+# ----- Secret scanner check -----
+# sync.sh fails closed without trufflehog or gitleaks. Warn here so the user
+# can install one before first sync attempt.
+if ! command -v trufflehog >/dev/null 2>&1 && ! command -v gitleaks >/dev/null 2>&1; then
+    echo "" >&2
+    echo "install: WARNING — no secret scanner found on PATH." >&2
+    echo "         sync.sh requires trufflehog or gitleaks to push." >&2
+    echo "" >&2
+    echo "         Install one before first sync:" >&2
+    echo "           brew install trufflehog        # or" >&2
+    echo "           brew install gitleaks" >&2
+    echo "" >&2
+fi
+
 # ----- Mode: migrate -----
 if [ "$MODE" = "migrate" ]; then
     if [ -z "$MIGRATE_SOURCE" ]; then
@@ -143,11 +160,20 @@ cat <<EOF
 
 Next steps (manual — installer never edits ~/.claude/ for safety):
 
-  1. Add the global hook to ~/.claude/settings.json. Snippet:
+  1. Add the global hook to ~/.claude/settings.json. The snippet template
+     uses placeholders — fill in the absolute paths shown below (do NOT use
+     \$HOME or ~ in the command; absolute paths defend against env-poisoning):
 
+       Python interpreter: $PYTHON_ABS
+       Hook wrapper:       $BRAIN_ROOT/harness/hooks/agentic_post_tool_global.py
+
+       So the hook entry is:
+         "command": "$PYTHON_ABS $BRAIN_ROOT/harness/hooks/agentic_post_tool_global.py"
+
+     Reference template:
        cat $REPO_DIR/adapters/claude-code/settings.snippet.json
 
-     Merge this into your existing settings.json under "hooks". Validate:
+     Merge into your settings.json under "hooks.PostToolUse". Validate:
        python3 -m json.tool ~/.claude/settings.json > /dev/null
 
   2. Initialize ~/.agent/ as a git repo and add a private remote:
@@ -167,10 +193,16 @@ Next steps (manual — installer never edits ~/.claude/ for safety):
   4. (Optional) Migrate an existing flat memory directory:
        $REPO_DIR/install.sh --migrate ~/.claude/projects/<slug>/memory
 
-  5. (Optional) Pre-commit hook for secret scanning:
+  5. (Recommended) Pre-commit hook for secret scanning:
        cd $BRAIN_ROOT
        cp $REPO_DIR/templates/pre-commit .git/hooks/pre-commit
        chmod +x .git/hooks/pre-commit
+
+  6. (Recommended) Server-side secret scan workflow on the brain repo
+     (catches \`git commit --no-verify\` bypass attempts):
+       mkdir -p $BRAIN_ROOT/.github/workflows
+       cp $REPO_DIR/templates/brain-secret-scan.yml \\
+          $BRAIN_ROOT/.github/workflows/secret-scan.yml
 
 See docs/claude-code-setup.md and docs/git-sync.md for details.
 EOF

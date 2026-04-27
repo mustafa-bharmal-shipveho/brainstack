@@ -12,6 +12,7 @@ import os, json, datetime, hashlib
 from cluster import content_cluster, extract_pattern
 from review_state import _lessons_sha
 from validate import extract_lesson_lines, check_exact_duplicate
+from _atomic import atomic_write_json
 
 
 def cluster_and_extract(entries, threshold=0.3):
@@ -162,8 +163,7 @@ def write_candidates(patterns, candidates_dir):
         }
 
         staged_path = os.path.join(candidates_dir, f"{slug}.json")
-        with open(staged_path, "w") as f:
-            json.dump(candidate, f, indent=2)
+        atomic_write_json(staged_path, candidate)
 
         # The slug must live in exactly one lifecycle location. Remove any
         # prior copy in rejected/ or graduated/ (the latter only for

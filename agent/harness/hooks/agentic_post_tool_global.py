@@ -3,60 +3,161 @@
 
 This is the entry point Claude Code invokes per tool call. It:
 
-  1. Resolves the target brain location:
-     - If BRAIN_ROOT env var is set and non-empty → use that
-     - Else → ~/.agent/
+  1. Resolves the target brain location safely:
+     - Default: ~/.agent/
+     - If BRAIN_ROOT env var is set, validate it resolves to a path under
+       $HOME (resolved real-path). If it doesn't, refuse and fall back to
+       the default. This prevents env-poisoning RCE: a hostile project's
+       .envrc / shell init that sets BRAIN_ROOT=/tmp/attacker can no longer
+       redirect the wrapper into running attacker-controlled Python.
   2. Checks for `.agent-local-override` in $CLAUDE_PROJECT_DIR.
-     If present, exits 0 immediately. Use case: the project has its own
-     upstream-agentic-stack `.agent/` folder with its own hooks, and we
-     don't want double-logging.
+     If present, exits 0 immediately and (when AGENTIC_DEBUG=1 or the
+     marker is in an unexpected location) logs the fire event so the user
+     notices when logging silently turns off.
   3. Otherwise, dispatches to the vendored claude_code_post_tool.py with
-     AGENT_ROOT pointing at the resolved brain. Reads the same JSON payload
-     from stdin and forwards it.
+     AGENT_ROOT pointing at the resolved brain.
 
 Always exits 0 (a hook failure shouldn't break Claude Code's tool flow).
 """
-import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 
 
+def _expand(path: str) -> Path:
+    """Expand ~ and resolve symlinks to real path."""
+    return Path(os.path.expanduser(path)).resolve()
+
+
+def _log_warning(msg: str) -> None:
+    """Append a warning to ~/.agent/hook.log (best effort) and stderr."""
+    sys.stderr.write(f"agentic-post-tool-global: {msg}\n")
+    try:
+        log = _expand("~/.agent/hook.log")
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a") as f:
+            f.write(f"{msg}\n")
+    except OSError:
+        pass
+
+
 def resolve_brain_root() -> Path:
-    """Pick the brain location based on env precedence."""
+    """Pick the brain location, validating env-var input.
+
+    Security: BRAIN_ROOT is attacker-controllable via shell env (e.g. a
+    project's .envrc sourced by the user's shell). We must not trust it
+    blindly — the wrapper exec's a Python script under the resolved
+    brain root. Constraints:
+      - resolved path must exist
+      - resolved path must be under $HOME
+      - resolved path must contain harness/hooks/claude_code_post_tool.py
+        (otherwise it's not a brain dir at all)
+    Falls back to ~/.agent on any failure, with a warning.
+    """
+    home = _expand("~")
+    default = home / ".agent"
+
     explicit = os.environ.get("BRAIN_ROOT", "").strip()
-    if explicit:
-        return Path(explicit).expanduser()
-    return Path(os.path.expanduser("~/.agent"))
+    if not explicit:
+        return default
+
+    try:
+        candidate = _expand(explicit)
+    except (OSError, ValueError) as e:
+        _log_warning(f"BRAIN_ROOT={explicit!r} could not be resolved: {e}; using default")
+        return default
+
+    # Must be under $HOME (real-path comparison, not string prefix —
+    # Path.is_relative_to handles symlink-resolved paths correctly).
+    try:
+        if not candidate.is_relative_to(home):
+            _log_warning(
+                f"BRAIN_ROOT={candidate} is outside $HOME ({home}); refusing and using default"
+            )
+            return default
+    except AttributeError:
+        # is_relative_to is 3.9+; on older interpreters fall back to relative_to
+        try:
+            candidate.relative_to(home)
+        except ValueError:
+            _log_warning(f"BRAIN_ROOT={candidate} is outside $HOME; refusing")
+            return default
+
+    # Must look like a brain dir (has the vendored hook we'd execute)
+    if not (candidate / "harness" / "hooks" / "claude_code_post_tool.py").exists():
+        _log_warning(
+            f"BRAIN_ROOT={candidate} does not contain harness/hooks/claude_code_post_tool.py; "
+            "refusing and using default"
+        )
+        return default
+
+    if candidate != default:
+        _log_warning(f"BRAIN_ROOT override accepted: {candidate} (default would be {default})")
+
+    return candidate
 
 
-def has_local_override() -> bool:
-    """True if $CLAUDE_PROJECT_DIR/.agent-local-override exists."""
+def has_local_override() -> tuple[bool, str]:
+    """Return (override_active, marker_path_or_empty)."""
     project = os.environ.get("CLAUDE_PROJECT_DIR", "").strip()
     if not project:
-        return False
+        return False, ""
     marker = Path(project) / ".agent-local-override"
-    return marker.exists()
+    if marker.exists():
+        return True, str(marker)
+    return False, ""
+
+
+def _log_override_fire(marker: str) -> None:
+    """Append override-fire events to <brain>/override.log.
+
+    Why: a `.agent-local-override` marker in a project root silently
+    disables global logging for every tool call. A malicious or careless
+    repo could ship that marker in its initial commit and the user would
+    never notice their tool usage stopped being captured. Logging fire
+    events to a separate file (not the noisy hook.log) gives the user a
+    cheap audit trail — `tail override.log` shows every project that has
+    suppressed logging today.
+
+    Rate-limited at the file-size level: writes are bounded by override
+    use, which is rare. We don't dedupe per-session because we want each
+    session that hit the marker to appear in the log, not just one of them.
+    """
+    try:
+        log = _expand("~/.agent/override.log")
+        log.parent.mkdir(parents=True, exist_ok=True)
+        # Cap at 1MB — beyond that the user has bigger problems than dedup.
+        if log.exists() and log.stat().st_size > 1_000_000:
+            return
+        # Pull the session id from stdin if available (don't consume — we
+        # don't read stdin in the override path, so just log without it).
+        cwd = os.environ.get("CLAUDE_PROJECT_DIR", "?")
+        with log.open("a") as f:
+            from datetime import datetime, timezone
+            ts = datetime.now(timezone.utc).isoformat()
+            f.write(f"{ts}\t{cwd}\t{marker}\n")
+    except OSError:
+        pass
 
 
 def main() -> int:
-    if has_local_override():
-        # Project's own hooks handle this; skip silently.
+    override, marker = has_local_override()
+    if override:
+        # Project's own hooks handle this; skip silently for the tool flow,
+        # but always record the fire event so the user notices when logging
+        # is disabled by a marker.
+        _log_override_fire(marker)
+        if os.environ.get("AGENTIC_DEBUG", "").strip():
+            _log_warning(f"local override active: {marker} (logging suppressed for this call)")
         return 0
 
     brain = resolve_brain_root()
     vendor_hook = brain / "harness" / "hooks" / "claude_code_post_tool.py"
 
     if not vendor_hook.exists():
-        # Brain not installed yet, or path mis-resolved. Don't error;
-        # Claude Code's tool flow shouldn't break because the hook is missing.
         return 0
 
-    # Forward stdin to the vendored hook. The vendored hook reads tool_name /
-    # tool_input / tool_response from stdin and resolves AGENT_ROOT from its
-    # own __file__ location — no env var needed since we pass the absolute
-    # path to the vendored script under the resolved brain.
     payload = sys.stdin.read()
     try:
         result = subprocess.run(
@@ -66,11 +167,10 @@ def main() -> int:
             text=True,
             timeout=30,
         )
-        # Pass through stderr for debuggability; do NOT propagate failure.
         if result.stderr:
             sys.stderr.write(result.stderr)
     except (subprocess.TimeoutExpired, OSError) as e:
-        sys.stderr.write(f"agentic-post-tool-global: hook dispatch failed: {e}\n")
+        _log_warning(f"hook dispatch failed: {e}")
     return 0
 
 

@@ -12,6 +12,10 @@
     2. Replace REPLACE_PYTHON with the full path to a Python 3.10+ interpreter
        (e.g. /opt/homebrew/bin/python3.13). The system /usr/bin/python3 on
        older macOS is 3.9 and will not work.
+
+  Locking note: dream_runner.py acquires the brain-wide lock via Python's
+  fcntl.flock — no dependency on the GNU `flock(1)` binary which isn't
+  bundled with macOS. If the lock is held by sync.sh, the runner exits 0.
 -->
 <plist version="1.0">
 <dict>
@@ -20,10 +24,10 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/env</string>
-        <string>bash</string>
-        <string>-c</string>
-        <string>flock -n REPLACE_HOME/.agent/.brain.lock REPLACE_PYTHON REPLACE_HOME/.agent/memory/auto_dream.py</string>
+        <string>REPLACE_PYTHON</string>
+        <string>REPLACE_HOME/.agent/tools/dream_runner.py</string>
+        <string>--brain-root</string>
+        <string>REPLACE_HOME/.agent</string>
     </array>
 
     <key>StartCalendarInterval</key>

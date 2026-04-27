@@ -10,6 +10,7 @@ history so a candidate that keeps reappearing is visibly churning rather
 than looking novel each time.
 """
 import os, json, datetime, hashlib
+from _atomic import atomic_write_json, atomic_write_text
 
 
 def _now():
@@ -64,8 +65,7 @@ def load_candidate(path):
 
 
 def save_candidate(candidate, path):
-    with open(path, "w") as f:
-        json.dump(candidate, f, indent=2)
+    atomic_write_json(path, candidate)
 
 
 def stage_candidate(candidate_path, reviewer="auto_dream"):
@@ -235,8 +235,7 @@ def write_review_queue_summary(candidates_dir, summary_path):
     pending = list_candidates(candidates_dir, status="staged")
     os.makedirs(os.path.dirname(summary_path), exist_ok=True)
     if not pending:
-        with open(summary_path, "w") as f:
-            f.write("# Review Queue\n\n_No pending candidates._\n")
+        atomic_write_text(summary_path, "# Review Queue\n\n_No pending candidates._\n")
         return 0
 
     staged_ats = [c.get("staged_at", "") for c in pending if c.get("staged_at")]
@@ -262,6 +261,5 @@ def write_review_queue_summary(candidates_dir, summary_path):
             f"rejections={cand.get('rejection_count', 0)}) "
             f"— {claim_preview}"
         )
-    with open(summary_path, "w") as f:
-        f.write("\n".join(lines) + "\n")
+    atomic_write_text(summary_path, "\n".join(lines) + "\n")
     return len(pending)

@@ -65,13 +65,21 @@ def sample_payload():
 
 def test_default_mode_writes_to_brain_root(tmp_path, sample_payload):
     """With BRAIN_ROOT env set, hook writes to that brain's episodic JSONL."""
-    brain = make_brain(tmp_path / "brain")
+    # The wrapper now validates BRAIN_ROOT lies under $HOME for security.
+    # Pin HOME to the test root so the validation passes.
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    brain = make_brain(fake_home / "brain")
     project = tmp_path / "project"
     project.mkdir()
 
     result = run_wrapper(
         sample_payload,
-        env_overrides={"BRAIN_ROOT": str(brain), "CLAUDE_PROJECT_DIR": str(project)},
+        env_overrides={
+            "HOME": str(fake_home),
+            "BRAIN_ROOT": str(brain),
+            "CLAUDE_PROJECT_DIR": str(project),
+        },
     )
     assert result.returncode == 0, f"hook failed: {result.stderr}"
 
@@ -87,7 +95,9 @@ def test_default_mode_writes_to_brain_root(tmp_path, sample_payload):
 
 def test_local_override_skips_global_hook(tmp_path, sample_payload):
     """`.agent-local-override` in project dir → wrapper exits 0 without writing."""
-    brain = make_brain(tmp_path / "brain")
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    brain = make_brain(fake_home / "brain")
     project = tmp_path / "project"
     project.mkdir()
     # Create override marker
@@ -95,7 +105,11 @@ def test_local_override_skips_global_hook(tmp_path, sample_payload):
 
     result = run_wrapper(
         sample_payload,
-        env_overrides={"BRAIN_ROOT": str(brain), "CLAUDE_PROJECT_DIR": str(project)},
+        env_overrides={
+            "HOME": str(fake_home),
+            "BRAIN_ROOT": str(brain),
+            "CLAUDE_PROJECT_DIR": str(project),
+        },
     )
     assert result.returncode == 0, "wrapper should exit 0 when overridden"
 
@@ -138,7 +152,9 @@ def test_no_brain_root_falls_back_to_home_agent(tmp_path, sample_payload, monkey
 
 def test_failure_payload_still_logs(tmp_path):
     """A failed Bash invocation (exit_code != 0) should still get logged."""
-    brain = make_brain(tmp_path / "brain")
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    brain = make_brain(fake_home / "brain")
     project = tmp_path / "project"
     project.mkdir()
 
@@ -150,9 +166,154 @@ def test_failure_payload_still_logs(tmp_path):
     }
     result = run_wrapper(
         fail_payload,
-        env_overrides={"BRAIN_ROOT": str(brain), "CLAUDE_PROJECT_DIR": str(project)},
+        env_overrides={
+            "HOME": str(fake_home),
+            "BRAIN_ROOT": str(brain),
+            "CLAUDE_PROJECT_DIR": str(project),
+        },
     )
     assert result.returncode == 0, f"hook should not propagate tool failures: {result.stderr}"
 
     episodic = brain / "memory" / "episodic" / "AGENT_LEARNINGS.jsonl"
     assert episodic.exists()
+
+
+# ----- New: BRAIN_ROOT validation (Fix #3) -----
+
+
+def test_brain_root_outside_home_is_rejected(tmp_path, sample_payload):
+    """BRAIN_ROOT pointing outside $HOME must fall back to default + log warning."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    # Default brain at $HOME/.agent — make it real so the wrapper has somewhere to dispatch
+    default_brain = make_brain(fake_home / ".agent")
+    # Hostile brain OUTSIDE $HOME
+    hostile = tmp_path / "hostile_brain"
+    make_brain(hostile)
+
+    project = tmp_path / "project"
+    project.mkdir()
+
+    result = run_wrapper(
+        sample_payload,
+        env_overrides={
+            "HOME": str(fake_home),
+            "BRAIN_ROOT": str(hostile),
+            "CLAUDE_PROJECT_DIR": str(project),
+        },
+    )
+    assert result.returncode == 0
+    # Hostile brain should NOT have been written to
+    hostile_jsonl = hostile / "memory" / "episodic" / "AGENT_LEARNINGS.jsonl"
+    if hostile_jsonl.exists():
+        assert not hostile_jsonl.read_text().strip(), (
+            "hostile BRAIN_ROOT must not receive episodic writes"
+        )
+    # Default brain should have received the write
+    default_jsonl = default_brain / "memory" / "episodic" / "AGENT_LEARNINGS.jsonl"
+    assert default_jsonl.exists() and default_jsonl.read_text().strip(), (
+        "fallback should have written to $HOME/.agent"
+    )
+    # And a warning should have been emitted
+    assert "outside" in result.stderr.lower() or "refusing" in result.stderr.lower()
+
+
+def test_brain_root_without_hook_script_is_rejected(tmp_path, sample_payload):
+    """A path under $HOME but missing the hook script must be rejected."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    default_brain = make_brain(fake_home / ".agent")
+    # Empty dir under $HOME — no harness/
+    empty = fake_home / "fake_brain"
+    empty.mkdir()
+
+    project = tmp_path / "project"
+    project.mkdir()
+
+    result = run_wrapper(
+        sample_payload,
+        env_overrides={
+            "HOME": str(fake_home),
+            "BRAIN_ROOT": str(empty),
+            "CLAUDE_PROJECT_DIR": str(project),
+        },
+    )
+    assert result.returncode == 0
+    # Default brain should have received the write
+    default_jsonl = default_brain / "memory" / "episodic" / "AGENT_LEARNINGS.jsonl"
+    assert default_jsonl.exists() and default_jsonl.read_text().strip()
+
+
+def test_brain_root_with_traversal_is_rejected(tmp_path, sample_payload):
+    """Path traversal via .. in BRAIN_ROOT must be rejected after resolution."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    default_brain = make_brain(fake_home / ".agent")
+    # tmp_path / ".." resolves outside fake_home (it's tmp_path's parent)
+    traversal = fake_home / ".." / "outside"
+    (tmp_path / "outside").mkdir()
+    make_brain(tmp_path / "outside")
+
+    project = tmp_path / "project"
+    project.mkdir()
+
+    result = run_wrapper(
+        sample_payload,
+        env_overrides={
+            "HOME": str(fake_home),
+            "BRAIN_ROOT": str(traversal),
+            "CLAUDE_PROJECT_DIR": str(project),
+        },
+    )
+    assert result.returncode == 0
+    # The traversal target should NOT have been written to
+    outside_jsonl = tmp_path / "outside" / "memory" / "episodic" / "AGENT_LEARNINGS.jsonl"
+    if outside_jsonl.exists():
+        assert not outside_jsonl.read_text().strip(), "traversal target must not receive writes"
+
+
+def test_local_override_fire_is_logged(tmp_path, sample_payload):
+    """When .agent-local-override fires, an entry must land in override.log."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    brain = make_brain(fake_home / ".agent")
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".agent-local-override").touch()
+
+    result = run_wrapper(
+        sample_payload,
+        env_overrides={
+            "HOME": str(fake_home),
+            "BRAIN_ROOT": str(brain),
+            "CLAUDE_PROJECT_DIR": str(project),
+        },
+    )
+    assert result.returncode == 0
+    override_log = brain / "override.log"
+    assert override_log.exists(), "override.log should be created on fire"
+    content = override_log.read_text()
+    assert str(project) in content, f"override.log should record project path; got: {content}"
+
+
+def test_brain_root_under_home_is_accepted(tmp_path, sample_payload):
+    """A custom BRAIN_ROOT that lives under $HOME must work."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    custom = make_brain(fake_home / "custom-brain")
+    project = tmp_path / "project"
+    project.mkdir()
+
+    result = run_wrapper(
+        sample_payload,
+        env_overrides={
+            "HOME": str(fake_home),
+            "BRAIN_ROOT": str(custom),
+            "CLAUDE_PROJECT_DIR": str(project),
+        },
+    )
+    assert result.returncode == 0
+    custom_jsonl = custom / "memory" / "episodic" / "AGENT_LEARNINGS.jsonl"
+    assert custom_jsonl.exists() and custom_jsonl.read_text().strip(), (
+        "custom BRAIN_ROOT under $HOME should be accepted"
+    )

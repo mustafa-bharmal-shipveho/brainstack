@@ -98,20 +98,26 @@ def _load_entries_locked(fd):
 
 
 def _write_entries_locked(fd, entries):
-    """Truncate-and-rewrite under the same lock _load_entries_locked used.
+    """Atomically rewrite under the same lock _load_entries_locked used.
 
-    Holding one fd across read+write is what makes the operation atomic
-    against concurrent `append_jsonl()` calls.
+    The previous in-place truncate-then-write left a torn (empty) file when a
+    SIGKILL or OOM hit between `os.ftruncate(0)` and `os.write(payload)`. We
+    instead write to a sibling `.tmp`, fsync, then `os.replace` over the
+    locked file. The flock survives the rename because it lives on the open
+    file description (the lock holder still has the original inode); concurrent
+    appenders that subsequently `open()` the path get the new inode without a
+    lock, but the dream cycle is guaranteed not to corrupt the on-disk state.
     """
+    from _atomic import atomic_write_bytes  # local import to avoid module-init cycles
     payload = "".join(json.dumps(e) + "\n" for e in entries).encode("utf-8")
-    if fd is None:
-        # Windows: best-effort, matches _episodic_io fallback.
-        with open(EPISODIC, "w") as f:
-            f.write(payload.decode("utf-8"))
-        return
-    os.ftruncate(fd, 0)
-    os.lseek(fd, 0, os.SEEK_SET)
-    os.write(fd, payload)
+    atomic_write_bytes(EPISODIC, payload)
+    if fd is not None:
+        # Re-sync our open fd to the new file so subsequent reads in the
+        # same dream-cycle window see consistent state.
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+        except OSError:
+            pass
 
 
 # Compatibility shims for any external caller that still imports the
