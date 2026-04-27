@@ -49,7 +49,7 @@ For private GitHub repo sync, see [`docs/git-sync.md`](docs/git-sync.md).
 │   └── MEMORY.md      # human-readable index
 ├── tools/             # auto_dream, graduate, reject, list_candidates, ...
 ├── hooks/             # Claude Code PostToolUse + Stop entry points
-└── .git/              # pushed to private remote (default: bharmalmustafa89/veho-agent-brain)
+└── .git/              # pushed to your private GitHub remote (you configure this)
 ```
 
 ## Status
