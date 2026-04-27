@@ -1,3 +1,11 @@
+# ----------------------------------------------------------------------------
+# Modified from codejunkie99/agentic-stack@df806ab (Apache-2.0)
+# Modifications by Mustafa Bharmal, 2026-04-26:
+#   - _bullet_for() extended to render optional `why` and `how_to_apply` fields
+#     when present. Backward compatible (output identical to upstream when
+#     these fields are absent).
+# See NOTICE file at repo root for full attribution.
+# ----------------------------------------------------------------------------
 """Render semantic/LESSONS.md from structured semantic/lessons.jsonl.
 
 lessons.jsonl is the source of truth. LESSONS.md is a derived view. Graduate.py
@@ -121,12 +129,24 @@ def _bullet_for(lesson, superseded_by):
     ev = lesson.get("evidence_ids", [])
     lid = lesson.get("id", "?")
     ann = f"status={status} confidence={conf} evidence={len(ev)} id={lid}"
+
+    # mustafa-agentic-stack extension: render optional why/how_to_apply.
+    # When absent, bullet output matches upstream exactly.
+    why = (lesson.get("why") or "").strip()
+    how_to_apply = (lesson.get("how_to_apply") or "").strip()
+    extras = []
+    if why:
+        extras.append(f"  - **Why:** {why}")
+    if how_to_apply:
+        extras.append(f"  - **How to apply:** {how_to_apply}")
+    extras_block = ("\n" + "\n".join(extras)) if extras else ""
+
     sup_by = superseded_by.get(lid)
     if sup_by:
-        return f"- ~~{claim}~~  <!-- {ann} superseded_by={sup_by} -->"
+        return f"- ~~{claim}~~  <!-- {ann} superseded_by={sup_by} -->{extras_block}"
     if status == "provisional":
-        return f"- [PROVISIONAL] {claim}  <!-- {ann} -->"
-    return f"- {claim}  <!-- {ann} -->"
+        return f"- [PROVISIONAL] {claim}  <!-- {ann} -->{extras_block}"
+    return f"- {claim}  <!-- {ann} -->{extras_block}"
 
 
 def _build_auto_section(lessons):
