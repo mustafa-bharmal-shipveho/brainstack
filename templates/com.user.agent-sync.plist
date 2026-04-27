@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hourly brain-sync launchd job.
+
+  Install:
+    cp com.user.agent-sync.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.user.agent-sync.plist
+
+  Edit before installing:
+    1. Replace REPLACE_HOME with your actual home dir (e.g. /Users/yourname)
+
+  The sync.sh script handles flock + commit + push + (optional) trufflehog.
+  Sync uses the same flock as the dream cycle, so no torn writes.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.agent-sync</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>bash</string>
+        <string>REPLACE_HOME/.agent/tools/sync.sh</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <key>StandardOutPath</key>
+    <string>REPLACE_HOME/.agent/sync.log</string>
+    <key>StandardErrorPath</key>
+    <string>REPLACE_HOME/.agent/sync.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

@@ -1,0 +1,74 @@
+# /dream — Review staged candidates
+
+The mechanical-staging dream cycle (`auto_dream.py`) runs nightly via launchd
+and stages candidate lessons in `~/.agent/memory/candidates/`. This command
+walks the review queue, decides graduate-or-reject for each, and records
+required rationale.
+
+## Phase 1 — List pending
+
+Run:
+
+```bash
+python3 ~/.agent/tools/list_candidates.py
+```
+
+This prints every staged candidate sorted by priority. For each, you'll see:
+- `id` (12-char hex)
+- `priority` (cluster_size × salience)
+- `claim` (canonical text)
+- `cluster size` (how many episodic events feed it)
+- `conditions` (extracted tags)
+- `evidence` (timestamps)
+- `rejections` (prior reject count, if any)
+- `staged` and `last` (timestamps)
+
+## Phase 2 — Decide
+
+For each candidate, read the cluster context and decide:
+
+- **Graduate** — the lesson is worth keeping. Append to `lessons.jsonl`.
+  Rationale is **required** — explain WHY the cluster supports the rule.
+  ```bash
+  python3 ~/.agent/tools/graduate.py <id> --rationale "..."
+  ```
+
+- **Reject** — the cluster is noise (cosmetic, too narrow, etc.). Reason
+  is **required** — explain why this won't generalize.
+  ```bash
+  python3 ~/.agent/tools/reject.py <id> --reason "..."
+  ```
+
+- **Reopen** — for a previously-rejected candidate, requeue it for review.
+  ```bash
+  python3 ~/.agent/tools/reopen.py <id>
+  ```
+
+## Phase 3 — Verify
+
+After the batch, confirm:
+
+```bash
+tail ~/.agent/memory/semantic/lessons.jsonl
+cat ~/.agent/memory/semantic/LESSONS.md
+```
+
+LESSONS.md should reflect the new graduations. Lessons with `why` /
+`how_to_apply` extension fields will render those under the bullet.
+
+## Why this works
+
+- **Mechanical staging** — `auto_dream.py` does only clustering and prefilter;
+  no LLM reasoning. Safe to cron, no API calls.
+- **Required rationale on graduate AND reject** — rubber-stamped promotions
+  and silent rejections are the failure modes this layer is designed to
+  prevent.
+- **Decision history is preserved** — rejected candidates retain their
+  decision log; recurring churn is visible, not fresh.
+
+## Don't
+
+- Don't graduate without reading the cluster's evidence. The rationale must
+  reflect the actual evidence, not your prior beliefs.
+- Don't reject without a reason that would survive your future self
+  reviewing it. "Too narrow" is fine; "didn't like it" is not.

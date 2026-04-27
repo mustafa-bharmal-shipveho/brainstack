@@ -1,0 +1,21 @@
+# Preferences
+
+How I want to work with AI assistants. This is the first file the agent
+reads at the start of every session.
+
+## Communication style
+
+- Concise — short responses, no fluff
+- Honest disagreement when warranted; don't rubber-stamp my plan
+- Update me at key moments, not every step
+
+## Code style
+
+- (project-specific; agent should defer to project conventions)
+- Minimal comments — only WHY, never WHAT
+
+## Risk tolerance
+
+- Local edits + reversible operations: proceed without asking
+- Push, force-push, deploy, delete: confirm explicitly
+- Money, prod data, user-visible changes: confirm explicitly

@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Pre-commit hook for the brain repo at ~/.agent/.
+# Runs the redact.py scanner over staged files; blocks the commit on any hit.
+#
+# Install:
+#   cp templates/pre-commit ~/.agent/.git/hooks/pre-commit
+#   chmod +x ~/.agent/.git/hooks/pre-commit
+set -euo pipefail
+
+BRAIN_ROOT="${BRAIN_ROOT:-$HOME/.agent}"
+
+if [ ! -f "$BRAIN_ROOT/tools/redact.py" ]; then
+    echo "pre-commit: redact.py not found at $BRAIN_ROOT/tools/" >&2
+    exit 0  # don't block if framework is mid-upgrade
+fi
+
+# Pick a Python that's >= 3.10
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+if ! "$PYTHON_BIN" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
+    for cand in python3.13 python3.12 python3.11 python3.10; do
+        if command -v "$cand" >/dev/null; then
+            PYTHON_BIN="$cand"
+            break
+        fi
+    done
+fi
+
+# Run redact on the entire brain (cheap; markdown + jsonl only)
+"$PYTHON_BIN" "$BRAIN_ROOT/tools/redact.py" "$BRAIN_ROOT"
