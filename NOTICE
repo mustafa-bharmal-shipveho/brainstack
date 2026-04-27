@@ -10,28 +10,31 @@ v0.11.2 (commit df806abace1a693e042844bf4ac0cccf9bb6270a). Each file
 preserves its original copyright header and includes a modification
 notice block per Apache License 2.0 §4(b).
 
-Vendored files (verbatim or with documented modifications):
+Vendored files (verbatim or with documented modifications). Paths shown
+below are relative to this repo's `agent/` source directory, which the
+installer copies to `~/.agent/` on the user's machine. Upstream paths in
+parentheses are relative to upstream's `.agent/` directory.
 
-  tools/auto_dream.py            (from .agent/memory/auto_dream.py)
-  tools/cluster.py               (from .agent/memory/cluster.py)
-  tools/promote.py               (from .agent/memory/promote.py)
-  tools/validate.py              (from .agent/memory/validate.py)
-  tools/review_state.py          (from .agent/memory/review_state.py)
-  tools/render_lessons.py        (from .agent/memory/render_lessons.py)
-  tools/decay.py                 (from .agent/memory/decay.py)
-  tools/archive.py               (from .agent/memory/archive.py)
-  tools/graduate.py              (from .agent/tools/graduate.py)
-  tools/reject.py                (from .agent/tools/reject.py)
-  tools/reopen.py                (from .agent/tools/reopen.py)
-  tools/list_candidates.py       (from .agent/tools/list_candidates.py)
-  tools/data_layer_export.py     (from .agent/tools/data_layer_export.py)
-  hooks/claude_code_post_tool.py (from .agent/harness/hooks/claude_code_post_tool.py)
-  hooks/_episodic_io.py          (from .agent/harness/hooks/_episodic_io.py)
-  hooks/_provenance.py           (from .agent/harness/hooks/_provenance.py)
-  hooks/on_failure.py            (from .agent/harness/hooks/on_failure.py)
-  hooks/post_execution.py        (from .agent/harness/hooks/post_execution.py)
-  hooks/salience.py              (from .agent/harness/salience.py)
-  hooks/text.py                  (from .agent/harness/text.py)
+  agent/memory/auto_dream.py            (from .agent/memory/auto_dream.py)
+  agent/memory/cluster.py               (from .agent/memory/cluster.py)
+  agent/memory/promote.py               (from .agent/memory/promote.py)
+  agent/memory/validate.py              (from .agent/memory/validate.py)
+  agent/memory/review_state.py          (from .agent/memory/review_state.py)
+  agent/memory/render_lessons.py        (from .agent/memory/render_lessons.py)
+  agent/memory/decay.py                 (from .agent/memory/decay.py)
+  agent/memory/archive.py               (from .agent/memory/archive.py)
+  agent/tools/graduate.py               (from .agent/tools/graduate.py)
+  agent/tools/reject.py                 (from .agent/tools/reject.py)
+  agent/tools/reopen.py                 (from .agent/tools/reopen.py)
+  agent/tools/list_candidates.py        (from .agent/tools/list_candidates.py)
+  agent/tools/data_layer_export.py      (from .agent/tools/data_layer_export.py)
+  agent/harness/hooks/claude_code_post_tool.py (from .agent/harness/hooks/claude_code_post_tool.py)
+  agent/harness/hooks/_episodic_io.py   (from .agent/harness/hooks/_episodic_io.py)
+  agent/harness/hooks/_provenance.py    (from .agent/harness/hooks/_provenance.py)
+  agent/harness/hooks/on_failure.py     (from .agent/harness/hooks/on_failure.py)
+  agent/harness/hooks/post_execution.py (from .agent/harness/hooks/post_execution.py)
+  agent/harness/salience.py             (from .agent/harness/salience.py)
+  agent/harness/text.py                 (from .agent/harness/text.py)
 
 Modifications summary:
 
@@ -46,13 +49,15 @@ Files originally written by Mustafa Bharmal (clean-room, not derived from
 upstream):
 
   install.sh, upgrade.sh
-  tools/redact.py
-  tools/migrate.py
-  tools/sync.sh
-  hooks/agentic_post_tool_global.py (the absolute-path entry point)
+  agent/tools/redact.py
+  agent/tools/migrate.py
+  agent/tools/sync.sh
+  agent/harness/hooks/agentic_post_tool_global.py (absolute-path Claude Code entry point)
   adapters/claude-code/*
-  schemas/*, templates/*
+  schemas/lessons.schema.json (extension fields documentation)
+  templates/*
   docs/*, README.md, CHANGELOG.md
   tests/*
+  memory_seed/* (empty directory templates)
 
 For the original Apache License 2.0 text, see LICENSE.
