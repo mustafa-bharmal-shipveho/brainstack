@@ -99,13 +99,21 @@ if [ "$MODE" = "upgrade" ]; then
         echo "install: $BRAIN_ROOT does not exist; nothing to upgrade. Run plain ./install.sh first." >&2
         exit 2
     fi
-    echo "==> Upgrading tools + hooks at $BRAIN_ROOT (memory/ left untouched)"
+    echo "==> Upgrading code at $BRAIN_ROOT (memory user data left untouched)"
     rsync -a --delete --exclude '__pycache__' --exclude '.pytest_cache' --exclude '*.pyc' \
         "$REPO_DIR/agent/tools/"   "$BRAIN_ROOT/tools/"
     rsync -a --delete --exclude '__pycache__' --exclude '.pytest_cache' --exclude '*.pyc' \
         "$REPO_DIR/agent/harness/" "$BRAIN_ROOT/harness/"
+    # memory/ holds BOTH framework code (*.py) and user data (working/, episodic/,
+    # candidates/, personal/, semantic/, *.md). Sync only the framework Python
+    # files individually so user data stays put.
+    for src in "$REPO_DIR/agent/memory/"*.py; do
+        [ -f "$src" ] || continue
+        cp -f "$src" "$BRAIN_ROOT/memory/$(basename "$src")"
+    done
     chmod +x "$BRAIN_ROOT/tools/"*.sh "$BRAIN_ROOT/tools/"*.py 2>/dev/null || true
     chmod +x "$BRAIN_ROOT/harness/hooks/"*.py 2>/dev/null || true
+    chmod +x "$BRAIN_ROOT/memory/"*.py 2>/dev/null || true
     echo "==> Upgrade complete."
     exit 0
 fi

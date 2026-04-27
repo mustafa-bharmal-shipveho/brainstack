@@ -122,17 +122,20 @@ BUILTIN_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 
 
 # ----- Multi-line patterns (whole-file scan) -----
+# Pattern definitions contain BEGIN/END markers as regex literals; the inline
+# `# redact-allow` comments on each literal-bearing line keep the redactor
+# from flagging its own source.
 MULTILINE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("pem_private_key", re.compile(
-        r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED |PGP )?PRIVATE KEY-----"
+        r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED |PGP )?PRIVATE KEY-----"  # redact-allow
         r"[\s\S]*?"
-        r"-----END (?:RSA |EC |DSA |OPENSSH |ENCRYPTED |PGP )?PRIVATE KEY-----"
+        r"-----END (?:RSA |EC |DSA |OPENSSH |ENCRYPTED |PGP )?PRIVATE KEY-----"  # redact-allow
     )),
     ("pgp_private_key", re.compile(
-        r"-----BEGIN PGP PRIVATE KEY BLOCK-----[\s\S]*?-----END PGP PRIVATE KEY BLOCK-----"
+        r"-----BEGIN PGP PRIVATE KEY BLOCK-----[\s\S]*?-----END PGP PRIVATE KEY BLOCK-----"  # redact-allow
     )),
     ("ssh_private_key", re.compile(
-        r"-----BEGIN OPENSSH PRIVATE KEY-----[\s\S]*?-----END OPENSSH PRIVATE KEY-----"
+        r"-----BEGIN OPENSSH PRIVATE KEY-----[\s\S]*?-----END OPENSSH PRIVATE KEY-----"  # redact-allow
     )),
 ]
 

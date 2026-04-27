@@ -35,3 +35,6 @@ DESIGN_NOTES.md
 candidates/
 semantic/lessons.jsonl
 episodic/AGENT_LEARNINGS.jsonl
+
+# Live brain — never commit user data into the framework repo.
+.agent/
