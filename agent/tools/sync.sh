@@ -93,19 +93,36 @@ cd "$BRAIN_ROOT"
 # ---- Sync-time JSONL scrubber (overwrites secrets in episodic JSONL) ----
 JSONL_SCRUBBER="$BRAIN_ROOT/tools/redact_jsonl.py"
 if [ -x "$JSONL_SCRUBBER" ] || [ -f "$JSONL_SCRUBBER" ]; then
-    # Scrubber returns 1 if it changed files; we still want to proceed (the
-    # files are now clean). Only treat exit code 2 as fatal.
-    set +e
-    "$PYTHON_BIN" "$JSONL_SCRUBBER" "$BRAIN_ROOT/memory/episodic" "$BRAIN_ROOT/data-layer" 2>>"$LOG_FILE"
-    rc=$?
-    set -e
-    if [ "$rc" -eq 2 ]; then
-        echo "$(date -u +%FT%TZ) sync: JSONL scrubber failed (rc=2); refusing to push" >> "$LOG_FILE"
-        exit 1
+    # Build a list of scrub targets that actually exist. data-layer/ is
+    # only created on first dashboard export, so a fresh brain doesn't
+    # have it; passing a missing path makes the scrubber exit 2 (fatal).
+    SCRUB_TARGETS=()
+    [ -d "$BRAIN_ROOT/memory/episodic" ] && SCRUB_TARGETS+=("$BRAIN_ROOT/memory/episodic")
+    [ -d "$BRAIN_ROOT/data-layer" ] && SCRUB_TARGETS+=("$BRAIN_ROOT/data-layer")
+
+    if [ "${#SCRUB_TARGETS[@]}" -gt 0 ]; then
+        # Scrubber returns 1 if it changed files; we still want to proceed.
+        # rc=2 is the only fatal case.
+        set +e
+        "$PYTHON_BIN" "$JSONL_SCRUBBER" "${SCRUB_TARGETS[@]}" 2>>"$LOG_FILE"
+        rc=$?
+        set -e
+        if [ "$rc" -eq 2 ]; then
+            echo "$(date -u +%FT%TZ) sync: JSONL scrubber failed (rc=2); refusing to push" >> "$LOG_FILE"
+            exit 1
+        fi
+        if [ "$rc" -eq 1 ]; then
+            echo "$(date -u +%FT%TZ) sync: JSONL scrubber rewrote secrets in episodic logs" >> "$LOG_FILE"
+        fi
     fi
-    if [ "$rc" -eq 1 ]; then
-        echo "$(date -u +%FT%TZ) sync: JSONL scrubber rewrote secrets in episodic logs" >> "$LOG_FILE"
-    fi
+
+    # Best-effort: clean up stale .tmp siblings left by killed atomic writes.
+    "$PYTHON_BIN" -c "
+import sys; sys.path.insert(0, '$BRAIN_ROOT/memory')
+from _atomic import cleanup_stale_tmp
+n = cleanup_stale_tmp('$BRAIN_ROOT/memory')
+if n: print(f'sync: cleaned {n} stale .tmp file(s)')
+" 2>>"$LOG_FILE" || true
 else
     echo "$(date -u +%FT%TZ) sync: WARNING redact_jsonl.py missing at $JSONL_SCRUBBER" >> "$LOG_FILE"
 fi

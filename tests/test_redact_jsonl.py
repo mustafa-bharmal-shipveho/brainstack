@@ -148,6 +148,45 @@ def test_atomic_write_no_temp_left_behind(tmp_path):
     assert not (tmp_path / "log.jsonl.tmp").exists()
 
 
+def test_entropy_sweep_catches_high_entropy_blob(tmp_path):
+    """A 50+ char high-entropy substring with no recognized prefix gets
+    scrubbed by the entropy sweep (B2 — base64 secrets that bypass regex).
+    """
+    f = tmp_path / "log.jsonl"
+    # Long random-looking blob with no key-prefix shape and no nearby
+    # secret keyword (avoid triggering generic_secret_assignment). Mixed
+    # case + digits to push Shannon entropy above 4.5.
+    blob = "Xq7Pv2Lm9Bn4Kc8Rf3Hd6Ws1Tj0Ge5Zu9Ay2MhEpRgQyFw"
+    write_jsonl(f, [{"data": f"value follows: {blob}"}])
+    result = run(str(f))
+    assert result.returncode == 1, f"expected scrub; stdout: {result.stdout}"
+    rows = read_jsonl(f)
+    assert blob not in rows[0]["data"], f"blob survived entropy sweep: {rows[0]}"
+
+
+def test_no_entropy_flag_passes_high_entropy_blob(tmp_path):
+    """--no-entropy preserves opaque blobs with no pattern match."""
+    f = tmp_path / "log.jsonl"
+    blob = "Xq7Pv2Lm9Bn4Kc8Rf3Hd6Ws1Tj0Ge5Zu9Ay2MhEpRgQyFw"
+    write_jsonl(f, [{"data": f"value follows: {blob}"}])
+    result = run("--no-entropy", str(f))
+    assert result.returncode == 0
+    assert blob in f.read_text()
+
+
+def test_secret_in_dict_key_scrubbed(tmp_path):
+    """Dict keys with secret-shaped substrings are also redacted."""
+    f = tmp_path / "log.jsonl"
+    write_jsonl(f, [{"AKIAIOSFODNN7EXAMPLE": "value"}])
+    result = run(str(f))
+    assert result.returncode == 1
+    rows = read_jsonl(f)
+    keys = list(rows[0].keys())
+    assert all("AKIAIOSFODNN7EXAMPLE" not in k for k in keys), (
+        f"key was not scrubbed: {keys}"
+    )
+
+
 def test_pem_block_scrubbed(tmp_path):
     f = tmp_path / "log.jsonl"
     pem = (

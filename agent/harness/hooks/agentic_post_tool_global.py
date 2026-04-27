@@ -109,7 +109,7 @@ def has_local_override() -> tuple[bool, str]:
     return False, ""
 
 
-def _log_override_fire(marker: str) -> None:
+def _log_override_fire(brain_root: Path, marker: str) -> None:
     """Append override-fire events to <brain>/override.log.
 
     Why: a `.agent-local-override` marker in a project root silently
@@ -123,15 +123,17 @@ def _log_override_fire(marker: str) -> None:
     Rate-limited at the file-size level: writes are bounded by override
     use, which is rare. We don't dedupe per-session because we want each
     session that hit the marker to appear in the log, not just one of them.
+
+    Logs into the *resolved* BRAIN_ROOT, not a hardcoded ~/.agent. This
+    matters when the user runs with a custom brain (BRAIN_ROOT env): the
+    audit trail must follow the brain it's actually protecting.
     """
     try:
-        log = _expand("~/.agent/override.log")
+        log = brain_root / "override.log"
         log.parent.mkdir(parents=True, exist_ok=True)
         # Cap at 1MB — beyond that the user has bigger problems than dedup.
         if log.exists() and log.stat().st_size > 1_000_000:
             return
-        # Pull the session id from stdin if available (don't consume — we
-        # don't read stdin in the override path, so just log without it).
         cwd = os.environ.get("CLAUDE_PROJECT_DIR", "?")
         with log.open("a") as f:
             from datetime import datetime, timezone
@@ -144,10 +146,11 @@ def _log_override_fire(marker: str) -> None:
 def main() -> int:
     override, marker = has_local_override()
     if override:
-        # Project's own hooks handle this; skip silently for the tool flow,
-        # but always record the fire event so the user notices when logging
-        # is disabled by a marker.
-        _log_override_fire(marker)
+        # Resolve the brain BEFORE recording the override — we want the
+        # audit log to live in the brain that *would have* received the
+        # tool-call event, not always ~/.agent.
+        brain = resolve_brain_root()
+        _log_override_fire(brain, marker)
         if os.environ.get("AGENTIC_DEBUG", "").strip():
             _log_warning(f"local override active: {marker} (logging suppressed for this call)")
         return 0

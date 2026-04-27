@@ -76,10 +76,31 @@ def test_lock_contention_exits_zero(tmp_path):
 
 
 def test_runner_does_not_call_shell_flock():
-    """The runner should not shell out to flock(1) — Python fcntl only."""
+    """The runner must use Python fcntl, not shell out to flock(1) or any
+    other subprocess. Strip docstrings + comments before checking so the
+    test inspects executable code only.
+    """
+    import re
+    import ast
     text = RUNNER.read_text()
-    # No `subprocess` invocation of flock
-    assert "flock(1)" not in text or "subprocess" not in text or "flock" not in text.split("subprocess")[1]
-    # Must use fcntl
-    assert "import fcntl" in text
-    assert "fcntl.flock" in text
+    # Must use Python fcntl
+    assert "import fcntl" in text, "dream_runner.py must import fcntl"
+    assert "fcntl.flock" in text, "dream_runner.py must call fcntl.flock"
+
+    # Parse the file and reject any subprocess / os.system / os.popen call
+    # in the executable body. Walking the AST avoids fragile string regex
+    # matching against docstrings.
+    tree = ast.parse(text)
+    forbidden_calls = {
+        ("subprocess", "run"), ("subprocess", "Popen"), ("subprocess", "call"),
+        ("os", "system"), ("os", "popen"), ("os", "spawnv"), ("os", "execv"),
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            attr = node.func
+            if isinstance(attr.value, ast.Name):
+                key = (attr.value.id, attr.attr)
+                assert key not in forbidden_calls, (
+                    f"dream_runner.py shells out via {key[0]}.{key[1]}; "
+                    f"should be Python fcntl only"
+                )

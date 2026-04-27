@@ -107,6 +107,9 @@ if [ "$MODE" = "upgrade" ]; then
     # memory/ holds BOTH framework code (*.py) and user data (working/, episodic/,
     # candidates/, personal/, semantic/, *.md). Sync only the framework Python
     # files individually so user data stays put.
+    # mkdir -p first so a partial brain (where memory/ doesn't exist yet)
+    # doesn't break the cp loop with "No such file or directory".
+    mkdir -p "$BRAIN_ROOT/memory"
     for src in "$REPO_DIR/agent/memory/"*.py; do
         [ -f "$src" ] || continue
         cp -f "$src" "$BRAIN_ROOT/memory/$(basename "$src")"

@@ -279,3 +279,146 @@ def test_entropy_does_not_flag_long_words(tmp_path):
     f.write_text("Antidisestablishmentarianismsupercalifragilisticexpialidocious\n")
     result = run_redact(tmp_path)
     assert result.returncode == 0, f"Pure alpha should pass. stdout: {result.stdout}"
+
+
+# ----- Redteam regressions -----
+
+
+def test_url_userinfo_credential_blocks(tmp_path):
+    """https://user:secret@host/ form must not slip through (B1)."""
+    f = tmp_path / "url.txt"
+    f.write_text("git remote add origin https://oauth2:Tx9JpQk2vNm5Lr8Hd6Yw@host.example/repo.git\n")
+    result = run_redact(tmp_path, "--no-entropy")
+    assert result.returncode != 0, f"URL userinfo password slipped through: {result.stdout}"
+    assert "url_userinfo" in result.stdout
+
+
+def test_my_token_env_var_blocks(tmp_path):
+    """MY_TOKEN= and similar PREFIX_KEYWORD_SUFFIX env names must not slip (B5).
+
+    Word boundary fails between `_` and `=` because both are word chars,
+    so the pattern was missing the most common environment-variable form.
+    """
+    f = tmp_path / "env.sh"
+    f.write_text(
+        "MY_TOKEN=abc123def456ghi789jklmnop123qrst\n"
+        "APP_API_KEY=xyz987abc123def456ghi789jkl012mn\n"
+        "X_PRIVATE_KEY=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+    )
+    result = run_redact(tmp_path, "--no-entropy")
+    assert result.returncode != 0, f"env-var prefix forms slipped through: {result.stdout}"
+    # All three env vars should be flagged
+    out = result.stdout
+    assert "env.sh:1" in out
+    assert "env.sh:2" in out
+    assert "env.sh:3" in out
+
+
+def test_slack_xapp_token_blocks(tmp_path):
+    """Newer Slack token shapes (xapp) must be caught (B9)."""
+    f = tmp_path / "slack.txt"
+    f.write_text("xapp-1-A1234567890-1234567890123-abcdef0123456789abcdef0123456789\n")
+    result = run_redact(tmp_path, "--no-entropy")
+    assert result.returncode != 0
+
+
+def test_slack_xoxc_token_blocks(tmp_path):
+    """xoxc client tokens (B9)."""
+    f = tmp_path / "slack.txt"
+    f.write_text("xoxc-1234567890-1234567890-AbCdEfGhIjKlMnOpQrSt\n")
+    result = run_redact(tmp_path, "--no-entropy")
+    assert result.returncode != 0
+
+
+def test_redos_pattern_in_private_file_is_rejected(tmp_path):
+    """A ReDoS-prone pattern in redact-private.txt must be rejected with a
+    warning (B4). We verify by running on a benign input — if the regex
+    were compiled, the run would either succeed or hang; with rejection,
+    it should succeed AND print the rejection warning to stderr.
+    """
+    (tmp_path / "redact-private.txt").write_text(
+        "(.+)+token\n"  # classic ReDoS shape
+    )
+    f = tmp_path / "input.txt"
+    # Adversarial input that would hang a (.+)+ pattern
+    f.write_text("a" * 50 + "X\n")
+    result = run_redact(tmp_path, "--no-entropy")
+    assert "ReDoS" in result.stderr or "rejected" in result.stderr.lower(), (
+        f"expected ReDoS rejection warning; stderr: {result.stderr}"
+    )
+
+
+def test_npm_token_blocks(tmp_path):
+    f = tmp_path / "npmrc"
+    f.write_text("//registry.npmjs.org/:_authToken=npm_" + "A" * 36 + "\n")
+    result = run_redact(tmp_path, "--no-entropy")
+    assert result.returncode != 0
+
+
+def test_twilio_account_sid_blocks(tmp_path):
+    f = tmp_path / "twilio.env"
+    f.write_text("TWILIO_ACCOUNT_SID=AC0123456789abcdef0123456789abcdef\n")
+    result = run_redact(tmp_path, "--no-entropy")
+    assert result.returncode != 0
+
+
+def test_allow_marker_buried_in_string_does_not_suppress(tmp_path):
+    """An attacker can't bury `# redact-allow` mid-string to suppress the
+    next line's secret (B3). Marker must look like a real comment.
+    """
+    f = tmp_path / "attack.json"
+    # The marker is in the middle of a JSON string field, not at start-of-line
+    # and not preceded by whitespace.
+    f.write_text(
+        'BAIT="prefix# redact-allow suffix"\n'
+        'AKIAIOSFODNN7EXAMPLE\n'
+    )
+    result = run_redact(tmp_path, "--no-entropy")
+    assert result.returncode != 0, (
+        f"buried marker should not suppress AWS key on next line; stdout: {result.stdout}"
+    )
+
+
+def test_allow_marker_with_leading_whitespace_works(tmp_path):
+    """The legitimate case still works: marker as a real comment."""
+    f = tmp_path / "fixture.py"
+    f.write_text(
+        '    # redact-allow: test fixture\n'
+        '    EXAMPLE = "AKIAIOSFODNN7EXAMPLE"\n'
+    )
+    result = run_redact(tmp_path, "--no-entropy")
+    assert result.returncode == 0
+
+
+def test_allow_marker_inline_comment_works(tmp_path):
+    """Inline marker on the same line as the secret still works (preceded by space)."""
+    f = tmp_path / "fixture.py"
+    f.write_text(
+        'EXAMPLE = "AKIAIOSFODNN7EXAMPLE"  # redact-allow: test fixture\n'
+    )
+    result = run_redact(tmp_path, "--no-entropy")
+    assert result.returncode == 0
+
+
+def test_two_secrets_on_one_line_both_reported(tmp_path):
+    """A line with two distinct token shapes must surface BOTH (B12).
+
+    The previous implementation broke after the first match per line,
+    silently letting the second slip through.
+    """
+    f = tmp_path / "double.txt"
+    f.write_text(
+        "AKIAIOSFODNN7EXAMPLE ghp_abcdefghijklmnopqrstuvwxyz0123456789\n"
+    )
+    result = run_redact(tmp_path, "--no-entropy")
+    assert result.returncode != 0
+    # Both pattern names should appear in stdout
+    assert "aws_access_key" in result.stdout
+    assert "github_pat" in result.stdout
+
+
+def test_sendgrid_key_blocks(tmp_path):
+    f = tmp_path / "sg.env"
+    f.write_text("SG.aBcDeFgHiJkLmNoPqRsTuV.aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789aBcDeFgHiJk\n")
+    result = run_redact(tmp_path, "--no-entropy")
+    assert result.returncode != 0

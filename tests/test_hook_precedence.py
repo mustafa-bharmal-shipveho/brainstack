@@ -296,6 +296,43 @@ def test_local_override_fire_is_logged(tmp_path, sample_payload):
     assert str(project) in content, f"override.log should record project path; got: {content}"
 
 
+def test_local_override_fire_lands_in_custom_brain_not_default(tmp_path, sample_payload):
+    """With a non-default BRAIN_ROOT, override.log must follow that brain.
+
+    Regression test for the bug where _log_override_fire hardcoded
+    ~/.agent regardless of the resolved BRAIN_ROOT, so the audit trail
+    landed in the wrong place when users ran with a custom brain.
+    """
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    # Default brain location — should NOT receive the override log
+    default_brain = make_brain(fake_home / ".agent")
+    # Custom brain — should receive it
+    custom_brain = make_brain(fake_home / "custom-brain")
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".agent-local-override").touch()
+
+    result = run_wrapper(
+        sample_payload,
+        env_overrides={
+            "HOME": str(fake_home),
+            "BRAIN_ROOT": str(custom_brain),
+            "CLAUDE_PROJECT_DIR": str(project),
+        },
+    )
+    assert result.returncode == 0
+    custom_log = custom_brain / "override.log"
+    default_log = default_brain / "override.log"
+    assert custom_log.exists(), "override.log should land in BRAIN_ROOT, not ~/.agent"
+    assert str(project) in custom_log.read_text()
+    if default_log.exists():
+        assert str(project) not in default_log.read_text(), (
+            "override.log should NOT have been written to ~/.agent when "
+            "BRAIN_ROOT pointed elsewhere"
+        )
+
+
 def test_brain_root_under_home_is_accepted(tmp_path, sample_payload):
     """A custom BRAIN_ROOT that lives under $HOME must work."""
     fake_home = tmp_path / "home"

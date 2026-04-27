@@ -178,6 +178,46 @@ def test_pipeline_idempotent_after_first_scrub(tmp_path):
     sys.version_info < (3, 10),
     reason="vendored hook needs Python >= 3.10",
 )
+def test_pipeline_scrubs_edit_old_new_strings(tmp_path):
+    """An Edit tool call where old_string/new_string contain a secret gets scrubbed."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    brain = fake_home / ".agent"
+    make_brain(brain)
+    project = tmp_path / "proj"
+    project.mkdir()
+
+    payload = {
+        "session_id": "e2e-edit",
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": "/tmp/conf.env",
+            "old_string": "AWS_KEY=AKIAIOSFODNN7EXAMPLE",
+            "new_string": "AWS_KEY=AKIA0000000000000000",
+        },
+        "tool_response": {"output": "ok", "exit_code": 0, "error": ""},
+    }
+    fire_hook(brain, fake_home, project, payload)
+
+    jsonl = brain / "memory" / "episodic" / "AGENT_LEARNINGS.jsonl"
+    pre = jsonl.read_text()
+    assert "AKIAIOSFODNN7EXAMPLE" in pre, (
+        "hook should have captured Edit old_string verbatim"
+    )
+
+    run(str(JSONL_SCRUBBER), str(brain / "memory" / "episodic"))
+
+    post = jsonl.read_text()
+    assert "AKIAIOSFODNN7EXAMPLE" not in post
+    # The replacement key (which still matches AKIA but is intentionally a
+    # placeholder) should also be scrubbed
+    assert "AKIA0000000000000000" not in post
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 10),
+    reason="vendored hook needs Python >= 3.10",
+)
 def test_pipeline_handles_authorization_bearer_in_curl(tmp_path):
     """A captured curl with an Authorization: Bearer header should get scrubbed."""
     fake_home = tmp_path / "home"

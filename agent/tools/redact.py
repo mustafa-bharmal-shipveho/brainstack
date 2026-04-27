@@ -70,11 +70,29 @@ BUILTIN_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("openai_project", re.compile(r"\bsk-proj-[A-Za-z0-9_-]{20,}\b")),
     ("anthropic_key", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{40,}\b")),
 
+    # ---- Twilio / SendGrid / Heroku / NPM ----
+    ("twilio_account_sid", re.compile(r"\bAC[a-f0-9]{32}\b")),
+    ("twilio_auth_token", re.compile(r"\bSK[a-f0-9]{32}\b")),
+    ("sendgrid_key", re.compile(r"\bSG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43,}\b")),
+    ("heroku_oauth", re.compile(
+        r"(?i)\bheroku\b[^\n]{0,40}[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}\b"
+    )),
+    ("npm_token", re.compile(r"\bnpm_[A-Za-z0-9]{36}\b")),
+    ("mailgun_key", re.compile(r"\bkey-[a-f0-9]{32}\b")),
+
     # ---- Slack ----
-    # xoxa, xoxb, xoxp, xoxr, xoxs (bot/user/refresh/etc.)
-    ("slack_token", re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b")),
+    # xoxa, xoxb, xoxc, xoxd, xoxe, xoxp, xoxr, xoxs, xapp (bot/user/refresh/etc.)
+    ("slack_token", re.compile(r"\bxox[abcdeprs]-[A-Za-z0-9-]{10,}\b")),
+    ("slack_app_token", re.compile(r"\bxapp-[0-9]+-[A-Z0-9]+-[0-9]+-[A-Za-z0-9]+\b")),
     ("slack_webhook", re.compile(
         r"https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]+"
+    )),
+    # URL credentials in userinfo (https://user:secret@host) — covers the
+    # class of bypass where embedding the secret in a URL makes the entropy
+    # sweep skip the line. We extract the password after the colon so the
+    # display doesn't expose it.
+    ("url_userinfo", re.compile(
+        r"://[A-Za-z0-9%._~+\-]+:([A-Za-z0-9%._~+\-]{8,})@"
     )),
 
     # ---- Stripe ----
@@ -106,12 +124,18 @@ BUILTIN_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 
     # ---- Generic high-entropy in key=value form ----
     # 30+ chars to avoid false positives on git hashes (40 hex chars) and
-    # snowflake IDs. The wider key alternation catches more vendors.
+    # snowflake IDs. We accept env-var names like MY_TOKEN, APP_API_KEY,
+    # SERVICE_PASSWORD by matching ([A-Z][A-Z0-9_]*)?KEYWORD([A-Z0-9_]*)?
+    # — `\b` would not fire between the underscore and `=` because both
+    # are word chars in Python re.
     ("generic_secret_assignment", re.compile(
         r"""(?ix)
-        \b(api[_\-]?key|secret(?:[_\-]?key)?|password|passwd|token|auth[_\-]?token
+        (?:^|[^A-Za-z0-9_])             # word-start, but not _ (env-var prefix safe)
+        ([A-Z][A-Z0-9_]*[_\-])?         # optional prefix: MY_, APP_, X_, etc.
+        (api[_\-]?key|secret(?:[_\-]?key)?|password|passwd|token|auth[_\-]?token
           |access[_\-]?token|client[_\-]?secret|private[_\-]?key|encryption[_\-]?key
           |session[_\-]?token|refresh[_\-]?token)
+        ([_\-][A-Z0-9_]*)?              # optional suffix: _V2, _PROD, etc.
         \s*[:=]\s*
         ['"]?
         ([A-Za-z0-9_+/=\-]{30,})
@@ -141,7 +165,13 @@ MULTILINE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 
 
 # ----- Allowlist marker -----
-ALLOWLIST_MARKER_RE = re.compile(r"#\s*redact-allow\b", re.IGNORECASE)
+# Marker must appear as a true comment: preceded by whitespace or line-start.
+# This rejects abuse where the marker is buried inside a JSON string field
+# or quoted secret value to suppress detection on a neighboring line.
+# `(?:^|\s)` enforces the comment-position constraint without requiring the
+# whole line to be a comment (we still allow inline form like
+# `KEY = "..." # redact-allow: fixture`).
+ALLOWLIST_MARKER_RE = re.compile(r"(?:^|\s)#\s*redact-allow\b", re.IGNORECASE)
 
 
 # ----- Filename-based skip rules -----
@@ -160,16 +190,55 @@ def is_binary(path: Path) -> bool:
         return True
 
 
-def iter_files(root: Path) -> Iterable[Path]:
-    """Yield text files under root, skipping VCS/cache and binaries."""
+def iter_files(root: Path, skip_files: set[Path] | None = None) -> Iterable[Path]:
+    """Yield text files under root, skipping VCS/cache, binaries, and the
+    explicit skip_files set. The skip_files set is real-path resolved before
+    comparison.
+    """
+    skip_resolved: set[Path] = set()
+    if skip_files:
+        for f in skip_files:
+            try:
+                skip_resolved.add(f.resolve())
+            except OSError:
+                pass
     for p in root.rglob("*"):
         if not p.is_file():
             continue
         if any(part in SKIP_DIRS for part in p.parts):
             continue
+        try:
+            if p.resolve() in skip_resolved:
+                continue
+        except OSError:
+            pass
         if is_binary(p):
             continue
         yield p
+
+
+# ReDoS-prone patterns: the constructs `(.+)+`, `(.*)+`, `(a+)+`,
+# overlapping alternations followed by `+` etc. exhibit catastrophic
+# backtracking on benign input. We refuse to compile any user pattern
+# containing these shapes — better to print a clear error than to hang
+# the pre-commit indefinitely and train users to bypass with --no-verify.
+_REDOS_RE = re.compile(
+    r"""
+      \([^)]*[+*][^)]*\)[+*]    # (...+...)+ or (...*...)*  — nested quantifier
+    """,
+    re.VERBOSE,
+)
+
+
+def _is_redos_dangerous(pattern: str) -> bool:
+    """True if the pattern likely exhibits catastrophic backtracking.
+
+    Heuristic — not a complete safety check, but catches the classic
+    nested-quantifier shape (`(...+...)+`) that shows up in CTFs and
+    incident postmortems. Better to ship a tighter pattern than to lose
+    the pre-commit hook to a 30-second hang.
+    """
+    return bool(_REDOS_RE.search(pattern))
 
 
 def load_private_patterns(target_root: Path) -> list[tuple[str, re.Pattern[str]]]:
@@ -177,7 +246,8 @@ def load_private_patterns(target_root: Path) -> list[tuple[str, re.Pattern[str]]
 
     Each non-blank, non-comment line is compiled as a regex. Invalid regexes
     are reported on stderr and skipped (we never want a malformed user
-    pattern to crash the pre-commit hook).
+    pattern to crash the pre-commit hook). Patterns matching ReDoS shapes
+    are also rejected with a warning.
     """
     private_file = target_root / "redact-private.txt"
     if not private_file.exists():
@@ -193,6 +263,13 @@ def load_private_patterns(target_root: Path) -> list[tuple[str, re.Pattern[str]]
     for i, raw in enumerate(lines, start=1):
         line = raw.strip()
         if not line or line.startswith("#"):
+            continue
+        if _is_redos_dangerous(line):
+            sys.stderr.write(
+                f"redact: ReDoS-prone pattern in {private_file}:{i} "
+                f"(nested quantifier like `(...+)+`); rejected. Rewrite with "
+                f"a non-backtracking shape.\n"
+            )
             continue
         try:
             patterns.append((f"private_{i}", re.compile(line)))
@@ -249,35 +326,49 @@ def scan_file(
     hits: list[tuple[int, str, str]] = []
     all_patterns = BUILTIN_PATTERNS + extra_patterns
 
-    # Per-line scan
+    # Per-line scan. We report ALL matches per line (and from multiple
+    # patterns) — a line containing two distinct secrets must surface both,
+    # and a line containing two AWS keys must surface both. The previous
+    # `break` after the first hit silently dropped the rest, which red-team
+    # testing showed could be exploited (B12).
     for i, line in enumerate(lines, start=1):
         if i in allow_lines:
             continue
+        # Track positions already hit on this line so two patterns matching
+        # the same span don't double-report (e.g. `Authorization: Bearer ghp_…`
+        # would otherwise match both auth_bearer and github_pat_classic).
+        consumed_spans: list[tuple[int, int]] = []
         for name, pat in all_patterns:
-            m = pat.search(line)
-            if m:
+            for m in pat.finditer(line):
+                if any(s <= m.start() < e for s, e in consumed_spans):
+                    continue
                 matched = m.group(0)
-                # For grouped patterns, prefer the value-capture group so the
-                # output redacts the secret rather than the field name.
-                if name == "generic_secret_assignment" and m.lastindex and m.lastindex >= 2:
-                    matched = m.group(2)
+                if name == "generic_secret_assignment" and m.lastindex and m.lastindex >= 4:
+                    matched = m.group(4)
+                elif name == "url_userinfo" and m.lastindex and m.lastindex >= 1:
+                    matched = m.group(1)
                 elif name in ("auth_bearer", "auth_basic") and m.lastindex and m.lastindex >= 1:
                     matched = m.group(1)
                 hits.append((i, name, matched))
-                break  # one hit per line is enough
+                consumed_spans.append((m.start(), m.end()))
 
-    # Whole-file scan for multi-line patterns
+    # Whole-file scan for multi-line patterns. Track interior lines so the
+    # entropy sweep below doesn't double-flag the random-looking base64 body
+    # of a PEM block (the block as a whole is already reported).
+    multiline_interior: set[int] = set()
     for name, pat in MULTILINE_PATTERNS:
         for m in pat.finditer(text):
             line_no = text.count("\n", 0, m.start()) + 1
+            end_line_no = text.count("\n", 0, m.end()) + 1
             if line_no in allow_lines:
                 continue
             hits.append((line_no, name, m.group(0)[:40] + "..."))
+            multiline_interior.update(range(line_no, end_line_no + 1))
 
     # Entropy sweep (optional)
     if entropy_threshold is not None:
         # Pre-compute hit lines to skip
-        hit_lines = {h[0] for h in hits}
+        hit_lines = {h[0] for h in hits} | multiline_interior
         for i, line in enumerate(lines, start=1):
             if i in allow_lines or i in hit_lines:
                 continue
@@ -323,8 +414,13 @@ def main() -> int:
     extra_patterns = load_private_patterns(root)
     entropy_threshold = None if args.no_entropy else args.entropy_threshold
 
+    # Skip the redact-private.txt file itself — its own pattern bodies would
+    # otherwise match themselves on whole-tree scans, training users to
+    # bypass the pre-commit hook with --no-verify.
+    skip_files = {root / "redact-private.txt"}
+
     total_hits = 0
-    for f in iter_files(root):
+    for f in iter_files(root, skip_files=skip_files):
         hits = scan_file(f, extra_patterns, entropy_threshold)
         for line_no, pattern_name, matched in hits:
             display = matched[:8] + "..." if len(matched) > 12 else matched

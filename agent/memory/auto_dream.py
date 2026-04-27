@@ -37,26 +37,39 @@ PROMOTION_THRESHOLD = 7.0
 CLUSTER_SIMILARITY = 0.3
 
 
+EPISODIC_LOCK = EPISODIC + ".lock"
+
+
 @contextlib.contextmanager
 def _episodic_locked():
-    """Hold an exclusive flock on AGENT_LEARNINGS.jsonl across the entire
-    dream-cycle read-modify-write window.
+    """Hold an exclusive flock across the dream-cycle read-modify-write window.
 
-    Without a window-spanning lock, an `append_jsonl()` call that lands
-    between `_load_entries_locked()` and `_write_entries_locked(kept)` is
-    silently truncated away by the rewrite. With this context manager,
-    every appender (`_episodic_io.append_jsonl`, which takes LOCK_EX on
-    the same file) blocks until the dream cycle releases the lock.
+    The lock is taken on a SENTINEL sibling file (`AGENT_LEARNINGS.jsonl.lock`),
+    NOT the data file itself. This decouples lock identity from data-file
+    inode identity so the atomic rewrite (`os.replace` in
+    `_write_entries_locked`) can swap the data file's inode without
+    invalidating in-flight appenders' locks. Locking the data file directly
+    causes silent data loss because:
+      - dream cycle locks data file → appender opens data file, blocks on flock
+      - dream cycle calls os.replace(tmp, data) → data file is now a new inode
+      - dream cycle releases lock on the (now-orphan) old inode
+      - appender's flock acquires on the orphan inode and writes there
+      - appender's bytes are unreachable from the path; file is "the new inode"
+    With sentinel locking, the appender's open()-then-write happens only
+    after sentinel-lock is released, by which point os.replace has completed
+    and open() on the data path resolves to the new inode unambiguously.
 
-    Yields the open file descriptor so callers can read/write without
-    racing on a second open(). On Windows (no fcntl) yields None and
-    falls back to the historical best-effort behavior.
+    Yields the lock file descriptor for callers that need to coordinate
+    further (currently only used as a sentinel — readers/writers should
+    use `_load_entries_locked()` / `_write_entries_locked()` to do their
+    own opens of EPISODIC).
+    On Windows (no fcntl) yields None and falls back to best-effort.
     """
     if fcntl is None:
         yield None
         return
     os.makedirs(os.path.dirname(EPISODIC), exist_ok=True)
-    fd = os.open(EPISODIC, os.O_RDWR | os.O_CREAT, 0o644)
+    fd = os.open(EPISODIC_LOCK, os.O_RDWR | os.O_CREAT, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield fd
@@ -67,25 +80,22 @@ def _episodic_locked():
             os.close(fd)
 
 
-def _load_entries_locked(fd):
-    """Read all entries from the locked fd, or fall back to plain read on
-    Windows (fd is None when fcntl is unavailable).
+def _load_entries_locked(_fd):
+    """Read all entries from EPISODIC. The sentinel lock held by the caller
+    means no appender will be writing while we read.
+
+    The fd argument is preserved for backward compatibility with the
+    pre-sentinel signature; it's now ignored (the sentinel is the lock,
+    not the data file).
     """
     entries = []
-    if fd is None:
-        if not os.path.exists(EPISODIC):
-            return entries
+    if not os.path.exists(EPISODIC):
+        return entries
+    try:
         with open(EPISODIC) as f:
             stream = f.read()
-    else:
-        os.lseek(fd, 0, os.SEEK_SET)
-        chunks = []
-        while True:
-            buf = os.read(fd, 65536)
-            if not buf:
-                break
-            chunks.append(buf)
-        stream = b"".join(chunks).decode("utf-8", errors="replace")
+    except OSError:
+        return entries
     for line in stream.splitlines():
         line = line.strip()
         if not line:
@@ -97,27 +107,19 @@ def _load_entries_locked(fd):
     return entries
 
 
-def _write_entries_locked(fd, entries):
-    """Atomically rewrite under the same lock _load_entries_locked used.
+def _write_entries_locked(_fd, entries):
+    """Atomically rewrite EPISODIC.
 
-    The previous in-place truncate-then-write left a torn (empty) file when a
-    SIGKILL or OOM hit between `os.ftruncate(0)` and `os.write(payload)`. We
-    instead write to a sibling `.tmp`, fsync, then `os.replace` over the
-    locked file. The flock survives the rename because it lives on the open
-    file description (the lock holder still has the original inode); concurrent
-    appenders that subsequently `open()` the path get the new inode without a
-    lock, but the dream cycle is guaranteed not to corrupt the on-disk state.
+    Two safety guarantees:
+      - SIGKILL during write: temp+fsync+os.replace means the original file
+        is intact until the rename, and the rename is atomic on POSIX/Windows.
+      - Concurrent appenders: the sentinel lock held by the dream cycle
+        blocks appenders from opening + writing AGENT_LEARNINGS.jsonl until
+        we release. After release, appenders' open() lands on the new inode.
     """
     from _atomic import atomic_write_bytes  # local import to avoid module-init cycles
     payload = "".join(json.dumps(e) + "\n" for e in entries).encode("utf-8")
     atomic_write_bytes(EPISODIC, payload)
-    if fd is not None:
-        # Re-sync our open fd to the new file so subsequent reads in the
-        # same dream-cycle window see consistent state.
-        try:
-            os.lseek(fd, 0, os.SEEK_SET)
-        except OSError:
-            pass
 
 
 # Compatibility shims for any external caller that still imports the
