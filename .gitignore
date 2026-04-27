@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual envs
+.venv/
+venv/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Test artifacts
+.coverage
+htmlcov/
+
+# Local design notes (not for public release until reviewed)
+DESIGN_NOTES.md
+
+# Privacy audit artifacts (committed only after manual review)
+.privacy-audit-cache/
+
+# These should never appear in this repo (data lives in ~/.agent/, not here)
+# Listed as defense-in-depth.
+*.jsonl
+!templates/lessons.jsonl.example
+!examples/**/*.jsonl
+candidates/
+semantic/lessons.jsonl
+episodic/AGENT_LEARNINGS.jsonl
