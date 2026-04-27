@@ -33,6 +33,25 @@ To set per project, use `direnv` or shell startup files. Example
 export BRAIN_ROOT=~/.work-brain
 ```
 
+### `BRAIN_ROOT` is security-sensitive
+
+The wrapper exec's a Python script under whatever `BRAIN_ROOT` resolves
+to. Without validation, a hostile process or a sourced `.envrc` could
+point `BRAIN_ROOT` at attacker-controlled Python (e.g.
+`BRAIN_ROOT=/tmp/attacker/.agent`).
+
+The wrapper enforces three constraints, and falls back to `~/.agent`
+with a warning to `~/.agent/hook.log` if any of them fail:
+
+1. The path must resolve (real-path, symlink-aware) under `$HOME`.
+2. The path must contain `harness/hooks/claude_code_post_tool.py`
+   (otherwise it's not a brain dir).
+3. The path-traversal `..` is normalized away by `Path.resolve()`
+   before the under-`$HOME` check.
+
+If you need to override `BRAIN_ROOT`, point it at a directory you own
+under your real home dir.
+
 ## Mode 3: `.agent-local-override` file (skip the global hook)
 
 If `$CLAUDE_PROJECT_DIR/.agent-local-override` exists (any contents,
@@ -50,6 +69,23 @@ cd /path/to/project
 touch .agent-local-override
 git add .agent-local-override   # commit it so teammates inherit
 ```
+
+### Override fires are audited
+
+Because a `.agent-local-override` marker silently disables global
+logging for every tool call in that project, a malicious or careless
+repo could ship the marker in its initial commit and you'd never notice
+your tool usage stopped being captured.
+
+Every override fire appends a line to `~/.agent/override.log`:
+
+```
+2026-04-27T03:14:15.926535+00:00\t/Users/me/projects/sketchy-repo\t/Users/me/projects/sketchy-repo/.agent-local-override
+```
+
+`tail ~/.agent/override.log` shows every project that has suppressed
+logging recently. If a project shows up there that you didn't expect,
+investigate the marker.
 
 ## Precedence order
 

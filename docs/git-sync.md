@@ -32,12 +32,14 @@ cp ~/Documents/codebase/mustafa-agentic-stack/templates/pre-commit \
 chmod +x ~/.agent/.git/hooks/pre-commit
 ```
 
-The hook runs `tools/redact.py` over every commit. It catches:
-- AWS access keys (`AKIA[16chars]`)
-- GitHub PATs / OAuth / server / refresh tokens
-- JWT-shaped tokens
-- Generic `api_key=` / `secret=` / `password=` / `token=` patterns
-  with 30+ char values
+The hook runs `tools/redact.py` over every commit. It catches the full
+pattern set documented in [docs/redaction-policy.md](redaction-policy.md):
+AWS / GitHub / OpenAI / Anthropic / Slack / Stripe / Sentry / Datadog /
+Google API keys, JWTs, Authorization headers, PEM private key blocks, and
+generic high-entropy strings (with URL-aware exemption).
+
+It also loads `~/.agent/redact-private.txt` and merges in any user-supplied
+patterns there.
 
 False positives are suppressed by per-line marker:
 
@@ -45,6 +47,11 @@ False positives are suppressed by per-line marker:
 # redact-allow: example value used in test fixture
 EXAMPLE_KEY = "AKIAIOSFODNN7EXAMPLE"
 ```
+
+The `git commit --no-verify` flag bypasses the local hook entirely. To
+catch that, install the GitHub Action workflow at
+`templates/brain-secret-scan.yml` into the brain repo's
+`.github/workflows/secret-scan.yml`.
 
 ## Automated hourly sync
 
@@ -57,11 +64,18 @@ launchctl load ~/Library/LaunchAgents/com.user.agent-sync.plist
 ```
 
 Every 60 minutes:
-1. Acquires `flock` on `~/.agent/.brain.lock` (waits if dream cycle is running)
-2. Stages all changes
-3. (If `trufflehog` is installed) runs entropy scan; aborts on any finding
-4. The pre-commit hook runs `redact.py`
-5. Commits with timestamp + pushes
+1. Acquires the brain-wide lock via `flock(1)` if available, else via a
+   Python `fcntl.flock` fallback. Backs off (exit 0) if the dream cycle
+   is mid-run.
+2. Runs `tools/redact_jsonl.py` to scrub secrets that the post-tool hook
+   captured into episodic JSONL before redaction had a chance.
+3. **REQUIRED** `trufflehog` or `gitleaks` scan over the brain dir;
+   aborts on any finding. (Set `SYNC_ALLOW_NO_SCANNER=1` to skip — not
+   recommended; `install.sh` warns if neither is on PATH.)
+4. Stages all changes.
+5. The pre-commit hook runs `redact.py` (with `redact-private.txt`
+   patterns merged).
+6. Commits with timestamp + pushes.
 
 Logs land in `~/.agent/sync.log`.
 
