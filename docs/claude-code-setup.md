@@ -55,7 +55,7 @@ hooks** — do **not** replace them:
         "hooks": [
           {
             "type": "command",
-            "command": "/opt/homebrew/bin/python3.13 \"$HOME/.agent/harness/hooks/agentic_post_tool_global.py\""
+            "command": "/opt/homebrew/bin/python3.13 /Users/yourname/.agent/harness/hooks/agentic_post_tool_global.py"
           }
         ]
       }
@@ -63,6 +63,13 @@ hooks** — do **not** replace them:
   }
 }
 ```
+
+**Use absolute paths — do NOT use `$HOME` or `~` in the command.** The
+hook command is shell-evaluated by Claude Code; a hostile `$HOME`
+environment variable (set by a sourced `.envrc` in some project) could
+otherwise redirect the hook to attacker-controlled Python. The
+installer prints the resolved absolute paths it recommends — paste
+those literally.
 
 Replace `/opt/homebrew/bin/python3.13` with whatever Python 3.10+
 interpreter you have. If you don't know:

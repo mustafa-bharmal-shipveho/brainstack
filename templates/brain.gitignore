@@ -1,0 +1,33 @@
+# Default .gitignore for the brain repo at ~/.agent/.
+# install.sh copies this into <brain>/.gitignore on a fresh install.
+
+# Logs (regenerated; not source of truth)
+*.log
+
+# Lock files (process-local; would conflict on multi-machine pulls)
+.brain.lock
+*.lock
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pytest / mypy / ruff caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Atomic-write temp files (cleaned up by sync.sh; no need to commit)
+*.tmp
+
+# Data-layer exports — derived from episodic JSONL + lessons.jsonl;
+# rebuildable via `python3 ~/.agent/tools/data_layer_export.py`.
+data-layer/exports/
+
+# FTS / search indexes (rebuildable)
+.index/
+
+# OS cruft
+.DS_Store
+Thumbs.db

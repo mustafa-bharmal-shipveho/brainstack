@@ -211,6 +211,13 @@ chmod +x "$BRAIN_ROOT/tools/"*.sh 2>/dev/null || true
 chmod +x "$BRAIN_ROOT/tools/"*.py 2>/dev/null || true
 chmod +x "$BRAIN_ROOT/harness/hooks/"*.py 2>/dev/null || true
 
+# Default .gitignore so the brain doesn't accidentally commit logs / lock
+# files / temp files / dashboard exports. Mirrors the contents documented in
+# docs/git-sync.md.
+if [ ! -f "$BRAIN_ROOT/.gitignore" ] && [ -f "$REPO_DIR/templates/brain.gitignore" ]; then
+    cp "$REPO_DIR/templates/brain.gitignore" "$BRAIN_ROOT/.gitignore"
+fi
+
 # Stub for private redaction patterns (lives in user's brain, not in framework).
 # Empty by default; the user can copy templates/redact-private.example.txt over
 # to seed common org-shape regexes.
