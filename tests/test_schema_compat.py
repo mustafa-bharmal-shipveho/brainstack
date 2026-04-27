@@ -57,8 +57,14 @@ def test_lessons_schema_extension_renders_when_present(tmp_path):
 
     md = (semantic / "LESSONS.md").read_text()
     assert "Always serialize timestamps in UTC" in md
-    assert "**Why:** Cross-region comparisons silently" in md
-    assert "**How to apply:** Anywhere a timestamp leaves" in md
+    # Extension fields render as italic (single-asterisk), NOT bold.
+    # Bold + dash-prefixed indented bullets get misread as new top-level
+    # bullets by migrate_legacy_bullets() — see render_lessons.py comment.
+    assert "*Why:* Cross-region comparisons silently" in md
+    assert "*How to apply:* Anywhere a timestamp leaves" in md
+    # No leading dash on the extension lines (would trigger legacy migration)
+    assert "- *Why:*" not in md
+    assert "- *How to apply:*" not in md
 
 
 def test_lessons_schema_backward_compatible(tmp_path):
