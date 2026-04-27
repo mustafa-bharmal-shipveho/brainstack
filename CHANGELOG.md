@@ -61,6 +61,73 @@ deployment decision and is intentionally not addressed by code.
   private keys matched the source file's own regex literals on whole-
   file scan. Inline `# redact-allow` markers on each literal line.
 
+### Persona-agent regression sweep (2026-04-27)
+
+Six parallel persona agents ran against the just-applied v0.1.1 code
+and surfaced 24 additional bugs, all fixed within v0.1.1:
+
+**Critical regression** (introduced by the v0.1.1 atomic-write fix and
+caught by the race-atomicity persona):
+- Lock inversion: `_write_entries_locked` used `os.replace`, which
+  swaps the data file's inode and invalidates `flock` held on the
+  old inode. Stress test reproduced ~3% silent data loss with 20
+  concurrent appenders + 1 dream cycle. **Fix:** switched both
+  `_episodic_io.append_jsonl` and `auto_dream._episodic_locked` to
+  flock a sentinel sibling (`<jsonl>.lock`), decoupling lock identity
+  from data-file inode lifetime. New `tests/test_concurrent_appends.py`
+  verifies 100/100 rows survive 20-way contention.
+
+**Red-team bypasses** (12 attacks executed; 7 closed):
+- B1 URL userinfo (`https://user:secret@host/`) — added
+  `url_userinfo` pattern.
+- B2 Base64-encoded secrets in JSONL — added entropy sweep to
+  `redact_jsonl.py`.
+- B3 `# redact-allow` marker abuse via JSON-string burial — marker
+  must now be at line-start or preceded by whitespace.
+- B4 ReDoS in user-supplied regex — `load_private_patterns` rejects
+  patterns matching nested-quantifier shapes.
+- B5 `\b` failed on `MY_TOKEN=` (both `_` and `=` are word chars) —
+  added optional `[A-Z][A-Z0-9_]*[_-]` prefix and `[_-][A-Z0-9_]*`
+  suffix groups; value capture moved to group 4.
+- B9 newer Slack token shapes (`xapp-`, `xoxc-`, `xoxd-`, `xoxe-`).
+- B12 multiple distinct secrets per line — drop `break` after first
+  hit; track consumed spans to avoid double-reporting overlaps.
+
+**Privacy-audit fixes**:
+- `redact-private.txt` self-flag (file lives under scanned root) —
+  added explicit skip list to `iter_files`.
+- PEM blocks generated triple `high_entropy` hits on inner base64 —
+  multi-line scan now records interior line range and entropy sweep
+  honors it.
+- Added Twilio (`AC*`, `SK*`), SendGrid (`SG.*`), NPM (`npm_*`),
+  Mailgun (`key-*`), Heroku patterns.
+- Shipped `templates/redact-private.example.txt` seed file.
+
+**Skeptic-codereview fixes**:
+- `_log_override_fire` hardcoded `~/.agent` regardless of resolved
+  `BRAIN_ROOT`. Test passed by accident on default brain. Now uses
+  resolved brain root.
+- `_atomic.cleanup_stale_tmp` was dead code — wired into `sync.sh`.
+- `redact_jsonl.atomic_write` duplicated `_atomic.atomic_write_bytes`
+  — now delegates with a portability fallback.
+- `scrub_value` didn't traverse dict keys — now does.
+- `test_runner_does_not_call_shell_flock` had a broken short-circuit
+  that always passed — replaced with AST-based forbidden-call walk.
+
+**Sysadmin-lifecycle fixes**:
+- `sync.sh` aborted fatally on a fresh brain because `data-layer/`
+  didn't exist. Build target list dynamically.
+- `install.sh --upgrade` `cp` loop died if `memory/` didn't exist
+  on a partial brain. `mkdir -p` first.
+- `_episodic_io.append_jsonl` raised `PermissionError` traceback per
+  tool call when JSONL was read-only. Now degrades silently.
+
+**Portability fix**:
+- Vendored `claude_code_post_tool.py` used `re.Pattern | None` syntax
+  without `from __future__ import annotations` → crashed on Python
+  3.9. Added the future import. Conftest 3.9-skip guard removed.
+  96/96 tests pass on both 3.9 and 3.13 now.
+
 ## v0.1.0 — Lean MVP + dashboard (2026-04-26)
 
 - `install.sh` targeting `~/.agent/` globally
