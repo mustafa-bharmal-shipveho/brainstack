@@ -1,0 +1,58 @@
+mustafa-agentic-stack
+Copyright 2026 Mustafa Bharmal
+
+This product includes software developed by codejunkie99 as part of the
+agentic-stack project (https://github.com/codejunkie99/agentic-stack),
+licensed under the Apache License, Version 2.0.
+
+The following files in this repository are derived from agentic-stack
+v0.11.2 (commit df806abace1a693e042844bf4ac0cccf9bb6270a). Each file
+preserves its original copyright header and includes a modification
+notice block per Apache License 2.0 §4(b).
+
+Vendored files (verbatim or with documented modifications):
+
+  tools/auto_dream.py            (from .agent/memory/auto_dream.py)
+  tools/cluster.py               (from .agent/memory/cluster.py)
+  tools/promote.py               (from .agent/memory/promote.py)
+  tools/validate.py              (from .agent/memory/validate.py)
+  tools/review_state.py          (from .agent/memory/review_state.py)
+  tools/render_lessons.py        (from .agent/memory/render_lessons.py)
+  tools/decay.py                 (from .agent/memory/decay.py)
+  tools/archive.py               (from .agent/memory/archive.py)
+  tools/graduate.py              (from .agent/tools/graduate.py)
+  tools/reject.py                (from .agent/tools/reject.py)
+  tools/reopen.py                (from .agent/tools/reopen.py)
+  tools/list_candidates.py       (from .agent/tools/list_candidates.py)
+  tools/data_layer_export.py     (from .agent/tools/data_layer_export.py)
+  hooks/claude_code_post_tool.py (from .agent/harness/hooks/claude_code_post_tool.py)
+  hooks/_episodic_io.py          (from .agent/harness/hooks/_episodic_io.py)
+  hooks/_provenance.py           (from .agent/harness/hooks/_provenance.py)
+  hooks/on_failure.py            (from .agent/harness/hooks/on_failure.py)
+  hooks/post_execution.py        (from .agent/harness/hooks/post_execution.py)
+  hooks/salience.py              (from .agent/harness/salience.py)
+  hooks/text.py                  (from .agent/harness/text.py)
+
+Modifications summary:
+
+  - Path resolution: directory layout under ~/.agent/ flattens upstream's
+    .agent/ wrapper. Files preserve their __file__-relative path resolution
+    logic; no code changes were required for this.
+  - tools/render_lessons.py: extended _bullet_for() to render optional
+    'why' and 'how_to_apply' fields when present in lesson rows. Backward
+    compatible — when absent, output matches upstream.
+
+Files originally written by Mustafa Bharmal (clean-room, not derived from
+upstream):
+
+  install.sh, upgrade.sh
+  tools/redact.py
+  tools/migrate.py
+  tools/sync.sh
+  hooks/agentic_post_tool_global.py (the absolute-path entry point)
+  adapters/claude-code/*
+  schemas/*, templates/*
+  docs/*, README.md, CHANGELOG.md
+  tests/*
+
+For the original Apache License 2.0 text, see LICENSE.
