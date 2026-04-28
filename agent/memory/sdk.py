@@ -23,6 +23,20 @@ from typing import Any, Callable, Dict, List, Optional
 _NAMESPACE_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 DEFAULT_NS = "default"
 
+# Names that collide with internal memory subdirectories OR Windows reserved
+# device names. Codex memory-systems persona finding: a namespace named
+# `snapshots` would map its episodic data into the same dir the kernel
+# already uses for archive snapshots, silently merging the two streams.
+_RESERVED_NAMESPACE_NAMES = frozenset({
+    # Internal memory subdirectories the kernel already uses.
+    "candidates", "episodic", "semantic", "working", "personal",
+    "snapshots", "rejected", "graduated", "archive", "audit",
+    # Windows reserved device names (lowercased — the regex already lowercases).
+    "con", "prn", "aux", "nul",
+    "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+    "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+})
+
 # Schema versioning. Writes always stamp CURRENT_SCHEMA. Reads accept any
 # version up to KNOWN_MAX_SCHEMA; rows with a newer schema_version are
 # dropped from query_semantic results (and a warning is logged once per
@@ -45,6 +59,12 @@ def _validate_namespace(namespace: str) -> str:
     if not _NAMESPACE_RE.match(namespace):
         raise ValueError(
             f"invalid namespace {namespace!r}: must match ^[a-z][a-z0-9_-]{{0,31}}$"
+        )
+    if namespace in _RESERVED_NAMESPACE_NAMES:
+        raise ValueError(
+            f"invalid namespace {namespace!r}: collides with reserved name "
+            f"(internal memory dir or Windows device). "
+            f"See _RESERVED_NAMESPACE_NAMES in agent/memory/sdk.py."
         )
     return namespace
 
@@ -194,7 +214,10 @@ def query_semantic(
         return rows[-k:]
     q = query.lower()
     matches: List[dict] = []
-    for r in rows:
+    # Iterate newest-to-oldest so the substring branch returns the MOST
+    # RECENT k matches, matching the no-query branch's last-k semantics.
+    # Codex memory-systems persona finding (v0.2-rc.2 review).
+    for r in reversed(rows):
         for field in ("claim", "why", "how_to_apply"):
             v = r.get(field)
             if isinstance(v, str) and q in v.lower():
