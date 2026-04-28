@@ -23,6 +23,15 @@ from typing import Any, Callable, Dict, List, Optional
 _NAMESPACE_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 DEFAULT_NS = "default"
 
+# Schema versioning. Writes always stamp CURRENT_SCHEMA. Reads accept any
+# version up to KNOWN_MAX_SCHEMA; rows with a newer schema_version are
+# dropped from query_semantic results (and a warning is logged once per
+# process) so a fresh process running an old SDK against a brain that has
+# been upgraded does not silently misinterpret data.
+CURRENT_SCHEMA = 1
+KNOWN_MAX_SCHEMA = 1
+_warned_about_future_schema = False
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _HARNESS_HOOKS = os.path.normpath(os.path.join(_HERE, "..", "harness", "hooks"))
 
@@ -109,7 +118,7 @@ def append_episodic(
     if not isinstance(event, dict):
         raise ValueError("event must be a dict")
     if "schema_version" not in event:
-        event["schema_version"] = 1
+        event["schema_version"] = CURRENT_SCHEMA
     if "ts" not in event:
         event["ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
     path = _episodic_path(namespace, brain_root)
@@ -121,9 +130,20 @@ def append_episodic(
 # --- Semantic query --------------------------------------------------
 
 def _read_jsonl(path: str) -> List[dict]:
+    """Read a JSONL file, drop unparseable lines, and filter rows whose
+    `schema_version` exceeds what this SDK understands.
+
+    Filtering is conservative: rows missing `schema_version` are kept
+    (treated as schema 1) so legacy v0.1 episodic streams still parse.
+    Rows with `schema_version > KNOWN_MAX_SCHEMA` are dropped and a single
+    warning is emitted per process so operators notice a forward-version
+    mismatch without flooding logs.
+    """
+    global _warned_about_future_schema
     if not os.path.exists(path):
         return []
     out: List[dict] = []
+    skipped_future = 0
     try:
         with open(path) as f:
             for line in f:
@@ -131,11 +151,22 @@ def _read_jsonl(path: str) -> List[dict]:
                 if not line:
                     continue
                 try:
-                    out.append(json.loads(line))
+                    row = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                v = row.get("schema_version", 1)
+                if isinstance(v, int) and v > KNOWN_MAX_SCHEMA:
+                    skipped_future += 1
+                    continue
+                out.append(row)
     except OSError:
         return []
+    if skipped_future and not _warned_about_future_schema:
+        _warned_about_future_schema = True
+        sys.stderr.write(
+            f"[mustafa-agentic-stack] dropped {skipped_future} row(s) from {path} "
+            f"with schema_version > {KNOWN_MAX_SCHEMA}; SDK upgrade may be needed\n"
+        )
     return out
 
 
