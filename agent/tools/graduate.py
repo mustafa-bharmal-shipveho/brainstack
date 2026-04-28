@@ -15,8 +15,31 @@ from review_state import mark_graduated
 from validate import heuristic_check
 from render_lessons import append_lesson, render_lessons, load_lessons
 
+# Default candidates/semantic locations match the v0.1 layout. The
+# `--namespace` flag (or BRAIN_ROOT env) overrides these at CLI time so
+# v0.2 namespaced brains route to the correct subdir.
 CANDIDATES = os.path.join(BASE, "memory/candidates")
 SEMANTIC = os.path.join(BASE, "memory/semantic")
+
+
+def _resolve_paths(namespace):
+    """Resolve (CANDIDATES, SEMANTIC) for the given namespace.
+
+    Honors BRAIN_ROOT when set; otherwise falls back to the in-repo
+    layout under BASE for legacy script-style invocation. namespace
+    "default" preserves v0.1 paths (no extra subdir).
+    """
+    brain_root = os.environ.get("BRAIN_ROOT")
+    if brain_root:
+        root = os.path.abspath(os.path.expanduser(brain_root))
+        memory = os.path.join(root, "memory")
+    else:
+        memory = os.path.join(BASE, "memory")
+    if namespace == "default":
+        return (os.path.join(memory, "candidates"),
+                os.path.join(memory, "semantic"))
+    return (os.path.join(memory, "candidates", namespace),
+            os.path.join(memory, "semantic", namespace))
 
 
 def _lesson_id(candidate):
@@ -46,7 +69,14 @@ def main():
                    help="Accept as provisional (probationary) rather than full.")
     p.add_argument("--supersedes", default=None,
                    help="ID of an existing lesson this replaces.")
+    p.add_argument("--namespace", default="default",
+                   help="Brain namespace (default: 'default' = v0.1 layout).")
     args = p.parse_args()
+
+    # Shadow the module-level constants with namespace-resolved paths so
+    # the rest of main() reads from the right place under v0.2 layouts.
+    global CANDIDATES, SEMANTIC
+    CANDIDATES, SEMANTIC = _resolve_paths(args.namespace)
 
     cand_path = os.path.join(CANDIDATES, f"{args.candidate_id}.json")
     if not os.path.exists(cand_path):

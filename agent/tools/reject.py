@@ -15,13 +15,34 @@ from review_state import mark_rejected
 CANDIDATES = os.path.join(BASE, "memory/candidates")
 
 
+def _resolve_candidates(namespace):
+    """Pick the candidates dir for the given namespace.
+
+    Honors BRAIN_ROOT; namespace 'default' keeps the v0.1 layout.
+    """
+    brain_root = os.environ.get("BRAIN_ROOT")
+    if brain_root:
+        memory = os.path.join(os.path.abspath(os.path.expanduser(brain_root)),
+                              "memory")
+    else:
+        memory = os.path.join(BASE, "memory")
+    if namespace == "default":
+        return os.path.join(memory, "candidates")
+    return os.path.join(memory, "candidates", namespace)
+
+
 def main():
     p = argparse.ArgumentParser(description="Reject a staged candidate.")
     p.add_argument("candidate_id")
     p.add_argument("--reason", required=True,
                    help="Why it's being rejected. Required.")
     p.add_argument("--reviewer", default="host-agent")
+    p.add_argument("--namespace", default="default",
+                   help="Brain namespace (default: 'default' = v0.1 layout).")
     args = p.parse_args()
+
+    global CANDIDATES
+    CANDIDATES = _resolve_candidates(args.namespace)
 
     try:
         rejected = mark_rejected(args.candidate_id, args.reviewer,

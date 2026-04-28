@@ -195,6 +195,10 @@ See [`docs/`](docs/) for full architecture, redaction policy, hook precedence, a
 
 ---
 
+## External consumers (v0.2-rc1)
+
+External agent frameworks can read and write the brain through `agent/memory/sdk.py` using namespaces. The SDK exposes `append_episodic`, `query_semantic`, `read_policy`, `write_policy`, and `register_clusterer` — each takes a `namespace` arg matching `^[a-z][a-z0-9_-]{0,31}$`. Pluggable per-namespace dream-cycle clusterers live in `agent/dream/registry.py` (`run_all` aggregates results across namespaces). Backward compatibility is preserved: `namespace="default"` maps to the v0.1 paths (no extra subdir under `episodic/`, `semantic/`, `candidates/`), so existing v0.1 brains do not need migration. New CLI flags `--namespace NS` are now available on `graduate.py` / `reject.py`, and two new tools (`promote.py`, `rollback.py`) manage tier policy + audit log per namespace. See `mustafa-agents` (companion repo) for the reference TypeScript runtime that consumes this SDK.
+
 ## License
 
 Apache 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE) for upstream attribution.

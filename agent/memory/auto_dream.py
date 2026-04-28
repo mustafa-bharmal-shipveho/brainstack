@@ -37,7 +37,78 @@ PROMOTION_THRESHOLD = 7.0
 CLUSTER_SIMILARITY = 0.3
 
 
+_NAMESPACE_RE = __import__("re").compile(r"^[a-z][a-z0-9_-]{0,31}$")
+
+
+def _resolve_brain_root(brain_root):
+    """Brain-root resolution: explicit arg > BRAIN_ROOT env > ~/.agent."""
+    if brain_root:
+        return os.path.abspath(brain_root)
+    env = os.environ.get("BRAIN_ROOT")
+    if env:
+        return os.path.abspath(env)
+    return os.path.abspath(os.path.expanduser("~/.agent"))
+
+
+def _ns_paths(brain_root, namespace):
+    """Compute the per-namespace paths used by the dream cycle.
+
+    Backward compat: namespace=='default' uses the v0.1 top-level paths
+    (no extra subdir) so existing brains don't need migration.
+    """
+    if namespace != "default" and not _NAMESPACE_RE.match(namespace or ""):
+        raise ValueError(f"invalid namespace: {namespace!r}")
+    root = _resolve_brain_root(brain_root)
+    memory = os.path.join(root, "memory")
+    if namespace == "default":
+        episodic = os.path.join(memory, "episodic", "AGENT_LEARNINGS.jsonl")
+        candidates = os.path.join(memory, "candidates")
+        semantic = os.path.join(memory, "semantic")
+        snapshots = os.path.join(memory, "episodic", "snapshots")
+        working = os.path.join(memory, "working")
+    else:
+        episodic = os.path.join(memory, "episodic", namespace, "AGENT_LEARNINGS.jsonl")
+        candidates = os.path.join(memory, "candidates", namespace)
+        semantic = os.path.join(memory, "semantic", namespace)
+        snapshots = os.path.join(memory, "episodic", namespace, "snapshots")
+        working = os.path.join(memory, "working", namespace)
+    review_queue = os.path.join(working, "REVIEW_QUEUE.md")
+    return {
+        "memory": memory,
+        "episodic": episodic,
+        "episodic_lock": episodic + ".lock",
+        "candidates": candidates,
+        "semantic": semantic,
+        "snapshots": snapshots,
+        "working": working,
+        "review_queue": review_queue,
+    }
+
+
 EPISODIC_LOCK = EPISODIC + ".lock"
+
+
+@contextlib.contextmanager
+def _episodic_locked_path(episodic_path):
+    """Sentinel-locked context for an arbitrary episodic JSONL path.
+
+    Same locking semantics as `_episodic_locked()` but parameterized so
+    namespaced runs can use it without mutating module-level state.
+    """
+    if fcntl is None:
+        yield None
+        return
+    os.makedirs(os.path.dirname(episodic_path), exist_ok=True)
+    sentinel = episodic_path + ".lock"
+    fd = os.open(sentinel, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield fd
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 @contextlib.contextmanager
@@ -78,6 +149,34 @@ def _episodic_locked():
             fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
+
+
+def _load_entries_locked_path(_fd, episodic_path):
+    """Read entries from an arbitrary episodic path (lock held by caller)."""
+    entries = []
+    if not os.path.exists(episodic_path):
+        return entries
+    try:
+        with open(episodic_path) as f:
+            stream = f.read()
+    except OSError:
+        return entries
+    for line in stream.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return entries
+
+
+def _write_entries_locked_path(_fd, entries, episodic_path):
+    """Atomically rewrite an arbitrary episodic path."""
+    from _atomic import atomic_write_bytes  # local import — module-init cycle
+    payload = "".join(json.dumps(e) + "\n" for e in entries).encode("utf-8")
+    atomic_write_bytes(episodic_path, payload)
 
 
 def _load_entries_locked(_fd):
@@ -207,6 +306,76 @@ def run_dream_cycle():
         f"prefiltered_out={prefiltered} pending_review={pending} "
         f"archived={len(archived)} kept={len(kept)}"
     )
+
+
+def run(brain_root=None, namespace="default", dry_run=False):
+    """Namespaced dream cycle. v0.2 entry point.
+
+    Resolves paths under the given namespace (with backward-compat for
+    "default"), runs cluster-extract-stage-prefilter-decay-archive, and
+    returns a structured result dict.
+
+    dry_run=True skips writes (useful for diagnostics) — but still reports
+    what would be written.
+    """
+    paths = _ns_paths(brain_root, namespace)
+    episodic = paths["episodic"]
+    candidates_dir = paths["candidates"]
+    semantic_dir = paths["semantic"]
+    snapshots_dir = paths["snapshots"]
+    working_dir = paths["working"]
+    review_queue = paths["review_queue"]
+
+    os.makedirs(os.path.dirname(episodic), exist_ok=True)
+    os.makedirs(candidates_dir, exist_ok=True)
+    os.makedirs(semantic_dir, exist_ok=True)
+    os.makedirs(working_dir, exist_ok=True)
+
+    result = {
+        "namespace": namespace,
+        "candidates_written": 0,
+        "rejected": 0,
+        "decayed": 0,
+    }
+
+    with _episodic_locked_path(episodic) as fd:
+        entries = _load_entries_locked_path(fd, episodic)
+        if not entries:
+            if not dry_run:
+                from review_state import write_review_queue_summary
+                try:
+                    write_review_queue_summary(candidates_dir, review_queue)
+                except Exception:
+                    pass
+            return result
+
+        patterns = cluster_and_extract(entries, threshold=CLUSTER_SIMILARITY)
+        promotable = {k: p for k, p in patterns.items()
+                      if p.get("canonical_salience", 0) >= PROMOTION_THRESHOLD}
+
+        if dry_run:
+            result["candidates_written"] = len(promotable)
+            return result
+
+        staged = write_candidates(promotable, candidates_dir)
+        prefiltered = _heuristic_prefilter(candidates_dir, semantic_dir)
+
+        kept, archived = decay_old_entries(entries, archive_dir=snapshots_dir)
+        _write_entries_locked_path(fd, kept, episodic)
+        archive_stale_workspace(working_dir=working_dir,
+                                archive_dir=snapshots_dir)
+
+        from review_state import write_review_queue_summary
+        try:
+            write_review_queue_summary(candidates_dir, review_queue)
+        except Exception:
+            pass
+
+        result["candidates_written"] = staged
+        result["rejected"] = prefiltered
+        result["decayed"] = len(archived)
+
+    return result
 
 
 if __name__ == "__main__":
