@@ -9,9 +9,14 @@
 
   Edit before installing:
     1. Replace REPLACE_HOME with your actual home dir (e.g. /Users/yourname)
+    2. Replace REPLACE_PYTHON with the absolute path to a Python >= 3.10
+       interpreter (e.g. /opt/homebrew/bin/python3.13). launchd jobs run
+       with a minimal PATH (no /opt/homebrew/bin), so `python3` resolves to
+       /usr/bin/python3 which is 3.9 on stock macOS — sync.sh refuses 3.9.
+       Setting PYTHON_BIN explicitly in EnvironmentVariables fixes that.
 
-  The sync.sh script handles flock + commit + push + (optional) trufflehog.
-  Sync uses the same flock as the dream cycle, so no torn writes.
+  The sync.sh script handles JSONL scrub + commit + push + scanner check.
+  Both dream and sync use Python fcntl (no shell `flock(1)` dependency).
 -->
 <plist version="1.0">
 <dict>
@@ -24,6 +29,19 @@
         <string>bash</string>
         <string>REPLACE_HOME/.agent/tools/sync.sh</string>
     </array>
+
+    <!-- launchd jobs inherit a minimal PATH that excludes /opt/homebrew/bin.
+         Set PYTHON_BIN (sync.sh honors it) and extend PATH so `git`, `gh`,
+         and any scanner (trufflehog/gitleaks) installed via Homebrew resolve. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHON_BIN</key>
+        <string>REPLACE_PYTHON</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>REPLACE_HOME</string>
+    </dict>
 
     <key>StartInterval</key>
     <integer>3600</integer>

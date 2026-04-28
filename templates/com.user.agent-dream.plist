@@ -30,6 +30,16 @@
         <string>REPLACE_HOME/.agent</string>
     </array>
 
+    <!-- launchd's minimal PATH excludes /opt/homebrew/bin. Set HOME so
+         dream_runner can resolve $HOME-based paths internally. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>REPLACE_HOME</string>
+    </dict>
+
     <key>StartCalendarInterval</key>
     <dict>
         <key>Hour</key>
