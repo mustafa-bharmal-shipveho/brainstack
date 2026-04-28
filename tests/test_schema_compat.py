@@ -129,6 +129,6 @@ def test_extension_fields_documented_as_extensions():
     schema = json.loads(schema_path.read_text())
     for fname in ["why", "how_to_apply", "original_markdown_path"]:
         desc = schema["properties"][fname]["description"]
-        assert "[mustafa-agentic-stack extension]" in desc, (
+        assert "[brainstack extension]" in desc, (
             f"Extension field {fname} not marked as extension in schema description"
         )

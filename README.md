@@ -1,4 +1,4 @@
-# mustafa-agentic-stack
+# brainstack
 
 **A persistent, git-synced memory for your AI coding agent. One brain across every project, every session, every machine.**
 
@@ -79,8 +79,8 @@ Per-project brains fragment context — you relearn the same lesson 10 times acr
 ## Quickstart
 
 ```bash
-git clone https://github.com/mustafa-bharmal-shipveho/mustafa-agentic-stack.git
-cd mustafa-agentic-stack
+git clone https://github.com/mustafa-bharmal-shipveho/brainstack.git
+cd brainstack
 
 # One-shot install: creates ~/.agent/, wires it as a git repo with
 # YOUR private remote, makes the initial commit, installs the
@@ -179,7 +179,7 @@ See [`docs/`](docs/) for full architecture, redaction policy, hook precedence, a
 - Adapters for Cursor, Codex CLI, Windsurf, Aider — same brain, different IDE
 - Onboarding wizard (`./install.sh --interactive`) for users who don't want to read docs
 - Linux launch units (systemd) alongside the macOS launchd plists
-- Brew tap for `brew install mustafa-agentic-stack` (or its eventual rename)
+- Brew tap for `brew install brainstack` (or its eventual rename)
 
 **v0.3 — Smarter dream cycle:**
 - Multi-machine append conflict resolution (timestamp-merge of episodic JSONL on `git pull`)

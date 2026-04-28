@@ -1,8 +1,8 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/mustafa-bharmal-shipveho/mustafa-agentic-stack/schemas/lessons.schema.json",
+  "$id": "https://github.com/mustafa-bharmal-shipveho/brainstack/schemas/lessons.schema.json",
   "title": "lessons.jsonl row",
-  "description": "Schema for one row of semantic/lessons.jsonl. Vendored fields match upstream agentic-stack v0.11.2. Extension fields (why, how_to_apply, original_markdown_path) are mustafa-agentic-stack additions, optional and backward-compatible.",
+  "description": "Schema for one row of semantic/lessons.jsonl. Vendored fields match upstream agentic-stack v0.11.2. Extension fields (why, how_to_apply, original_markdown_path) are brainstack additions, optional and backward-compatible.",
   "type": "object",
   "required": ["id", "claim", "status", "accepted_at", "reviewer", "rationale"],
   "properties": {
@@ -51,15 +51,15 @@
 
     "why": {
       "type": "string",
-      "description": "[mustafa-agentic-stack extension] The reason behind the rule — context like 'incident from 2025-01' or 'compliance requirement'. Rendered in LESSONS.md as 'Why:' under the bullet when present."
+      "description": "[brainstack extension] The reason behind the rule — context like 'incident from 2025-01' or 'compliance requirement'. Rendered in LESSONS.md as 'Why:' under the bullet when present."
     },
     "how_to_apply": {
       "type": "string",
-      "description": "[mustafa-agentic-stack extension] When/where the rule kicks in — 'in tests touching the database', 'on every PR review'. Rendered in LESSONS.md as 'How to apply:' under the bullet when present."
+      "description": "[brainstack extension] When/where the rule kicks in — 'in tests touching the database', 'on every PR review'. Rendered in LESSONS.md as 'How to apply:' under the bullet when present."
     },
     "original_markdown_path": {
       "type": "string",
-      "description": "[mustafa-agentic-stack extension] If migrated from a flat memory dir, points to the long-form companion markdown that preserves any structure not captured in the JSONL row."
+      "description": "[brainstack extension] If migrated from a flat memory dir, points to the long-form companion markdown that preserves any structure not captured in the JSONL row."
     }
   },
   "additionalProperties": true

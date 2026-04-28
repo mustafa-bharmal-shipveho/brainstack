@@ -1,4 +1,4 @@
-# Common dev tasks for mustafa-agentic-stack.
+# Common dev tasks for brainstack.
 # Use `make help` to list targets.
 
 # Python interpreter (override: make PY=...)

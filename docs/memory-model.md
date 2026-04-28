@@ -66,7 +66,7 @@ is a derived view rendered by `render_lessons.py`. Schema:
 ```
 
 The last three fields (`why`, `how_to_apply`, `original_markdown_path`)
-are mustafa-agentic-stack extensions to upstream's schema. Backward
+are brainstack extensions to upstream's schema. Backward
 compatible: when absent, rendering matches upstream exactly.
 
 `semantic/lessons/<filename>.md` holds the long-form companion markdown

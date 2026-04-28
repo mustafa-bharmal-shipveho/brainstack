@@ -5,8 +5,8 @@ Step-by-step wiring of the brain into your Claude Code config.
 ## 1. Install the brain
 
 ```bash
-git clone https://github.com/mustafa-bharmal-shipveho/mustafa-agentic-stack.git
-cd mustafa-agentic-stack
+git clone https://github.com/mustafa-bharmal-shipveho/brainstack.git
+cd brainstack
 ./install.sh
 ```
 
@@ -103,7 +103,7 @@ If you have an existing `~/.claude/commands/dream.md`, replace it with
 the review-staged-candidates flow:
 
 ```bash
-cp ~/Documents/codebase/mustafa-agentic-stack/templates/dream-command.md.template \
+cp ~/Documents/codebase/brainstack/templates/dream-command.md.template \
     ~/.claude/commands/dream.md
 ```
 

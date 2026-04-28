@@ -27,7 +27,7 @@ that should never be public.
 Install the pre-commit hook to block accidental secret commits:
 
 ```bash
-cp ~/Documents/codebase/mustafa-agentic-stack/templates/pre-commit \
+cp ~/Documents/codebase/brainstack/templates/pre-commit \
     ~/.agent/.git/hooks/pre-commit
 chmod +x ~/.agent/.git/hooks/pre-commit
 ```
@@ -56,7 +56,7 @@ catch that, install the GitHub Action workflow at
 ## Automated hourly sync
 
 ```bash
-cp ~/Documents/codebase/mustafa-agentic-stack/templates/com.user.agent-sync.plist \
+cp ~/Documents/codebase/brainstack/templates/com.user.agent-sync.plist \
     ~/Library/LaunchAgents/
 
 # Edit REPLACE_HOME placeholder, then:
@@ -114,7 +114,7 @@ A laptop crash recovers via:
 ```bash
 # On the new machine:
 git clone https://github.com/<your-account>/<your-private-repo>.git ~/.agent
-cd ~/Documents/codebase/mustafa-agentic-stack
+cd ~/Documents/codebase/brainstack
 ./install.sh --upgrade   # refresh tools/hooks (memory/ untouched)
 ```
 

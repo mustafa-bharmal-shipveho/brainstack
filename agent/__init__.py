@@ -1,4 +1,4 @@
-"""mustafa-agentic-stack agent package.
+"""brainstack agent package.
 
 The codebase historically used flat sys.path-style imports inside agent/
 subdirectories. v0.2 adds package-style entry points (e.g. agent.memory.sdk,

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# mustafa-agentic-stack installer for the global brain at ~/.agent/.
+# brainstack installer for the global brain at ~/.agent/.
 #
 # Modes:
 #   ./install.sh              -- install fresh ~/.agent/ if missing, else show status

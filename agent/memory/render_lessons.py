@@ -130,7 +130,7 @@ def _bullet_for(lesson, superseded_by):
     lid = lesson.get("id", "?")
     ann = f"status={status} confidence={conf} evidence={len(ev)} id={lid}"
 
-    # mustafa-agentic-stack extension: render optional why/how_to_apply.
+    # brainstack extension: render optional why/how_to_apply.
     # When absent, bullet output matches upstream exactly.
     #
     # IMPORTANT: do NOT use `- ` prefixed lines for these. migrate_legacy_bullets()

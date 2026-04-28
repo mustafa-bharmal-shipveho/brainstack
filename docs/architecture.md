@@ -5,7 +5,7 @@
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │ PUBLIC, SHAREABLE                                               │
-│ github.com/mustafa-bharmal-shipveho/mustafa-agentic-stack       │
+│ github.com/mustafa-bharmal-shipveho/brainstack       │
 │   ├── install.sh, upgrade.sh                                    │
 │   ├── agent/    ←── source of truth for tools + hooks + schemas │
 │   ├── adapters/claude-code/                                     │

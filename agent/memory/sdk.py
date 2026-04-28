@@ -184,7 +184,7 @@ def _read_jsonl(path: str) -> List[dict]:
     if skipped_future and not _warned_about_future_schema:
         _warned_about_future_schema = True
         sys.stderr.write(
-            f"[mustafa-agentic-stack] dropped {skipped_future} row(s) from {path} "
+            f"[brainstack] dropped {skipped_future} row(s) from {path} "
             f"with schema_version > {KNOWN_MAX_SCHEMA}; SDK upgrade may be needed\n"
         )
     return out

@@ -56,7 +56,7 @@ A starter set of org-PII shapes ships at
 Copy it over to seed common patterns:
 
 ```bash
-cp ~/Documents/codebase/mustafa-agentic-stack/templates/redact-private.example.txt \
+cp ~/Documents/codebase/brainstack/templates/redact-private.example.txt \
     ~/.agent/redact-private.txt
 # then edit ~/.agent/redact-private.txt
 ```
@@ -157,11 +157,11 @@ Then exits 1, blocking the commit. Options:
 
 ## Privacy audit before publishing the framework
 
-The PUBLIC framework repo (`mustafa-agentic-stack`) must never contain
+The PUBLIC framework repo (`brainstack`) must never contain
 personal data. Before any push to that repo, run the audit checklist:
 
 ```bash
-REPO=~/Documents/codebase/mustafa-agentic-stack
+REPO=~/Documents/codebase/brainstack
 gitleaks detect --source "$REPO" --redact
 trufflehog filesystem "$REPO"
 trufflehog git file://"$REPO"
