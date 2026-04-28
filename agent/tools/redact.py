@@ -88,12 +88,14 @@ BUILTIN_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("slack_webhook", re.compile(
         r"https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]+"
     )),
-    # URL credentials in userinfo (https://user:secret@host) — covers the
-    # class of bypass where embedding the secret in a URL makes the entropy
-    # sweep skip the line. We extract the password after the colon so the
-    # display doesn't expose it.
+    # URL credentials in userinfo (the `<scheme>://<user>:<pass>@<host>`
+    # form) covers the class of bypass where embedding a password in a
+    # URL makes the entropy sweep skip the line. {4,} is intentionally
+    # low to catch placeholder passwords in test fixtures and captured
+    # tool calls; real credentials are almost always longer, but
+    # trufflehog flags ANY userinfo URI so the scrubber needs to keep up.
     ("url_userinfo", re.compile(
-        r"://[A-Za-z0-9%._~+\-]+:([A-Za-z0-9%._~+\-]{8,})@"
+        r"://[A-Za-z0-9%._~+\-]+:([A-Za-z0-9%._~+\-]{4,})@"
     )),
 
     # ---- Stripe ----

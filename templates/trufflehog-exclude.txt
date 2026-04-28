@@ -1,0 +1,17 @@
+# Paths excluded from local trufflehog scan in sync.sh.
+#
+# Why: trufflehog's local scan in sync.sh is defense-in-depth for the
+# user's own `git commit --no-verify` bypass attempts. Historical
+# commits' loose objects in `.git/objects/` are static — anything in
+# there has already been committed and (if it was a bypass) the
+# server-side workflow at templates/brain-secret-scan.yml catches it
+# at push time. Including .git/objects/ in the LOCAL scan flags
+# historical test fixtures (e.g. example URLs in past commits) every
+# hour, which trains users to ignore the scan.
+#
+# The pre-commit hook + redact_jsonl.py keep NEW content clean; this
+# file just stops the local scan from flagging the past.
+#
+# One regex per line. trufflehog matches against each path.
+^\.git/objects/
+^\.git/

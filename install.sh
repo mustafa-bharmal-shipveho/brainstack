@@ -16,6 +16,12 @@
 #                                commit to the remote (skipped by default
 #                                so the user can review locally first).
 #   --brain-root <path>       -- override $BRAIN_ROOT for this run only.
+#   --install-scanner [name]  -- attempt to install a secret scanner
+#                                (default: trufflehog; pass `gitleaks` to
+#                                use that instead). Skipped if already on
+#                                PATH or no supported package manager.
+#                                Currently supports macOS (brew) and Linux
+#                                with apt/dnf/pacman.
 #
 # Always prints manual-merge instructions for ~/.claude/settings.json. The
 # installer never auto-edits user settings — you copy the snippet by hand,
@@ -26,6 +32,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BRAIN_ROOT="${BRAIN_ROOT:-$HOME/.agent}"
 BRAIN_REMOTE="${BRAIN_REMOTE_URL:-}"
 PUSH_INITIAL_COMMIT=0
+INSTALL_SCANNER=""
 
 MODE="install"
 MIGRATE_SOURCE=""
@@ -59,8 +66,26 @@ while [ $# -gt 0 ]; do
             fi
             shift 2
             ;;
+        --install-scanner)
+            # Optional name argument: --install-scanner trufflehog | gitleaks
+            # If next arg is missing or starts with `--`, default to trufflehog.
+            if [ $# -ge 2 ] && [[ "$2" != --* ]]; then
+                INSTALL_SCANNER="$2"
+                shift 2
+            else
+                INSTALL_SCANNER="trufflehog"
+                shift
+            fi
+            case "$INSTALL_SCANNER" in
+                trufflehog|gitleaks) : ;;
+                *)
+                    echo "install: --install-scanner accepts only 'trufflehog' or 'gitleaks' (got: $INSTALL_SCANNER)" >&2
+                    exit 2
+                    ;;
+            esac
+            ;;
         --help|-h)
-            sed -n '2,22p' "$0" | sed 's/^# //; s/^#//'
+            sed -n '2,28p' "$0" | sed 's/^# //; s/^#//'
             exit 0
             ;;
         *)
@@ -70,6 +95,54 @@ while [ $# -gt 0 ]; do
             ;;
     esac
 done
+
+
+# ----- Helper: install a secret scanner via the local package manager -----
+maybe_install_scanner() {
+    local name="$1"
+    [ -z "$name" ] && return 0
+    if command -v "$name" >/dev/null 2>&1; then
+        echo "==> $name already on PATH; skipping install"
+        return 0
+    fi
+    echo "==> Installing $name (this may take a minute)..."
+    if command -v brew >/dev/null 2>&1; then
+        # Homebrew works on macOS and Linuxbrew
+        if [ "$name" = "trufflehog" ]; then
+            brew install trufflesecurity/trufflehog/trufflehog
+        else
+            brew install "$name"
+        fi
+    elif command -v apt-get >/dev/null 2>&1; then
+        # apt only carries gitleaks reliably; trufflehog needs a binary install
+        if [ "$name" = "gitleaks" ]; then
+            sudo apt-get update && sudo apt-get install -y gitleaks
+        else
+            echo "install: trufflehog isn't in apt; install via:" >&2
+            echo "    curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin" >&2
+            return 1
+        fi
+    elif command -v dnf >/dev/null 2>&1; then
+        sudo dnf install -y "$name" || {
+            echo "install: $name not found via dnf; install manually" >&2
+            return 1
+        }
+    elif command -v pacman >/dev/null 2>&1; then
+        sudo pacman -S --noconfirm "$name" || {
+            echo "install: $name not found via pacman; install manually" >&2
+            return 1
+        }
+    else
+        echo "install: no supported package manager (brew/apt/dnf/pacman); install $name manually" >&2
+        return 1
+    fi
+    if command -v "$name" >/dev/null 2>&1; then
+        echo "==> $name installed: $(command -v "$name")"
+    else
+        echo "install: $name installation finished but binary not on PATH; check your shell rc" >&2
+        return 1
+    fi
+}
 
 # ----- Python version check -----
 PYTHON_BIN="${PYTHON_BIN:-python3}"
@@ -93,15 +166,25 @@ fi
 # Resolve absolute path so launchd plists / hook commands don't depend on PATH.
 PYTHON_ABS="$("$PYTHON_BIN" -c 'import sys; print(sys.executable)')"
 
-# ----- Secret scanner check -----
-# sync.sh fails closed without trufflehog or gitleaks. Warn here so the user
-# can install one before first sync attempt.
-if ! command -v trufflehog >/dev/null 2>&1 && ! command -v gitleaks >/dev/null 2>&1; then
+# ----- Secret scanner check / optional install -----
+# sync.sh fails closed without trufflehog or gitleaks. If --install-scanner
+# was passed, attempt installation now; otherwise warn so the user can
+# install before first sync.
+if [ -n "$INSTALL_SCANNER" ]; then
+    maybe_install_scanner "$INSTALL_SCANNER" || {
+        echo "install: scanner install failed; sync.sh will refuse to push" >&2
+        echo "         Set SYNC_ALLOW_NO_SCANNER=1 to bypass (NOT RECOMMENDED)." >&2
+    }
+elif ! command -v trufflehog >/dev/null 2>&1 && ! command -v gitleaks >/dev/null 2>&1; then
     echo "" >&2
-    echo "install: WARNING — no secret scanner found on PATH." >&2
+    echo "install: WARNING - no secret scanner found on PATH." >&2
     echo "         sync.sh requires trufflehog or gitleaks to push." >&2
     echo "" >&2
-    echo "         Install one before first sync:" >&2
+    echo "         Install via this script:" >&2
+    echo "           ./install.sh --install-scanner            # default: trufflehog" >&2
+    echo "           ./install.sh --install-scanner gitleaks   # alternative" >&2
+    echo "" >&2
+    echo "         Or manually:" >&2
     echo "           brew install trufflehog        # or" >&2
     echo "           brew install gitleaks" >&2
     echo "" >&2
@@ -252,6 +335,12 @@ chmod +x "$BRAIN_ROOT/harness/hooks/"*.py 2>/dev/null || true
 # docs/git-sync.md.
 if [ ! -f "$BRAIN_ROOT/.gitignore" ] && [ -f "$REPO_DIR/templates/brain.gitignore" ]; then
     cp "$REPO_DIR/templates/brain.gitignore" "$BRAIN_ROOT/.gitignore"
+fi
+
+# Default trufflehog exclude so sync.sh's local scan skips .git/objects/
+# (historical commits — already covered by server-side workflow + pre-commit).
+if [ ! -f "$BRAIN_ROOT/.trufflehog-exclude.txt" ] && [ -f "$REPO_DIR/templates/trufflehog-exclude.txt" ]; then
+    cp "$REPO_DIR/templates/trufflehog-exclude.txt" "$BRAIN_ROOT/.trufflehog-exclude.txt"
 fi
 
 # Stub for private redaction patterns (lives in user's brain, not in framework).

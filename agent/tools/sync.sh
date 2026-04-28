@@ -154,9 +154,17 @@ if [ -z "$SCANNER" ]; then
     fi
 fi
 
+# Optional: $BRAIN_ROOT/.trufflehog-exclude.txt lets the user exclude paths
+# from the local scan (e.g. .git/objects/ which carries historical commits'
+# objects). Going-forward content is already covered by the pre-commit hook
+# and JSONL scrubber; the server-side workflow catches --no-verify bypasses.
+TH_EXCLUDE="$BRAIN_ROOT/.trufflehog-exclude.txt"
+
 case "$SCANNER" in
     trufflehog)
-        if ! trufflehog filesystem . --no-update --fail >/dev/null 2>>"$LOG_FILE"; then
+        TH_ARGS=(filesystem . --no-update --fail)
+        [ -f "$TH_EXCLUDE" ] && TH_ARGS+=(--exclude-paths "$TH_EXCLUDE")
+        if ! trufflehog "${TH_ARGS[@]}" >/dev/null 2>>"$LOG_FILE"; then
             echo "$(date -u +%FT%TZ) sync: trufflehog flagged secrets; refusing to push" >> "$LOG_FILE"
             exit 1
         fi
