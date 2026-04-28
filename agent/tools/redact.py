@@ -302,9 +302,18 @@ ENTROPY_TOKEN_RE = re.compile(r"[A-Za-z0-9_\-]{32,}")
 # strip surgical.
 _URL_RE = re.compile(r"\b\w+://\S+")
 ENTROPY_DEFAULT_THRESHOLD = 4.5  # bits/char; >=4.5 is empirically random-looking
-# Strings that are obviously not secrets even though they're high-entropy.
+# Strings that are obviously not secrets even though they're high-entropy:
+#  - pure hex 32+ (commit hashes, git blob IDs)
+#  - pure digits (timestamps, counters)
+#  - pure alpha (long compound words)
+#  - dream-cycle cluster keys: `pattern_<slug>_<hashes>` shape generated
+#    by promote.py / cluster.py. Auto-generated, never user input.
+#    Skipping them prevents the pre-commit hook from blocking the
+#    framework's own legitimate dream-cycle output. Vendor-specific
+#    patterns (AWS, GitHub, etc.) still apply, so a hostile
+#    `pattern_<aws-key>` is still caught by the prefix scanners above.
 ENTROPY_IGNORE = re.compile(
-    r"^(?:[a-f0-9]{32,}|[0-9]+|[a-zA-Z]+)$"  # pure hex / pure digits / pure alpha
+    r"^(?:[a-f0-9]{32,}|[0-9]+|[a-zA-Z]+|pattern_[a-z0-9_\-]+)$"
 )
 
 

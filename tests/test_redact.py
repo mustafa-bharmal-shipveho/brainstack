@@ -441,6 +441,40 @@ def test_high_entropy_token_next_to_url_caught(tmp_path):
     )
 
 
+def test_dream_cycle_cluster_key_does_not_false_positive(tmp_path):
+    """Dream cycle's `pattern_<slug>_<hashes>` cluster keys must not trip
+    entropy detection (they're auto-generated, not user input). The
+    framework's own pre-commit hook blocking its own dream-cycle output
+    is the canonical scanner-self-bite failure mode.
+    """
+    f = tmp_path / "candidate.json"
+    f.write_text(
+        '{"key": "pattern_help-me-understand-how-cuddly-liskov_q30ws5x1dokvjh_c0avd09hug3_5e243b"}\n'
+    )
+    result = run_redact(tmp_path)
+    assert result.returncode == 0, (
+        f"cluster-key pattern slug should pass entropy; stdout: {result.stdout}"
+    )
+
+
+def test_pattern_prefix_does_not_open_bypass_for_real_aws_key(tmp_path):
+    """Adding `pattern_<...>` to ENTROPY_IGNORE must not open a bypass for
+    real secrets. The ignore is constrained to lowercase-only cluster keys
+    (the dream cycle never uses uppercase), so a hostile string like
+    `pattern_AKIA<uppercase-key>_...` still trips entropy detection.
+    Defense in depth: even if the AWS-prefix regex's word-boundary fails
+    on the underscore boundary, entropy holds the line.
+    """
+    f = tmp_path / "leak.txt"
+    f.write_text("pattern_AKIAIOSFODNN7EXAMPLE_other_stuff\n")
+    result = run_redact(tmp_path)
+    # Must be blocked by SOMETHING — entropy or vendor regex; here it's
+    # high_entropy because the uppercase makes the token fail ENTROPY_IGNORE.
+    assert result.returncode != 0, (
+        f"hostile pattern_ prefix still bypasses redactor; stdout: {result.stdout}"
+    )
+
+
 def test_url_alone_still_does_not_false_positive(tmp_path):
     """The URL strip should not flag the URL itself."""
     f = tmp_path / "note.md"
