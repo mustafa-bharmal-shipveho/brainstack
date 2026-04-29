@@ -1,0 +1,124 @@
+name: recall — quality gate
+
+# What this does, in plain language:
+#
+# Every time someone opens or updates a PR that touches the `recall/` package
+# or its tests, run the synthetic-corpus retrieval benchmark and compare the
+# numbers against the checked-in baseline at tests/recall/bench_baseline.json.
+#
+# If the PR makes hybrid-retrieval bucket-paraphrase recall@5 drop by more
+# than 5 percentage points vs. the baseline, the job fails and the PR is
+# blocked until the regression is fixed (or the baseline is intentionally
+# updated as part of the PR — see CONTRIBUTING).
+#
+# This catches "I refactored core.py and it accidentally got worse" before
+# merge, while still letting honest regressions land if they're called out
+# explicitly via a baseline update in the same PR.
+#
+# Runs at scale 80 only (~30s incl. embedding model load) for fast feedback.
+# The post-merge `recall-bench-update` workflow runs at multiple scales and
+# updates the baseline.
+
+on:
+  pull_request:
+    paths:
+      - 'recall/**'
+      - 'tests/recall/**'
+      - 'pyproject.toml'
+      - '.github/workflows/recall-bench.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      - name: Install package + extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev,embeddings,mcp]'
+
+      - name: Run bench (scale 80) — capture JSON
+        env:
+          # Avoid Hugging Face rate-limit warning noise; doesn't gate anything
+          HF_HUB_DISABLE_TELEMETRY: '1'
+        run: |
+          python tests/recall/bench_e2e.py --scale 80 --report --json /tmp/ci-bench.json | tee /tmp/bench-report.txt
+
+      - name: Compare against baseline
+        id: compare
+        run: |
+          python tests/recall/bench_compare.py \
+            --current /tmp/ci-bench.json \
+            --baseline tests/recall/bench_baseline.json \
+            --tolerance 5 | tee /tmp/compare.txt
+
+      - name: Comment on PR with bench results
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let report = '';
+            try { report = fs.readFileSync('/tmp/compare.txt', 'utf8'); } catch (e) {}
+            let bench = '';
+            try { bench = fs.readFileSync('/tmp/bench-report.txt', 'utf8'); } catch (e) {}
+
+            const status = '${{ steps.compare.outcome }}';
+            const emoji = status === 'success' ? '✅' : '⛔';
+            const verdict = status === 'success'
+              ? 'Quality gate passed — within tolerance vs. baseline.'
+              : 'Quality gate FAILED — regression beyond tolerance vs. baseline. See `tests/recall/bench_baseline.json`. If the regression is intentional, update the baseline in this PR.';
+
+            const body = [
+              `## ${emoji} recall quality gate`,
+              '',
+              verdict,
+              '',
+              report,
+              '',
+              '<details><summary>Full bench output</summary>',
+              '',
+              '```',
+              bench.slice(0, 6000),
+              '```',
+              '',
+              '</details>'
+            ].join('\n');
+
+            // Look for an existing comment from this workflow on this PR and update it,
+            // so we don't spam a new comment on every push.
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const marker = '## ✅ recall quality gate';
+            const markerFail = '## ⛔ recall quality gate';
+            const existing = comments.find(c => c.body && (c.body.startsWith(marker) || c.body.startsWith(markerFail)));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
