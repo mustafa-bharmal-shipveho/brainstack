@@ -103,9 +103,12 @@ open it for the brainstack-installed case. Example for advanced overrides:
     }
   ],
   "ranking": {
-    "mode": "hybrid",                          // "hybrid" | "dense" | "sparse"
-    "embedder": "BAAI/bge-base-en-v1.5",         // dense embedder (FastEmbed model name)
-    "sparse_embedder": "Qdrant/bm25"             // sparse / BM25-IDF encoder
+    "mode": "hybrid",                                    // "hybrid" | "dense" | "sparse"
+    "embedder": "BAAI/bge-base-en-v1.5",                   // dense embedder (FastEmbed model name)
+    "sparse_embedder": "Qdrant/bm25",                      // sparse / BM25-IDF encoder
+    "reranker": "cross_encoder",                           // "cross_encoder" | "none"
+    "reranker_model": "jinaai/jina-reranker-v1-turbo-en",  // FastEmbed cross-encoder
+    "rerank_n": 20                                         // candidates fed to the reranker
   },
   "default_k": 5
 }
@@ -157,11 +160,15 @@ Retrieval pipeline at query time:
 1. Embed the query with `BAAI/bge-base-en-v1.5` (dense, 768-dim) and `Qdrant/bm25`
    (sparse, IDF-weighted) via FastEmbed.
 2. Qdrant `Prefetch` runs both legs against the per-source collection (top-20 each).
-3. `Fusion.RRF` fuses the two ranked lists, producing the final top-K with
-   bounded `[0, 1]` scores. Type/source filters are applied as Qdrant payload
-   conditions inside the prefetch.
-4. Results are deserialized from each point's payload back into `Document` +
-   `QueryResult` shapes for the JSON output.
+3. `Fusion.RRF` fuses the two ranked lists. Type/source filters are applied as
+   Qdrant payload conditions inside the prefetch.
+4. **Cross-encoder rerank** (default-on): the top-20 candidates are scored by
+   `jinaai/jina-reranker-v1-turbo-en`, which scores `(query, doc)` pairs together
+   instead of via independent embeddings — closes the semantic-distance gap that
+   bi-encoders alone can't bridge. Latency cost: ~400 ms p50. Disable with
+   `--rerank none` for sub-millisecond queries when paraphrase quality matters less.
+5. Final top-K returned as JSON. Results are deserialized from each point's
+   payload back into `Document` + `QueryResult` shapes.
 
 Storage at `$XDG_CACHE_HOME/recall/qdrant/` (embedded mode, no daemon, no Docker).
 

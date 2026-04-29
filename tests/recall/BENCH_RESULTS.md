@@ -4,8 +4,9 @@ Reproduce: `python tests/recall/bench_e2e.py --report --scale {80|1000|5000}` (f
 brainstack repo root, `.venv` active).
 
 Stack under test: Qdrant embedded mode + FastEmbed (`BAAI/bge-base-en-v1.5` dense
-+ `Qdrant/bm25` sparse) fused with `Fusion.RRF`. Numbers are warm-cache for
-recall (mirrors `recall query` after one `recall reindex`).
++ `Qdrant/bm25` sparse) fused with `Fusion.RRF`, then a `jinaai/jina-reranker-v1-turbo-en`
+cross-encoder rerank stage on the top-20 candidates. Numbers are warm-cache
+for recall (mirrors `recall query` after one `recall reindex`).
 
 The harness builds a deterministic synthetic brain at the requested scale and
 runs ~400 eval queries (split lexical / paraphrase). All numbers are
@@ -16,11 +17,17 @@ lesson, not necessarily lesson #01 specifically.
 
 ## Headline: how does recall hold up as the brain grows?
 
-| Brain size | Eval set | Without recall<br>(truncated 200 lines)<br>**paraphrase** | Without recall<br>(full MEMORY.md)<br>**paraphrase** | With recall (hybrid)<br>**paraphrase** | Hybrid p50 ms |
+| Brain size | Eval set | Without recall<br>(truncated 200 lines)<br>**paraphrase** | Without recall<br>(full MEMORY.md)<br>**paraphrase** | With recall (hybrid + rerank)<br>**paraphrase** | Hybrid+rerank p50 ms |
 |---|---|---|---|---|---|
-| 80 lessons | 36 queries | 56% | 56% | **100%** | 10.2 |
-| 1,000 lessons | 196 queries | **12%** | 38% | **100%** | 12.2 |
-| 5,000 lessons | 400 queries | **12%** | 35% | **100%** | 38.0 |
+| 80 lessons | 36 queries | 56% | 56% | **100%** | 470 |
+| 1,000 lessons | 196 queries | **12%** | 38% | **100%** | 461 |
+| 5,000 lessons | 400 queries | **12%** | 35% | **95%** | 245 |
+
+The reranker adds ~250-470 ms per query on CPU. Disable with `--rerank none` for
+sub-millisecond queries when paraphrase quality matters less. Real-brain testing
+showed the rerank materially improves quality on hand-picked paraphrases (3-4/5
+hits at #1 vs 1-2/5 hits at #1 without rerank), even though synthetic numbers at
+scale 80 don't show a clear delta (already at 100% bucket-recall ceiling).
 
 The two columns labelled "without recall" matter for different reasons:
 

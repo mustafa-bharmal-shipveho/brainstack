@@ -96,11 +96,20 @@ class RankingConfig:
     `embedder` and `sparse_embedder` are FastEmbed model names. The defaults are
     BAAI/bge-base-en-v1.5 (~440 MB, top English semantic) and Qdrant/bm25
     (sparse, no neural model, instant).
+
+    `reranker` selects an optional third stage that reorders the top-N
+    candidates by a direct (query, document) cross-encoder score. Closes the
+    paraphrase gap that bi-encoders alone can't bridge.
+      - "cross_encoder": local FastEmbed cross-encoder (default, ~80 MB)
+      - "none":          no rerank — fastest path
     """
 
     mode: str = "hybrid"
     embedder: str = "BAAI/bge-base-en-v1.5"
     sparse_embedder: str = "Qdrant/bm25"
+    reranker: str = "cross_encoder"
+    reranker_model: str = "jinaai/jina-reranker-v1-turbo-en"
+    rerank_n: int = 20
 
 
 @dataclass(frozen=True)
@@ -285,12 +294,22 @@ def _config_from_dict(data: dict) -> Config:
             mode=mode,
             embedder=str(ranking_raw.get("embedder", "BAAI/bge-base-en-v1.5")),
             sparse_embedder=str(ranking_raw.get("sparse_embedder", "Qdrant/bm25")),
+            reranker=str(ranking_raw.get("reranker", "cross_encoder")),
+            reranker_model=str(
+                ranking_raw.get("reranker_model", "jinaai/jina-reranker-v1-turbo-en")
+            ),
+            rerank_n=int(ranking_raw.get("rerank_n", 20)),
         )
     else:
         ranking = RankingConfig(
             mode=str(ranking_raw.get("mode", "hybrid")),
             embedder=str(ranking_raw.get("embedder", "BAAI/bge-base-en-v1.5")),
             sparse_embedder=str(ranking_raw.get("sparse_embedder", "Qdrant/bm25")),
+            reranker=str(ranking_raw.get("reranker", "cross_encoder")),
+            reranker_model=str(
+                ranking_raw.get("reranker_model", "jinaai/jina-reranker-v1-turbo-en")
+            ),
+            rerank_n=int(ranking_raw.get("rerank_n", 20)),
         )
     return Config(
         sources=sources,

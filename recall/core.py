@@ -61,6 +61,9 @@ class HybridRetriever:
         collections: Optional[Sequence[str]] = None,
         embedder: str = "BAAI/bge-base-en-v1.5",
         sparse_embedder: str = "Qdrant/bm25",
+        reranker: str = "cross_encoder",
+        reranker_model: str = "jinaai/jina-reranker-v1-turbo-en",
+        rerank_n: int = 20,
         # Legacy kwargs accepted for back-compat; ignored.
         bm25_weight: Optional[float] = None,
         embedding_weight: Optional[float] = None,
@@ -71,6 +74,9 @@ class HybridRetriever:
 
         self._dense_model = embedder
         self._sparse_model = sparse_embedder
+        self._reranker = reranker
+        self._reranker_model = reranker_model
+        self._rerank_n = int(rerank_n)
         self._client = qb._qdrant_client_singleton(cache_dir())
         self.documents: list[Document] = list(documents) if documents else []
 
@@ -116,19 +122,36 @@ class HybridRetriever:
             return []
 
         merged: list[QueryResult] = []
+        use_rerank = self._reranker == "cross_encoder"
         for coll in targets:
-            merged.extend(
-                qb.query_hybrid(
-                    self._client,
-                    coll,
-                    query,
-                    k,
-                    type_filter=type_filter,
-                    source_filter=None,  # already constrained by collection
-                    dense_model=self._dense_model,
-                    sparse_model=self._sparse_model,
+            if use_rerank:
+                merged.extend(
+                    qb.query_hybrid_rerank(
+                        self._client,
+                        coll,
+                        query,
+                        k,
+                        type_filter=type_filter,
+                        source_filter=None,  # already constrained by collection
+                        dense_model=self._dense_model,
+                        sparse_model=self._sparse_model,
+                        reranker_model=self._reranker_model,
+                        rerank_n=self._rerank_n,
+                    )
                 )
-            )
+            else:
+                merged.extend(
+                    qb.query_hybrid(
+                        self._client,
+                        coll,
+                        query,
+                        k,
+                        type_filter=type_filter,
+                        source_filter=None,  # already constrained by collection
+                        dense_model=self._dense_model,
+                        sparse_model=self._sparse_model,
+                    )
+                )
         # Stable sort by score desc, then path for determinism
         merged.sort(key=lambda r: (-r.score, r.document.path))
         return merged[:k]

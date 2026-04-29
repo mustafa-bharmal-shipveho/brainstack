@@ -33,6 +33,9 @@ def recall_query_handler(
         collections=[s.name for s in cfg.sources],
         embedder=cfg.ranking.embedder,
         sparse_embedder=cfg.ranking.sparse_embedder,
+        reranker=cfg.ranking.reranker,
+        reranker_model=cfg.ranking.reranker_model,
+        rerank_n=cfg.ranking.rerank_n,
     )
     results = retriever.query(query, k=k, type_filter=type, source_filter=source)
     return serialize_results(results)

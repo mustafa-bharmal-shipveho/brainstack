@@ -21,8 +21,10 @@ from recall.core import Document, QueryResult
 # embedder factories don't pay the import cost.
 _DENSE_DEFAULT = "BAAI/bge-base-en-v1.5"
 _SPARSE_DEFAULT = "Qdrant/bm25"
+_RERANKER_DEFAULT = "jinaai/jina-reranker-v1-turbo-en"
 _DENSE_DIM = 768  # bge-base-en-v1.5 output dim
 _HYBRID_PREFETCH = 20  # over-pull from each leg before RRF
+_RERANK_OVERSAMPLE = 20  # candidates fed to the reranker before truncating to k
 
 
 # ---------------------------------------------------------------------------
@@ -35,6 +37,7 @@ _clients: dict[str, QdrantClient] = {}
 _embedder_lock = threading.Lock()
 _dense_embedders: dict[str, object] = {}
 _sparse_embedders: dict[str, object] = {}
+_cross_encoders: dict[str, object] = {}
 
 
 def _qdrant_client_singleton(cache_dir: Path) -> QdrantClient:
@@ -67,6 +70,16 @@ def _reset_client_cache_for_tests() -> None:
         _clients.clear()
 
 
+def _reset_model_cache_for_tests() -> None:
+    """Test hook: drop the lazy embedder/cross-encoder caches. Useful when a test
+    swaps in a stub model — without this the previous instance survives.
+    """
+    with _embedder_lock:
+        _dense_embedders.clear()
+        _sparse_embedders.clear()
+        _cross_encoders.clear()
+
+
 def _get_embedder(name: str = _DENSE_DEFAULT):
     from fastembed import TextEmbedding
 
@@ -87,6 +100,18 @@ def _get_sparse_embedder(name: str = _SPARSE_DEFAULT):
             emb = SparseTextEmbedding(model_name=name)
             _sparse_embedders[name] = emb
         return emb
+
+
+def _get_cross_encoder(name: str = _RERANKER_DEFAULT):
+    """Lazy-load FastEmbed cross-encoder. Used for the third reranking stage."""
+    from fastembed.rerank.cross_encoder import TextCrossEncoder
+
+    with _embedder_lock:
+        ce = _cross_encoders.get(name)
+        if ce is None:
+            ce = TextCrossEncoder(model_name=name)
+            _cross_encoders[name] = ce
+        return ce
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +261,57 @@ def query_hybrid(
         )
         out.append(QueryResult(document=doc, score=float(sp.score)))
     return out
+
+
+def query_hybrid_rerank(
+    client: QdrantClient,
+    collection: str,
+    query: str,
+    k: int,
+    type_filter: Optional[str] = None,
+    source_filter: Optional[str] = None,
+    dense_model: str = _DENSE_DEFAULT,
+    sparse_model: str = _SPARSE_DEFAULT,
+    reranker_model: str = _RERANKER_DEFAULT,
+    rerank_n: int = _RERANK_OVERSAMPLE,
+) -> list[QueryResult]:
+    """Hybrid query + cross-encoder rerank.
+
+    1. Pull top-`rerank_n` from `query_hybrid` (oversample)
+    2. Score every (query, doc.text) pair with the cross-encoder
+    3. Sort by rerank score descending, return top-k
+
+    The cross-encoder scores are 0-1 floats from FastEmbed and replace the
+    Qdrant fusion score in the returned `QueryResult.score` for transparency.
+    """
+    if k <= 0:
+        return []
+    n = max(rerank_n, k)
+    candidates = query_hybrid(
+        client,
+        collection,
+        query,
+        n,
+        type_filter=type_filter,
+        source_filter=source_filter,
+        dense_model=dense_model,
+        sparse_model=sparse_model,
+    )
+    if not candidates:
+        return []
+    if len(candidates) <= k:
+        # No rerank value when we already have <=k candidates; return as is
+        return candidates
+
+    encoder = _get_cross_encoder(reranker_model)
+    texts = [c.document.text for c in candidates]
+    rerank_scores = list(encoder.rerank(query, texts))
+    paired = list(zip(candidates, rerank_scores))
+    paired.sort(key=lambda x: -float(x[1]))
+    return [
+        QueryResult(document=c.document, score=float(s))
+        for c, s in paired[:k]
+    ]
 
 
 def count(client: QdrantClient, collection: str) -> int:

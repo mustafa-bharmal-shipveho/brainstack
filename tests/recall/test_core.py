@@ -121,3 +121,71 @@ class TestHybridRetrieverFacade:
         results = retriever.query("description number 1", k=10)
         # No more than 3 unique paths come back (deterministic UUID5(path) ids).
         assert len({r.document.path for r in results}) <= 3
+
+
+class TestCrossEncoderReranker:
+    """Cross-encoder rerank stage tests.
+
+    The reranker is default-on. These tests confirm:
+    - It changes ranking on a paraphrased query the bi-encoder gets wrong
+    - reranker="none" bypasses the third stage cleanly
+    - Short corpora (n <= k) skip the rerank short-circuit
+    """
+
+    def test_rerank_can_change_top_position(self):
+        # Construct a corpus where one doc's body is a clear semantic match for the
+        # query while its description is bland. The bi-encoder may rank others above
+        # it; the cross-encoder should pull it forward.
+        docs = [
+            _make_doc(
+                "incident-runbook",
+                "operations doc",
+                body="when production goes down at 2am, paste the rollback SQL inline first",
+            ),
+            _make_doc("docs-style", "writing reference docs", body="use the style guide"),
+            _make_doc(
+                "team-roster",
+                "who works on which team",
+                body="alphabetical list of engineers and their teams",
+            ),
+            _make_doc(
+                "build-pipeline",
+                "CI build steps reference",
+                body="how the test suite runs in CI",
+            ),
+            _make_doc(
+                "release-notes",
+                "changelog generation rules",
+                body="how releases are tagged",
+            ),
+        ]
+        retriever = HybridRetriever(docs, reranker="cross_encoder", rerank_n=10)
+        results = retriever.query(
+            "production is on fire at 2am, what now", k=3
+        )
+        names = [r.document.frontmatter["name"] for r in results]
+        assert "incident-runbook" in names
+
+    def test_reranker_none_skips_third_stage(self):
+        docs = [
+            _make_doc("a", "alpha", body="alpha bravo charlie"),
+            _make_doc("b", "bravo", body="bravo charlie delta"),
+        ]
+        retriever = HybridRetriever(docs, reranker="none")
+        results = retriever.query("alpha", k=2)
+        assert len(results) == 2  # both surface, no rerank crash
+
+    def test_reranker_short_corpus_short_circuits(self):
+        # When candidates <= k, rerank is wasted and should pass through.
+        docs = [_make_doc(f"d{i}", f"desc {i}") for i in range(3)]
+        retriever = HybridRetriever(docs, reranker="cross_encoder", rerank_n=20)
+        results = retriever.query("desc 1", k=5)
+        assert 1 <= len(results) <= 3
+
+    def test_reranker_default_is_cross_encoder(self):
+        # Sanity: HybridRetriever() default value matches RankingConfig default
+        from recall.config import RankingConfig
+
+        cfg = RankingConfig()
+        assert cfg.reranker == "cross_encoder"
+        assert cfg.reranker_model == "jinaai/jina-reranker-v1-turbo-en"

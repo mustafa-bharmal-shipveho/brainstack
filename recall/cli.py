@@ -61,6 +61,11 @@ def query(
     k: int = typer.Option(None, "--k", "-k", help="Number of results"),
     source: str = typer.Option(None, "--source", "-s", help="Filter by source name"),
     type: str = typer.Option(None, "--type", "-t", help="Filter by frontmatter type"),
+    rerank: str = typer.Option(
+        None,
+        "--rerank",
+        help='Override reranker: "cross_encoder" | "none". Default = config value.',
+    ),
 ):
     """Search the brain for memories relevant to QUERY. Outputs JSON."""
     cfg = load_config()
@@ -72,11 +77,15 @@ def query(
     # If we just rebuilt, pass docs in to be upserted (idempotent thanks to
     # uuid5(path) point ids). If the index is up to date, skip the embedding
     # step and let HybridRetriever query the existing collection directly.
+    effective_reranker = rerank if rerank is not None else cfg.ranking.reranker
     retriever = HybridRetriever(
         documents=cache.documents if fresh else None,
         collections=[s.name for s in cfg.sources],
         embedder=cfg.ranking.embedder,
         sparse_embedder=cfg.ranking.sparse_embedder,
+        reranker=effective_reranker,
+        reranker_model=cfg.ranking.reranker_model,
+        rerank_n=cfg.ranking.rerank_n,
     )
 
     query_str = " ".join(text)
