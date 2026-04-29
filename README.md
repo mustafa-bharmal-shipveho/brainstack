@@ -106,6 +106,29 @@ make report-status
 
 ---
 
+## Retrieval (v0.2)
+
+Once your brain has more than a few dozen lessons, the auto-loaded `MEMORY.md` index alone stops being enough — paraphrases miss, and the agent burns context reading whole files to find what it needs. The `recall` package (top-level `recall/`) is the read-side companion: a CLI + MCP server that does hybrid BM25 + embedding retrieval against the same `~/.agent/memory/` your write-side already populates.
+
+Zero-config inside brainstack — `recall` reads `$BRAIN_ROOT` and indexes `$BRAIN_ROOT/memory/` automatically. You don't set up anything separately.
+
+```bash
+# Install retrieval extras (one-time)
+pip install -e '.[embeddings,mcp]'
+
+# Index your brain (read-only on the brain; cache lives at ~/.cache/recall/)
+recall reindex
+
+# Query
+recall query "how do I avoid context bloat from reading too many files"
+```
+
+JSON output, top-K matches with curated `description` fields. Works from any shell — Claude Code, Cursor, Codex CLI, plain bash. For MCP-aware clients, register `recall-mcp`.
+
+See [`recall/README.md`](recall/README.md) for the full retriever surface (filters, MCP setup, second-brain repos, retrieval-quality numbers).
+
+---
+
 ## Architecture (v0.1)
 
 ```
