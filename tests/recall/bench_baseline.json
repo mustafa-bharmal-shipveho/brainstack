@@ -1,0 +1,69 @@
+{
+  "scale": 80,
+  "seed": 42,
+  "k": 5,
+  "n_lessons": 80,
+  "n_eval_cases": 36,
+  "results": [
+    {
+      "name": "Without recall (index, truncated 200 lines)",
+      "recall_at_k": 0.6111111111111112,
+      "bucket_recall_at_k": 0.8055555555555556,
+      "recall_lexical": 0.95,
+      "bucket_lexical": 1.0,
+      "recall_paraphrase": 0.1875,
+      "bucket_paraphrase": 0.5625,
+      "p50_ms": 0.2050834591500461,
+      "p95_ms": 0.3428750205785036,
+      "n": 36
+    },
+    {
+      "name": "Without recall (index, full)",
+      "recall_at_k": 0.6111111111111112,
+      "bucket_recall_at_k": 0.8055555555555556,
+      "recall_lexical": 0.95,
+      "bucket_lexical": 1.0,
+      "recall_paraphrase": 0.1875,
+      "bucket_paraphrase": 0.5625,
+      "p50_ms": 0.17508352175354958,
+      "p95_ms": 0.1908749109134078,
+      "n": 36
+    },
+    {
+      "name": "Without recall (index + reads, full)",
+      "recall_at_k": 0.5555555555555556,
+      "bucket_recall_at_k": 0.8333333333333334,
+      "recall_lexical": 0.9,
+      "bucket_lexical": 1.0,
+      "recall_paraphrase": 0.125,
+      "bucket_paraphrase": 0.625,
+      "p50_ms": 0.8755210437811911,
+      "p95_ms": 1.0211669141426682,
+      "n": 36
+    },
+    {
+      "name": "With recall (BM25-only, warm)",
+      "recall_at_k": 0.5833333333333334,
+      "bucket_recall_at_k": 0.9166666666666666,
+      "recall_lexical": 0.95,
+      "bucket_lexical": 1.0,
+      "recall_paraphrase": 0.125,
+      "bucket_paraphrase": 0.8125,
+      "p50_ms": 0.07739546708762646,
+      "p95_ms": 0.13354199472814798,
+      "n": 36
+    },
+    {
+      "name": "With recall (hybrid, warm)",
+      "recall_at_k": 0.6944444444444444,
+      "bucket_recall_at_k": 1.0,
+      "recall_lexical": 1.0,
+      "bucket_lexical": 1.0,
+      "recall_paraphrase": 0.3125,
+      "bucket_paraphrase": 1.0,
+      "p50_ms": 3.7447079666890204,
+      "p95_ms": 19.669750006869435,
+      "n": 36
+    }
+  ]
+}

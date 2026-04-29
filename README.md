@@ -127,6 +127,43 @@ JSON output, top-K matches with curated `description` fields. Works from any she
 
 See [`recall/README.md`](recall/README.md) for the full retriever surface (filters, MCP setup, second-brain repos, retrieval-quality numbers).
 
+<!-- recall-quality:start -->
+
+### Retrieval quality (auto-updated by CI on every merge to main)
+
+Last refresh: **2026-04-29** (scale 80 / 1,000 / 5,000 synthetic lessons).
+
+The single number that matters: **how often does the retriever surface a
+relevant lesson in the top 5 results, when the user asks a paraphrased
+question** (a question that doesn't share words with the lesson title)?
+
+| Brain size | Today<sup>1</sup> | Best case<sup>2</sup> | With `recall` (hybrid)<sup>3</sup> | Latency |
+|---|---|---|---|---|
+| **80 lessons (you today)** | 56% | 56% | **100%** | 3.7 ms |
+| **1,000 lessons** | 12% | 38% | **90%** | 5.1 ms |
+| **5,000 lessons** | 12% | 35% | **90%** | 13.1 ms |
+
+<sup>1</sup> What you get if you only have `MEMORY.md` auto-loaded — the index
+truncates at 200 lines, so past ~150 lessons most of your brain is invisible
+to the LLM.
+<sup>2</sup> Optimistic baseline: the LLM somehow has the *full* MEMORY.md in
+context (e.g. you `Read` it explicitly). Even then, lexical matching tops out.
+<sup>3</sup> Hybrid retrieval = BM25 keyword search + sentence-transformer
+embeddings, fused with Reciprocal Rank Fusion. Indexes the full body of every
+lesson, not just the description column.
+
+**Latency** is per-query wall clock, warm-cache, on the CI runner. Add the
+embedding-model load (~90 MB, one-time on first call) for cold start.
+
+**Numbers come from `tests/recall/bench_e2e.py`** (synthetic corpus, fixed
+seed — re-runs produce the same results). PRs that touch `recall/` are
+gated on this metric: a PR fails CI if hybrid bucket-paraphrase recall@5
+drops by more than 5 percentage points vs. the baseline checked in at
+`tests/recall/bench_baseline.json`. See `tests/recall/BENCH_RESULTS.md`
+for the full per-strategy breakdown.
+
+<!-- recall-quality:end -->
+
 ---
 
 ## Architecture (v0.1)

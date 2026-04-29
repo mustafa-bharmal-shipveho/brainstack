@@ -216,14 +216,59 @@ def _make_body(rng: random.Random, bucket: dict, phrasing: tuple, idx: int) -> s
     return " ".join(sentences)
 
 
-def generate_corpus(seed: int = 42) -> tuple[list[Lesson], list[EvalCase]]:
+_VERBS = [
+    "avoid", "prefer", "ensure", "never use", "always check", "stop using",
+    "lean on", "audit", "guard against", "prove",
+]
+_CONTEXTS = [
+    "at scale", "under load", "in production", "during incidents", "after deploys",
+    "on cold start", "in CI", "in staging", "during onboarding", "on legacy systems",
+]
+_QUALIFIERS = [
+    "by default", "explicitly", "as a habit", "before merging", "as part of code review",
+    "in the on-call runbook", "during retrospectives",
+]
+
+
+def _expanded_phrasings(bucket: dict, target_per_bucket: int, rng: random.Random) -> list[tuple]:
+    """Combinatorial expansion of a bucket's seed phrasings.
+
+    Each seed phrasing × verb × context × qualifier produces a distinct lesson.
+    Falls back to bucket['phrasings'] when target_per_bucket <= len(phrasings).
+    """
+    seeds = bucket["phrasings"]
+    if target_per_bucket <= len(seeds):
+        return list(seeds[:target_per_bucket])
+    expanded: list[tuple] = []
+    for s in seeds:
+        for v in _VERBS:
+            for c in _CONTEXTS:
+                for q in _QUALIFIERS:
+                    if isinstance(s, tuple) and len(s) == 3:
+                        expanded.append((f"{v} {s[0]}", f"{c}: {s[1]}", f"{q} — {s[2]}"))
+                    elif isinstance(s, tuple) and len(s) == 2:
+                        expanded.append((f"{v} {s[0]} {c}", f"{q} — {s[1]}"))
+                    else:
+                        expanded.append((f"{v} {s[0]} ({c}, {q})",))
+    rng.shuffle(expanded)
+    return expanded[:target_per_bucket]
+
+
+def generate_corpus(seed: int = 42, target_size: int = 80) -> tuple[list[Lesson], list[EvalCase]]:
     rng = random.Random(seed)
     lessons: list[Lesson] = []
     eval_cases: list[EvalCase] = []
 
+    n_buckets = len(BUCKETS)
+    per_bucket = max(1, target_size // n_buckets)
+    # Distribute remainder across the first few buckets so we hit target_size exactly
+    remainder = target_size - per_bucket * n_buckets
+
     for bi, bucket in enumerate(BUCKETS):
-        for i, phrasing in enumerate(bucket["phrasings"]):
-            slug = f"{bucket['slug']}-{i+1:02d}"
+        n = per_bucket + (1 if bi < remainder else 0)
+        phrasings = _expanded_phrasings(bucket, n, rng)
+        for i, phrasing in enumerate(phrasings):
+            slug = f"{bucket['slug']}-{i+1:04d}"
             # Build the description
             if len(phrasing) == 3:
                 description = bucket["description_template"].format(*phrasing)
@@ -243,13 +288,21 @@ def generate_corpus(seed: int = 42) -> tuple[list[Lesson], list[EvalCase]]:
                 )
             )
 
-    # Build eval queries: 10 lexical (share words with description), 10 paraphrase.
-    # Pick 20 random lessons; first 10 get a lexical query, last 10 get a paraphrase.
-    chosen = rng.sample(lessons, 20)
+    # Build eval queries.
+    # - Lexical: query reuses 2+ content words from a target's description.
+    # - Paraphrase: query for a bucket as a whole (no shared words with any specific
+    #   target's description). For paraphrase we *don't* tag a specific slug —
+    #   bucket-recall is the meaningful metric. We tag any lesson in the bucket and
+    #   score via bucket_for_slug at scoring time.
+    # Scale eval set with corpus size, capped at 200 to keep bench runtime sane.
+    lexical_count = min(200, max(20, target_size // 10))
+    paraphrase_count = min(200, max(20, target_size // 10))
 
-    for lesson in chosen[:10]:
-        # Lexical: query reuses 2+ content words from the description.
-        words = [w for w in lesson.description.replace(":", " ").split() if len(w) > 3]
+    chosen_lex = rng.sample(lessons, min(lexical_count, len(lessons)))
+    for lesson in chosen_lex:
+        words = [w for w in lesson.description.replace(":", " ").replace("—", " ").split() if len(w) > 3]
+        if len(words) < 3:
+            continue
         rng.shuffle(words)
         picked = words[:3]
         eval_cases.append(
@@ -270,17 +323,22 @@ def generate_corpus(seed: int = 42) -> tuple[list[Lesson], list[EvalCase]]:
         "cli-edge-cases": "the password manager keeps choking on a vault name with square brackets",
         "context-bloat": "the agent keeps reading huge files I don't need, what should I change",
     }
-    for lesson in chosen[10:]:
-        q = paraphrase_map.get(lesson.bucket_slug)
-        if q is None:
+    # For each bucket, generate `paraphrase_count // n_buckets` paraphrase queries pointing at
+    # any lesson in that bucket (target_slug only used as a hint; scoring uses bucket recall).
+    per_bucket_paraphrase = max(1, paraphrase_count // n_buckets)
+    for bucket in BUCKETS:
+        bucket_lessons = [l for l in lessons if l.bucket_slug == bucket["slug"]]
+        if not bucket_lessons:
             continue
-        eval_cases.append(
-            EvalCase(
-                query=q,
-                target_slug=lesson.slug,
-                kind="paraphrase",
-            )
-        )
+        base_query = paraphrase_map.get(bucket["slug"])
+        if base_query is None:
+            continue
+        for j in range(per_bucket_paraphrase):
+            target = rng.choice(bucket_lessons)
+            # For variety across multiple per-bucket queries, lightly tweak the base query
+            tweaks = ["", " right now", " in this codebase", " for our team", " honestly"]
+            q = base_query + tweaks[j % len(tweaks)]
+            eval_cases.append(EvalCase(query=q, target_slug=target.slug, kind="paraphrase"))
 
     return lessons, eval_cases
 
@@ -334,11 +392,18 @@ def _normalize(s: str) -> set[str]:
     return {w.lower() for w in s.replace("/", " ").replace(":", " ").split() if len(w) > 2}
 
 
-def retrieve_index_only(brain_root: Path, query: str, k: int = 5) -> list[str]:
+_MEMORY_MD_AUTOLOAD_LINES = 200  # Claude Code's default auto-load truncation
+
+
+def retrieve_index_only(brain_root: Path, query: str, k: int = 5, max_lines: Optional[int] = None) -> list[str]:
     """Without-recall: substring match on MEMORY.md description column.
-    Returns top-K lesson slugs by overlap count.
+
+    If `max_lines` is set, only the first `max_lines` of MEMORY.md are visible —
+    simulates Claude Code's auto-load truncation at scale.
     """
     memory_md = (brain_root / "memory" / "MEMORY.md").read_text(encoding="utf-8")
+    if max_lines is not None:
+        memory_md = "\n".join(memory_md.splitlines()[:max_lines])
     qwords = _normalize(query)
     scored: list[tuple[int, str]] = []
     for line in memory_md.splitlines():
@@ -510,6 +575,18 @@ def main():
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--k", type=int, default=5)
+    parser.add_argument(
+        "--scale",
+        type=int,
+        default=80,
+        help="Total number of synthetic lessons (defaults to 80; try 1000, 5000)",
+    )
+    parser.add_argument(
+        "--json",
+        type=str,
+        default=None,
+        help="Write machine-readable results JSON to this path (in addition to stdout report)",
+    )
     args = parser.parse_args()
 
     if args.brain_root:
@@ -527,7 +604,7 @@ def main():
 
     print(f"Brain root: {brain_root}", flush=True)
 
-    lessons, eval_cases = generate_corpus(seed=args.seed)
+    lessons, eval_cases = generate_corpus(seed=args.seed, target_size=args.scale)
     print(f"Generated {len(lessons)} lessons, {len(eval_cases)} eval cases "
           f"({sum(1 for c in eval_cases if c.kind == 'lexical')} lexical, "
           f"{sum(1 for c in eval_cases if c.kind == 'paraphrase')} paraphrase)", flush=True)
@@ -540,6 +617,10 @@ def main():
     def s_index_only(q, k):
         return retrieve_index_only(brain_root, q, k)
 
+    def s_index_only_truncated(q, k):
+        # Simulates Claude Code's MEMORY.md auto-load cap (~200 lines).
+        return retrieve_index_only(brain_root, q, k, max_lines=_MEMORY_MD_AUTOLOAD_LINES)
+
     def s_index_reads(q, k):
         return retrieve_index_plus_reads(brain_root, q, k)
 
@@ -547,13 +628,23 @@ def main():
     results = []
     results.append(
         bench_strategy_split(
-            "Without recall (index-only)", s_index_only, eval_cases, bucket_for_slug, k=args.k
+            "Without recall (index, truncated 200 lines)",
+            s_index_only_truncated,
+            eval_cases,
+            bucket_for_slug,
+            k=args.k,
         )
     )
     print(f"  ✓ {results[-1]['name']}", flush=True)
     results.append(
         bench_strategy_split(
-            "Without recall (index + reads)", s_index_reads, eval_cases, bucket_for_slug, k=args.k
+            "Without recall (index, full)", s_index_only, eval_cases, bucket_for_slug, k=args.k
+        )
+    )
+    print(f"  ✓ {results[-1]['name']}", flush=True)
+    results.append(
+        bench_strategy_split(
+            "Without recall (index + reads, full)", s_index_reads, eval_cases, bucket_for_slug, k=args.k
         )
     )
     print(f"  ✓ {results[-1]['name']}", flush=True)
@@ -614,6 +705,19 @@ def main():
         print("- 'index + reads' reads up to 10 file bodies per query.")
         print("- Hybrid latency includes the MiniLM forward pass per query.")
         print()
+
+    # Machine-readable JSON output
+    if args.json:
+        payload = {
+            "scale": args.scale,
+            "seed": args.seed,
+            "k": args.k,
+            "n_lessons": len(lessons),
+            "n_eval_cases": len(eval_cases),
+            "results": results,
+        }
+        Path(args.json).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        print(f"Wrote JSON results to {args.json}", flush=True)
 
     if cleanup:
         shutil.rmtree(brain_root, ignore_errors=True)

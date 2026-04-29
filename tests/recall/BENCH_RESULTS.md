@@ -1,73 +1,130 @@
 # Retrieval benchmark — recall vs no-recall
 
-Reproduce: `python tests/recall/bench_e2e.py --report` (from brainstack repo root, with `.venv` active).
+Reproduce: `python tests/recall/bench_e2e.py --report --scale {80|1000|5000}` (from
+brainstack repo root, `.venv` active).
 
-The harness builds a deterministic synthetic brain (80 lessons across 8 conceptual buckets, fixed
-seed) at `$TMPDIR/brainstack-bench-*/memory/semantic/lessons/` and runs 20 eval queries (10 lexical,
-10 paraphrase) through four retrieval strategies. Latency is per-query wall clock, warm-cache for
-recall (mirrors what `recall query` does in production after one `recall reindex`).
+The harness builds a deterministic synthetic brain at the requested scale and runs ~400 eval
+queries (split lexical / paraphrase). All numbers are **bucket-recall@5** unless noted: the
+strategy gets credit if any lesson from the right conceptual bucket lands in the top-5.
+This matches real use — when the user asks "production is on fire at 2am," they want any
+incident-response lesson, not necessarily lesson #01 specifically.
 
-## Slug-exact recall@5
+Latency is warm-cache for recall (mirrors `recall query` in production after one `recall reindex`).
 
-The query was tagged to a specific lesson; the strategy must surface that exact lesson in top-5.
+## Headline: how does recall hold up as the brain grows?
 
-| Strategy | Overall | Lexical | Paraphrase | p50 ms | p95 ms |
+| Brain size | Eval set | Without recall<br>(truncated 200 lines)<br>**paraphrase** | Without recall<br>(full MEMORY.md)<br>**paraphrase** | With recall (hybrid)<br>**paraphrase** | Hybrid p50 ms |
 |---|---|---|---|---|---|
-| Without recall (index-only) | 50% | 100% | 0% | 0.2 | 0.3 |
-| Without recall (index + reads) | 50% | 100% | 0% | 1.5 | 3.9 |
-| With recall (BM25-only, warm) | 60% | 100% | 20% | 0.1 | 0.1 |
-| With recall (hybrid, warm) | 70% | 100% | 40% | 7.6 | 70.2 |
+| 80 lessons | 36 queries | 56% | 56% | **100%** | 4.0 |
+| 1,000 lessons | 196 queries | **12%** | 38% | **90%** | 4.9 |
+| 5,000 lessons | 400 queries | **12%** | 35% | **90%** | 12.9 |
 
-## Bucket-recall@5
+The two columns labelled "without recall" matter for different reasons:
 
-The query is satisfied if any lesson from the right conceptual bucket is in top-5. Closer to real
-use: when the user asks "production is on fire at 2am" they want *any* incident-response lesson,
-not necessarily one specific one.
+- **Truncated 200 lines** is what Claude Code's auto-load actually does today. Past ~150 lessons,
+  most of the brain is invisible to the LLM by default. At 1k lessons, only ~20% of the index
+  is visible. At 5k, only ~4%.
+- **Full MEMORY.md** is the optimistic case where the LLM somehow has the entire index in
+  context (e.g., you `Read` it explicitly). Even then, substring matching tops out around 35-56%
+  on paraphrases — the LLM's semantic reasoning would do better than substring matching, but
+  it's still bottlenecked by the description column.
 
-| Strategy | Overall | Lexical | Paraphrase | p50 ms | p95 ms |
-|---|---|---|---|---|---|
-| Without recall (index-only) | 65% | 100% | 30% | 0.2 | 0.3 |
-| Without recall (index + reads) | 70% | 100% | 40% | 1.5 | 3.9 |
-| With recall (BM25-only, warm) | 95% | 100% | 90% | 0.1 | 0.1 |
-| With recall (hybrid, warm) | **100%** | 100% | **100%** | 7.6 | 70.2 |
+Hybrid recall is the only strategy that stays at **90-100% paraphrase recall** as the brain grows.
 
-## Reading the table
+## Full tables
 
-- **Lexical recall is 100% everywhere** — even substring matching catches queries that share words
-  with the description. The choice of strategy doesn't matter for queries you wrote with the
-  memory-file's exact vocabulary in mind.
-- **Paraphrase recall is the differentiator.** The user almost never types the exact wording the
-  lesson author used. Without recall, paraphrase coverage is 30-40% (slug-exact: 0%). With hybrid
-  recall, it's 100% (slug-exact: 40%).
-- **Latency for the warm path is dominated by the embedding forward pass** (7.6 ms p50). BM25-only
-  is sub-millisecond. Both are negligible compared to a single LLM round-trip.
-- **`index + reads` is what a careful agent does today** — read 10 candidate files and rerank by
-  body overlap. It costs an order of magnitude more wall-clock than BM25-only via recall, and
-  delivers materially worse quality on paraphrases. For agent contexts this also means 10× the
-  context bloat from those file reads.
+### Scale 80 (where you are today: ~30 lessons + notes ≈ 40-50 .md files)
 
-## Methodology / honesty notes
+```
+Strategy                                            Overall  Lexical  Paraphrase  p50 ms
+Without recall (index, truncated 200 lines)          81%      100%       56%        0.2
+Without recall (index, full)                         81%      100%       56%        0.2
+Without recall (index + reads, full)                 83%      100%       62%        0.9
+With recall (BM25-only, warm)                        92%      100%       81%        0.1
+With recall (hybrid, warm)                          100%      100%      100%        4.0
+```
 
-- 80 lessons is small. At 800 lessons the gap between BM25-only and hybrid would likely widen
-  (BM25 hit rate falls off as the corpus grows and lexical matches scatter); at 5000+ a vector
-  DB starts paying off, but recall stays in the same shape.
-- The 20-query eval set is not large enough for tight confidence intervals. Treat the numbers as
-  directional, not exact. The harness is seeded so the *same* numbers come out each run on the
-  same machine — useful for spotting regressions in the retriever code.
-- The "without recall" baselines simulate what an agent does when it only has `MEMORY.md` auto-
-  loaded at session start. They're optimistic — a real agent without retrieval also has to *find*
-  MEMORY.md and decide whether to read it; the bench gives free access. So the actual gap in
-  practice is a bit wider than these numbers show.
-- Hybrid p95 latency (70 ms) is dominated by the first MiniLM call after the model is loaded but
-  before warm-up. Subsequent calls are closer to p50.
+At your current scale, recall wins by ~40 percentage points on paraphrase but it's not catastrophic
+to live without it — the LLM with MEMORY.md auto-loaded probably gets to ~70-80% in practice
+because it has semantic reasoning the bench's substring-matching baseline doesn't.
 
-## Cost vs. value
+### Scale 1,000 (where you'd be after a year of active use)
 
-| | Cost | Value |
-|---|---|---|
-| Add `recall query` to the agent's path | 0.1 ms (BM25) — 7.6 ms (hybrid) per call | +60-70 percentage points on paraphrase recall |
-| Skip retrieval, rely on MEMORY.md auto-load | 0 ms | 30-40% paraphrase recall; agent re-explains "things you already taught it" |
+```
+Strategy                                            Overall  Lexical  Paraphrase  p50 ms
+Without recall (index, truncated 200 lines)          18%       23%       12%        0.6
+Without recall (index, full)                         69%      100%       38%        2.1
+Without recall (index + reads, full)                 65%      100%       29%        4.7
+With recall (BM25-only, warm)                        61%       94%       27%        0.6
+With recall (hybrid, warm)                          *94%       98%      *90%        4.9
+```
 
-For an agent doing a single LLM round-trip per turn (~1 s), 7.6 ms is rounding error. The
-quality improvement on paraphrased queries is what closes the loop on "the agent should remember
-what I told it last week, even if I phrase it differently this week."
+This is where the truncation cap becomes load-bearing. **88% of paraphrased queries miss without
+recall** because the relevant lesson is past line 200 of MEMORY.md — Claude Code never even sees it
+during auto-load.
+
+### Scale 5,000 (a multi-year brain shared across teams or tools)
+
+```
+Strategy                                            Overall  Lexical  Paraphrase  p50 ms
+Without recall (index, truncated 200 lines)          12%       11%       12%        1.4
+Without recall (index, full)                         67%       99%       35%       10.6
+Without recall (index + reads, full)                 62%       98%       25%       19.2
+With recall (BM25-only, warm)                        58%       91%       25%        4.0
+With recall (hybrid, warm)                          *92%       93%      *90%       12.9
+```
+
+At 5k lessons, the substring scan over MEMORY.md is also slowing down (10.6 ms) — the same
+neighborhood as recall's hybrid path. Recall trades equal or less wall-clock for ~2.5× the
+quality on paraphrase queries.
+
+## Key observations
+
+1. **Lexical queries are easy for everyone** — even substring matching catches 90-100% of
+   queries that share words with the description, regardless of strategy. Recall doesn't help if
+   you write your queries with the lesson author's exact vocabulary. People rarely do.
+
+2. **Paraphrase is where the divergence happens.** "Production on fire at 2am" doesn't share a
+   single content word with `feedback_action_first_for_incidents — Incident/PSI: lead with
+   runnable artifact, not a runbook plan`. Substring match returns nothing useful. Embeddings
+   match the semantic intent.
+
+3. **The MEMORY.md auto-load truncation is the silent killer at scale.** It's invisible from
+   inside a session — the LLM doesn't know what it's not seeing. But at 1000+ lessons, 80% of
+   your brain is dark by default. Recall doesn't have this ceiling.
+
+4. **BM25-only matches without-recall on paraphrase, surprisingly.** Pure lexical methods,
+   whether substring on MEMORY.md or BM25 over full bodies, top out around 25-30% on hard
+   paraphrases. Embeddings are the unlock — they lift paraphrase recall from 25-30% to 90%.
+
+5. **Hybrid latency (4-13 ms) is rounding error compared to a single LLM round-trip
+   (~1000 ms).** You're paying nothing meaningful in wall-clock for ~2.5-7.5× quality.
+
+## Honest caveats
+
+- **The "without recall" baselines underestimate the LLM-on-MEMORY.md path.** They simulate
+  substring matching, but a real LLM with MEMORY.md in context applies semantic reasoning that
+  substring matching can't. So in practice the LLM-on-MEMORY.md path beats these numbers
+  somewhat — but it can't beat the truncation cap at scale, and it can't read content that
+  isn't in MEMORY.md (only descriptions are).
+
+- **Synthetic content is plausible-but-not-real.** The bench corpus is procedurally generated
+  via combinatorial templates. It's diverse enough to differentiate strategies but it isn't
+  YOUR voice. The numbers are directional, not absolute predictions of what you'll experience.
+
+- **The eval set is auto-generated.** Lexical queries reuse 3 random words from a target's
+  description. Paraphrase queries are 8 hand-written natural-language questions per bucket,
+  randomly assigned to specific lessons. With 400 queries at scale 5000 the noise is
+  manageable; at scale 80 with 36 queries it's tighter and individual numbers can move ±5%.
+
+- **The bench tests retrieval quality. It doesn't test "did the LLM use the retrieved memory
+  well?"** That's a downstream question — answer with real-world use over a few weeks once
+  recall is wired into your slash-command or MCP path.
+
+## Bottom line
+
+At your current brain size (~50 files), recall is a quality-of-life win, not a necessity —
+the LLM-on-MEMORY.md path probably gets you most of the way there. **At 200+ lessons, the
+truncation cap starts hurting, and recall becomes the only path that scales.** This PR
+is future-proofing for when the auto-memory framework has captured a year of your work,
+not a "fix-it-now" thing.
