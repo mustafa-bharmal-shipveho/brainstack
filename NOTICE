@@ -59,5 +59,11 @@ upstream):
   docs/*, README.md, CHANGELOG.md
   tests/*
   memory_seed/* (empty directory templates)
+  recall/* — read-side retriever (CLI + MCP server). Hybrid BM25 + sentence-
+    transformers via Reciprocal Rank Fusion. Recognizes the auto-memory
+    frontmatter convention so it can read brains produced by this framework.
+    Originally developed standalone as `recall-brain` and integrated here.
+  tests/recall/* — test suite for the retriever (parametrized query corpus,
+    Hypothesis property tests, adversarial-input regression tests).
 
 For the original Apache License 2.0 text, see LICENSE.
