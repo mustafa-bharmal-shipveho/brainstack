@@ -95,13 +95,14 @@ def sources():
     cfg = load_config()
     out = []
     for s in cfg.sources:
-        path = Path(s.path)
+        path = Path(s.resolved_path)
         exists = path.exists()
         n_docs = sum(1 for _ in discover_documents(s)) if exists else 0
         out.append(
             {
                 "name": s.name,
                 "path": s.path,
+                "resolved_path": s.resolved_path,
                 "frontmatter": s.frontmatter,
                 "exists": exists,
                 "documents": n_docs,
@@ -143,8 +144,10 @@ def doctor():
     try:
         cfg = load_config()
         for s in cfg.sources:
-            if not Path(s.path).exists():
-                issues.append(f"Source '{s.name}' path missing: {s.path}")
+            if not Path(s.resolved_path).exists():
+                issues.append(
+                    f"Source '{s.name}' path missing: {s.path} → {s.resolved_path}"
+                )
     except Exception as e:
         issues.append(f"Failed to load config: {e}")
 

@@ -139,7 +139,7 @@ def _build_indexed_text(name: str, description: str, body: str) -> str:
 
 
 def discover_documents(source: SourceConfig) -> Iterator[Document]:
-    root = Path(source.path)
+    root = Path(source.resolved_path)
     if not root.exists():
         return
 

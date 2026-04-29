@@ -82,10 +82,13 @@ def test_brain_root_with_tilde_is_expanded(monkeypatch):
     assert resolved == Path.home() / ".agent" / "memory"
 
 
-def test_default_config_uses_resolved_brain_home(monkeypatch, tmp_path):
-    """Sanity: default_config() composes resolve_brain_home() into the source
-    path, so the BRAIN_ROOT inheritance flows through to the auto-generated
-    config the user never has to open.
+def test_default_config_writes_brain_root_literal(monkeypatch, tmp_path):
+    """default_config() writes the env-var literal `$BRAIN_ROOT/memory` (not the
+    resolved value) into the source path. This is what gets serialized to disk,
+    so the saved config picks up env-var changes on the next run instead of
+    baking in a stale path.
+
+    The literal is expanded at read time via SourceConfig.resolved_path.
     """
     from recall.config import default_config
 
@@ -96,4 +99,41 @@ def test_default_config_uses_resolved_brain_home(monkeypatch, tmp_path):
     cfg = default_config()
 
     assert len(cfg.sources) == 1
-    assert cfg.sources[0].path == str(brain_root / "memory")
+    src = cfg.sources[0]
+    # `path` preserves the env-var literal so the on-disk config is portable.
+    assert src.path == "$BRAIN_ROOT/memory"
+    # `resolved_path` does the expansion when an actual filesystem path is needed.
+    assert src.resolved_path == str(brain_root / "memory")
+
+
+def test_default_config_writes_brain_home_literal_when_set(monkeypatch, tmp_path):
+    """Same idea: if BRAIN_HOME is set, write `$BRAIN_HOME` as the literal path."""
+    from recall.config import default_config
+
+    brain_home = tmp_path / "explicit-home"
+    monkeypatch.setenv("BRAIN_HOME", str(brain_home))
+
+    cfg = default_config()
+
+    src = cfg.sources[0]
+    assert src.path == "$BRAIN_HOME"
+    assert src.resolved_path == str(brain_home)
+
+
+def test_default_config_resolves_xdg_when_neither_set(monkeypatch, tmp_path):
+    """When neither env var is set, freezing the resolved XDG path is fine —
+    it's stable across runs (no env var to track), and reading the literal
+    `$XDG_DATA_HOME/brain` would invite confusion.
+    """
+    from recall.config import default_config
+
+    xdg = tmp_path / "xdg-data"
+    _clear_env(monkeypatch, "BRAIN_HOME", "BRAIN_ROOT")
+    monkeypatch.setenv("XDG_DATA_HOME", str(xdg))
+
+    cfg = default_config()
+
+    src = cfg.sources[0]
+    # Stable absolute path, not an env-var literal
+    assert src.path == str(xdg / "brain")
+    assert src.resolved_path == str(xdg / "brain")

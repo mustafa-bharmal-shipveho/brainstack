@@ -17,6 +17,19 @@ VALID_FRONTMATTER_MODES = {"auto-memory", "optional"}
 
 @dataclass(frozen=True)
 class SourceConfig:
+    """Single source entry in the user config.
+
+    `path` may contain unresolved env-var placeholders (e.g. `$BRAIN_ROOT/memory`)
+    or `~`. The `__post_init__` validates and resolves into `_resolved_path` (the
+    absolute filesystem path to actually read from), but preserves the original
+    `path` string verbatim so `_config_to_dict` can serialize the env-var form
+    back to disk. That way changing `$BRAIN_ROOT` between runs is reflected
+    automatically — the saved config doesn't bake in a stale resolved value.
+
+    Use `source.resolved_path` whenever you need an actual filesystem path.
+    Tests that assert `.path` is absolute should use `.resolved_path` instead.
+    """
+
     name: str
     path: str
     glob: str
@@ -50,14 +63,25 @@ class SourceConfig:
                 f"Invalid frontmatter mode: {self.frontmatter!r}. "
                 f"Must be one of {sorted(VALID_FRONTMATTER_MODES)}"
             )
-        # Resolve path: expand ~ and env vars
+        # Resolve once for validation, store on the side. Don't overwrite `self.path`.
         resolved = os.path.expanduser(os.path.expandvars(self.path))
-        # Note: we keep relative paths relative; absolute paths are absolute.
-        # Tests assert is_absolute() when given an absolute path.
         if not os.path.isabs(resolved):
             resolved = str(Path(resolved).resolve())
         # frozen dataclass — bypass via object.__setattr__
-        object.__setattr__(self, "path", resolved)
+        object.__setattr__(self, "_resolved_path", resolved)
+
+    @property
+    def resolved_path(self) -> str:
+        """Filesystem path to read from. `path` may contain env-var literals;
+        this is always an absolute resolved string.
+
+        Re-resolves on access so a long-running process picks up env-var changes
+        between calls (rare, but free correctness).
+        """
+        resolved = os.path.expanduser(os.path.expandvars(self.path))
+        if not os.path.isabs(resolved):
+            resolved = str(Path(resolved).resolve())
+        return resolved
 
 
 @dataclass(frozen=True)
@@ -143,13 +167,32 @@ def cache_dir() -> Path:
 # ---------------------------------------------------------------------------
 
 
+def _default_brain_path_literal() -> str:
+    """Path string written into the auto-generated default config.
+
+    We prefer env-var literals (`$BRAIN_ROOT/memory`, `$BRAIN_HOME`) over the
+    *resolved* value so that the saved config picks up env-var changes on the
+    next run. Without this, an early write of e.g. `/tmp/play-brain/memory`
+    would shadow the user's real `$BRAIN_ROOT/memory` forever, even after they
+    set BRAIN_ROOT to something different. The literal is expanded at config
+    load time via `os.path.expandvars` in SourceConfig.__post_init__.
+
+    If neither env var is set, fall back to the resolved XDG path — that path
+    is stable across runs (no env var to track), so freezing it is fine.
+    """
+    if os.environ.get("BRAIN_HOME"):
+        return "$BRAIN_HOME"
+    if os.environ.get("BRAIN_ROOT"):
+        return "$BRAIN_ROOT/memory"
+    return str(resolve_brain_home())
+
+
 def default_config() -> Config:
-    brain = resolve_brain_home()
     return Config(
         sources=[
             SourceConfig(
                 name="brain",
-                path=str(brain),
+                path=_default_brain_path_literal(),
                 glob="**/*.md",
                 frontmatter="auto-memory",
                 exclude=[
