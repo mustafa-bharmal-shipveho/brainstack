@@ -182,10 +182,14 @@ class TestCrossEncoderReranker:
         results = retriever.query("desc 1", k=5)
         assert 1 <= len(results) <= 3
 
-    def test_reranker_default_is_cross_encoder(self):
-        # Sanity: HybridRetriever() default value matches RankingConfig default
+    def test_reranker_default_is_none(self):
+        # Sanity: HybridRetriever() default value matches RankingConfig default.
+        # Rerank is opt-in (per-query --rerank cross_encoder, or per-user via
+        # config.json) because real-brain testing showed it's a wash at the
+        # current scale and content shape.
         from recall.config import RankingConfig
 
         cfg = RankingConfig()
-        assert cfg.reranker == "cross_encoder"
+        assert cfg.reranker == "none"
+        # Model name is still set so opt-in users get a sensible default
         assert cfg.reranker_model == "jinaai/jina-reranker-v1-turbo-en"

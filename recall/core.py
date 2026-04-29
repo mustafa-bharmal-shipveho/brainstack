@@ -61,7 +61,7 @@ class HybridRetriever:
         collections: Optional[Sequence[str]] = None,
         embedder: str = "BAAI/bge-base-en-v1.5",
         sparse_embedder: str = "Qdrant/bm25",
-        reranker: str = "cross_encoder",
+        reranker: str = "none",
         reranker_model: str = "jinaai/jina-reranker-v1-turbo-en",
         rerank_n: int = 20,
         # Legacy kwargs accepted for back-compat; ignored.

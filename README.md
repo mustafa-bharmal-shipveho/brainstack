@@ -139,9 +139,9 @@ question** (a question that doesn't share words with the lesson title)?
 
 | Brain size | Today<sup>1</sup> | Best case<sup>2</sup> | With `recall` (hybrid)<sup>3</sup> | Latency |
 |---|---|---|---|---|
-| **80 lessons (you today)** | 56% | 56% | **100%** | 470.3 ms |
-| **1,000 lessons** | 12% | 38% | **100%** | 460.8 ms |
-| **5,000 lessons** | 12% | 35% | **95%** | 245.0 ms |
+| **80 lessons (you today)** | 56% | 56% | **100%** | 10.2 ms |
+| **1,000 lessons** | 12% | 38% | **100%** | 12.2 ms |
+| **5,000 lessons** | 12% | 35% | **100%** | 38.0 ms |
 
 <sup>1</sup> What you get if you only have `MEMORY.md` auto-loaded — the index
 truncates at 200 lines, so past ~150 lessons most of your brain is invisible

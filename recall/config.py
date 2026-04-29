@@ -98,16 +98,21 @@ class RankingConfig:
     (sparse, no neural model, instant).
 
     `reranker` selects an optional third stage that reorders the top-N
-    candidates by a direct (query, document) cross-encoder score. Closes the
-    paraphrase gap that bi-encoders alone can't bridge.
-      - "cross_encoder": local FastEmbed cross-encoder (default, ~80 MB)
-      - "none":          no rerank — fastest path
+    candidates by a direct (query, document) cross-encoder score.
+      - "none":          no rerank — fastest path (default)
+      - "cross_encoder": local FastEmbed cross-encoder (opt-in via --rerank
+                         flag or config). On real-brain testing the rerank
+                         was a wash — it helps when the query has clear
+                         semantic intent and hurts when the bi-encoder
+                         already had a good top-3. Default off; flip on
+                         per-query with `--rerank cross_encoder` or per-user
+                         by setting `"reranker": "cross_encoder"` here.
     """
 
     mode: str = "hybrid"
     embedder: str = "BAAI/bge-base-en-v1.5"
     sparse_embedder: str = "Qdrant/bm25"
-    reranker: str = "cross_encoder"
+    reranker: str = "none"
     reranker_model: str = "jinaai/jina-reranker-v1-turbo-en"
     rerank_n: int = 20
 
