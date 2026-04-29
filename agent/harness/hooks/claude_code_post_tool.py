@@ -597,7 +597,11 @@ def main() -> None:
     detail = _detail(tool_name, tool_input, tool_response, success)
 
     # --- write episodic entry ---
+    # PR1 schema unification: explicit origin/summary even though
+    # log_execution defaults to "coding.tool_call" — surfaces the writer
+    # contract so anyone reading this hook sees which stream it produces.
     pscore = _pain_score(importance, success)
+    summary = (reflection or action or "")[:120]
     if success:
         log_execution(
             skill_name="claude-code",
@@ -608,6 +612,8 @@ def main() -> None:
             importance=importance,
             confidence=0.7,
             pain_score=pscore,
+            origin="coding.tool_call",
+            summary=summary,
         )
     else:
         on_failure(
@@ -618,6 +624,8 @@ def main() -> None:
             confidence=0.7,
             importance=importance,
             pain_score=pscore,
+            origin="coding.tool_call",
+            summary=summary,
         )
 
 

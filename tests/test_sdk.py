@@ -76,6 +76,29 @@ def test_append_episodic_returns_stamped_event(brain):
     assert "ts" in ev
 
 
+# --- PR1: origin stamping --------------------------------------------------
+
+def test_append_episodic_stamps_default_origin_when_missing(brain):
+    """Backward-compat: events without `origin` get `coding.tool_call`.
+
+    The canonical writer (claude_code_post_tool.py) stamps origin
+    explicitly going forward, but third-party callers that worked
+    before PR1 must keep working.
+    """
+    ev = sdk.append_episodic("default", {"id": "e3", "summary": "no origin"})
+    assert ev["origin"] == "coding.tool_call"
+
+
+def test_append_episodic_preserves_explicit_origin(brain):
+    """Caller-provided origin is not overwritten."""
+    ev = sdk.append_episodic("inbox", {
+        "id": "e4",
+        "summary": "explicit",
+        "origin": "agentry.inbox.action",
+    })
+    assert ev["origin"] == "agentry.inbox.action"
+
+
 def _seed_lessons(brain, namespace, rows):
     if namespace == "default":
         sem = brain / "memory" / "semantic"
