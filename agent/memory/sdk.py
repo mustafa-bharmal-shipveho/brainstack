@@ -285,6 +285,125 @@ def read_policy(
     return {}
 
 
+# --- Stats (PR5) -----------------------------------------------------
+
+def _list_namespaces(brain_root: Optional[str]) -> List[str]:
+    """Walk `<root>/memory/episodic/` and return the namespaces present.
+
+    The default namespace is reported as "default" if the bare
+    `AGENT_LEARNINGS.jsonl` exists at the top level (v0.1 layout).
+    Each subdir under episodic/ that contains an AGENT_LEARNINGS.jsonl
+    is also reported. `snapshots/` and other reserved names are excluded.
+    """
+    root = _resolve_brain_root(brain_root)
+    epi_root = os.path.join(root, "memory", "episodic")
+    if not os.path.isdir(epi_root):
+        return []
+    out: List[str] = []
+    if os.path.isfile(os.path.join(epi_root, "AGENT_LEARNINGS.jsonl")):
+        out.append("default")
+    try:
+        for name in sorted(os.listdir(epi_root)):
+            full = os.path.join(epi_root, name)
+            if not os.path.isdir(full):
+                continue
+            if name in _RESERVED_NAMESPACE_NAMES:
+                continue
+            if os.path.isfile(os.path.join(full, "AGENT_LEARNINGS.jsonl")):
+                out.append(name)
+    except OSError:
+        pass
+    return out
+
+
+def _count_jsonl_lines(path: str) -> int:
+    """Count non-empty lines in a JSONL file. Returns 0 on missing/unreadable."""
+    if not os.path.exists(path):
+        return 0
+    n = 0
+    try:
+        with open(path) as f:
+            for line in f:
+                if line.strip():
+                    n += 1
+    except OSError:
+        return 0
+    return n
+
+
+def _count_candidates(namespace: str, brain_root: Optional[str]) -> int:
+    """Count staged candidate JSONs (excluding rejected/ + graduated/)."""
+    cdir = _candidates_dir(namespace, brain_root)
+    if not os.path.isdir(cdir):
+        return 0
+    n = 0
+    try:
+        for entry in os.listdir(cdir):
+            if entry.endswith(".json"):
+                n += 1
+    except OSError:
+        return 0
+    return n
+
+
+def stats(
+    namespace: Optional[str] = None,
+    brain_root: Optional[str] = None,
+) -> dict:
+    """Return per-namespace counts for the brain.
+
+    With `namespace=None` (default), aggregates across every namespace
+    discovered under `~/.agent/memory/episodic/`. With an explicit
+    namespace, returns just that namespace's counts (and `namespaces`
+    is a 1-element list).
+
+    Shape:
+      {
+        "namespaces": ["default", "inbox", "mustafa-agent"],
+        "episodeCount": 3712,
+        "lessonCount": 20,
+        "candidateCount": 4,
+        "perNamespace": {
+          "default": {"episodes": 3700, "lessons": 18, "candidates": 2},
+          ...
+        }
+      }
+    """
+    if namespace is not None:
+        _validate_namespace(namespace)
+        namespaces = [namespace]
+    else:
+        namespaces = _list_namespaces(brain_root)
+
+    per_ns: Dict[str, Dict[str, int]] = {}
+    total_episodes = 0
+    total_lessons = 0
+    total_candidates = 0
+    for ns in namespaces:
+        epath = _episodic_path(ns, brain_root)
+        sdir = _semantic_dir(ns, brain_root)
+        lpath = os.path.join(sdir, "lessons.jsonl")
+        episodes = _count_jsonl_lines(epath)
+        lessons = _count_jsonl_lines(lpath)
+        candidates = _count_candidates(ns, brain_root)
+        per_ns[ns] = {
+            "episodes": episodes,
+            "lessons": lessons,
+            "candidates": candidates,
+        }
+        total_episodes += episodes
+        total_lessons += lessons
+        total_candidates += candidates
+
+    return {
+        "namespaces": namespaces,
+        "episodeCount": total_episodes,
+        "lessonCount": total_lessons,
+        "candidateCount": total_candidates,
+        "perNamespace": per_ns,
+    }
+
+
 def write_policy(
     namespace: str,
     policy: dict,

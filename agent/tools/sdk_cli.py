@@ -182,6 +182,26 @@ def _cmd_write_policy(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_stats(args: argparse.Namespace) -> int:
+    """PR5: per-namespace + aggregate counts for the `agentry brain stats` CLI.
+
+    `--namespace` is OPTIONAL (unlike the other subcommands) — without it,
+    stats walks every namespace it finds under `<brain_root>/memory/episodic/`.
+    """
+    try:
+        ns: Optional[str] = args.namespace if args.namespace else None
+        result = sdk.stats(namespace=ns, brain_root=args.brain_root)
+    except ValueError as e:
+        msg = str(e)
+        if "namespace" in msg:
+            return _emit_error("invalid_namespace", msg, 3)
+        return _emit_error("invalid_args", msg, 2)
+    except OSError as e:
+        return _emit_error("io_error", f"{type(e).__name__}: {e}", 4)
+    _emit_ok(result)
+    return 0
+
+
 # --- argparse setup --------------------------------------------------
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -218,6 +238,13 @@ def _build_parser() -> argparse.ArgumentParser:
     g2.add_argument("--policy", default=None, help="policy as JSON or YAML string")
     g2.add_argument("--policy-stdin", action="store_true", help="read policy from stdin")
     w.set_defaults(handler=_cmd_write_policy)
+
+    # PR5: stats subcommand — namespace is optional here (unlike the others).
+    s = sub.add_parser("stats", help="per-namespace + aggregate brain counts")
+    s.add_argument("--namespace", default=None,
+                   help="restrict to one namespace (default: walk all)")
+    s.add_argument("--brain-root", default=None, help="brain root path override")
+    s.set_defaults(handler=_cmd_stats)
 
     return p
 
