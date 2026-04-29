@@ -13,8 +13,8 @@
       "bucket_lexical": 1.0,
       "recall_paraphrase": 0.1875,
       "bucket_paraphrase": 0.5625,
-      "p50_ms": 0.2050834591500461,
-      "p95_ms": 0.3428750205785036,
+      "p50_ms": 0.226020987611264,
+      "p95_ms": 0.3855000250041485,
       "n": 36
     },
     {
@@ -25,8 +25,8 @@
       "bucket_lexical": 1.0,
       "recall_paraphrase": 0.1875,
       "bucket_paraphrase": 0.5625,
-      "p50_ms": 0.17508352175354958,
-      "p95_ms": 0.1908749109134078,
+      "p50_ms": 0.19114604219794273,
+      "p95_ms": 0.24329207371920347,
       "n": 36
     },
     {
@@ -37,32 +37,32 @@
       "bucket_lexical": 1.0,
       "recall_paraphrase": 0.125,
       "bucket_paraphrase": 0.625,
-      "p50_ms": 0.8755210437811911,
-      "p95_ms": 1.0211669141426682,
+      "p50_ms": 0.9304164559580386,
+      "p95_ms": 1.5816249651834369,
       "n": 36
     },
     {
       "name": "With recall (BM25-only, warm)",
-      "recall_at_k": 0.5833333333333334,
-      "bucket_recall_at_k": 0.9166666666666666,
-      "recall_lexical": 0.95,
+      "recall_at_k": 0.7222222222222222,
+      "bucket_recall_at_k": 1.0,
+      "recall_lexical": 1.0,
       "bucket_lexical": 1.0,
-      "recall_paraphrase": 0.125,
-      "bucket_paraphrase": 0.8125,
-      "p50_ms": 0.07739546708762646,
-      "p95_ms": 0.13354199472814798,
+      "recall_paraphrase": 0.375,
+      "bucket_paraphrase": 1.0,
+      "p50_ms": 8.15347908064723,
+      "p95_ms": 13.184290961362422,
       "n": 36
     },
     {
       "name": "With recall (hybrid, warm)",
-      "recall_at_k": 0.6944444444444444,
+      "recall_at_k": 0.7222222222222222,
       "bucket_recall_at_k": 1.0,
       "recall_lexical": 1.0,
       "bucket_lexical": 1.0,
-      "recall_paraphrase": 0.3125,
+      "recall_paraphrase": 0.375,
       "bucket_paraphrase": 1.0,
-      "p50_ms": 3.7447079666890204,
-      "p95_ms": 19.669750006869435,
+      "p50_ms": 10.224749974440783,
+      "p95_ms": 15.081290970556438,
       "n": 36
     }
   ]

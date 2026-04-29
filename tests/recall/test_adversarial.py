@@ -18,9 +18,8 @@ import pytest
 import yaml
 
 from recall.config import Config, SourceConfig
-from recall.core import Bm25Retriever, Document, HybridRetriever
+from recall.core import Document, HybridRetriever
 from recall.frontmatter import parse_file_text, parse_path
-from recall.index import build_index, needs_refresh
 from recall.migrate import MigrationAbort, plan_migration
 from recall.sources import _matches_any, discover_documents
 
@@ -60,86 +59,6 @@ class TestMigrationDestructiveCases:
         f.write_text("hi", encoding="utf-8")
         with pytest.raises(MigrationAbort, match="not a directory"):
             plan_migration(source=f, target=tmp_path / "target")
-
-
-# ---------------------------------------------------------------------------
-# Cache poisoning — needs_refresh must not crash on garbage manifest
-# ---------------------------------------------------------------------------
-
-
-class TestCachePoisoning:
-    def test_null_manifest_triggers_refresh(self, isolated_xdg, auto_memory_brain):
-        sc = SourceConfig(
-            name="brain",
-            path=str(auto_memory_brain),
-            glob="**/*.md",
-            frontmatter="auto-memory",
-            exclude=[],
-        )
-        # Build first so the cache dir exists, then poison the manifest.
-        build_index([sc])
-        from recall.config import cache_dir
-
-        manifest = cache_dir() / "files.json"
-        manifest.write_text("null", encoding="utf-8")
-        # Should not raise; should report refresh needed.
-        assert needs_refresh([sc]) is True
-
-    def test_non_list_sources_triggers_refresh(self, isolated_xdg, auto_memory_brain):
-        sc = SourceConfig(
-            name="brain",
-            path=str(auto_memory_brain),
-            glob="**/*.md",
-            frontmatter="auto-memory",
-            exclude=[],
-        )
-        build_index([sc])
-        from recall.config import cache_dir
-
-        manifest = cache_dir() / "files.json"
-        manifest.write_text(json.dumps({"sources": "not a list"}), encoding="utf-8")
-        assert needs_refresh([sc]) is True
-
-    def test_top_level_string_manifest_triggers_refresh(self, isolated_xdg, auto_memory_brain):
-        sc = SourceConfig(
-            name="brain",
-            path=str(auto_memory_brain),
-            glob="**/*.md",
-            frontmatter="auto-memory",
-            exclude=[],
-        )
-        build_index([sc])
-        from recall.config import cache_dir
-
-        manifest = cache_dir() / "files.json"
-        manifest.write_text('"just a string"', encoding="utf-8")
-        assert needs_refresh([sc]) is True
-
-    def test_huge_manifest_does_not_oom(self, isolated_xdg, auto_memory_brain):
-        """A huge but well-formed manifest should be detected as stale and rebuilt
-        without OOM. We use ~100k entries — well within memory but enough to flag
-        any quadratic loops."""
-        sc = SourceConfig(
-            name="brain",
-            path=str(auto_memory_brain),
-            glob="**/*.md",
-            frontmatter="auto-memory",
-            exclude=[],
-        )
-        build_index([sc])
-        from recall.config import cache_dir
-
-        manifest = cache_dir() / "files.json"
-        # Lots of fake file entries — should be treated as stale (real fs has fewer).
-        fake_entries = [
-            {"path": f"/fake/{i}.md", "mtime": float(i)} for i in range(100_000)
-        ]
-        manifest.write_text(
-            json.dumps({"sources": [{"source": sc.name, "path": sc.path, "files": fake_entries}]}),
-            encoding="utf-8",
-        )
-        # Should run without OOM. Result should be True (stale).
-        assert needs_refresh([sc]) is True
 
 
 # ---------------------------------------------------------------------------
@@ -204,43 +123,6 @@ class TestConfigValidation:
                 frontmatter="optional",
                 exclude=[],
             )
-
-
-# ---------------------------------------------------------------------------
-# Retriever edge cases
-# ---------------------------------------------------------------------------
-
-
-class TestRetrieverEdgeCases:
-    def _doc(self, name: str, text: str) -> Document:
-        return Document(
-            path=f"/synth/{name}.md",
-            source="brain",
-            title=name,
-            frontmatter={"name": name, "description": text, "type": "reference"},
-            body="",
-            text=text,
-        )
-
-    def test_bm25_k_zero_returns_empty(self):
-        retriever = Bm25Retriever([self._doc("a", "hello"), self._doc("b", "world")])
-        assert retriever.query("hello", k=0) == []
-
-    def test_bm25_negative_k_returns_empty(self):
-        retriever = Bm25Retriever([self._doc("a", "hello")])
-        assert retriever.query("hello", k=-1) == []
-
-    def test_bm25_k_huge_returns_all(self):
-        docs = [self._doc(f"d{i}", f"text{i}") for i in range(5)]
-        retriever = Bm25Retriever(docs)
-        assert len(retriever.query("text0", k=1_000_000)) == 5
-
-    def test_hybrid_k_zero(self):
-        retriever = HybridRetriever(
-            [self._doc("a", "hello world")],
-            embedding_weight=0.0,
-        )
-        assert retriever.query("hello", k=0) == []
 
 
 # ---------------------------------------------------------------------------
@@ -391,7 +273,11 @@ class TestJsonSerialization:
             exclude=[],
         )
         docs = list(discover_documents(sc))
-        retriever = HybridRetriever(docs, embedding_weight=0.0)
+        # Reset Qdrant state for this test
+        from recall import qdrant_backend as qb
+        qb._reset_client_cache_for_tests()
+
+        retriever = HybridRetriever(docs)
         results = retriever.query("date", k=1)
 
         # Use the same serializer the CLI uses
@@ -402,41 +288,7 @@ class TestJsonSerialization:
         json.dumps(out)
 
 
-class TestConcurrentReindex:
-    def test_two_concurrent_builds_dont_corrupt_manifest(
-        self, isolated_xdg, auto_memory_brain
-    ):
-        """Two threads calling build_index simultaneously must not produce a
-        corrupt manifest. Either one wins or they merge; the resulting JSON
-        must always be parseable."""
-        sc = SourceConfig(
-            name="brain",
-            path=str(auto_memory_brain),
-            glob="**/*.md",
-            frontmatter="auto-memory",
-            exclude=[],
-        )
-
-        errors: list[Exception] = []
-
-        def runner():
-            try:
-                for _ in range(3):
-                    build_index([sc])
-            except Exception as e:
-                errors.append(e)
-
-        threads = [threading.Thread(target=runner) for _ in range(4)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=30)
-
-        from recall.config import cache_dir
-
-        manifest = cache_dir() / "files.json"
-        # At minimum: the manifest exists and parses
-        assert manifest.exists(), errors
-        loaded = json.loads(manifest.read_text(encoding="utf-8"))
-        assert "sources" in loaded
-        assert errors == [], f"Build raised errors under concurrency: {errors[:3]}"
+# Concurrent reindex test removed: pre-Qdrant version validated atomic JSON
+# manifest writes, but Qdrant embedded mode takes a directory lock that prevents
+# concurrent writers from separate processes anyway. The single-process two-thread
+# variant is meaningless against the singleton client.

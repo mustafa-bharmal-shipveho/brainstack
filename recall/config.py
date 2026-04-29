@@ -86,9 +86,21 @@ class SourceConfig:
 
 @dataclass(frozen=True)
 class RankingConfig:
-    bm25_weight: float = 1.0
-    embedding_weight: float = 1.0
-    embedding_model: str = "all-MiniLM-L6-v2"
+    """Hybrid retrieval config.
+
+    `mode` selects which retrieval legs are active:
+      - "hybrid": dense + sparse, fused via Qdrant RRF (default; best quality)
+      - "dense":  embedding-only (use when sparse adds noise on a corpus)
+      - "sparse": BM25-only (use when offline / before embedding model is downloaded)
+
+    `embedder` and `sparse_embedder` are FastEmbed model names. The defaults are
+    BAAI/bge-base-en-v1.5 (~440 MB, top English semantic) and Qdrant/bm25
+    (sparse, no neural model, instant).
+    """
+
+    mode: str = "hybrid"
+    embedder: str = "BAAI/bge-base-en-v1.5"
+    sparse_embedder: str = "Qdrant/bm25"
 
 
 @dataclass(frozen=True)
@@ -196,11 +208,17 @@ def default_config() -> Config:
                 glob="**/*.md",
                 frontmatter="auto-memory",
                 exclude=[
+                    # Write-side staging dirs — not graduated content
                     "episodic/**",
                     "candidates/**",
                     "working/**",
                     "scripts/**",
                     "__pycache__/**",
+                    # Aggregate / index files: these are concatenations of other
+                    # files' content, so they always score high on lexical AND
+                    # semantic similarity, drowning out the actual source lessons.
+                    "MEMORY.md",
+                    "semantic/LESSONS.md",
                 ],
             )
         ],
@@ -246,12 +264,34 @@ def _config_from_dict(data: dict) -> Config:
                 exclude=list(raw.get("exclude", [])),
             )
         )
-    ranking_raw = data.get("ranking", {})
-    ranking = RankingConfig(
-        bm25_weight=float(ranking_raw.get("bm25_weight", 1.0)),
-        embedding_weight=float(ranking_raw.get("embedding_weight", 1.0)),
-        embedding_model=ranking_raw.get("embedding_model", "all-MiniLM-L6-v2"),
-    )
+    ranking_raw = data.get("ranking") or {}
+    # Lenient migration of pre-Qdrant config shape
+    # ({bm25_weight, embedding_weight, embedding_model}) → new shape
+    # ({mode, embedder, sparse_embedder}). Old configs keep working without
+    # the user editing the file by hand.
+    legacy_keys = {"bm25_weight", "embedding_weight", "embedding_model"}
+    if legacy_keys & set(ranking_raw):
+        bw = float(ranking_raw.get("bm25_weight", 1.0))
+        ew = float(ranking_raw.get("embedding_weight", 1.0))
+        if bw > 0 and ew > 0:
+            mode = "hybrid"
+        elif ew > 0:
+            mode = "dense"
+        elif bw > 0:
+            mode = "sparse"
+        else:
+            mode = "hybrid"
+        ranking = RankingConfig(
+            mode=mode,
+            embedder=str(ranking_raw.get("embedder", "BAAI/bge-base-en-v1.5")),
+            sparse_embedder=str(ranking_raw.get("sparse_embedder", "Qdrant/bm25")),
+        )
+    else:
+        ranking = RankingConfig(
+            mode=str(ranking_raw.get("mode", "hybrid")),
+            embedder=str(ranking_raw.get("embedder", "BAAI/bge-base-en-v1.5")),
+            sparse_embedder=str(ranking_raw.get("sparse_embedder", "Qdrant/bm25")),
+        )
     return Config(
         sources=sources,
         ranking=ranking,

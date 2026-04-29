@@ -3,21 +3,24 @@
 Reproduce: `python tests/recall/bench_e2e.py --report --scale {80|1000|5000}` (from
 brainstack repo root, `.venv` active).
 
-The harness builds a deterministic synthetic brain at the requested scale and runs ~400 eval
-queries (split lexical / paraphrase). All numbers are **bucket-recall@5** unless noted: the
-strategy gets credit if any lesson from the right conceptual bucket lands in the top-5.
-This matches real use — when the user asks "production is on fire at 2am," they want any
-incident-response lesson, not necessarily lesson #01 specifically.
+Stack under test: Qdrant embedded mode + FastEmbed (`BAAI/bge-base-en-v1.5` dense
++ `Qdrant/bm25` sparse) fused with `Fusion.RRF`. Numbers are warm-cache for
+recall (mirrors `recall query` after one `recall reindex`).
 
-Latency is warm-cache for recall (mirrors `recall query` in production after one `recall reindex`).
+The harness builds a deterministic synthetic brain at the requested scale and
+runs ~400 eval queries (split lexical / paraphrase). All numbers are
+**bucket-recall@5** unless noted: the strategy gets credit if any lesson from
+the right conceptual bucket lands in the top-5. This matches real use — when
+the user asks "production is on fire at 2am," they want any incident-response
+lesson, not necessarily lesson #01 specifically.
 
 ## Headline: how does recall hold up as the brain grows?
 
 | Brain size | Eval set | Without recall<br>(truncated 200 lines)<br>**paraphrase** | Without recall<br>(full MEMORY.md)<br>**paraphrase** | With recall (hybrid)<br>**paraphrase** | Hybrid p50 ms |
 |---|---|---|---|---|---|
-| 80 lessons | 36 queries | 56% | 56% | **100%** | 4.0 |
-| 1,000 lessons | 196 queries | **12%** | 38% | **90%** | 4.9 |
-| 5,000 lessons | 400 queries | **12%** | 35% | **90%** | 12.9 |
+| 80 lessons | 36 queries | 56% | 56% | **100%** | 10.2 |
+| 1,000 lessons | 196 queries | **12%** | 38% | **100%** | 12.2 |
+| 5,000 lessons | 400 queries | **12%** | 35% | **100%** | 38.0 |
 
 The two columns labelled "without recall" matter for different reasons:
 

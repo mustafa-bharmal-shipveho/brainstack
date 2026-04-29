@@ -13,6 +13,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
+from typing import Optional
 
 import typer
 
@@ -38,10 +39,17 @@ app = typer.Typer(
 )
 
 
-def _load_or_build(cfg: Config):
+def _load_or_build(cfg: Config) -> tuple[Optional[object], bool]:
+    """Returns (cache, fresh).
+
+    `fresh=True` means we just rebuilt — the in-memory documents list is
+    authoritative. `fresh=False` means the existing Qdrant collection is
+    valid; the documents list is reconstructed from disk for shape-compat
+    but the retriever should query the existing collection directly.
+    """
     if needs_refresh(cfg.sources):
-        return build_index(cfg.sources)
-    return load_index(cfg.sources)
+        return build_index(cfg.sources), True
+    return load_index(cfg.sources), False
 
 
 _serialize = serialize_results  # backwards-compat alias inside the module
@@ -56,16 +64,19 @@ def query(
 ):
     """Search the brain for memories relevant to QUERY. Outputs JSON."""
     cfg = load_config()
-    cache = _load_or_build(cfg)
+    cache, fresh = _load_or_build(cfg)
     if cache is None or not cache.documents:
         typer.echo("[]")
         raise typer.Exit(code=0)
 
+    # If we just rebuilt, pass docs in to be upserted (idempotent thanks to
+    # uuid5(path) point ids). If the index is up to date, skip the embedding
+    # step and let HybridRetriever query the existing collection directly.
     retriever = HybridRetriever(
-        cache.documents,
-        bm25_weight=cfg.ranking.bm25_weight,
-        embedding_weight=cfg.ranking.embedding_weight,
-        embedding_model=cfg.ranking.embedding_model,
+        documents=cache.documents if fresh else None,
+        collections=[s.name for s in cfg.sources],
+        embedder=cfg.ranking.embedder,
+        sparse_embedder=cfg.ranking.sparse_embedder,
     )
 
     query_str = " ".join(text)
@@ -151,11 +162,36 @@ def doctor():
     except Exception as e:
         issues.append(f"Failed to load config: {e}")
 
-    # Optional deps
-    if importlib.util.find_spec("sentence_transformers") is None:
-        notes.append("sentence-transformers: not installed (BM25-only retrieval)")
+    # Required deps for retrieval (Qdrant + FastEmbed)
+    try:
+        import qdrant_client  # noqa: F401
+        from importlib.metadata import version as _ver
+        try:
+            qver = _ver("qdrant-client")
+        except Exception:
+            qver = "unknown"
+        notes.append(f"qdrant-client: installed ({qver})")
+    except ImportError:
+        issues.append("qdrant-client: NOT installed (required for retrieval)")
+    try:
+        import fastembed  # noqa: F401
+        notes.append("fastembed: installed")
+    except ImportError:
+        issues.append("fastembed: NOT installed (required for retrieval)")
+
+    # Embedded Qdrant data dir
+    qdrant_data = cd / "qdrant"
+    if qdrant_data.exists():
+        notes.append(f"Qdrant store: {qdrant_data} (present)")
     else:
-        notes.append("sentence-transformers: installed")
+        notes.append(
+            f"Qdrant store: {qdrant_data} (will be created on first reindex)"
+        )
+    notes.append(
+        "First reindex downloads BAAI/bge-base-en-v1.5 (~440 MB) "
+        "to ~/.cache/fastembed/ — one-time."
+    )
+
     if importlib.util.find_spec("mcp") is None:
         notes.append("mcp: not installed (recall-mcp unavailable)")
     else:

@@ -24,14 +24,15 @@ def recall_query_handler(
 ) -> list[dict]:
     """The handler dispatched to by the MCP tool. Pure Python, no MCP deps."""
     cfg = load_config()
-    cache = build_index(cfg.sources) if needs_refresh(cfg.sources) else load_index(cfg.sources)
+    fresh = needs_refresh(cfg.sources)
+    cache = build_index(cfg.sources) if fresh else load_index(cfg.sources)
     if cache is None or not cache.documents:
         return []
     retriever = HybridRetriever(
-        cache.documents,
-        bm25_weight=cfg.ranking.bm25_weight,
-        embedding_weight=cfg.ranking.embedding_weight,
-        embedding_model=cfg.ranking.embedding_model,
+        documents=cache.documents if fresh else None,
+        collections=[s.name for s in cfg.sources],
+        embedder=cfg.ranking.embedder,
+        sparse_embedder=cfg.ranking.sparse_embedder,
     )
     results = retriever.query(query, k=k, type_filter=type, source_filter=source)
     return serialize_results(results)

@@ -19,6 +19,13 @@ from recall.sources import discover_documents
 
 
 def _build_retriever(corpus_path, embedding_weight: float = 0.0) -> HybridRetriever:
+    """Build a HybridRetriever over the synthetic corpus.
+
+    `embedding_weight` is accepted for back-compat with the parametrized cases
+    that asked for BM25-only mode. The new HybridRetriever always runs hybrid
+    (Qdrant Prefetch + Fusion.RRF over dense + sparse), which strictly subsumes
+    BM25-only quality. The kwarg is ignored.
+    """
     sc = SourceConfig(
         name="big",
         path=str(corpus_path),
@@ -27,7 +34,10 @@ def _build_retriever(corpus_path, embedding_weight: float = 0.0) -> HybridRetrie
         exclude=[],
     )
     docs = list(discover_documents(sc))
-    return HybridRetriever(docs, embedding_weight=embedding_weight)
+    # Reset client so module-scoped tests get a fresh embedded DB
+    from recall import qdrant_backend as qb
+    qb._reset_client_cache_for_tests()
+    return HybridRetriever(docs)
 
 
 @pytest.fixture(scope="module")

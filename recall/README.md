@@ -33,19 +33,24 @@ set `BRAIN_HOME` — it takes precedence over `BRAIN_ROOT`.
 
 ## Retrieval quality
 
-Numbers from the parametrized test suite (40-doc synthetic corpus, 120+ queries):
+Numbers from the synthetic-corpus benchmark in `tests/recall/bench_e2e.py`
+(deterministic seed, scales 80 / 1k / 5k). Hybrid retrieval = Qdrant Prefetch
+over `BAAI/bge-base-en-v1.5` (dense, 768d) + `Qdrant/bm25` (sparse, IDF), fused
+with `Fusion.RRF`.
 
-| Mode | Recall@5 (lexical) | Recall@5 (paraphrase) | Recall@5 (overall) |
-|---|---|---|---|
-| BM25-only | ≥ 90% | ~40% | ≥ 60% |
-| Hybrid (BM25 + embeddings) | ~100% | ~70% | ≥ 85% |
+See `tests/recall/BENCH_RESULTS.md` for the full per-strategy table. Headline:
+
+| Brain size | Bucket-recall@5 paraphrase, no recall | with Qdrant hybrid |
+|---|---|---|
+| 80 lessons | ~56% | ~100% |
+| 1,000 lessons | ~38% (full MEMORY.md), ~12% (200-line truncation) | ~100% |
+| 5,000 lessons | numbers in BENCH_RESULTS.md | numbers in BENCH_RESULTS.md |
 
 "Lexical" = the query shares key tokens with the target's frontmatter
 `description`. "Paraphrase" = it doesn't (e.g., "what runs when I
-`kubectl apply`" vs. a memory titled `kubernetes-pods`). For a 90 MB
-general-purpose embedding model, ~70% on hard paraphrases is consistent
-with what other small-model RAG systems achieve. The optional
-`[embeddings]` extra is recommended.
+`kubectl apply`" vs. a memory titled `kubernetes-pods`). The remaining
+paraphrase-recall gap on small corpora and outlier queries is expected to
+close with the v0.3 cross-encoder reranker (see roadmap).
 
 ## CLI
 
@@ -98,9 +103,9 @@ open it for the brainstack-installed case. Example for advanced overrides:
     }
   ],
   "ranking": {
-    "bm25_weight": 1.0,        // currently a toggle: any value > 0 enables BM25
-    "embedding_weight": 1.0,   // any value > 0 enables embeddings if installed
-    "embedding_model": "all-MiniLM-L6-v2"
+    "mode": "hybrid",                          // "hybrid" | "dense" | "sparse"
+    "embedder": "BAAI/bge-base-en-v1.5",         // dense embedder (FastEmbed model name)
+    "sparse_embedder": "Qdrant/bm25"             // sparse / BM25-IDF encoder
   },
   "default_k": 5
 }
@@ -129,24 +134,36 @@ Append a source. Frontmatter is optional for these:
   are skipped.
 - **Adversarial-input hardened.** YAML frontmatter is capped at 256 KiB and
   parsed with `safe_load` (defeats billion-laughs and `!!python/object`
-  exploits). Cache manifests are defensively typed.
-- **Concurrent-reindex safe.** Index writes use per-process tmp filenames +
-  atomic rename.
+  exploits).
 
 ## Architecture
 
 ```
 recall/
-├── frontmatter.py   # YAML parsing — adversarial-input hardened
-├── config.py        # XDG paths, BRAIN_ROOT/BRAIN_HOME resolution
-├── sources.py       # file discovery, glob, exclude, symlink containment
-├── core.py          # BM25Plus + sentence-transformers + Reciprocal Rank Fusion
-├── index.py         # cache: build, load, refresh-on-stale, atomic writes
-├── migrate.py       # two-layer-backup migration plan + verify + rollback
-├── serialize.py     # JSON-safe coercion (YAML dates → ISO strings)
-├── cli.py           # Typer CLI — query / reindex / sources / doctor
-└── mcp_server.py    # MCP wrapper: exposes recall_query as one tool
+├── frontmatter.py     # YAML parsing — adversarial-input hardened
+├── config.py          # XDG paths, BRAIN_ROOT/BRAIN_HOME resolution, RankingConfig
+├── sources.py         # file discovery, glob, exclude, symlink containment
+├── qdrant_backend.py  # Qdrant embedded client + FastEmbed dense/sparse models
+├── core.py            # HybridRetriever facade (delegates to qdrant_backend)
+├── index.py           # build_index / load_index / needs_refresh (delegates)
+├── migrate.py         # two-layer-backup migration plan + verify + rollback
+├── serialize.py       # JSON-safe coercion (YAML dates → ISO strings)
+├── cli.py             # Typer CLI — query / reindex / sources / doctor
+└── mcp_server.py      # MCP wrapper: exposes recall_query as one tool
 ```
+
+Retrieval pipeline at query time:
+
+1. Embed the query with `BAAI/bge-base-en-v1.5` (dense, 768-dim) and `Qdrant/bm25`
+   (sparse, IDF-weighted) via FastEmbed.
+2. Qdrant `Prefetch` runs both legs against the per-source collection (top-20 each).
+3. `Fusion.RRF` fuses the two ranked lists, producing the final top-K with
+   bounded `[0, 1]` scores. Type/source filters are applied as Qdrant payload
+   conditions inside the prefetch.
+4. Results are deserialized from each point's payload back into `Document` +
+   `QueryResult` shapes for the JSON output.
+
+Storage at `$XDG_CACHE_HOME/recall/qdrant/` (embedded mode, no daemon, no Docker).
 
 ## Standalone usage (without brainstack)
 
