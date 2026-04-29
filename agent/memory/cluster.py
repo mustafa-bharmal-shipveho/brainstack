@@ -74,8 +74,34 @@ def pattern_id(claim, conditions):
     ).hexdigest()[:12]
 
 
+DEFAULT_ORIGIN = "coding.tool_call"
+
+
+def _origin_of(entry):
+    """Origin discriminator for an episode.
+
+    Missing or empty `origin` collapses to the legacy default
+    (`coding.tool_call`) so existing data clusters identically to before
+    the field was introduced.
+    """
+    o = entry.get("origin")
+    if isinstance(o, str) and o:
+        return o
+    return DEFAULT_ORIGIN
+
+
 def _entry_features(entry):
-    """Content feature set for clustering: action + reflection + detail."""
+    """Content feature set for clustering.
+
+    Prefers `summary` when present and non-empty (PR1 schema unification:
+    new writers emit a one-line `summary` that captures the episode's
+    cluster-relevant content directly). Falls back to the prior fields
+    `(action, reflection, detail)` for legacy episodes that predate the
+    summary contract.
+    """
+    summary = entry.get("summary")
+    if isinstance(summary, str) and summary:
+        return word_set(summary)
     text = " ".join([
         entry.get("action", ""),
         entry.get("reflection", ""),
@@ -84,25 +110,15 @@ def _entry_features(entry):
     return word_set(text)
 
 
-def content_cluster(entries, threshold=0.3, min_size=2):
-    """Single-linkage agglomerative clustering on Jaccard similarity.
+def _cluster_one_bucket(featured, threshold, min_size):
+    """The original single-linkage agglomeration, applied to a pre-bucketed list.
 
-    An entry joins every existing cluster it's similar to, and all such
-    clusters merge into one — proper single-linkage. Without the merge
-    step, ordering matters: entries [A, C, B] where A~B~C but A⊄C would
-    produce two clusters [A,B] + [C] instead of one, so recurrence
-    counts and promotion thresholds become input-order dependent.
-
-    Entries with empty feature sets are dropped (jaccard of two empty
-    sets would otherwise be 1.0). Clusters smaller than min_size are
-    filtered so singletons don't create candidate churn.
+    Extracted so `content_cluster` can call it once per origin bucket
+    when `group_by_origin=True`.
     """
-    featured = [(e, _entry_features(e)) for e in entries]
-    featured = [(e, fs) for e, fs in featured if fs]
-
     clusters = []  # each: list of (entry, feature_set)
     for item in featured:
-        e_i, fs_i = item
+        _, fs_i = item
         matching_indices = [
             i for i, c in enumerate(clusters)
             if any(jaccard(fs_i, fs_j) >= threshold for _, fs_j in c)
@@ -117,8 +133,45 @@ def content_cluster(entries, threshold=0.3, min_size=2):
         for idx in reversed(matching_indices[1:]):
             target.extend(clusters[idx])
             del clusters[idx]
-
     return [[e for e, _ in c] for c in clusters if len(c) >= min_size]
+
+
+def content_cluster(entries, threshold=0.3, min_size=2, group_by_origin=True):
+    """Single-linkage agglomerative clustering on Jaccard similarity.
+
+    An entry joins every existing cluster it's similar to, and all such
+    clusters merge into one — proper single-linkage. Without the merge
+    step, ordering matters: entries [A, C, B] where A~B~C but A⊄C would
+    produce two clusters [A,B] + [C] instead of one, so recurrence
+    counts and promotion thresholds become input-order dependent.
+
+    Entries with empty feature sets are dropped (jaccard of two empty
+    sets would otherwise be 1.0). Clusters smaller than min_size are
+    filtered so singletons don't create candidate churn.
+
+    `group_by_origin` (default True): pre-bucket entries by their
+    `origin` field and run agglomeration WITHIN each bucket
+    independently. Two entries from different origins (e.g. coding tool
+    calls vs an agentry inbox action) never end up in the same cluster
+    even when their feature sets are identical. Missing-origin entries
+    collapse to `coding.tool_call` so legacy data clusters as before.
+    Pass `group_by_origin=False` to fall back to the prior cross-origin
+    clustering.
+    """
+    featured = [(e, _entry_features(e)) for e in entries]
+    featured = [(e, fs) for e, fs in featured if fs]
+
+    if not group_by_origin:
+        return _cluster_one_bucket(featured, threshold, min_size)
+
+    buckets = {}
+    for e, fs in featured:
+        buckets.setdefault(_origin_of(e), []).append((e, fs))
+    out = []
+    # Iterate buckets in insertion order so cluster output is deterministic.
+    for bucket in buckets.values():
+        out.extend(_cluster_one_bucket(bucket, threshold, min_size))
+    return out
 
 
 def extract_pattern(cluster):
@@ -159,6 +212,12 @@ def extract_pattern(cluster):
     canonical_with_recurrence["recurrence_count"] = len(cluster)
     canonical_salience = salience_score(canonical_with_recurrence)
 
+    # All members of a cluster share an origin (when `group_by_origin=True`,
+    # which is the default). For mixed-origin clusters from
+    # `group_by_origin=False`, fall back to the canonical's origin so the
+    # downstream candidate JSON still has a deterministic `origin` value.
+    origin = _origin_of(canonical)
+
     return {
         "id": pid,
         "name": name,
@@ -167,4 +226,5 @@ def extract_pattern(cluster):
         "evidence_ids": [e.get("timestamp", "") for e in cluster if e.get("timestamp")],
         "cluster_size": len(cluster),
         "canonical_salience": canonical_salience,
+        "origin": origin,
     }
