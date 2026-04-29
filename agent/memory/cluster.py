@@ -44,24 +44,27 @@ def _canonicalize_condition(c):
     return c.casefold()
 
 
-def pattern_id(claim, conditions):
+def pattern_id(claim, conditions, origin=None):
     """Stable content-derived pattern id. Single source of truth.
 
-    Same logical (claim, conditions) → same id. Conditions are canonicalized
-    before hashing: case-folded, unicode-whitespace collapsed, zero-width
-    characters stripped, outer-trimmed, empties dropped, deduplicated,
-    sorted. So `['Alpha']`, `[' alpha ']`, `['alpha\\u200b']`, and
-    `['alpha']` all hash the same.
+    Same logical (claim, conditions, origin) → same id. Conditions are
+    canonicalized before hashing: case-folded, unicode-whitespace
+    collapsed, zero-width characters stripped, outer-trimmed, empties
+    dropped, deduplicated, sorted. So `['Alpha']`, `[' alpha ']`,
+    `['alpha\\u200b']`, and `['alpha']` all hash the same.
 
     What's NOT normalized: punctuation, hyphens, underscores. `'cross-region'`
     and `'cross_region'` are still distinct — they're likely distinct
     concepts. Callers who want them equivalent must pre-normalize.
 
-    Ids WILL still differ across birth paths for the same claim when
-    conditions are genuinely different (cluster intersection vs user-provided
-    vs full claim word_set). That's intentional: conditions are the stable
-    signature of "under what circumstances does this claim hold," and
-    different contexts deserve different lifecycle state.
+    Origin discriminator: when `origin` is None or `coding.tool_call`
+    (the legacy default), the hash input is the original `(claim,
+    conditions)` shape — preserving lifecycle continuity for already-
+    staged candidates from before PR1. When `origin` is a non-default
+    value (agentry-side writers), it is mixed into the hash so cross-
+    origin clusters with identical text don't collide on the same pid
+    (codex review of PR1 caught this — `cluster_and_extract` keys its
+    return dict by `name` which embeds pid; collision = lost cluster).
     """
     canonical = sorted({
         _canonicalize_condition(c)
@@ -69,8 +72,11 @@ def pattern_id(claim, conditions):
         if _canonicalize_condition(c)
     })
     conditions_key = "|".join(canonical)
+    origin_key = ""
+    if origin and origin != DEFAULT_ORIGIN:
+        origin_key = "||origin=" + str(origin)
     return hashlib.md5(
-        (_normalize_claim(claim) + "||" + conditions_key).encode()
+        (_normalize_claim(claim) + "||" + conditions_key + origin_key).encode()
     ).hexdigest()[:12]
 
 
@@ -93,19 +99,24 @@ def _origin_of(entry):
 def _entry_features(entry):
     """Content feature set for clustering.
 
-    Prefers `summary` when present and non-empty (PR1 schema unification:
-    new writers emit a one-line `summary` that captures the episode's
-    cluster-relevant content directly). Falls back to the prior fields
-    `(action, reflection, detail)` for legacy episodes that predate the
-    summary contract.
+    PR1 schema unification: new writers emit a one-line `summary` field.
+    To keep `pattern_id` (claim+conditions hash) stable across the
+    migration boundary, the feature set is the **union** of
+    `word_set(summary)` and `word_set(action + reflection + detail)`.
+    A pre-PR1 episode (no summary) and a post-PR1 episode (with summary
+    derived as `reflection[:120]`) collapse to the same word set,
+    because summary's tokens are already a subset of reflection's.
+    Lifecycle state in `candidates/` (rejection_count, decisions) thus
+    carries across the migration even when membership shifts by one
+    episode. Empty/non-string summary contributes nothing.
     """
     summary = entry.get("summary")
-    if isinstance(summary, str) and summary:
-        return word_set(summary)
+    summary_text = summary if (isinstance(summary, str) and summary) else ""
     text = " ".join([
-        entry.get("action", ""),
-        entry.get("reflection", ""),
-        entry.get("detail", ""),
+        summary_text,
+        entry.get("action", "") or "",
+        entry.get("reflection", "") or "",
+        entry.get("detail", "") or "",
     ])
     return word_set(text)
 
@@ -179,6 +190,10 @@ def extract_pattern(cluster):
 
     Without an LLM we cannot synthesize a generalization, so:
       - claim: canonical (highest-salience) member's reflection or action
+        or summary (PR1: agentry-style writers may emit summary as the
+        only narrative — codex review caught that summary-only clusters
+        were producing empty claims and being silently skipped by
+        `write_candidates`)
       - conditions: tokens shared by every cluster member
       - name: longest shared terms + content hash (deterministic, collision-free)
       - evidence_ids: all member timestamps
@@ -189,7 +204,12 @@ def extract_pattern(cluster):
         single episode was extreme. salience_score already caps recurrence at 3.
     """
     canonical = max(cluster, key=salience_score)
-    claim = (canonical.get("reflection") or canonical.get("action") or "").strip()
+    claim = (
+        canonical.get("reflection")
+        or canonical.get("action")
+        or canonical.get("summary")
+        or ""
+    ).strip()
 
     feature_sets = [_entry_features(e) for e in cluster]
     common = set.intersection(*feature_sets) if feature_sets else set()
@@ -217,6 +237,11 @@ def extract_pattern(cluster):
     # `group_by_origin=False`, fall back to the canonical's origin so the
     # downstream candidate JSON still has a deterministic `origin` value.
     origin = _origin_of(canonical)
+
+    # Recompute pid + name with origin so cross-origin clusters with
+    # identical text don't collide (codex/api/schema persona finding).
+    pid = pattern_id(claim, sorted(common), origin)
+    name = f"pattern_{name_base}_{pid[:6]}"
 
     return {
         "id": pid,

@@ -38,19 +38,29 @@ DEFAULT_ORIGIN = "coding.tool_call"
 
 
 def _episodic_path(brain_root: str, namespace: str) -> str:
+    # Validate namespace — without this the `--namespace` CLI arg flows
+    # straight into a path concatenation, enabling path-traversal writes
+    # via `--namespace ../../../etc/foo` (multi-tenant persona finding
+    # on PR1). `sdk._episodic_path` itself does NOT validate; the regex
+    # check lives in `_validate_namespace` which the public entry points
+    # `append_episodic` etc. call but path-builders do not.
+    sdk._validate_namespace(namespace)
     return sdk._episodic_path(namespace, brain_root)
 
 
 def _backfill_lines(lines):
-    """Return (rewritten_lines, stamped_count) for the given iterable.
+    """Return (rewritten_lines, stamped_count, dropped_count) for the input.
 
     Lines that parse as JSON and lack `origin` are stamped. Lines that
     parse but already have a non-empty `origin` are passed through
-    unchanged. Lines that don't parse are dropped silently (caller
-    can compare input vs output count if it cares about loss).
+    unchanged. Lines that don't parse (or don't decode to a dict) are
+    dropped — we count them and surface to the CLI so the operator can
+    decide whether to abort. Dropping mirrors the rest of the pipeline's
+    parser tolerance; reporting the count was a schema-persona finding.
     """
     out = []
     stamped = 0
+    dropped = 0
     for raw in lines:
         s = raw.strip()
         if not s:
@@ -58,14 +68,16 @@ def _backfill_lines(lines):
         try:
             row = json.loads(s)
         except json.JSONDecodeError:
+            dropped += 1
             continue
         if not isinstance(row, dict):
+            dropped += 1
             continue
         if not row.get("origin"):
             row["origin"] = DEFAULT_ORIGIN
             stamped += 1
         out.append(json.dumps(row))
-    return out, stamped
+    return out, stamped, dropped
 
 
 def backfill(brain_root: str, namespace: str = "default",
@@ -92,6 +104,7 @@ def backfill(brain_root: str, namespace: str = "default",
 
     rewritten = None
     stamped = 0
+    dropped = 0
     lock_fd = None
     try:
         if have_flock:
@@ -99,9 +112,9 @@ def backfill(brain_root: str, namespace: str = "default",
             fcntl.flock(lock_fd, fcntl.LOCK_EX)  # type: ignore[union-attr]
         with open(path, "rb") as f:
             raw = f.read().decode("utf-8", errors="replace")
-        rewritten, stamped = _backfill_lines(raw.splitlines())
+        rewritten, stamped, dropped = _backfill_lines(raw.splitlines())
         if dry_run or stamped == 0:
-            return stamped
+            return (stamped, dropped)
         # Trailing newline matches the append_jsonl convention.
         body = ("\n".join(rewritten) + "\n").encode("utf-8") if rewritten else b""
         atomic_write_bytes(path, body)
@@ -111,7 +124,7 @@ def backfill(brain_root: str, namespace: str = "default",
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)  # type: ignore[union-attr]
             finally:
                 os.close(lock_fd)
-    return stamped
+    return (stamped, dropped)
 
 
 def main(argv: Optional[list] = None) -> int:
@@ -125,7 +138,11 @@ def main(argv: Optional[list] = None) -> int:
     args = p.parse_args(argv)
 
     try:
-        stamped = backfill(args.brain_root, args.namespace, args.dry_run)
+        stamped, dropped = backfill(args.brain_root, args.namespace, args.dry_run)
+    except ValueError as e:
+        # Raised by sdk._validate_namespace on path-traversal-shaped namespaces.
+        sys.stderr.write(f"invalid namespace: {e}\n")
+        return 3
     except FileNotFoundError as e:
         sys.stderr.write(f"episodic JSONL not found: {e}\n")
         return 2
@@ -134,7 +151,10 @@ def main(argv: Optional[list] = None) -> int:
         return 4
 
     verb = "would stamp" if args.dry_run else "stamped"
-    sys.stdout.write(f"{verb} {stamped} episode(s) with origin={DEFAULT_ORIGIN}\n")
+    msg = f"{verb} {stamped} episode(s) with origin={DEFAULT_ORIGIN}"
+    if dropped:
+        msg += f" (dropped {dropped} unparseable line(s))"
+    sys.stdout.write(msg + "\n")
     return 0
 
 

@@ -15,9 +15,18 @@ from validate import extract_lesson_lines, check_exact_duplicate
 from _atomic import atomic_write_json
 
 
-def cluster_and_extract(entries, threshold=0.3):
-    """Cluster entries by content similarity, extract a pattern per cluster."""
-    clusters = content_cluster(entries, threshold=threshold)
+def cluster_and_extract(entries, threshold=0.3, group_by_origin=True):
+    """Cluster entries by content similarity, extract a pattern per cluster.
+
+    PR1: `group_by_origin=True` (default) buckets entries by their
+    `origin` field before clustering, so cross-origin events with
+    identical text never end up in the same cluster. Pass False to
+    fall back to the prior cross-origin behaviour (e.g., for a one-off
+    diagnostic dream pass).
+    """
+    clusters = content_cluster(
+        entries, threshold=threshold, group_by_origin=group_by_origin
+    )
     return {p["name"]: p for p in (extract_pattern(c) for c in clusters)}
 
 
@@ -156,6 +165,7 @@ def write_candidates(patterns, candidates_dir):
             "evidence_ids": p.get("evidence_ids", []),
             "cluster_size": p.get("cluster_size", 1),
             "canonical_salience": p.get("canonical_salience", 0.0),
+            "origin": p.get("origin", "coding.tool_call"),
             "staged_at": staged_at,
             "status": "staged",
             "decisions": decisions,

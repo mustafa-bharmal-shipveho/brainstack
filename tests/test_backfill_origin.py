@@ -128,7 +128,7 @@ def test_backfill_missing_file_returns_2(tmp_path):
 
 
 def test_backfill_skips_unparseable_lines(tmp_path):
-    """Malformed JSON lines don't abort the run."""
+    """Malformed JSON lines don't abort the run, and the count is reported."""
     jsonl = tmp_path / "memory" / "episodic" / "AGENT_LEARNINGS.jsonl"
     jsonl.parent.mkdir(parents=True, exist_ok=True)
     with open(jsonl, "w") as f:
@@ -142,3 +142,24 @@ def test_backfill_skips_unparseable_lines(tmp_path):
     assert len(rows) == 2
     assert rows[0]["origin"] == "coding.tool_call"
     assert rows[1]["origin"] == "agentry.x"
+    # Output must call out the dropped count so the operator can decide
+    # whether to abort (schema-persona finding).
+    assert "dropped" in r.stdout.lower() and "1" in r.stdout, (
+        f"expected 'dropped 1' in output: {r.stdout!r}"
+    )
+
+
+def test_backfill_rejects_path_traversal_namespace(tmp_path):
+    """`--namespace ../../etc/foo` must be rejected before any path
+    arithmetic. Without validation, the backfill would atomic-write
+    to an attacker-controlled location (multi-tenant persona finding)."""
+    r = _run(tmp_path, namespace="../../../etc/foo")
+    assert r.returncode == 3, f"expected exit 3, got {r.returncode}; stderr: {r.stderr}"
+    assert "invalid namespace" in r.stderr.lower()
+
+
+def test_backfill_rejects_uppercase_namespace(tmp_path):
+    """Per `^[a-z][a-z0-9_-]{0,31}$`, uppercase is invalid."""
+    r = _run(tmp_path, namespace="UpperCase")
+    assert r.returncode == 3
+    assert "invalid namespace" in r.stderr.lower()

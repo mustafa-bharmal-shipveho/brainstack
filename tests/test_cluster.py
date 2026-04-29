@@ -44,18 +44,33 @@ def _entry(text: str, *, origin=None, summary=None):
 
 # --- _entry_features --------------------------------------------------
 
-def test_entry_features_prefers_summary_when_present():
+def test_entry_features_includes_summary_words():
     e = _entry(
-        "ignored ignored ignored",
+        "command line text",
         summary="distinct content for clustering",
     )
     feats = cluster._entry_features(e)
     # Summary words should be in the feature set.
     assert "distinct" in feats
     assert "clustering" in feats
-    # action/reflection/detail words ("ignored") should NOT dominate when
-    # summary is present.
-    assert "ignored" not in feats
+    # The action/reflection/detail words are *also* in the set —
+    # _entry_features unions both so cluster pids stay stable across
+    # the PR1 migration boundary (reliability-persona finding).
+    assert "command" in feats
+    assert "text" in feats
+
+
+def test_entry_features_pid_stable_across_pre_post_pr1():
+    """A pre-PR1 entry (no summary) and a post-PR1 entry (with summary
+    derived as the first 120 chars of reflection) must produce the same
+    feature set. Otherwise `pattern_id` shifts and lifecycle state in
+    candidates/ detaches at the migration boundary."""
+    pre_pr1 = _entry("alpha beta gamma delta epsilon")
+    pre_pr1.pop("summary", None)  # legacy data has no summary
+    # Post-PR1 derives summary from reflection[:120].
+    post_pr1 = _entry("alpha beta gamma delta epsilon",
+                      summary="alpha beta gamma delta epsilon")
+    assert cluster._entry_features(pre_pr1) == cluster._entry_features(post_pr1)
 
 
 def test_entry_features_falls_back_to_action_reflection_detail():
@@ -147,6 +162,55 @@ def test_extract_pattern_stamps_default_origin_for_legacy_cluster():
     cluster_in = [_entry("legacy text") for _ in range(3)]
     p = cluster.extract_pattern(cluster_in)
     assert p["origin"] == "coding.tool_call"
+
+
+# --- pattern_id origin discrimination (codex finding) ----------------
+
+def test_pattern_id_default_origin_matches_legacy_hash():
+    """coding.tool_call (default) must hash like origin=None for backward
+    compat — pre-PR1 candidates keep their slugs."""
+    pid_legacy = cluster.pattern_id("a claim", ["x", "y"])
+    pid_default = cluster.pattern_id("a claim", ["x", "y"], "coding.tool_call")
+    assert pid_legacy == pid_default
+
+
+def test_pattern_id_non_default_origin_changes_hash():
+    """Non-default origins produce distinct pids so cross-origin clusters
+    with identical text don't collide on the same slug (codex finding)."""
+    pid_default = cluster.pattern_id("a claim", ["x", "y"], "coding.tool_call")
+    pid_inbox = cluster.pattern_id("a claim", ["x", "y"], "agentry.inbox.action")
+    assert pid_default != pid_inbox
+
+
+def test_extract_pattern_distinct_pid_across_origins():
+    """Two clusters from different origins with identical claim text
+    must produce distinct ids and names. Otherwise `cluster_and_extract`'s
+    name-keyed dict overwrites one with the other."""
+    text = "shared phrase here"
+    c1 = [_entry(text, origin="coding.tool_call") for _ in range(3)]
+    c2 = [_entry(text, origin="agentry.inbox.action") for _ in range(3)]
+    p1 = cluster.extract_pattern(c1)
+    p2 = cluster.extract_pattern(c2)
+    assert p1["id"] != p2["id"]
+    assert p1["name"] != p2["name"]
+
+
+# --- claim falls back to summary (codex finding) ---------------------
+
+def test_extract_pattern_falls_back_to_summary_for_claim():
+    """When a cluster's canonical episode has no reflection or action
+    (e.g., agentry-style writers using only summary), claim falls back
+    to summary so write_candidates doesn't silently drop the cluster."""
+    base = {
+        "timestamp": "2026-04-29T00:00:00+00:00",
+        "summary": "summary-only cluster claim",
+        "pain_score": 9,
+        "importance": 9,
+        "origin": "agentry.x.action",
+    }
+    cluster_in = [dict(base) for _ in range(3)]
+    p = cluster.extract_pattern(cluster_in)
+    assert p["claim"] == "summary-only cluster claim"
 
 
 # --- regression: clusters smaller than min_size are still filtered ----

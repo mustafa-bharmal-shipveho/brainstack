@@ -13,13 +13,18 @@ DEFAULT_ORIGIN = "coding.tool_call"
 SUMMARY_MAX = 120
 
 
-def _derive_summary(reflection: str, action: str) -> str:
+def _derive_summary(reflection, action) -> str:
     """Return a 1-line cluster-relevant snippet when the caller didn't
     pass an explicit summary. Prefer reflection (richer narrative) over
-    action (mechanical label)."""
-    text = reflection.strip() if reflection else ""
+    action (mechanical label).
+
+    Defensive against non-string callers: SDK consumers can pass any
+    truthy value here, and `int.strip()` would otherwise crash the
+    post-tool hook. Coerce to str before truncating.
+    """
+    text = str(reflection).strip() if reflection else ""
     if not text:
-        text = action.strip() if action else ""
+        text = str(action).strip() if action else ""
     return text[:SUMMARY_MAX]
 
 
