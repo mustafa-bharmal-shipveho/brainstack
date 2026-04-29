@@ -35,8 +35,13 @@ def _count_recent_failures(skill_name):
     return count
 
 
+DEFAULT_ORIGIN = "coding.tool_call"
+SUMMARY_MAX = 120
+
+
 def on_failure(skill_name, action, error, context="", confidence=0.9,
-               evidence_ids=None, importance=None, pain_score=None):
+               evidence_ids=None, importance=None, pain_score=None,
+               origin=DEFAULT_ORIGIN, summary=None):
     # Format reflection without the noisy `type(error).__name__:` prefix
     # when the caller passes a pre-formatted string (the common case for
     # hook callers). Only include the type name for actual Exception objects
@@ -46,6 +51,11 @@ def on_failure(skill_name, action, error, context="", confidence=0.9,
                  f"{str(error)[:200]}")
     else:
         _refl = f"FAILURE in {skill_name}: {str(error)[:200]}"
+
+    # PR1 schema unification: stamp origin/summary so failure entries
+    # cluster alongside successful ones in the same origin bucket.
+    if summary is None:
+        summary = (_refl or action or "").strip()[:SUMMARY_MAX]
 
     # Let callers override the generic (7/8) defaults so a failed deploy or
     # schema migration is recorded with its true importance and pain score;
@@ -63,6 +73,8 @@ def on_failure(skill_name, action, error, context="", confidence=0.9,
         "confidence": confidence,
         "source": build_source(skill_name),
         "evidence_ids": list(evidence_ids) if evidence_ids else [],
+        "origin": origin,
+        "summary": summary,
     }
     # _count_recent_failures returns PRIOR failures only; add 1 for this one
     # so the rewrite flag fires on the Nth failure, not the (N+1)th.

@@ -141,6 +141,13 @@ def append_episodic(
         event["schema_version"] = CURRENT_SCHEMA
     if "ts" not in event:
         event["ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    # PR1 schema unification: every episode carries an `origin` discriminator
+    # so the dream cycle can group "what coding did" separately from "what an
+    # agent did" (cluster.py groups within origin). Backward compat: callers
+    # that don't stamp explicitly get `coding.tool_call`, matching the legacy
+    # interpretation.
+    if not event.get("origin"):
+        event["origin"] = "coding.tool_call"
     path = _episodic_path(namespace, brain_root)
     io = _import_episodic_io()
     io.append_jsonl(path, event)
