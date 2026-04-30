@@ -29,7 +29,15 @@ cd brainstack
 
 Then merge the printed snippet into `~/.claude/settings.json` (the installer never edits user config — see [`docs/claude-code-setup.md`](docs/claude-code-setup.md)).
 
-Migrating from a flat memory directory: `./install.sh --migrate ~/.claude/projects/<slug>/memory`. Verify health any time with `./install.sh --verify` or `make report-status`.
+Migrating from an existing native auto-memory directory:
+
+```bash
+./install.sh --migrate ~/.claude/projects/<slug>/memory
+```
+
+By default this also **replaces the source dir with a symlink** to `~/.agent/memory` (after backing up the original to `<source>.bak.<unix-ts>`), so Claude Code's ongoing native writes flow into the brain. Pass `--no-symlink` to leave the source dir in place — but then native writes after migration won't reach the brain. Re-running `--migrate` on an already-symlinked source is a no-op.
+
+Verify health any time with `./install.sh --verify` or `make report-status`.
 
 ---
 
