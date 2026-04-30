@@ -916,6 +916,99 @@ def _interactive(env: Optional[dict] = None, dst: Optional[Path] = None) -> int:
     return _execute_with_confirm(src=chosen.path, dst=dst)
 
 
+# ---- auto-migrate-all (PR-D) ----------------------------------------
+
+
+def auto_migrate_all(
+    brain_root: Path,
+    lock_path: Optional[Path] = None,
+    lock_timeout: float = 0.0,
+) -> dict:
+    """Run every tool listed in `<brain>/auto-migrate.json` sequentially.
+
+    Holds a global fcntl lock at `lock_path` (default
+    `<brain>/.auto-migrate.lock`) for the duration so a manual `--migrate`
+    can't run concurrently — important because adapters share a
+    `_imported.jsonl` sidecar that's read-modify-write.
+
+    `lock_timeout = 0` (default) → fail fast if another holder. Anything
+    > 0 polls for that many seconds before giving up.
+
+    Per-tool failures are logged but don't abort the whole run. Returns
+    a dict summary with `ran`, `errors`, and (if applicable) `skipped`.
+    """
+    import fcntl
+
+    if lock_path is None:
+        lock_path = brain_root / ".auto-migrate.lock"
+    brain_root.mkdir(parents=True, exist_ok=True)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Acquire the lock FIRST — before reading config — so concurrent
+    # invocations short-circuit at the lock instead of one of them
+    # racing past the empty-config / no-tools shortcut.
+    # Non-blocking try first; if `lock_timeout > 0`, poll until acquired
+    # or timeout.
+    lock_fd = open(lock_path, "w")
+    deadline = time.monotonic() + lock_timeout
+    while True:
+        try:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                lock_fd.close()
+                return {
+                    "ran": 0, "errors": [], "skipped": True,
+                    "reason": "lock held by another auto-migrate run",
+                }
+            time.sleep(0.05)
+
+    try:
+        # Now that we hold the lock, read config + iterate.
+        cfg_path = brain_root / "auto-migrate.json"
+        if not cfg_path.is_file():
+            return {"ran": 0, "errors": [], "skipped": False, "reason": "no config"}
+        try:
+            config = json.loads(cfg_path.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            return {"ran": 0, "errors": [{"format": "config", "error": str(e)}], "skipped": False}
+
+        tools = config.get("tools", []) or []
+        if not tools:
+            return {"ran": 0, "errors": [], "skipped": False, "reason": "no tools enabled"}
+
+        ran = 0
+        errors: list[dict] = []
+        results: list[dict] = []
+        for tool in tools:
+            fmt = tool.get("format")
+            src = Path(tool.get("source", ""))
+            try:
+                result = dispatch(src=src, dst=brain_root, dry_run=False)
+                results.append(result.to_dict())
+                ran += 1
+            except Exception as e:
+                errors.append({"format": fmt, "source": str(src), "error": str(e)})
+        return {
+            "schema_version": 1,
+            "ran": ran,
+            "errors": errors,
+            "results": results,
+            "skipped": False,
+        }
+    finally:
+        try:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        lock_fd.close()
+
+
+import time as _time_module  # noqa: E402  (lazy alias to avoid circular import noise)
+time = _time_module
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     p = argparse.ArgumentParser(prog="migrate_dispatcher")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -931,6 +1024,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     sp_exec.add_argument("dst")
 
     sp_int = sub.add_parser("interactive", help="discover + prompt + execute")
+
+    sp_auto = sub.add_parser("auto-migrate-all", help="run every enabled tool sequentially under a global lock")
+    sp_auto.add_argument("--brain-root", default=None)
 
     args = p.parse_args(argv)
 
@@ -956,6 +1052,12 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.cmd == "interactive":
         return _interactive()
+
+    if args.cmd == "auto-migrate-all":
+        brain_root = Path(args.brain_root or os.environ.get("BRAIN_ROOT") or os.path.expanduser("~/.agent"))
+        result = auto_migrate_all(brain_root=brain_root)
+        print(json.dumps(result, indent=2))
+        return 0 if not result.get("errors") else 1
 
     return 2
 
