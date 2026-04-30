@@ -197,20 +197,17 @@ def test_dispatch_routes_claude_code_to_adapter(tmp_path):
     assert (dst / "memory" / "semantic" / "lessons" / "feedback_x.md").exists()
 
 
-def test_dispatch_refuses_no_adapter_cursor(tmp_path):
-    """A cursor-plans source must refuse with a clear message until PR-B."""
+def test_dispatch_routes_cursor_plans_to_adapter(tmp_path):
+    """PR-B landed the Cursor adapter — cursor-plans sources now dispatch
+    cleanly. (The pre-PR-B `test_dispatch_refuses_no_adapter_cursor` was
+    a placeholder for this exact transition.)"""
     src = tmp_path / "plans"
     src.mkdir()
     (src / "thing_x.plan.md").write_text("# plan\n")
 
-    with pytest.raises(NoAdapterError) as exc:
-        dispatch(src=src, dst=tmp_path / "dst", dry_run=False)
-    # The error message must point at the future PR — a user reading the
-    # error should understand it's not their fault, and that an adapter
-    # is on the way.
-    msg = str(exc.value).lower()
-    assert "cursor" in msg
-    assert "adapter" in msg or "not yet supported" in msg
+    result = dispatch(src=src, dst=tmp_path / "dst", dry_run=True)
+    assert result.format == "cursor-plans"
+    assert result.files_planned >= 1
 
 
 def test_dispatch_refuses_no_adapter_codex(tmp_path):
