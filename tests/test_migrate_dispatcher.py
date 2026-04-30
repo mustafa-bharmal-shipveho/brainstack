@@ -210,17 +210,22 @@ def test_dispatch_routes_cursor_plans_to_adapter(tmp_path):
     assert result.files_planned >= 1
 
 
-def test_dispatch_refuses_no_adapter_codex(tmp_path):
-    """A codex-cli source must refuse with a clear message until PR-C."""
+def test_dispatch_routes_codex_to_adapter(tmp_path):
+    """PR-C landed the Codex CLI adapter — codex-cli sources now dispatch
+    cleanly. (The pre-PR-C `test_dispatch_refuses_no_adapter_codex` was
+    a placeholder for this exact transition.)"""
     src = tmp_path / "codex"
+    src.mkdir()
+    (src / "config.toml").write_text("# fake\n")
     sess = src / "sessions" / "2026" / "04" / "29"
     sess.mkdir(parents=True)
-    (sess / "rollout-x.jsonl").write_text('{"x":1}\n')
+    (sess / "rollout-x.jsonl").write_text(
+        '{"type":"event_msg","timestamp":"2026-04-29T10:00:00Z","payload":{"type":"x"}}\n'
+    )
 
-    with pytest.raises(NoAdapterError) as exc:
-        dispatch(src=src, dst=tmp_path / "dst", dry_run=False)
-    msg = str(exc.value).lower()
-    assert "codex" in msg
+    result = dispatch(src=src, dst=tmp_path / "dst", dry_run=True)
+    assert result.format == "codex-cli"
+    assert result.files_planned >= 1
 
 
 def test_dispatch_dry_run_writes_nothing(tmp_path):

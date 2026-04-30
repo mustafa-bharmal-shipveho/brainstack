@@ -560,8 +560,12 @@ register_adapter(ClaudeCodeAdapter())
 try:
     import cursor_adapter  # noqa: F401  side-effect import
 except ImportError:
-    # cursor_adapter ships with brainstack; if it's missing the user has
-    # a partial install. The Claude Code adapter still works.
+    pass
+
+# PR-C: Codex CLI adapter. Same side-effect import pattern.
+try:
+    import codex_adapter  # noqa: F401  side-effect import
+except ImportError:
     pass
 
 
