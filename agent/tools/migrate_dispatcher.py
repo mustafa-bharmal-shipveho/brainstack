@@ -538,9 +538,31 @@ def get_adapter_for(fmt: str) -> Optional[Adapter]:
     return None
 
 
-# Bootstrap: register the only built-in adapter. PR-B + PR-C will
-# append additional `register_adapter(...)` calls during their import.
+# Bootstrap: register the built-in adapters. Each adapter's module
+# self-registers on import via a `_register_once()` helper, so adding a
+# new one is just a new import line here.
+#
+# When this file runs as `python3 migrate_dispatcher.py ...` (install.sh's
+# invocation), Python loads it as `__main__`. Adapter modules later do
+# `from migrate_dispatcher import register_adapter`, which would
+# otherwise load a SECOND copy of this module under the canonical name,
+# giving each its own `_ADAPTERS` list — adapters would register on the
+# canonical copy while dispatch() reads from `__main__`'s. Alias both
+# names to the same module object before any adapter loads.
+if __name__ == "__main__":
+    sys.modules.setdefault("migrate_dispatcher", sys.modules[__name__])
+
 register_adapter(ClaudeCodeAdapter())
+
+# PR-B: Cursor plans adapter. Imported for the side effect of registering
+# the adapter — protected against duplicate-format errors via the
+# adapter module's own `_register_once()` guard.
+try:
+    import cursor_adapter  # noqa: F401  side-effect import
+except ImportError:
+    # cursor_adapter ships with brainstack; if it's missing the user has
+    # a partial install. The Claude Code adapter still works.
+    pass
 
 
 def _src_dst_overlap(src: Path, dst: Path) -> bool:

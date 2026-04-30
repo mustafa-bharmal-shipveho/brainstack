@@ -392,6 +392,8 @@ def test_install_migrate_symlinks_native_dir(tmp_path):
     # resolve the path-relative `from _atomic import ...`.
     import shutil
     shutil.copy(MIGRATE_SCRIPT, brain / "tools" / "migrate.py")
+    shutil.copy(REPO_ROOT / "agent" / "tools" / "migrate_dispatcher.py", brain / "tools")
+    shutil.copy(REPO_ROOT / "agent" / "tools" / "cursor_adapter.py", brain / "tools")
     shutil.copy(REPO_ROOT / "agent" / "memory" / "_atomic.py", brain / "memory" / "_atomic.py")
 
     make_flat_memory(src, {"feedback_x.md": SAMPLE_FEEDBACK, "user_x.md": SAMPLE_USER})
@@ -545,6 +547,8 @@ def test_install_migrate_refuses_pre_existing_unrelated_symlink(tmp_path):
     (brain / "tools").mkdir(parents=True)
     import shutil
     shutil.copy(MIGRATE_SCRIPT, brain / "tools" / "migrate.py")
+    shutil.copy(REPO_ROOT / "agent" / "tools" / "migrate_dispatcher.py", brain / "tools")
+    shutil.copy(REPO_ROOT / "agent" / "tools" / "cursor_adapter.py", brain / "tools")
 
     # User pre-symlinks src to their own dir (not the brain)
     src.symlink_to(elsewhere)
@@ -589,6 +593,8 @@ def test_install_migrate_rejects_conflicting_symlink_flags(tmp_path):
     (brain / "tools").mkdir(parents=True)
     import shutil
     shutil.copy(MIGRATE_SCRIPT, brain / "tools" / "migrate.py")
+    shutil.copy(REPO_ROOT / "agent" / "tools" / "migrate_dispatcher.py", brain / "tools")
+    shutil.copy(REPO_ROOT / "agent" / "tools" / "cursor_adapter.py", brain / "tools")
 
     install_script = REPO_ROOT / "install.sh"
     env = os.environ.copy()
@@ -700,6 +706,8 @@ def test_install_migrate_handles_trailing_slash_in_source(tmp_path):
     (brain / "tools").mkdir(parents=True)
     import shutil
     shutil.copy(MIGRATE_SCRIPT, brain / "tools" / "migrate.py")
+    shutil.copy(REPO_ROOT / "agent" / "tools" / "migrate_dispatcher.py", brain / "tools")
+    shutil.copy(REPO_ROOT / "agent" / "tools" / "cursor_adapter.py", brain / "tools")
     shutil.copy(REPO_ROOT / "agent" / "memory" / "_atomic.py", brain / "memory" / "_atomic.py")
 
     install_script = REPO_ROOT / "install.sh"
@@ -740,6 +748,8 @@ def test_install_migrate_uses_absolute_brain_path_in_symlink(tmp_path):
     (brain / "tools").mkdir(parents=True)
     import shutil
     shutil.copy(MIGRATE_SCRIPT, brain / "tools" / "migrate.py")
+    shutil.copy(REPO_ROOT / "agent" / "tools" / "migrate_dispatcher.py", brain / "tools")
+    shutil.copy(REPO_ROOT / "agent" / "tools" / "cursor_adapter.py", brain / "tools")
     shutil.copy(REPO_ROOT / "agent" / "memory" / "_atomic.py", brain / "memory" / "_atomic.py")
 
     install_script = REPO_ROOT / "install.sh"

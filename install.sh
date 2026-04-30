@@ -345,14 +345,46 @@ except Exception:
     fi
 
     echo "==> Migrating $MIGRATE_SOURCE -> $BRAIN_ROOT"
-    if ! "$PYTHON_BIN" "$BRAIN_ROOT/tools/migrate.py" "$MIGRATE_SOURCE" "$BRAIN_ROOT"; then
-        echo "install: migrate.py failed; not symlinking native dir" >&2
-        echo "         migration data (if any wrote successfully) is in $BRAIN_ROOT/memory" >&2
-        echo "         your source dir at $MIGRATE_SOURCE is unchanged" >&2
-        echo "         tip: if this is a Python version error, retry with" >&2
-        echo "              PYTHON_BIN=python3.13 ./install.sh --migrate $MIGRATE_SOURCE" >&2
-        exit 1
-    fi
+    # Detect format up front so we can route through the right path.
+    # Per codex review of PR-B: previously this branch always invoked
+    # migrate.py directly, which is the Claude-Code adapter — running it
+    # on a Cursor or Codex source produced garbled output (Cursor plans
+    # routed to personal/notes/ as generic Claude misc) AND would have
+    # symlinked the native dir to the brain (wrong for Cursor/Codex,
+    # whose tools keep writing to their own dirs).
+    src_format="$("$PYTHON_BIN" "$BRAIN_ROOT/tools/migrate_dispatcher.py" plan "$MIGRATE_SOURCE" "$BRAIN_ROOT" 2>&1 | grep -E "^  Detected format:" | sed 's/^  Detected format: *//' | head -1)"
+
+    case "$src_format" in
+        claude-code-flat|claude-code-nested|claude-code-mixed)
+            # Claude Code path: the legacy migrate.py invocation. After
+            # success, the symlink swap below installs the native symlink
+            # so Claude Code's ongoing auto-memory writes flow into the brain.
+            if ! "$PYTHON_BIN" "$BRAIN_ROOT/tools/migrate.py" "$MIGRATE_SOURCE" "$BRAIN_ROOT"; then
+                echo "install: migrate.py failed; not symlinking native dir" >&2
+                echo "         migration data (if any wrote successfully) is in $BRAIN_ROOT/memory" >&2
+                echo "         your source dir at $MIGRATE_SOURCE is unchanged" >&2
+                echo "         tip: if this is a Python version error, retry with" >&2
+                echo "              PYTHON_BIN=python3.13 ./install.sh --migrate $MIGRATE_SOURCE" >&2
+                exit 1
+            fi
+            ;;
+        *)
+            # Non-Claude path: dispatcher routes to the right adapter
+            # (Cursor today; PR-C's Codex adapter next). These tools
+            # keep writing to their native dirs, so SYMLINK_NATIVE is
+            # ignored — we ingest a snapshot only.
+            if ! "$PYTHON_BIN" "$BRAIN_ROOT/tools/migrate_dispatcher.py" execute "$MIGRATE_SOURCE" "$BRAIN_ROOT"; then
+                echo "install: dispatcher migration failed for format=$src_format" >&2
+                echo "         your source dir at $MIGRATE_SOURCE is unchanged" >&2
+                exit 1
+            fi
+            # Suppress the symlink swap below — it's Claude-only.
+            SYMLINK_NATIVE=0
+            echo "==> Non-Claude source ($src_format) migrated as a snapshot."
+            echo "    Source dir at $MIGRATE_SOURCE left untouched. Re-run when"
+            echo "    you want to import newer entries."
+            ;;
+    esac
 
     if [ "$SYMLINK_NATIVE" = "1" ]; then
         # Replace native source with a symlink to brain/memory so future
