@@ -13,31 +13,39 @@ cd brainstack
 This creates `~/.agent/` with the 4-layer memory scaffolding, all tools,
 and the hook wrapper. It does **not** edit `~/.claude/settings.json`.
 
-## 2. (Optional) Migrate an existing flat memory directory
+## 2. (Optional) Migrate an existing native auto-memory directory
 
 If you've been using Claude Code's auto-memory at
 `~/.claude/projects/<slug>/memory/` and want to bring those entries
-into the new layered structure:
+into the brain:
 
 ```bash
 ./install.sh --migrate ~/.claude/projects/<slug>/memory
 ```
 
-The migration parses `feedback_*.md`, `user_*.md`, `project_*.md`,
-`cycle-*.md`, `reference_*.md` patterns and routes each into the
-correct layer.
+This does two things:
 
-After migration, **symlink** the old auto-memory location to point at
-the new brain so Claude Code's auto-memory feature loads from the same
-place:
+1. **Migrates content losslessly into `~/.agent/memory/`.** Both flat
+   layouts (`feedback_*.md`, `user_*.md`, `project_*.md`, `cycle-*.md`,
+   `reference_*.md` at root) and modern nested layouts (`personal/profile/`,
+   `personal/notes/`, `personal/references/`, `semantic/lessons/`) are
+   handled. Frontmatter is preserved on both the companion `.md` and as
+   structured columns on `lessons.jsonl`. `MEMORY.md` hook annotations
+   (`— one-line description`) survive the regenerated index.
 
-```bash
-mv ~/.claude/projects/<slug>/memory ~/.claude/projects/<slug>/memory.flat-pre-install
-ln -s ~/.agent/memory ~/.claude/projects/<slug>/memory
-```
+2. **Replaces the source dir with a symlink to `~/.agent/memory`.** The
+   original content is moved to `<source>.bak.<unix-ts>` first. After this,
+   Claude Code's native auto-memory writes flow into the brain on every
+   session. Re-running `--migrate` on an already-symlinked source is a
+   no-op.
 
-(The flat backup preserves your originals; delete it after a couple of
-sessions when you're confident the migration is good.)
+To skip step 2 (keep the source dir untouched), pass `--no-symlink`. Note
+that without the symlink, native writes after migration will NOT reach the
+brain — you'd be on your own to forward them.
+
+If your source is already a symlink to somewhere other than the brain
+(advanced setup, dotfiles repo, network mount), `--migrate` will refuse
+rather than silently overwrite the link target.
 
 ## 3. Wire up the PostToolUse hook
 

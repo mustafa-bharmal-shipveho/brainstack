@@ -22,6 +22,15 @@
 #                                PATH or no supported package manager.
 #                                Currently supports macOS (brew) and Linux
 #                                with apt/dnf/pacman.
+#   --symlink-native          -- (DEFAULT, --migrate only) after migrating,
+#                                replace the source dir with a symlink to
+#                                $BRAIN_ROOT/memory so Claude Code's native
+#                                writes flow into the brain. Original content
+#                                is moved to <source>.bak.<unix-ts>.
+#   --no-symlink              -- (--migrate only) leave the source dir in
+#                                place after migration. Native writes will
+#                                NOT reach the brain; you must set up your
+#                                own forwarding to capture them.
 #
 # Always prints manual-merge instructions for ~/.claude/settings.json. The
 # installer never auto-edits user settings — you copy the snippet by hand,
@@ -36,6 +45,13 @@ INSTALL_SCANNER=""
 
 MODE="install"
 MIGRATE_SOURCE=""
+# After a successful --migrate, replace the source dir with a symlink to
+# $BRAIN_ROOT/memory so Claude Code's ongoing native writes flow into the
+# brain instead of drifting away from it. Default ON; opt out with
+# --no-symlink for users who want to keep their native dir untouched.
+SYMLINK_NATIVE=1
+# Track explicit user intent so we can refuse mutually exclusive flag pairs.
+SYMLINK_NATIVE_FLAG_COUNT=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -45,6 +61,16 @@ while [ $# -gt 0 ]; do
             MODE="migrate"
             MIGRATE_SOURCE="${2:-}"
             shift 2 || true
+            ;;
+        --symlink-native)
+            SYMLINK_NATIVE=1
+            SYMLINK_NATIVE_FLAG_COUNT=$((SYMLINK_NATIVE_FLAG_COUNT + 1))
+            shift
+            ;;
+        --no-symlink)
+            SYMLINK_NATIVE=0
+            SYMLINK_NATIVE_FLAG_COUNT=$((SYMLINK_NATIVE_FLAG_COUNT + 1))
+            shift
             ;;
         --brain-remote)
             BRAIN_REMOTE="${2:-}"
@@ -85,7 +111,7 @@ while [ $# -gt 0 ]; do
             esac
             ;;
         --help|-h)
-            sed -n '2,28p' "$0" | sed 's/^# //; s/^#//'
+            sed -n '2,38p' "$0" | sed 's/^# //; s/^#//'
             exit 0
             ;;
         *)
@@ -95,6 +121,14 @@ while [ $# -gt 0 ]; do
             ;;
     esac
 done
+
+# Mutually exclusive: passing both --symlink-native and --no-symlink is
+# almost always a wrapper-script bug. Refuse rather than silently using
+# whichever appeared last (per API persona finding #12).
+if [ "$SYMLINK_NATIVE_FLAG_COUNT" -gt 1 ]; then
+    echo "install: --symlink-native and --no-symlink are mutually exclusive" >&2
+    exit 2
+fi
 
 
 # ----- Helper: install a secret scanner via the local package manager -----
@@ -196,7 +230,15 @@ if [ "$MODE" = "migrate" ]; then
         echo "install: --migrate requires a source directory" >&2
         exit 2
     fi
-    if [ ! -d "$MIGRATE_SOURCE" ]; then
+    # Strip trailing slash. Shell completion happily appends one when the
+    # arg is a directory; later `mv tmp_link "$MIGRATE_SOURCE"` would treat
+    # a trailing-slash destination as "must be an existing dir" and fail
+    # after we've already moved the source to backup.
+    MIGRATE_SOURCE="${MIGRATE_SOURCE%/}"
+    # Use -e (existence) so symlinks pass too; we distinguish symlink vs
+    # regular dir below. The pair `-e + later -d` is intentional — see comment
+    # at the bottom of this block.
+    if [ ! -e "$MIGRATE_SOURCE" ] && [ ! -L "$MIGRATE_SOURCE" ]; then
         echo "install: migrate source not found: $MIGRATE_SOURCE" >&2
         exit 2
     fi
@@ -204,9 +246,139 @@ if [ "$MODE" = "migrate" ]; then
         echo "install: $BRAIN_ROOT does not exist; run install first" >&2
         exit 2
     fi
+    # The brain memory dir must exist before we can compare a symlink against
+    # it, AND `migrate.py` writes into it. Without this guard the idempotency
+    # check could spuriously fall through (per reliability/security review).
+    if [ ! -d "$BRAIN_ROOT/memory" ]; then
+        echo "install: $BRAIN_ROOT/memory does not exist; run install first" >&2
+        exit 2
+    fi
+
+    # Helper: canonical absolute path via Python's os.path.realpath. Handles
+    # absolute and relative symlink targets, broken symlinks (returns the
+    # input path unchanged for non-existent targets) and macOS BSD vs GNU
+    # readlink differences. Echoes the resolved path to stdout, empty on
+    # any error.
+    resolve_real() {
+        "$PYTHON_BIN" -c 'import os, sys
+try:
+    print(os.path.realpath(sys.argv[1]))
+except Exception:
+    pass' "$1" 2>/dev/null
+    }
+
+    brain_resolved="$(resolve_real "$BRAIN_ROOT/memory")"
+    if [ -z "$brain_resolved" ]; then
+        # `brain_resolved` is what we'll write into the symlink (when the
+        # swap runs). It must be absolute regardless of how the user passed
+        # `--brain-root` / `BRAIN_ROOT` (relative paths would create a
+        # broken symlink resolved relative to the symlink's parent dir).
+        echo "install: could not resolve $BRAIN_ROOT/memory to an absolute path" >&2
+        exit 2
+    fi
+
+    if [ -L "$MIGRATE_SOURCE" ]; then
+        link_resolved="$(resolve_real "$MIGRATE_SOURCE")"
+        if [ -n "$link_resolved" ] && [ "$link_resolved" = "$brain_resolved" ]; then
+            # Already pointing at the right place — true no-op.
+            echo "==> $MIGRATE_SOURCE is already symlinked to $BRAIN_ROOT/memory — no-op"
+            exit 0
+        fi
+        # Symlink exists but points elsewhere — refuse to silently overwrite
+        # user-owned topology (per reliability persona finding #4 + security
+        # finding #11). The user must remove the existing symlink themselves
+        # if they really want to retarget it.
+        echo "install: $MIGRATE_SOURCE is a symlink, but its target ($link_resolved)" >&2
+        echo "         is not $BRAIN_ROOT/memory ($brain_resolved)." >&2
+        echo "         Refusing to overwrite. Remove the symlink and re-run if intended." >&2
+        exit 2
+    fi
+
+    # Not a symlink — must be a real directory at this point.
+    if [ ! -d "$MIGRATE_SOURCE" ]; then
+        echo "install: migrate source must be a directory: $MIGRATE_SOURCE" >&2
+        exit 2
+    fi
+
     echo "==> Migrating $MIGRATE_SOURCE -> $BRAIN_ROOT"
-    "$PYTHON_BIN" "$BRAIN_ROOT/tools/migrate.py" "$MIGRATE_SOURCE" "$BRAIN_ROOT"
-    exit $?
+    if ! "$PYTHON_BIN" "$BRAIN_ROOT/tools/migrate.py" "$MIGRATE_SOURCE" "$BRAIN_ROOT"; then
+        echo "install: migrate.py failed; not symlinking native dir" >&2
+        echo "         migration data (if any wrote successfully) is in $BRAIN_ROOT/memory" >&2
+        echo "         your source dir at $MIGRATE_SOURCE is unchanged" >&2
+        echo "         tip: if this is a Python version error, retry with" >&2
+        echo "              PYTHON_BIN=python3.13 ./install.sh --migrate $MIGRATE_SOURCE" >&2
+        exit 1
+    fi
+
+    if [ "$SYMLINK_NATIVE" = "1" ]; then
+        # Replace native source with a symlink to brain/memory so future
+        # native writes (Claude Code, Cursor, etc.) flow into the brain.
+        #
+        # Atomic-ish symlink swap (per reliability + security review):
+        #   1. Create the new symlink at a sibling temp name.
+        #   2. Move the original source dir to the timestamped backup.
+        #   3. Rename the temp symlink into the original source path.
+        # If step 1 or 2 fails, the source is intact. If step 3 fails, the
+        # backup retains the original data and the temp symlink is left for
+        # the user to inspect — no silent data loss.
+        #
+        # `mktemp -d` would be cleaner for the backup name, but we want the
+        # backup to live as a sibling of the source, and `mktemp -d` doesn't
+        # accept a custom parent on all macOS versions reliably. Use a high-
+        # resolution timestamp to avoid same-second collisions.
+        ts="$(date +%s)"
+        # Append PID + a short random tag to avoid same-second collisions
+        # whether the backup-naming attacker is human, scripted, or just two
+        # parallel migrations of separate dirs.
+        rand="$RANDOM-$$"
+        backup="${MIGRATE_SOURCE%/}.bak.$ts.$rand"
+        if [ -e "$backup" ] || [ -L "$backup" ]; then
+            echo "install: backup target $backup already exists; aborting" >&2
+            exit 1
+        fi
+        tmp_link="${MIGRATE_SOURCE%/}.symlink-tmp.$ts.$rand"
+        if [ -e "$tmp_link" ] || [ -L "$tmp_link" ]; then
+            echo "install: temp symlink path $tmp_link already exists; aborting" >&2
+            exit 1
+        fi
+
+        # Step 1 — make the new symlink at the temp name. Use the resolved
+        # absolute path (computed above) so a relative `--brain-root` doesn't
+        # produce a symlink whose target dangles relative to the source's
+        # parent dir.
+        if ! ln -s "$brain_resolved" "$tmp_link"; then
+            echo "install: failed to create temp symlink at $tmp_link" >&2
+            echo "         source dir at $MIGRATE_SOURCE is unchanged" >&2
+            echo "         migration data is in $BRAIN_ROOT/memory" >&2
+            exit 1
+        fi
+        # Step 2 — move the original source to the backup.
+        if ! mv "$MIGRATE_SOURCE" "$backup"; then
+            echo "install: failed to back up $MIGRATE_SOURCE -> $backup" >&2
+            echo "         migration data is in $BRAIN_ROOT/memory; source is intact" >&2
+            echo "         remove $tmp_link and re-run --migrate to retry the symlink swap" >&2
+            rm -f "$tmp_link" 2>/dev/null || true
+            exit 1
+        fi
+        # Step 3 — rename the temp symlink into the source position. If this
+        # fails, the user is left with no source dir and no symlink; surface
+        # the recovery path explicitly.
+        if ! mv "$tmp_link" "$MIGRATE_SOURCE"; then
+            echo "install: failed to install symlink at $MIGRATE_SOURCE" >&2
+            echo "         source data is preserved at $backup" >&2
+            echo "         temp symlink left at $tmp_link" >&2
+            echo "         to recover manually: mv \"$backup\" \"$MIGRATE_SOURCE\"" >&2
+            exit 1
+        fi
+        echo "==> Backed up original source -> $backup"
+        echo "==> Symlinked $MIGRATE_SOURCE -> $BRAIN_ROOT/memory"
+        echo "    Native auto-memory writes now flow into the brain."
+    else
+        echo "==> --no-symlink set; leaving $MIGRATE_SOURCE in place" >&2
+        echo "==> WARNING: native writes after this point will NOT reach the brain." >&2
+        echo "    Re-run with --symlink-native (or symlink manually) to capture them." >&2
+    fi
+    exit 0
 fi
 
 # ----- Mode: verify -----

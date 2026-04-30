@@ -115,7 +115,12 @@ def test_lessons_jsonl_required_fields_match_upstream():
     schema_path = REPO_ROOT / "schemas" / "lessons.schema.json"
     schema = json.loads(schema_path.read_text())
     declared_fields = set(schema["properties"].keys())
-    extension_fields = {"why", "how_to_apply", "original_markdown_path"}
+    extension_fields = {
+        "why", "how_to_apply", "original_markdown_path",
+        # Migration-extension fields added when migrating native auto-memory
+        # dirs into the brain. See CHANGELOG / lessons.schema.json.
+        "name", "type", "source_session_id",
+    }
     upstream_in_schema = declared_fields - extension_fields
     assert upstream_in_schema == expected_fields, (
         f"Schema drift: missing={expected_fields - upstream_in_schema} "
@@ -131,4 +136,10 @@ def test_extension_fields_documented_as_extensions():
         desc = schema["properties"][fname]["description"]
         assert "[brainstack extension]" in desc, (
             f"Extension field {fname} not marked as extension in schema description"
+        )
+    # Migration-extension fields use a slightly different tag.
+    for fname in ["name", "type", "source_session_id"]:
+        desc = schema["properties"][fname]["description"]
+        assert "[brainstack migration extension]" in desc, (
+            f"Migration field {fname} not marked as extension in schema description"
         )

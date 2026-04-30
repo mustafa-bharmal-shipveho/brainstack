@@ -1,5 +1,60 @@
 # Changelog
 
+## Unreleased — Lossless native-dir migration (2026-04-29)
+
+Closes 4 documented losslessness gaps in `agent/tools/migrate.py` + `install.sh`
+so that migrating a Claude Code / Cursor native auto-memory directory into the
+brainstack `~/.agent/memory/` format never drops content.
+
+### Migration
+
+- **Recursive walk preserves nested target-shaped paths.** `personal/profile/`,
+  `personal/notes/`, `personal/references/`, `semantic/lessons/` (and deeper
+  subdirs like `semantic/lessons/sub-archive/`) round-trip verbatim. Was:
+  shallow `iterdir()` silently dropped nested files.
+- **`MEMORY.md` hook annotations survive index regeneration.** `parse_index_hooks()`
+  reads source MEMORY.md and re-applies `— hook text` suffixes onto matching
+  entries in the new index. Was: hooks discarded.
+- **Frontmatter fields carried into `lessons.jsonl`.** `name`, `type`, and
+  `originSessionId` (mapped to snake_case `source_session_id` to avoid
+  collision with the v0.3 episode `origin` discriminator) are now structured
+  columns on lesson rows. Was: only `description` consulted.
+- **`install.sh --migrate` symlinks native dir → brain by default.** New
+  `--symlink-native` (default) / `--no-symlink` flags. After migration, the
+  source dir is moved to `<source>.bak.<unix-ts>.<random>` and replaced with
+  a symlink to `$BRAIN_ROOT/memory`. Atomic-ish swap: temp symlink created
+  first, source moved to backup, temp renamed into place — failures at any
+  step preserve the original data and surface a recovery message.
+
+### Hardening (from persona review)
+
+- **Atomic writes in `migrate.py`.** Companion `.md`, `lessons.jsonl`, and
+  regenerated `MEMORY.md` now go through `_atomic.atomic_write_*`. SIGKILL
+  during migration leaves the previous file intact (matches the v0.1.1
+  hardening of `auto_dream` / `promote` / `review_state`).
+- **Self-recursion guard.** `migrate.py` refuses to run when source and target
+  overlap, and skips symlinked files during the recursive walk. Closes a
+  symlink-as-file exfiltration vector and prevents direct re-invocation on
+  a post-install symlink from walking the brain itself.
+- **Pre-existing user-owned symlinks respected.** If `<source>` is already
+  a symlink to somewhere other than the brain (advanced setups, dotfiles
+  repos, network mounts), `install.sh --migrate` refuses rather than
+  silently overwriting it.
+- **Portable readlink resolution.** Idempotency check uses Python
+  `os.path.realpath` (already required ≥ 3.10) instead of a `cd; pwd -P`
+  dance that broke on relative symlink targets and missing brain dirs.
+- **Mutually exclusive flag conflict refused.** Passing both `--symlink-native`
+  and `--no-symlink` errors with exit 2 rather than silently using whichever
+  appeared last.
+
+### Tests
+
+- 5 → 20 in `tests/test_migrate.py`. New tests cover recursion, hook
+  preservation, frontmatter carryover (rename test), install symlink swap,
+  pre-existing-symlink refusal, mutex flag conflict, self-recursion guard,
+  symlink-as-file rejection, nested-feedback subdir preservation, and an
+  end-to-end "every input byte addressable from new brain" round-trip.
+
 ## v0.3 — Episode schema unification + stats subcommand (2026-04-29)
 
 The companion [`agentry`](https://github.com/mustafa-bharmal-shipveho/agentry) integration added two writers (coding sessions + agentry's personal-agent surfaces) on the same brain. To keep their lessons distinct without splitting into separate stores, every episode now carries two new fields and the dream cycle clusters within-stream.

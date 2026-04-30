@@ -59,7 +59,20 @@
     },
     "original_markdown_path": {
       "type": "string",
-      "description": "[brainstack extension] If migrated from a flat memory dir, points to the long-form companion markdown that preserves any structure not captured in the JSONL row."
+      "description": "[brainstack extension] If migrated from a native auto-memory dir, points to the long-form companion markdown under <brain>/memory/ that preserves the original frontmatter and prose. NOT the source path — the source dir may be deleted post-migration."
+    },
+
+    "name": {
+      "type": "string",
+      "description": "[brainstack migration extension] Frontmatter `name` from the source feedback file. Capped at 200 chars. Distinct from the candidate-internal `pattern_<terms>_<hash>` naming that promote.py uses — see CHANGELOG."
+    },
+    "type": {
+      "type": "string",
+      "description": "[brainstack migration extension] Frontmatter `type` from the source feedback file (typically `feedback`). Capped at 200 chars."
+    },
+    "source_session_id": {
+      "type": "string",
+      "description": "[brainstack migration extension] Snake-case mapping of the source frontmatter's `originSessionId` — the Claude Code session that produced this feedback. Named `source_session_id` (NOT `origin_session_id`) to avoid collision with the v0.3 episodic `origin` discriminator (`coding.tool_call`, `agentry.<agent>.<event>`). Lessons do not carry `origin`."
     }
   },
   "additionalProperties": true
