@@ -583,6 +583,46 @@ def _src_dst_overlap(src: Path, dst: Path) -> bool:
     return s == d or s in d.parents or d in s.parents
 
 
+def _acquire_auto_migrate_lock(brain_root: Path, timeout: float = 0.0):
+    """Acquire `<brain>/.auto-migrate.lock` — the same lock
+    `auto_migrate_all` takes. Returns an open fd that the caller must
+    close to release (or pass to `_release_auto_migrate_lock`).
+
+    Returns None if the lock can't be acquired within `timeout` seconds.
+    Per codex P2 #3: manual dispatches need to hold the same lock as
+    the LaunchAgent's auto-migrate-all run, otherwise concurrent execution
+    can race on `_imported.jsonl`.
+    """
+    import fcntl
+    lock_path = brain_root / ".auto-migrate.lock"
+    try:
+        brain_root.mkdir(parents=True, exist_ok=True)
+        fd = open(lock_path, "w")
+    except OSError:
+        return None
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                fd.close()
+                return None
+            time.sleep(0.05)
+
+
+def _release_auto_migrate_lock(fd) -> None:
+    if fd is None:
+        return
+    import fcntl
+    try:
+        fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    fd.close()
+
+
 def dispatch(
     src: Path,
     dst: Path,
@@ -629,7 +669,30 @@ def dispatch(
 
     adapter = get_adapter_for(fmt)
     if adapter is not None:
-        return adapter.migrate(src, dst, dry_run=dry_run, options=options)
+        # Take the auto-migrate lock for non-dry runs so a manual
+        # `--migrate` doesn't race with the LaunchAgent's `auto-migrate-all`
+        # firing on the same brain (both write to the shared
+        # `_imported.jsonl` sidecar). Dry-runs are read-only and don't
+        # need the lock.
+        lock_fd = None
+        contention_warning: Optional[str] = None
+        if not dry_run:
+            lock_fd = _acquire_auto_migrate_lock(dst, timeout=2.0)
+            if lock_fd is None:
+                # Lock-held doesn't block the user — they explicitly
+                # asked to migrate. Surface the contention in warnings
+                # so the result is auditable.
+                contention_warning = (
+                    "could not acquire auto-migrate lock; another migrate "
+                    "may be running concurrently"
+                )
+        try:
+            result = adapter.migrate(src, dst, dry_run=dry_run, options=options)
+            if contention_warning:
+                result.warnings.append(contention_warning)
+            return result
+        finally:
+            _release_auto_migrate_lock(lock_fd)
 
     # No adapter — produce a message that points at the right future work.
     if fmt == "cursor-plans":
@@ -916,6 +979,99 @@ def _interactive(env: Optional[dict] = None, dst: Optional[Path] = None) -> int:
     return _execute_with_confirm(src=chosen.path, dst=dst)
 
 
+# ---- auto-migrate-all (PR-D) ----------------------------------------
+
+
+def auto_migrate_all(
+    brain_root: Path,
+    lock_path: Optional[Path] = None,
+    lock_timeout: float = 0.0,
+) -> dict:
+    """Run every tool listed in `<brain>/auto-migrate.json` sequentially.
+
+    Holds a global fcntl lock at `lock_path` (default
+    `<brain>/.auto-migrate.lock`) for the duration so a manual `--migrate`
+    can't run concurrently — important because adapters share a
+    `_imported.jsonl` sidecar that's read-modify-write.
+
+    `lock_timeout = 0` (default) → fail fast if another holder. Anything
+    > 0 polls for that many seconds before giving up.
+
+    Per-tool failures are logged but don't abort the whole run. Returns
+    a dict summary with `ran`, `errors`, and (if applicable) `skipped`.
+    """
+    import fcntl
+
+    if lock_path is None:
+        lock_path = brain_root / ".auto-migrate.lock"
+    brain_root.mkdir(parents=True, exist_ok=True)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Acquire the lock FIRST — before reading config — so concurrent
+    # invocations short-circuit at the lock instead of one of them
+    # racing past the empty-config / no-tools shortcut.
+    # Non-blocking try first; if `lock_timeout > 0`, poll until acquired
+    # or timeout.
+    lock_fd = open(lock_path, "w")
+    deadline = time.monotonic() + lock_timeout
+    while True:
+        try:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                lock_fd.close()
+                return {
+                    "ran": 0, "errors": [], "skipped": True,
+                    "reason": "lock held by another auto-migrate run",
+                }
+            time.sleep(0.05)
+
+    try:
+        # Now that we hold the lock, read config + iterate.
+        cfg_path = brain_root / "auto-migrate.json"
+        if not cfg_path.is_file():
+            return {"ran": 0, "errors": [], "skipped": False, "reason": "no config"}
+        try:
+            config = json.loads(cfg_path.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            return {"ran": 0, "errors": [{"format": "config", "error": str(e)}], "skipped": False}
+
+        tools = config.get("tools", []) or []
+        if not tools:
+            return {"ran": 0, "errors": [], "skipped": False, "reason": "no tools enabled"}
+
+        ran = 0
+        errors: list[dict] = []
+        results: list[dict] = []
+        for tool in tools:
+            fmt = tool.get("format")
+            src = Path(tool.get("source", ""))
+            try:
+                result = dispatch(src=src, dst=brain_root, dry_run=False)
+                results.append(result.to_dict())
+                ran += 1
+            except Exception as e:
+                errors.append({"format": fmt, "source": str(src), "error": str(e)})
+        return {
+            "schema_version": 1,
+            "ran": ran,
+            "errors": errors,
+            "results": results,
+            "skipped": False,
+        }
+    finally:
+        try:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        lock_fd.close()
+
+
+import time as _time_module  # noqa: E402  (lazy alias to avoid circular import noise)
+time = _time_module
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     p = argparse.ArgumentParser(prog="migrate_dispatcher")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -931,6 +1087,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     sp_exec.add_argument("dst")
 
     sp_int = sub.add_parser("interactive", help="discover + prompt + execute")
+
+    sp_auto = sub.add_parser("auto-migrate-all", help="run every enabled tool sequentially under a global lock")
+    sp_auto.add_argument("--brain-root", default=None)
 
     args = p.parse_args(argv)
 
@@ -956,6 +1115,12 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.cmd == "interactive":
         return _interactive()
+
+    if args.cmd == "auto-migrate-all":
+        brain_root = Path(args.brain_root or os.environ.get("BRAIN_ROOT") or os.path.expanduser("~/.agent"))
+        result = auto_migrate_all(brain_root=brain_root)
+        print(json.dumps(result, indent=2))
+        return 0 if not result.get("errors") else 1
 
     return 2
 

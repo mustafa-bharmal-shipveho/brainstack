@@ -55,10 +55,30 @@ SYMLINK_NATIVE_FLAG_COUNT=0
 # --dry-run shows the plan without executing; used by tests + cautious users.
 DRY_RUN=0
 
+# Captures any extra args after a mode flag so they can be forwarded to
+# the relevant helper. Used for --setup-auto-migrate / --remove-auto-migrate
+# which delegate to the Python helper for everything past the mode.
+EXTRA_ARGS=()
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --upgrade) MODE="upgrade"; shift ;;
         --verify) MODE="verify"; shift ;;
+        --setup-auto-migrate)
+            MODE="setup-auto-migrate"
+            shift
+            # Everything else is forwarded to auto_migrate_install.py setup.
+            # Note: global flags (--dry-run, --brain-root) parsed earlier
+            # are also forwarded — see the call site for the merge logic.
+            while [ $# -gt 0 ]; do EXTRA_ARGS+=("$1"); shift; done
+            break
+            ;;
+        --remove-auto-migrate)
+            MODE="remove-auto-migrate"
+            shift
+            while [ $# -gt 0 ]; do EXTRA_ARGS+=("$1"); shift; done
+            break
+            ;;
         --migrate)
             MODE="migrate"
             # Consume the source path only if the next arg is NOT another
@@ -455,6 +475,35 @@ except Exception:
         echo "    Re-run with --symlink-native (or symlink manually) to capture them." >&2
     fi
     exit 0
+fi
+
+# ----- Mode: setup-auto-migrate / remove-auto-migrate -----
+# Delegate to the Python helper. Forwards everything after the mode flag
+# (--enable, --disable, --all, --none, --dry-run, --print-plist, etc.).
+if [ "$MODE" = "setup-auto-migrate" ] || [ "$MODE" = "remove-auto-migrate" ]; then
+    helper="$BRAIN_ROOT/tools/auto_migrate_install.py"
+    if [ ! -f "$helper" ]; then
+        echo "install: $helper is missing" >&2
+        echo "         run: ./install.sh --upgrade   to refresh tools" >&2
+        exit 2
+    fi
+    # Forward globally-parsed flags to the helper. `--dry-run` (parsed by
+    # this wrapper) is the most important one — codex review P2 caught
+    # `./install.sh --dry-run --setup-auto-migrate --all` performing a
+    # real install because DRY_RUN never reached argparse.
+    forwarded_args=()
+    if [ "$DRY_RUN" = "1" ]; then
+        forwarded_args+=(--dry-run)
+    fi
+    forwarded_args+=(--brain-root "$BRAIN_ROOT")
+    # If the user ALSO passed --brain-root in the post-flag args, the
+    # helper's argparse takes the LAST one, which is what they intended.
+    if [ "$MODE" = "setup-auto-migrate" ]; then
+        BRAIN_ROOT="$BRAIN_ROOT" "$PYTHON_BIN" "$helper" setup "${forwarded_args[@]}" "${EXTRA_ARGS[@]}"
+    else
+        BRAIN_ROOT="$BRAIN_ROOT" "$PYTHON_BIN" "$helper" remove "${forwarded_args[@]}" "${EXTRA_ARGS[@]}"
+    fi
+    exit $?
 fi
 
 # ----- Mode: verify -----
