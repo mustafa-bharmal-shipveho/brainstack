@@ -29,13 +29,27 @@ cd brainstack
 
 Then merge the printed snippet into `~/.claude/settings.json` (the installer never edits user config — see [`docs/claude-code-setup.md`](docs/claude-code-setup.md)).
 
-Migrating from an existing native auto-memory directory:
+Migrating from existing AI-tool memory dirs (Claude Code, Cursor, Codex CLI):
 
 ```bash
+# Interactive — discovers what's on disk and lets you pick what to import:
+./install.sh --migrate
+
+# Or point at a specific source explicitly:
 ./install.sh --migrate ~/.claude/projects/<slug>/memory
 ```
 
-By default this also **replaces the source dir with a symlink** to `~/.agent/memory` (after backing up the original to `<source>.bak.<unix-ts>`), so Claude Code's ongoing native writes flow into the brain. Pass `--no-symlink` to leave the source dir in place — but then native writes after migration won't reach the brain. Re-running `--migrate` on an already-symlinked source is a no-op.
+For Claude Code's native auto-memory, `--migrate` defaults to swapping the source for a symlink to `~/.agent/memory` (with a timestamped backup) — so Claude Code's ongoing writes flow into the brain in real time. Cursor + Codex sources are ingested as snapshots (those tools keep writing to their own dirs).
+
+### Set it once, forget it
+
+```bash
+./install.sh --setup-auto-migrate
+```
+
+Wizard asks which tools you use, installs ONE LaunchAgent that runs every hour and ingests new Cursor plans + Codex CLI sessions into the brain — sub-second incremental runs via offset-tracked idempotency. Claude Code is already automatic via the symlink. After this runs, you don't have to remember to migrate anything again.
+
+Power users can drive it non-interactively: `--enable cursor-plans,codex-cli`, `--all`, `--none`, `--dry-run`, `--print-plist`. Tear-down: `./install.sh --remove-auto-migrate`.
 
 Verify health any time with `./install.sh --verify` or `make report-status`.
 
@@ -44,18 +58,18 @@ Verify health any time with `./install.sh --verify` or `make report-status`.
 ## How it works
 
 ```
-              capture           distill            graduate           recall
-Claude Code ─────────► episodic/ ────────► candidates/ ─────────► semantic/ ────────► next session
-(PostToolUse hook)     JSONL log,           staged by              you review            auto-loaded via
-                       sentinel-locked      dream cycle            graduate.py /         MEMORY.md → CLAUDE.md
-                                            (nightly, launchd)     reject.py
+                                capture                distill                graduate              recall
+   ┌─ Claude Code (real-time hook) ──────────► episodic/ ──────────► candidates/ ──────────► semantic/ ────► next session
+   ├─ Cursor (hourly LaunchAgent) ─────────────►   JSONL log,         staged by              you review        auto-loaded
+   └─ Codex CLI (hourly LaunchAgent) ──────────►   sentinel-locked    dream cycle            graduate.py /     via MEMORY.md
+                                                                      (nightly)              reject.py         → CLAUDE.md
 
-                       ↻ git sync (hourly via launchd) — push to your private brain remote, scanner-gated
+                                              ↻ git sync (hourly) — push to your private brain remote, scanner-gated
 ```
 
-Five stages:
+Five stages, three input sources:
 
-1. **Capture (every tool call).** `PostToolUse` hook writes to `~/.agent/memory/episodic/AGENT_LEARNINGS.jsonl`. Sentinel-locked so concurrent sessions don't corrupt the log.
+1. **Capture.** Claude Code writes via `PostToolUse` hook in real time. Cursor + Codex CLI are ingested hourly by the auto-migrate LaunchAgent (per-tool adapters parse their native formats — `*.plan.md` for Cursor, `rollout-*.jsonl` for Codex sessions). Each source feeds the same `~/.agent/memory/episodic/` (Codex episodes land under `episodic/codex/` for namespace isolation).
 2. **Distill (nightly).** `auto_dream.py` clusters episodes by salience and promotes high-signal patterns to `~/.agent/memory/candidates/`. Atomic writes; no torn-file windows.
 3. **Graduate (your review).** `agent/tools/graduate.py <id>` promotes a candidate to `~/.agent/memory/semantic/` (permanent). `reject.py` discards. `MEMORY.md` index updates so the next session loads it automatically.
 4. **Sync (hourly).** `sync.sh` runs `trufflehog`/`gitleaks`, scrubs episodic JSONL with `redact_jsonl.py`, then `git push` to your private brain remote. Override audit log + a server-side GitHub Action catch local bypasses.
@@ -117,11 +131,18 @@ Quality numbers (synthetic-corpus, deterministic seed) and per-strategy benchmar
 
 ---
 
+## What's shipped
+
+- **Multi-tool ingest.** Claude Code (real-time via symlink), Cursor plans, Codex CLI sessions. Pluggable `Adapter` Protocol — see [`docs/multi-tool-migrate.md`](docs/multi-tool-migrate.md) for authoring a new one.
+- **Auto-migrate LaunchAgent.** `./install.sh --setup-auto-migrate` — sets it once, forget it.
+- **Discovery + interactive wizard.** `./install.sh --migrate` (no source) auto-detects what's on disk and lets you pick.
+
 ## Roadmap
 
-- **v0.2 — Multi-harness.** Adapters for Cursor, Codex CLI, Windsurf, Aider. Linux systemd units alongside macOS launchd. Brew tap. Interactive install wizard.
-- **v0.3 — Smarter dream cycle.** Multi-machine append-conflict resolution. Brain visualization dashboard. LLM-graded salience (currently keyword-based).
+- **v0.2 polish.** Aider, Cline, Windsurf, Continue adapters when those tools' data shows up on a real user's machine. Brew tap. Linux systemd-timer port (currently macOS launchd only).
+- **v0.3 — Smarter dream cycle.** Per-namespace clusterer so Codex episodes graduate to lessons (today they ingest but stay in `episodic/codex/` because the default clusterer is namespace-default-only). Multi-machine append-conflict resolution. Brain visualization dashboard. LLM-graded salience.
 - **v0.4 — Compounding intelligence.** Opt-in cross-user lesson sharing (auto-redacted). Cross-project retrieval ("when working on repos like this, you learned…"). Active-recall verification.
+- **Hook adapters for Cursor + Codex** (replaces the hourly polling with direct-write capture). Each tool needs its own integration — separate PR per tool when their native hook stories settle.
 
 Throughline: keep the security posture sharp. The framework's value is proportional to how much you trust putting your tool-call history into a remote.
 

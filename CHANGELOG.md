@@ -1,5 +1,61 @@
 # Changelog
 
+## Unreleased — Multi-tool migration series (2026-04-30)
+
+Five PRs (#6 → #10) shipped together, turning brainstack from "Claude Code
+only" into a multi-tool brain that ingests Claude Code, Cursor plans, and
+Codex CLI sessions automatically.
+
+### Added
+
+- **Multi-tool adapter chassis** (PR #7) at `agent/tools/migrate_dispatcher.py`.
+  Pluggable `Adapter` Protocol with public `register_adapter` / `unregister_adapter` /
+  `get_adapter_for` / `discover_candidates`. `MigrationResult` is JSON-serializable
+  with `schema_version` + `tool_specific` escape hatch.
+- **Cursor adapter** (PR #8) at `agent/tools/cursor_adapter.py`. Ingests
+  `~/.cursor/plans/*.plan.md` byte-for-byte into `personal/notes/cursor/`
+  under namespace `cursor`.
+- **Codex CLI adapter** (PR #9) at `agent/tools/codex_adapter.py`. Ingests
+  `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-*.jsonl` + `~/.codex/history.jsonl`
+  into `episodic/codex/AGENT_LEARNINGS.jsonl`. Offset-tracked idempotency:
+  re-runs only import the byte range appended since the last run, so
+  hourly ticks against a 7,000-episode codex history complete sub-second.
+- **Auto-migrate setup wizard** (PR #10): `./install.sh --setup-auto-migrate`
+  installs ONE LaunchAgent (`com.brainstack.auto-migrate`) that runs every
+  enabled tool sequentially under a global fcntl lock. After running the
+  wizard, no manual intervention needed — Cursor + Codex flow into the
+  brain hourly. Non-interactive flags `--enable`, `--disable`, `--all`,
+  `--none`, `--dry-run`, `--print-plist` for CI / dotfile bootstrap.
+  Tear-down via `--remove-auto-migrate`.
+- **Discovery flow** (PR #7): `./install.sh --migrate` with no source path
+  drops into an interactive wizard that auto-detects what's on disk
+  (Claude Code project memories, Cursor plans, Codex CLI sessions) and
+  lets you pick what to import. Plus `--dry-run` for preview.
+
+### Changed
+
+- `install.sh --migrate` is no longer Claude-only. The non-dry path
+  detects the source format via the dispatcher and routes to the right
+  adapter. Cursor + Codex sources are ingested as snapshots (the
+  `--symlink-native` swap is suppressed — those tools keep writing to
+  their own dirs; only Claude Code's flat / nested memory gets the
+  symlink).
+- Manual `dispatch()` calls now hold the same fcntl lock the auto-migrate
+  LaunchAgent does, preventing races on the shared `_imported.jsonl`
+  sidecar.
+
+### Hardening (codex review across 4 passes)
+
+- Plist generated via Python `plistlib`, not `sed` — paths with spaces /
+  XML metacharacters round-trip correctly.
+- Modern `launchctl bootout`/`bootstrap` API (refused under sudo).
+- Brain root resolved to absolute before plist generation (relative
+  paths produced unusable LaunchAgents).
+- `--dry-run` honored at function level — no filesystem writes during
+  preview.
+- 23 tests for the auto-migrate path with mocked `launchctl`. Total
+  test count: 269 → 292.
+
 ## Unreleased — Lossless native-dir migration (2026-04-29)
 
 Closes 4 documented losslessness gaps in `agent/tools/migrate.py` + `install.sh`
