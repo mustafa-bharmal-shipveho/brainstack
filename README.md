@@ -257,7 +257,54 @@ See [`docs/`](docs/) for full architecture, redaction policy, hook precedence, a
 
 ## External consumers (v0.2-rc1)
 
-External agent frameworks can read and write the brain through `agent/memory/sdk.py` using namespaces. The SDK exposes `append_episodic`, `query_semantic`, `read_policy`, `write_policy`, and `register_clusterer` — each takes a `namespace` arg matching `^[a-z][a-z0-9_-]{0,31}$`. Pluggable per-namespace dream-cycle clusterers live in `agent/dream/registry.py` (`run_all` aggregates results across namespaces). Backward compatibility is preserved: `namespace="default"` maps to the v0.1 paths (no extra subdir under `episodic/`, `semantic/`, `candidates/`), so existing v0.1 brains do not need migration. New CLI flags `--namespace NS` are now available on `graduate.py` / `reject.py`, and two new tools (`promote.py`, `rollback.py`) manage tier policy + audit log per namespace. See `mustafa-agents` (companion repo) for the reference TypeScript runtime that consumes this SDK.
+External agent frameworks can read and write the brain through `agent/memory/sdk.py` using namespaces. The SDK exposes `append_episodic`, `query_semantic`, `read_policy`, `write_policy`, and `register_clusterer` — each takes a `namespace` arg matching `^[a-z][a-z0-9_-]{0,31}$`. Pluggable per-namespace dream-cycle clusterers live in `agent/dream/registry.py` (`run_all` aggregates results across namespaces). Backward compatibility is preserved: `namespace="default"` maps to the v0.1 paths (no extra subdir under `episodic/`, `semantic/`, `candidates/`), so existing v0.1 brains do not need migration. New CLI flags `--namespace NS` are now available on `graduate.py` / `reject.py`, and two new tools (`promote.py`, `rollback.py`) manage tier policy + audit log per namespace. See [`agentry`](https://github.com/mustafa-bharmal-shipveho/agentry) (the reference TypeScript runtime) for an end-to-end consumer of this SDK — its `MemoryProvider` interface lets users swap brainstack for any other backend without forking.
+
+## v0.3 — episode schema unification + stats subcommand
+
+The companion [`agentry`](https://github.com/mustafa-bharmal-shipveho/agentry) integration (Apr 2026) added two writers (coding sessions + agentry's personal-agent surfaces) on the same brain. To keep their lessons distinct without splitting into separate stores, every episode now carries two new fields and the dream cycle clusters within-stream.
+
+### `origin` + `summary` fields
+
+Every episode written via `sdk.append_episodic` (or the `claude_code_post_tool.py` hook) carries:
+- **`origin: str`** — discriminator. `coding.tool_call` for Claude Code post-tool hooks (default — auto-stamped if missing); `agentry.<agent>.<event>` for personal-agent writers; freeform for other frameworks.
+- **`summary: str`** — 1-line cluster feature. Auto-derived as `(reflection or action)[:120]` when not explicit. `cluster.py` reads `summary` first, falls back to the legacy `(action, reflection, detail)` triplet — pre-v0.3 episodes cluster identically to before.
+
+`cluster.content_cluster` groups by `origin` before clustering within bucket. Two episodes with identical text but different origins never end up in the same cluster — codex-driven decision after a multi-tenant review caught that pattern_id collisions would silently drop one origin's candidate. `pattern_id(claim, conditions, origin)` now mixes origin into the hash unless it's the legacy `coding.tool_call` default (back-compat for already-staged candidates).
+
+Candidates now carry `origin` too (`promote.write_candidates` propagates it), so per-namespace lessons stay traceable to their stream.
+
+### Migrating legacy episodes
+
+A one-shot helper stamps `origin: "coding.tool_call"` on entries written before v0.3:
+
+```bash
+# Dry-run first — reports counts without writing
+python3 -m agent.tools.backfill_origin --brain-root ~/.agent --dry-run
+
+# Real run (atomic; idempotent; preserves entries that already have an explicit origin)
+python3 -m agent.tools.backfill_origin --brain-root ~/.agent
+```
+
+Sentinel-locked under `<jsonl>.lock` (matches the dream cycle's contract) so concurrent appends from a live Claude Code session are safe. Reports the count of dropped unparseable lines so operators can decide whether to investigate.
+
+### `sdk_cli stats` subcommand
+
+```bash
+$ python3 -m agent.tools.sdk_cli stats --brain-root ~/.agent
+{
+  "namespaces": ["default", "inbox", "mustafa-agent"],
+  "episodeCount": 3712,
+  "lessonCount": 20,
+  "candidateCount": 4,
+  "perNamespace": {
+    "default":       {"episodes": 3700, "lessons": 18, "candidates": 2},
+    "inbox":         {"episodes":    8, "lessons":  1, "candidates": 1},
+    "mustafa-agent": {"episodes":    4, "lessons":  1, "candidates": 1}
+  }
+}
+```
+
+`--namespace NS` to slice. Walks `<brain>/memory/episodic/` and excludes reserved subdirs (`snapshots/`, `working/`, etc.) so a stray jsonl in a kernel-internal dir doesn't leak into the count. The agentry-side `agentry brain stats` CLI is a thin presenter over this output.
 
 ## License
 
