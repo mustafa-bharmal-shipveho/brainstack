@@ -1,5 +1,72 @@
 # Changelog
 
+## v0.3 — Episode schema unification + stats subcommand (2026-04-29)
+
+The companion [`agentry`](https://github.com/mustafa-bharmal-shipveho/agentry) integration added two writers (coding sessions + agentry's personal-agent surfaces) on the same brain. To keep their lessons distinct without splitting into separate stores, every episode now carries two new fields and the dream cycle clusters within-stream.
+
+### `origin` + `summary` fields
+
+Every episode written via `sdk.append_episodic` (or the `claude_code_post_tool.py` hook) carries:
+
+- **`origin: str`** — discriminator. `coding.tool_call` for Claude Code post-tool hooks (default — auto-stamped if missing); `agentry.<agent>.<event>` for personal-agent writers; freeform for other frameworks.
+- **`summary: str`** — 1-line cluster feature. Auto-derived as `(reflection or action)[:120]` when not explicit. `cluster.py` reads `summary` first, falls back to the legacy `(action, reflection, detail)` triplet — pre-v0.3 episodes cluster identically to before.
+
+`cluster.content_cluster` groups by `origin` before clustering within bucket. Two episodes with identical text but different origins never end up in the same cluster — codex-driven decision after a multi-tenant review caught that `pattern_id` collisions would silently drop one origin's candidate. `pattern_id(claim, conditions, origin)` now mixes origin into the hash unless it's the legacy `coding.tool_call` default (back-compat for already-staged candidates).
+
+Candidates now carry `origin` too (`promote.write_candidates` propagates it), so per-namespace lessons stay traceable to their stream.
+
+### Migrating legacy episodes
+
+A one-shot helper stamps `origin: "coding.tool_call"` on entries written before v0.3:
+
+```bash
+# Dry-run first — reports counts without writing
+python3 -m agent.tools.backfill_origin --brain-root ~/.agent --dry-run
+
+# Real run (atomic; idempotent; preserves entries that already have an explicit origin)
+python3 -m agent.tools.backfill_origin --brain-root ~/.agent
+```
+
+Sentinel-locked under `<jsonl>.lock` (matches the dream cycle's contract) so concurrent appends from a live Claude Code session are safe. Reports the count of dropped unparseable lines so operators can decide whether to investigate.
+
+### `sdk_cli stats` subcommand
+
+```bash
+$ python3 -m agent.tools.sdk_cli stats --brain-root ~/.agent
+{
+  "namespaces": ["default", "inbox", "mustafa-agent"],
+  "episodeCount": 3712,
+  "lessonCount": 20,
+  "candidateCount": 4,
+  "perNamespace": {
+    "default":       {"episodes": 3700, "lessons": 18, "candidates": 2},
+    "inbox":         {"episodes":    8, "lessons":  1, "candidates": 1},
+    "mustafa-agent": {"episodes":    4, "lessons":  1, "candidates": 1}
+  }
+}
+```
+
+`--namespace NS` to slice. Walks `<brain>/memory/episodic/` and excludes reserved subdirs (`snapshots/`, `working/`, etc.) so a stray jsonl in a kernel-internal dir doesn't leak into the count. The agentry-side `agentry brain stats` CLI is a thin presenter over this output.
+
+## v0.2-rc1 — External-consumer SDK + namespaces (2026-04-29)
+
+External agent frameworks can now read and write the brain through `agent/memory/sdk.py` using namespaces.
+
+### Added
+
+- `agent/memory/sdk.py` — exposes `append_episodic`, `query_semantic`, `read_policy`, `write_policy`, and `register_clusterer`. Each takes a `namespace` arg matching `^[a-z][a-z0-9_-]{0,31}$`.
+- `agent/dream/registry.py` — pluggable per-namespace dream-cycle clusterers; `run_all` aggregates results across namespaces.
+- `agent/tools/promote.py` and `agent/tools/rollback.py` — manage tier policy + audit log per namespace.
+- `--namespace NS` flag on `graduate.py` and `reject.py`.
+
+### Changed
+
+- Backward compatibility: `namespace="default"` maps to the v0.1 paths (no extra subdir under `episodic/`, `semantic/`, `candidates/`). Existing v0.1 brains do not need migration.
+
+### Reference consumer
+
+[`agentry`](https://github.com/mustafa-bharmal-shipveho/agentry) (TypeScript runtime) is the end-to-end SDK consumer. Its `MemoryProvider` interface lets users swap brainstack for any other backend without forking.
+
 ## v0.1.1 — Security hardening (2026-04-27)
 
 Applies the priority-2-through-10 findings from `SECURITY_REVIEW.md`. C1
