@@ -583,6 +583,46 @@ def _src_dst_overlap(src: Path, dst: Path) -> bool:
     return s == d or s in d.parents or d in s.parents
 
 
+def _acquire_auto_migrate_lock(brain_root: Path, timeout: float = 0.0):
+    """Acquire `<brain>/.auto-migrate.lock` — the same lock
+    `auto_migrate_all` takes. Returns an open fd that the caller must
+    close to release (or pass to `_release_auto_migrate_lock`).
+
+    Returns None if the lock can't be acquired within `timeout` seconds.
+    Per codex P2 #3: manual dispatches need to hold the same lock as
+    the LaunchAgent's auto-migrate-all run, otherwise concurrent execution
+    can race on `_imported.jsonl`.
+    """
+    import fcntl
+    lock_path = brain_root / ".auto-migrate.lock"
+    try:
+        brain_root.mkdir(parents=True, exist_ok=True)
+        fd = open(lock_path, "w")
+    except OSError:
+        return None
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                fd.close()
+                return None
+            time.sleep(0.05)
+
+
+def _release_auto_migrate_lock(fd) -> None:
+    if fd is None:
+        return
+    import fcntl
+    try:
+        fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    fd.close()
+
+
 def dispatch(
     src: Path,
     dst: Path,
@@ -629,7 +669,30 @@ def dispatch(
 
     adapter = get_adapter_for(fmt)
     if adapter is not None:
-        return adapter.migrate(src, dst, dry_run=dry_run, options=options)
+        # Take the auto-migrate lock for non-dry runs so a manual
+        # `--migrate` doesn't race with the LaunchAgent's `auto-migrate-all`
+        # firing on the same brain (both write to the shared
+        # `_imported.jsonl` sidecar). Dry-runs are read-only and don't
+        # need the lock.
+        lock_fd = None
+        contention_warning: Optional[str] = None
+        if not dry_run:
+            lock_fd = _acquire_auto_migrate_lock(dst, timeout=2.0)
+            if lock_fd is None:
+                # Lock-held doesn't block the user — they explicitly
+                # asked to migrate. Surface the contention in warnings
+                # so the result is auditable.
+                contention_warning = (
+                    "could not acquire auto-migrate lock; another migrate "
+                    "may be running concurrently"
+                )
+        try:
+            result = adapter.migrate(src, dst, dry_run=dry_run, options=options)
+            if contention_warning:
+                result.warnings.append(contention_warning)
+            return result
+        finally:
+            _release_auto_migrate_lock(lock_fd)
 
     # No adapter — produce a message that points at the right future work.
     if fmt == "cursor-plans":

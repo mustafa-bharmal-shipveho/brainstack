@@ -571,6 +571,122 @@ def test_remove_auto_migrate_clean_teardown(tmp_path):
 # --- 18: refuses under sudo ---
 
 
+def test_install_dry_run_writes_no_files(tmp_path):
+    """Codex P3: install_plist(dry_run=True) was creating plist_dir +
+    writing the .bak file before the dry-run check. Function-level
+    contract violated. Pin the fix."""
+    plist_dir = tmp_path / "non-existent-yet" / "LaunchAgents"
+    fake = FakeLaunchctl()
+    plist_bytes = generate_plist(tmp_path, Path(sys.executable))
+    # Existing plist with different content — would normally trigger backup
+    plist_dir.mkdir(parents=True)
+    (plist_dir / f"{LABEL}.plist").write_bytes(b"<plist>old</plist>\n")
+
+    # Snapshot dir state
+    before = sorted(plist_dir.iterdir())
+
+    result = install_plist(
+        plist_bytes=plist_bytes, plist_dir=plist_dir,
+        launchctl_bin=fake, uid=502, dry_run=True,
+    )
+    after = sorted(plist_dir.iterdir())
+    # No new files (no .bak created)
+    assert before == after, f"dry_run wrote files: {set(after) - set(before)}"
+    # No launchctl calls
+    assert fake.calls == []
+    # But the result advisory-reports what backup WOULD be created
+    assert result.dry_run is True
+    assert result.backed_up_path is not None  # advisory
+
+
+def test_brain_root_resolved_in_plist(tmp_path):
+    """Codex P2: a relative brain_root must be resolved to absolute
+    before generating the plist. launchd doesn't run from the installer's
+    cwd; a relative path would dangle."""
+    # Use a relative path explicitly (not Path.resolve()'d)
+    rel = Path("relative-brain-dir")
+    abs_brain = tmp_path / rel
+    abs_brain.mkdir(parents=True)
+    # Even when caller passes the relative form, plist must contain absolute
+    plist_bytes = generate_plist(rel, Path(sys.executable))
+    parsed = plistlib.loads(plist_bytes)
+    args = parsed["ProgramArguments"]
+    # Every path argument must be absolute (start with /)
+    for a in args:
+        if "/" in a:
+            assert a.startswith("/"), f"non-absolute path in plist: {a!r}"
+
+
+def test_dispatch_takes_auto_migrate_lock(tmp_path):
+    """Codex P2 #3: manual dispatch() must hold the auto-migrate lock so
+    a concurrent LaunchAgent firing doesn't race on `_imported.jsonl`."""
+    import fcntl
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "feedback_x.md").write_text("---\ntype: feedback\n---\nbody\n")
+    dst = tmp_path / "brain"
+
+    # Hold the lock externally before calling dispatch
+    dst.mkdir()
+    lock_path = dst / ".auto-migrate.lock"
+    held = open(lock_path, "w")
+    fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    # Import dispatch in this scope
+    from migrate_dispatcher import dispatch
+    # Dispatch must NOT block forever; it tries the lock with a 2s timeout.
+    # When timeout expires, it surfaces a contention warning and proceeds
+    # (we don't block the user's manual run).
+    import time as _t
+    start = _t.monotonic()
+    result = dispatch(src=src, dst=dst, dry_run=False)
+    elapsed = _t.monotonic() - start
+    held.close()  # release for cleanup
+
+    # Took at most ~2.5s (2s timeout + small slack)
+    assert elapsed < 5.0, f"dispatch blocked too long under lock contention: {elapsed:.2f}s"
+    # Surfaced a contention warning
+    assert any("lock" in w.lower() for w in result.warnings), \
+        f"contention warning missing: {result.warnings}"
+
+
+def test_install_sh_forwards_dry_run_flag_to_setup(tmp_path):
+    """Codex P2 #1: `./install.sh --dry-run --setup-auto-migrate --all`
+    previously performed a real install because DRY_RUN was never
+    forwarded. Pin the fix by invoking install.sh that way."""
+    import shutil
+    brain = _stage_brain(tmp_path)
+    plist_dir = tmp_path / "LaunchAgents"
+    plist_dir.mkdir()
+    fake_home = tmp_path / "home"
+    (fake_home / ".cursor" / "plans").mkdir(parents=True)
+    (fake_home / ".cursor" / "plans" / "x.plan.md").write_text("# x\n")
+
+    install_script = REPO_ROOT / "install.sh"
+    env = os.environ.copy()
+    env["BRAIN_ROOT"] = str(brain)
+    env["HOME"] = str(fake_home)
+    if "PYTHON_BIN" not in env:
+        for c in ("python3.13", "python3.12", "python3.11", "python3.10"):
+            if shutil.which(c):
+                env["PYTHON_BIN"] = c
+                break
+
+    # Note the order: --dry-run BEFORE --setup-auto-migrate.
+    result = subprocess.run(
+        ["bash", str(install_script), "--dry-run", "--setup-auto-migrate",
+         "--all", "--plist-dir", str(plist_dir)],
+        capture_output=True, text=True, env=env, timeout=30,
+    )
+    assert result.returncode == 0, \
+        f"--dry-run --setup-auto-migrate failed:\n{result.stderr}\n{result.stdout}"
+    # No plist installed
+    assert not (plist_dir / f"{LABEL}.plist").exists(), \
+        "dry-run wrote a plist; --dry-run was not forwarded to the helper"
+    # No config written
+    assert not (brain / "auto-migrate.json").exists()
+
+
 def test_refuses_under_sudo(tmp_path, monkeypatch, capsys):
     """Helper must refuse to run as root — LaunchAgents are user-scoped."""
     brain = _stage_brain(tmp_path)

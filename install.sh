@@ -67,7 +67,9 @@ while [ $# -gt 0 ]; do
         --setup-auto-migrate)
             MODE="setup-auto-migrate"
             shift
-            # Everything else is forwarded to auto_migrate_install.py setup
+            # Everything else is forwarded to auto_migrate_install.py setup.
+            # Note: global flags (--dry-run, --brain-root) parsed earlier
+            # are also forwarded — see the call site for the merge logic.
             while [ $# -gt 0 ]; do EXTRA_ARGS+=("$1"); shift; done
             break
             ;;
@@ -485,10 +487,21 @@ if [ "$MODE" = "setup-auto-migrate" ] || [ "$MODE" = "remove-auto-migrate" ]; th
         echo "         run: ./install.sh --upgrade   to refresh tools" >&2
         exit 2
     fi
+    # Forward globally-parsed flags to the helper. `--dry-run` (parsed by
+    # this wrapper) is the most important one — codex review P2 caught
+    # `./install.sh --dry-run --setup-auto-migrate --all` performing a
+    # real install because DRY_RUN never reached argparse.
+    forwarded_args=()
+    if [ "$DRY_RUN" = "1" ]; then
+        forwarded_args+=(--dry-run)
+    fi
+    forwarded_args+=(--brain-root "$BRAIN_ROOT")
+    # If the user ALSO passed --brain-root in the post-flag args, the
+    # helper's argparse takes the LAST one, which is what they intended.
     if [ "$MODE" = "setup-auto-migrate" ]; then
-        BRAIN_ROOT="$BRAIN_ROOT" "$PYTHON_BIN" "$helper" setup --brain-root "$BRAIN_ROOT" "${EXTRA_ARGS[@]}"
+        BRAIN_ROOT="$BRAIN_ROOT" "$PYTHON_BIN" "$helper" setup "${forwarded_args[@]}" "${EXTRA_ARGS[@]}"
     else
-        BRAIN_ROOT="$BRAIN_ROOT" "$PYTHON_BIN" "$helper" remove --brain-root "$BRAIN_ROOT" "${EXTRA_ARGS[@]}"
+        BRAIN_ROOT="$BRAIN_ROOT" "$PYTHON_BIN" "$helper" remove "${forwarded_args[@]}" "${EXTRA_ARGS[@]}"
     fi
     exit $?
 fi

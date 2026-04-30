@@ -128,7 +128,14 @@ def generate_plist(
 
     Use `plistlib.dumps` (NOT sed) so paths with spaces, `&`, or XML
     metacharacters round-trip correctly.
+
+    `brain_root` is resolved to an absolute path before substitution —
+    launchd does not run from the installer's cwd, so a relative path
+    here would produce a LaunchAgent that can't find its own files.
     """
+    # Resolve to absolute. `Path.resolve(strict=False)` works even if
+    # the dir doesn't exist yet (the wizard creates it).
+    brain_root = brain_root.resolve()
     log_path = str(brain_root / "auto-migrate.log")
     dispatcher_path = str(brain_root / "tools" / "migrate_dispatcher.py")
     plist = {
@@ -206,33 +213,43 @@ def install_plist(
     first run immediately.
 
     If a plist already exists at the target path AND its content differs
-    from `plist_bytes`, save it as `.bak.<unix-ts>` first (Codex P2:
-    don't silently overwrite hand-edits).
+    from `plist_bytes`, save it as `.bak.<unix-ts>` first.
 
     Idempotent: re-running with byte-identical bytes performs the same
     bootout/bootstrap dance but doesn't create a backup of itself.
+
+    `dry_run=True` makes NO filesystem changes — no mkdir, no backup,
+    no plist write, no launchctl. The returned `backed_up_path` reflects
+    where the backup WOULD go, so callers previewing the install see
+    the full plan.
     """
-    plist_dir.mkdir(parents=True, exist_ok=True)
     plist_path = plist_dir / f"{LABEL}.plist"
     if uid is None:
         uid = _euid()
 
+    # Compute the proposed backup path (if any) without writing it. The
+    # actual mkdir + write only happens when `dry_run=False` below.
     backup_path: Optional[Path] = None
-    if plist_path.exists():
-        existing = plist_path.read_bytes()
-        if existing != plist_bytes:
-            ts = int(time.time())
-            backup_path = plist_dir / f"{LABEL}.plist.bak.{ts}"
-            backup_path.write_bytes(existing)
+    would_back_up = (
+        plist_path.exists()
+        and plist_path.read_bytes() != plist_bytes
+    )
+    if would_back_up:
+        ts = int(time.time())
+        backup_path = plist_dir / f"{LABEL}.plist.bak.{ts}"
 
     if dry_run:
         return InstallResult(
             plist_path=plist_path,
             label=LABEL,
-            backed_up_path=backup_path,
+            backed_up_path=backup_path,  # advisory — not actually written
             dry_run=True,
         )
 
+    # Real run starts here — only now do we touch the filesystem.
+    plist_dir.mkdir(parents=True, exist_ok=True)
+    if backup_path is not None:
+        backup_path.write_bytes(plist_path.read_bytes())
     plist_path.write_bytes(plist_bytes)
 
     # bootout — tolerate "not loaded" (typically returncode 36 on macOS).
@@ -378,8 +395,11 @@ def main(
         return 0
 
     # ---- setup ----
-    brain_root = Path(args.brain_root)
-    plist_dir = Path(args.plist_dir)
+    # Resolve brain_root + plist_dir to absolute paths immediately —
+    # launchd does not run from the installer's cwd, so relative paths
+    # in the plist would dangle (codex P2 #2).
+    brain_root = Path(args.brain_root).expanduser().resolve()
+    plist_dir = Path(args.plist_dir).expanduser().resolve()
 
     # Decide which tools to enable.
     try:
