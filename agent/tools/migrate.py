@@ -540,6 +540,16 @@ def main():
 
     print(f"migrate: wrote {len(lessons)} lesson(s), {len(written)} file(s)")
     print(f"         index: {index_path}")
+    # Machine-readable result line for the dispatcher (and any future
+    # automation). Always last line of stdout. Older parsers reading the
+    # human lines above keep working unchanged.
+    result_payload = {
+        "schema_version": 1,
+        "lessons_written": len(lessons),
+        "files_written": len(written),
+        "index_path": str(index_path),
+    }
+    print(f"MIGRATE_RESULT_JSON: {json.dumps(result_payload)}")
     return 0
 
 

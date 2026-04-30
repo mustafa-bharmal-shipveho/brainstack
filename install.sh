@@ -52,6 +52,8 @@ MIGRATE_SOURCE=""
 SYMLINK_NATIVE=1
 # Track explicit user intent so we can refuse mutually exclusive flag pairs.
 SYMLINK_NATIVE_FLAG_COUNT=0
+# --dry-run shows the plan without executing; used by tests + cautious users.
+DRY_RUN=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -59,9 +61,17 @@ while [ $# -gt 0 ]; do
         --verify) MODE="verify"; shift ;;
         --migrate)
             MODE="migrate"
-            MIGRATE_SOURCE="${2:-}"
-            shift 2 || true
+            # Consume the source path only if the next arg is NOT another
+            # flag (handles `--migrate <path>`, `--migrate <path> --dry-run`,
+            # `--migrate --dry-run`, and bare `--migrate` correctly).
+            if [ $# -ge 2 ] && [[ "$2" != --* ]]; then
+                MIGRATE_SOURCE="$2"
+                shift 2
+            else
+                shift
+            fi
             ;;
+        --dry-run) DRY_RUN=1; shift ;;
         --symlink-native)
             SYMLINK_NATIVE=1
             SYMLINK_NATIVE_FLAG_COUNT=$((SYMLINK_NATIVE_FLAG_COUNT + 1))
@@ -226,9 +236,43 @@ fi
 
 # ----- Mode: migrate -----
 if [ "$MODE" = "migrate" ]; then
+    # No source path → drop into discovery + interactive flow.
     if [ -z "$MIGRATE_SOURCE" ]; then
-        echo "install: --migrate requires a source directory" >&2
-        exit 2
+        if [ "$DRY_RUN" = "1" ]; then
+            echo "install: --dry-run requires a source path; pass --migrate <path> --dry-run, or omit --dry-run to run interactive discovery." >&2
+            exit 2
+        fi
+        # Brain root must exist before discovery — discovery itself doesn't
+        # write, but it's pointless without a target to migrate into.
+        if [ ! -d "$BRAIN_ROOT" ]; then
+            echo "install: $BRAIN_ROOT does not exist; run install first" >&2
+            exit 2
+        fi
+        if [ ! -f "$BRAIN_ROOT/tools/migrate_dispatcher.py" ]; then
+            echo "install: $BRAIN_ROOT/tools/migrate_dispatcher.py is missing" >&2
+            echo "         run: ./install.sh --upgrade   to refresh tools" >&2
+            exit 2
+        fi
+        BRAIN_ROOT="$BRAIN_ROOT" "$PYTHON_BIN" "$BRAIN_ROOT/tools/migrate_dispatcher.py" interactive
+        exit $?
+    fi
+    # --dry-run with a source: run plan, write nothing.
+    if [ "$DRY_RUN" = "1" ]; then
+        if [ ! -e "$MIGRATE_SOURCE" ] && [ ! -L "$MIGRATE_SOURCE" ]; then
+            echo "install: migrate source not found: $MIGRATE_SOURCE" >&2
+            exit 2
+        fi
+        if [ ! -d "$BRAIN_ROOT" ]; then
+            echo "install: $BRAIN_ROOT does not exist; run install first" >&2
+            exit 2
+        fi
+        if [ ! -f "$BRAIN_ROOT/tools/migrate_dispatcher.py" ]; then
+            echo "install: $BRAIN_ROOT/tools/migrate_dispatcher.py is missing" >&2
+            echo "         run: ./install.sh --upgrade   to refresh tools" >&2
+            exit 2
+        fi
+        BRAIN_ROOT="$BRAIN_ROOT" "$PYTHON_BIN" "$BRAIN_ROOT/tools/migrate_dispatcher.py" plan "$MIGRATE_SOURCE" "$BRAIN_ROOT"
+        exit $?
     fi
     # Strip trailing slash. Shell completion happily appends one when the
     # arg is a directory; later `mv tmp_link "$MIGRATE_SOURCE"` would treat
