@@ -4,11 +4,11 @@ Long autonomous run on `mustafa/runtime-v0`. Updated after every sub-phase.
 
 ## Current state
 
-- **Phase:** Night 1 wrap-up
-- **State:** YELLOW-1 (Phase 1 + 2c complete; Phase 0 partially blocked on user-triggered Claude sessions)
-- **Last commit:** `subphase-2c-synthetic`
-- **Last tag:** `subphase-2c-synthetic`
-- **Branch:** `mustafa/runtime-v0` (7 commits ahead of `main`)
+- **Phase:** Night 1 complete
+- **State:** YELLOW-1 (Phase 1 + 2c complete with codex APPROVE; Phase 0 partially blocked on user-triggered Claude sessions; persona BLOCKs addressed in code or documented as Phase 3+4 work)
+- **Last commit:** `26bf25b runtime(reviews): apply codex + persona findings`
+- **Last tag:** `night-1-reviews`
+- **Branch:** `mustafa/runtime-v0` (9 commits ahead of `main`)
 - **Open question:** see `HALT.md` — user runs the harness in the morning, decides go/no-go on Night 2
 
 ## Plan reference
