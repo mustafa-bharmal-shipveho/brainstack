@@ -14,8 +14,6 @@ Three layers, one stack:
 
 The model gets smarter every release. Your agent only gets smarter if its context does. This is the substrate for that.
 
-Built on top of [codejunkie99/agentic-stack](https://github.com/codejunkie99/agentic-stack) — vendored dream cycle, clustering, lesson rendering. See [`UPSTREAM.md`](UPSTREAM.md).
-
 ---
 
 ## Quickstart
@@ -63,29 +61,22 @@ Migrating from existing AI-tool memory dirs (Claude Code, Cursor, Codex CLI):
                                               ↻ git sync (hourly) — push to your private brain remote, scanner-gated
 ```
 
-**Five stages, three input sources:**
+**Four stages, three input sources:**
 
 1. **Capture.** Claude Code writes via `PostToolUse` hook in real time. Cursor + Codex CLI ingest hourly via the auto-migrate LaunchAgent. All three feed the same `~/.agent/memory/episodic/`.
 2. **Distill (nightly).** `auto_dream.py` clusters episodes by salience; high-signal patterns become candidates.
 3. **Graduate (your review).** `graduate.py <id>` promotes a candidate to permanent `semantic/`; `reject.py` discards.
 4. **Sync (hourly).** `sync.sh` runs `trufflehog`/`gitleaks`, scrubs JSONL, pushes to your private brain remote.
-5. **Recall (next session).** `MEMORY.md` auto-loads via `CLAUDE.md`. Beyond ~150 lessons, use the `recall` CLI / MCP.
-
-Edit the brain directly when you don't want to wait for the dream cycle:
-
-```bash
-recall remember "always use /agent-team for development"
-recall remember "use SELECT FOR UPDATE SKIP LOCKED for queue claims" --as postgres-locking
-recall forget agent-team    # archives by name or substring; multi-match lists candidates
-```
-
-Lessons land in `~/.agent/memory/semantic/lessons/<slug>.md` and auto-load on every future session, forever.
 
 Set-and-forget multi-tool ingest: `./install.sh --setup-auto-migrate` installs a single hourly LaunchAgent that pulls Cursor + Codex CLI sessions in alongside Claude Code's real-time symlink. `--enable`, `--all`, `--dry-run` for non-interactive runs; `--remove-auto-migrate` to tear down. Details: [`docs/dream-cycle.md`](docs/dream-cycle.md), [`docs/git-sync.md`](docs/git-sync.md), [`docs/memory-model.md`](docs/memory-model.md).
 
+Built on top of [codejunkie99/agentic-stack](https://github.com/codejunkie99/agentic-stack) — vendored dream cycle, clustering, lesson rendering. See [`UPSTREAM.md`](UPSTREAM.md).
+
 ---
 
-## Retrieval: hybrid search across the global brain
+## Retrieval: how you read and edit the brain
+
+Next session, `MEMORY.md` auto-loads via `CLAUDE.md`. Beyond ~150 lessons that index alone stops being enough, so the `recall` CLI / MCP server takes over with hybrid Qdrant + BM25 search over `$BRAIN_ROOT/memory/`.
 
 ```bash
 pip install -e '.[embeddings,mcp]'
@@ -93,7 +84,17 @@ recall reindex
 recall query "how do I avoid context bloat from reading too many files"
 ```
 
-Qdrant + BM25 hybrid over `$BRAIN_ROOT/memory/`. Tool-agnostic — works as a CLI, an MCP server, or a Python import; callable from Claude Code, Cursor, Codex CLI, or your own scripts. Quality numbers (synthetic-corpus, deterministic seed) and per-strategy benchmark in [`recall/README.md`](recall/README.md). PRs touching `recall/` gate on a 5pp recall@5 tolerance.
+Edit the brain directly when you don't want to wait for the dream cycle to graduate something:
+
+```bash
+recall remember "always use /agent-team for development"
+recall remember "use SELECT FOR UPDATE SKIP LOCKED for queue claims" --as postgres-locking
+recall forget agent-team    # archives by name or substring; multi-match lists candidates
+```
+
+`recall remember` writes a markdown lesson to `~/.agent/memory/semantic/lessons/<slug>.md`; it auto-loads on every future session, forever. `recall forget` moves it to `archived/` (recoverable). Both accept natural queries — no cryptic IDs to copy-paste.
+
+Tool-agnostic — runs as CLI, MCP server, or Python import; callable from Claude Code, Cursor, Codex CLI, or your own scripts. Quality numbers (synthetic-corpus, deterministic seed) and per-strategy benchmark in [`recall/README.md`](recall/README.md). PRs touching `recall/` gate on a 5pp recall@5 tolerance.
 
 ---
 
