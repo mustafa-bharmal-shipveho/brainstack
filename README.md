@@ -176,6 +176,8 @@ cd brainstack
              --push-initial-commit
 ```
 
+`install.sh` also creates a venv at `.venv/`, runs `pip install -e .`, and symlinks the `recall` CLI into `~/.local/bin/`. After install, `recall runtime tail`, `recall runtime timeline`, etc. work as bare commands (assuming `~/.local/bin` is on your `$PATH` — the installer prints a one-line PATH-export tip if it isn't).
+
 Then merge the printed snippet into `~/.claude/settings.json` (the installer never edits user config — see [`docs/claude-code-setup.md`](docs/claude-code-setup.md)).
 
 Migrating from existing AI-tool memory dirs (Claude Code, Cursor, Codex CLI):
