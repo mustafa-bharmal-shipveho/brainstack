@@ -1,12 +1,12 @@
 # brainstack
 
-**A persistent, git-synced brain for your AI coding agent — with a runtime that decides what your agent actually remembers each turn.**
+**A persistent, git-synced brain for your AI coding agent — with a runtime that records, budgets, and replays what enters your agent's context each turn.**
 
 Three layers, one stack:
 
 - **Storage.** One global memory at `~/.agent/`. Every tool call → episodic log → nightly dream cycle clusters salient patterns → graduated lessons land in `semantic/` and are auto-loaded on every future session. Mistakes get codified once, never repeated.
 - **Retrieval.** Hybrid recall (Qdrant + BM25) finds the right memory for any query. Tool-agnostic: works with Claude Code, Cursor, Codex CLI.
-- **Runtime (v0.2).** Token budgets per bucket, eviction policy as a forkable Python file, full replay/audit. Answers *"why didn't the model know X?"* from artifacts instead of guesswork. The layer the rest of the field (mem0, Letta, claude-obsidian, Zep, Cognee) doesn't own.
+- **Runtime (v0.2).** Token budgets per bucket, eviction policy as a forkable Python file, full replay/audit. Answers *"why didn't the model know X?"* from artifacts instead of guesswork. The runtime *records and replays* every injection decision a Claude Code session makes; it does not yet inject CLAUDE.md content itself (Phase 4 of the roadmap wires that). What it controls is the log, the manifest, and the replay — which is enough to debug and prove behavior.
 
 **Constant git sync.** Hourly push to your private remote (with required secret-scanner gate). Reinstall on a new machine and `git pull` brings back every lesson, every preference, every reference.
 

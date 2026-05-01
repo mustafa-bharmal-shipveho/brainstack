@@ -62,7 +62,9 @@ recall.cli  -- runtime sub-app -- runtime/adapters/claude_code/cli.py
                                         |
                                   produces
                                         v
-                                ~/.agent/runtime/logs/manifest/turn-N.json
+                                Manifest snapshots in-memory (write-to-disk
+                                deferred to v0.x; today the manifest is
+                                reconstructed on demand from the event log)
 ```
 
 `runtime/core/` has zero adapter or Claude-specific imports. Adding a

@@ -2,7 +2,12 @@
 
 Claude Code reads `~/.claude/settings.json` (or a per-project equivalent).
 The hooks system is a JSON object keyed by event name. We add entries that
-invoke this Python package's adapter via `python -m runtime.adapters.claude_code.hooks <event>`.
+invoke this Python package's adapter via the ABSOLUTE path to the
+adapter's hooks.py file. Phase 6 power-user review caught the bug: using
+`python -m runtime.adapters.claude_code.hooks` is unreliable when the
+user's session has a different `runtime` package on sys.path (very
+common — many projects have a `runtime/` dir). Absolute path resolution
+sidesteps the shadowing.
 
 Design constraints:
   - Idempotent: re-running install_claude_code_hooks must be a no-op.
@@ -11,6 +16,7 @@ Design constraints:
     can detect already-installed instances.
   - Safe: never silently overwrite an existing settings.json. If a parse
     fails, we report and refuse to write.
+  - Robust to module-name shadowing.
 """
 from __future__ import annotations
 
@@ -23,11 +29,41 @@ from pathlib import Path
 # during install/uninstall without ambiguity.
 _INSTALL_MARKER = "# brainstack-runtime"
 
+
+def _resolve_hooks_script() -> str:
+    """Absolute path to runtime/adapters/claude_code/hooks.py."""
+    return str(Path(__file__).parent / "hooks.py")
+
+
+def _resolve_pkg_root() -> str:
+    """Directory containing the `runtime/` package — the path that needs to
+    be on PYTHONPATH for `runtime.*` imports inside hooks.py to resolve."""
+    # __file__ -> .../runtime/adapters/claude_code/installer.py
+    return str(Path(__file__).resolve().parents[3])
+
+
+_HOOKS_SCRIPT = _resolve_hooks_script()
+_PKG_ROOT = _resolve_pkg_root()
+
+
+def _hook_cmd(event: str) -> str:
+    """Build a robust hook command that survives module shadowing.
+
+    Setting PYTHONPATH ensures `from runtime.* import` resolves to OUR
+    runtime package (installed alongside this file) regardless of the
+    user's cwd or any `runtime/` directory in their project. Calling the
+    script via absolute path bypasses `-m runtime` resolution entirely.
+    """
+    return (
+        f"PYTHONPATH={_PKG_ROOT} {sys.executable} {_HOOKS_SCRIPT} {event}  {_INSTALL_MARKER}"
+    )
+
+
 _HOOK_TEMPLATES: dict[str, str] = {
-    "SessionStart":     f"{sys.executable} -m runtime.adapters.claude_code.hooks SessionStart {_INSTALL_MARKER}",
-    "UserPromptSubmit": f"{sys.executable} -m runtime.adapters.claude_code.hooks UserPromptSubmit {_INSTALL_MARKER}",
-    "PostToolUse":      f"{sys.executable} -m runtime.adapters.claude_code.hooks PostToolUse {_INSTALL_MARKER}",
-    "Stop":             f"{sys.executable} -m runtime.adapters.claude_code.hooks Stop {_INSTALL_MARKER}",
+    "SessionStart":     _hook_cmd("SessionStart"),
+    "UserPromptSubmit": _hook_cmd("UserPromptSubmit"),
+    "PostToolUse":      _hook_cmd("PostToolUse"),
+    "Stop":             _hook_cmd("Stop"),
 }
 
 # PostToolUse uses a matcher to fire only on tools that produce useful items
