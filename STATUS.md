@@ -4,11 +4,12 @@ Long autonomous run on `mustafa/runtime-v0`. Updated after every sub-phase.
 
 ## Current state
 
-- **Phase:** 0 (Empirical)
-- **Sub-phase:** 0a (in progress) — hook telemetry harness
-- **Last commit:** _none yet_
-- **Last tag:** _none yet_
-- **Open question:** none
+- **Phase:** Night 1 wrap-up
+- **State:** YELLOW-1 (Phase 1 + 2c complete; Phase 0 partially blocked on user-triggered Claude sessions)
+- **Last commit:** `subphase-2c-synthetic`
+- **Last tag:** `subphase-2c-synthetic`
+- **Branch:** `mustafa/runtime-v0` (7 commits ahead of `main`)
+- **Open question:** see `HALT.md` — user runs the harness in the morning, decides go/no-go on Night 2
 
 ## Plan reference
 
@@ -18,21 +19,55 @@ thesis, sub-phase breakdown, persona schedule, and synthetic test catalogue.
 ## Sub-phase progress
 
 - [x] Setup — feature branch + runtime/ skeleton
-- [ ] 0a — hook telemetry harness
-- [ ] 0b — tool-event payload sampler
-- [ ] 0c — concurrent-hook flock smoke test
-- [ ] 0d — phase0-empirical.md writeup + go/no-go
-- [ ] 1a-1d — Spec
-- [ ] 2a-2c — Fixtures
+- [x] 0a (built) — hook telemetry harness — execution blocked, awaits user
+- [ ] 0b — tool-event payload sampler (depends on 0a)
+- [x] 0c — concurrent-hook flock smoke test
+- [ ] 0d — phase0-empirical.md writeup + go/no-go (template in place; user fills in 0a/0b sections after running harness)
+- [x] 1a (partial) — manifest schema v1.0 (tool-specific fields reserved as `x_tool_*` pending 0b)
+- [x] 1b — TokenCounter Protocol + offline default
+- [x] 1c — Policy Protocol + LRU/recency/pinned-first defaults
+- [x] 1d — event log schema + data-policy doc
+- [ ] 2a — record-mode adapter (depends on 0a/0b)
+- [ ] 2b — record real fixtures (depends on 2a)
+- [x] 2c — synthetic test battery (5 of 8 categories; 3 already covered elsewhere)
+- [x] codex review (Phase 1 + 2c diff)
+- [x] persona reviews — Skeptic + Security
 - [ ] 3a-3h — Core impl (Night 2)
 - [ ] 4a-4d — Adapter + dogfood (Night 3)
 - [ ] 5a-5e — Docs (Night 3)
 - [ ] 6a-6d — Review + PR (Night 3)
 
-## Night 1 endpoint target
+## Test counts
 
-End of Phase 2 — empirical answers known, schemas committed, real fixtures
-recorded. Implementation has not started. Defensible spec.
+| Suite | Tests |
+|---|---|
+| Brainstack pre-existing | 581 |
+| Runtime new | 121 (10 events + 13 manifest + 25 policy + 10 tokens + 5 harness flock + 13 leak + 12 paths + 14 policy stress + 10 budget overflow + 5 timestamp + 4 misc) |
+| Total | 629 (+ 121 new = 702 candidate v0.2 release count) |
+
+All green.
+
+## LOC
+
+```
+runtime/core/         ~1.0k LOC
+tests/runtime/        ~1.5k LOC + ~200 LOC docs/policy
+runtime/_empirical/   ~400 LOC harness + ~200 LOC docs
+TOTAL                 ~3.3k (under 2k production / 500 test budget for runtime/core/, runtime/adapters/)
+```
+
+Production LOC under `runtime/core/` is ~1.0k — well under the 2.0k v0 cap.
+
+## Night 1 endpoint adjustment
+
+The original plan said "Night 1 endpoint = end of Phase 2." Reality:
+- Phase 0 is half done (0a built but unrun, 0c green, 0b/0d pending user)
+- Phase 1 fully done with quality
+- Phase 2c done; 2a/2b need the empirical answers first
+
+Net: I am AHEAD on Phase 1 quality and BEHIND on Phase 2 fixtures (which
+need real Claude sessions). Total deliverable for Night 1 is comparable
+to plan, just with a different shape.
 
 ## How to resume after compaction
 
@@ -40,3 +75,12 @@ recorded. Implementation has not started. Defensible spec.
 2. `git -C ~/Documents/brainstack log --oneline -20` for commit history.
 3. `git -C ~/Documents/brainstack tag -l 'subphase-*'` for sub-phase tags.
 4. Read the most recent sub-phase output file.
+5. Read `HALT.md` for the user-action handoff.
+
+## Reviews dispatched (codex + personas)
+
+Three `codex exec` calls dispatched in parallel before STATUS.md was
+finalized. Outputs in `/tmp/{codex-runtime-review,persona-skeptic,persona-security}-output.txt`. Findings are committed to the repo at
+`runtime/_review_outputs/` in the final Night-1 commit (`night-1-reviews` tag).
+
+If any returned BLOCK, the run halted before this paragraph was written.
