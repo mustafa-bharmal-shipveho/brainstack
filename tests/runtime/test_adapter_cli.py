@@ -481,6 +481,43 @@ def test_add_no_match_errors(cli_env: Path, tmp_path: Path) -> None:
     result = runner.invoke(app, ["add", "does-not-exist", "--brain-root", str(brain)])
     assert result.exit_code != 0
     assert "no file matches" in result.output
+    assert "--text" in result.output  # error message suggests --text fallback
+
+
+def test_add_treats_quoted_text_as_text(cli_env: Path) -> None:
+    """Query with spaces is treated as raw text (no file resolution)."""
+    runner = CliRunner()
+    result = runner.invoke(app, ["add", "always use /agent-team for development"])
+    assert result.exit_code == 0
+    assert "added:" in result.output
+    log = cli_env / "logs" / "events.log.jsonl"
+    text = log.read_text()
+    # Source path is the inline-text marker, not a real path
+    assert '"source_path":"<inline-text>"' in text
+    # And the content stash file contains the original text
+    content_dir = cli_env / "logs" / "added"
+    files = list(content_dir.glob("c-*.txt"))
+    assert len(files) == 1
+    assert files[0].read_text() == "always use /agent-team for development"
+
+
+def test_add_text_flag_forces_text_mode_for_single_word(cli_env: Path) -> None:
+    """--text on a single word forces text mode even though the resolver
+    would have searched for a file."""
+    runner = CliRunner()
+    result = runner.invoke(app, ["add", "agent-team", "--text"])
+    assert result.exit_code == 0
+    log = cli_env / "logs" / "events.log.jsonl"
+    text = log.read_text()
+    assert '"source_path":"<inline-text>"' in text
+
+
+def test_add_help_mentions_text_mode(cli_env: Path) -> None:
+    """Help text documents text mode so users discover it."""
+    runner = CliRunner()
+    result = runner.invoke(app, ["add", "--help"])
+    assert result.exit_code == 0
+    assert "raw text" in result.output or "--text" in result.output
 
 
 def test_add_command_writes_event_and_content_file(cli_env: Path, tmp_path: Path) -> None:

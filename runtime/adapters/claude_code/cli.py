@@ -539,23 +539,30 @@ def cmd_add(
     brain_root: Path = typer.Option(
         Path("~/.agent/").expanduser(),
         "--brain-root",
-        help="root directory to search when query is a name rather than a path. Default: ~/.agent/",
+        help="root directory to search when query is a file name. Default: ~/.agent/",
+    ),
+    text: bool = typer.Option(
+        False, "--text",
+        help="force-treat the query as raw text (don't try to resolve as a file)",
     ),
 ) -> None:
-    """Push a file into the next session's context (re-injection on UserPromptSubmit).
+    """Push content into the next session's context (re-injection on UserPromptSubmit).
 
-    `query` can be any of:
-      • exact path             (~/path/to/lesson.md or relative)
-      • lesson name (basename) (postgres-locking)
-      • substring              ("postgres locking")
+    Three input modes — picks automatically:
+      • path or name → reads a file (`recall runtime add ~/lesson.md`,
+                                     `recall runtime add postgres-locking`)
+      • text         → uses the query as-is when it contains spaces
+                       (`recall runtime add "use /agent-team for this"`)
+      • --text       → force-treat as raw text even for a single word
 
-    For names/substrings we search under `--brain-root` (default ~/.agent/).
-    Multi-match is rejected with a candidate list — re-run with a fuller path.
+    File resolution priority: exact path → unique basename under brain_root →
+    unique substring match. Multi-match prints candidates and exits non-zero.
+    Single-word with no match also exits — pass --text to override.
 
-    Reads the resolved file, computes its token count, writes an AddItem
-    event with intent=user-add, and stashes the content under
-    log_dir/added/<id>.txt. The next UserPromptSubmit (with
-    enable_reinjection=true) surfaces it in the re-injection block.
+    The content gets a content-hashed id, gets written as an AddItem event
+    with intent=user-add, and is stashed under log_dir/added/<id>.txt. The
+    next UserPromptSubmit (with enable_reinjection=true) surfaces it in
+    the re-injection block prepended to your prompt.
     """
     import hashlib
     import time
@@ -567,20 +574,29 @@ def cmd_add(
 
     cfg = _config()
 
-    # Resolve query to a concrete file
-    result = resolve_brain_path(query, brain_root)
-    if result.match is None:
-        if result.candidates:
-            typer.echo(f"'{query}' matched {len(result.candidates)} files (be more specific):", err=True)
-            for c in result.candidates:
-                typer.echo(f"  {c}", err=True)
-        else:
-            typer.echo(f"no file matches '{query}' under {brain_root}", err=True)
-            typer.echo("  (try a full path, or run `recall runtime add ~/full/path.md`)", err=True)
-        raise typer.Exit(2)
+    # Decide: text or file?
+    # - explicit --text always wins
+    # - query with spaces = text (path-shaped queries don't typically contain spaces)
+    # - single-word query → try the file resolver first; only error if no match
+    is_text = text or " " in query
 
-    path = Path(result.match)
-    content = path.read_text(encoding="utf-8")
+    if is_text:
+        content = query
+        source_path = "<inline-text>"
+    else:
+        result = resolve_brain_path(query, brain_root)
+        if result.match is None:
+            if result.candidates:
+                typer.echo(f"'{query}' matched {len(result.candidates)} files (be more specific):", err=True)
+                for c in result.candidates:
+                    typer.echo(f"  {c}", err=True)
+            else:
+                typer.echo(f"no file matches '{query}' under {brain_root}", err=True)
+                typer.echo("  (pass --text to add the query as raw text, or try a full path)", err=True)
+            raise typer.Exit(2)
+        path = Path(result.match)
+        content = path.read_text(encoding="utf-8")
+        source_path = str(path)
     counter = OfflineTokenCounter()
     token_count = counter.count(content)
     sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -588,7 +604,7 @@ def cmd_add(
     snap = InjectionItemSnapshot(
         id=item_id,
         bucket=bucket,
-        source_path=str(path),
+        source_path=source_path,
         sha256=sha,
         token_count=token_count,
         retrieval_reason="user-add",
@@ -614,7 +630,8 @@ def cmd_add(
     content_dir.mkdir(parents=True, exist_ok=True)
     (content_dir / f"{item_id}.txt").write_text(content, encoding="utf-8")
 
-    typer.echo(f"added: {item_id} ({token_count} tok) -> {bucket} bucket")
+    src_label = source_path if source_path != "<inline-text>" else f'"{content[:50]}{"…" if len(content) > 50 else ""}"'
+    typer.echo(f"added: {item_id} ({token_count} tok) {src_label} -> {bucket} bucket")
     if cfg.enable_reinjection:
         typer.echo("will be re-injected on the next user prompt")
     else:
