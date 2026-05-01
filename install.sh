@@ -498,10 +498,14 @@ if [ "$MODE" = "setup-auto-migrate" ] || [ "$MODE" = "remove-auto-migrate" ]; th
     forwarded_args+=(--brain-root "$BRAIN_ROOT")
     # If the user ALSO passed --brain-root in the post-flag args, the
     # helper's argparse takes the LAST one, which is what they intended.
+    # `${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}` guards against `set -u` tripping
+    # on an empty array under macOS bash 3.2 — `--remove-auto-migrate` with
+    # no trailing flags is the common case and used to error with
+    # "EXTRA_ARGS[@]: unbound variable" before this guard.
     if [ "$MODE" = "setup-auto-migrate" ]; then
-        BRAIN_ROOT="$BRAIN_ROOT" "$PYTHON_BIN" "$helper" setup "${forwarded_args[@]}" "${EXTRA_ARGS[@]}"
+        BRAIN_ROOT="$BRAIN_ROOT" "$PYTHON_BIN" "$helper" setup "${forwarded_args[@]}" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
     else
-        BRAIN_ROOT="$BRAIN_ROOT" "$PYTHON_BIN" "$helper" remove "${forwarded_args[@]}" "${EXTRA_ARGS[@]}"
+        BRAIN_ROOT="$BRAIN_ROOT" "$PYTHON_BIN" "$helper" remove "${forwarded_args[@]}" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
     fi
     exit $?
 fi
