@@ -134,30 +134,33 @@ def render_diff(a: Manifest, b: Manifest) -> str:
 # ---------- internals ----------
 
 def _replay_to_manifests(events: list[EventRecord], config: ReplayConfig) -> list[Manifest]:
-    """Drive the engine through the event stream; capture a manifest per turn."""
+    """Drive the engine through the event stream; capture a manifest per turn.
+
+    Optimization (Phase 3 perf review): we snapshot on turn boundaries plus
+    once at the end, not on every event. The previous implementation called
+    snapshot() per event which produced O(n_events) snapshots that were
+    immediately overwritten — wasted O(n_items log n_items) work. This keeps
+    correctness (the last snapshot per turn is the final one) and cuts
+    replay cost dramatically for long sessions.
+    """
     eng = Engine(
         budgets=config.budgets,
         policy=config.policy,
         session_id=config.session_id,
     )
     manifests: list[Manifest] = []
-    last_seen_turn = -1
+    if not events:
+        return manifests
+    pending_turn = -1
     for ev in events:
+        # If the turn is about to change, snapshot the OLD turn first.
+        if pending_turn != -1 and ev.event in {"UserPromptSubmit"}:
+            manifests.append(eng.snapshot())
         for engine_event in _translate(ev):
             eng.apply(engine_event)
-        # Capture a manifest snapshot when we leave a turn boundary
-        if eng.current_turn != last_seen_turn:
-            if manifests:
-                # We've moved to a new turn; the last snapshot is now finalized.
-                pass  # nothing to do; we always re-snapshot below
-            last_seen_turn = eng.current_turn
-        # Always update the "current" manifest at the back; we'll dedupe
-        # to one-per-turn at the end
-        snap = eng.snapshot()
-        if manifests and manifests[-1].turn == snap.turn:
-            manifests[-1] = snap
-        else:
-            manifests.append(snap)
+        pending_turn = eng.current_turn
+    # Final snapshot for the last turn we landed on.
+    manifests.append(eng.snapshot())
     return manifests
 
 
