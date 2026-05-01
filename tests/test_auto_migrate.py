@@ -618,8 +618,12 @@ def test_brain_root_resolved_in_plist(tmp_path):
 
 
 def test_dispatch_takes_auto_migrate_lock(tmp_path):
-    """Codex P2 #3: manual dispatch() must hold the auto-migrate lock so
-    a concurrent LaunchAgent firing doesn't race on `_imported.jsonl`."""
+    """Manual dispatch() must hold the auto-migrate lock so a concurrent
+    LaunchAgent firing doesn't race on `_imported.jsonl`. When the lock
+    can't be acquired in 2s, dispatch refuses to run rather than proceeding
+    unsafely — the earlier "warn and proceed" path produced mid-line
+    sidecar offsets and "skipped malformed line" warnings on the next run.
+    """
     import fcntl
     src = tmp_path / "src"
     src.mkdir()
@@ -634,9 +638,8 @@ def test_dispatch_takes_auto_migrate_lock(tmp_path):
 
     # Import dispatch in this scope
     from migrate_dispatcher import dispatch
-    # Dispatch must NOT block forever; it tries the lock with a 2s timeout.
-    # When timeout expires, it surfaces a contention warning and proceeds
-    # (we don't block the user's manual run).
+    # Dispatch must NOT block forever; it tries the lock with a 2s timeout
+    # and then bails cleanly.
     import time as _t
     start = _t.monotonic()
     result = dispatch(src=src, dst=dst, dry_run=False)
@@ -645,9 +648,14 @@ def test_dispatch_takes_auto_migrate_lock(tmp_path):
 
     # Took at most ~2.5s (2s timeout + small slack)
     assert elapsed < 5.0, f"dispatch blocked too long under lock contention: {elapsed:.2f}s"
-    # Surfaced a contention warning
+    # Refused to migrate under contention
+    assert result.files_written == 0, \
+        f"expected no files written under contention, got {result.files_written}"
     assert any("lock" in w.lower() for w in result.warnings), \
         f"contention warning missing: {result.warnings}"
+    # The brain target must NOT have been written (no sidecar drift)
+    assert not (dst / "memory" / "_imported.jsonl").exists(), \
+        "sidecar should not be written when lock acquisition failed"
 
 
 def test_install_sh_forwards_dry_run_flag_to_setup(tmp_path):

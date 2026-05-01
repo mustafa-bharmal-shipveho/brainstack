@@ -628,6 +628,7 @@ def dispatch(
     dst: Path,
     dry_run: bool = False,
     options: Optional[dict] = None,
+    _lock_already_held: bool = False,
 ) -> MigrationResult:
     """Detect format, route to adapter, return result.
 
@@ -635,6 +636,11 @@ def dispatch(
     dispatch signature stable as PR-B / PR-C grow per-adapter knobs
     (currently `namespace`; future: `symlink_native`, etc.). Unknown
     keys are passed through; adapters ignore what they don't consume.
+
+    `_lock_already_held` is an internal flag set by `auto_migrate_all`
+    when iterating tools — the parent already holds the auto-migrate
+    lock, so the per-tool dispatch must NOT try to acquire it again
+    (would self-deadlock against the parent's fd and refuse the run).
 
     Raises NoAdapterError if no adapter is registered for the detected
     format.
@@ -673,24 +679,34 @@ def dispatch(
         # `--migrate` doesn't race with the LaunchAgent's `auto-migrate-all`
         # firing on the same brain (both write to the shared
         # `_imported.jsonl` sidecar). Dry-runs are read-only and don't
-        # need the lock.
+        # need the lock. When called from `auto_migrate_all`, the parent
+        # already holds the lock — re-acquiring on a second fd would
+        # deadlock against itself, so we skip via `_lock_already_held`.
         lock_fd = None
-        contention_warning: Optional[str] = None
-        if not dry_run:
+        if not dry_run and not _lock_already_held:
             lock_fd = _acquire_auto_migrate_lock(dst, timeout=2.0)
             if lock_fd is None:
-                # Lock-held doesn't block the user — they explicitly
-                # asked to migrate. Surface the contention in warnings
-                # so the result is auditable.
-                contention_warning = (
-                    "could not acquire auto-migrate lock; another migrate "
-                    "may be running concurrently"
+                # Refuse to run unlocked — proceeding would race the lock
+                # holder on `_imported.jsonl` and produce mid-line offsets
+                # on the next read (observed: "skipped malformed line"
+                # warnings caused by a partial-line offset). Better to
+                # fail fast and let the user retry; the next hourly
+                # LaunchAgent firing will catch any new entries anyway.
+                return MigrationResult(
+                    format=fmt,
+                    files_written=0,
+                    files_planned=0,
+                    warnings=[
+                        "could not acquire auto-migrate lock within 2s; "
+                        "another migrate is running on this brain — retry "
+                        "in a moment, or wait for the next LaunchAgent tick"
+                    ],
+                    dry_run=dry_run,
+                    namespace=namespace,
+                    source_path=src,
                 )
         try:
-            result = adapter.migrate(src, dst, dry_run=dry_run, options=options)
-            if contention_warning:
-                result.warnings.append(contention_warning)
-            return result
+            return adapter.migrate(src, dst, dry_run=dry_run, options=options)
         finally:
             _release_auto_migrate_lock(lock_fd)
 
@@ -1048,7 +1064,13 @@ def auto_migrate_all(
             fmt = tool.get("format")
             src = Path(tool.get("source", ""))
             try:
-                result = dispatch(src=src, dst=brain_root, dry_run=False)
+                # We already hold the auto-migrate lock at this scope —
+                # tell `dispatch` to skip its own acquire so it doesn't
+                # self-deadlock against our fd.
+                result = dispatch(
+                    src=src, dst=brain_root, dry_run=False,
+                    _lock_already_held=True,
+                )
                 results.append(result.to_dict())
                 ran += 1
             except Exception as e:
