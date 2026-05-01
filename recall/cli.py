@@ -38,6 +38,15 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 
+# Runtime subcommand group (brainstack v0.2): manifest + budgets + replay.
+# Imported lazily so the runtime/ tree's import errors never break the
+# existing recall CLI.
+try:
+    from runtime.adapters.claude_code.cli import app as _runtime_app
+    app.add_typer(_runtime_app, name="runtime")
+except Exception:  # pragma: no cover
+    pass
+
 
 def _load_or_build(cfg: Config) -> tuple[Optional[object], bool]:
     """Returns (cache, fresh).
