@@ -21,7 +21,6 @@ under `x_*` prefix are preserved across round-trips.
 """
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 from dataclasses import asdict, dataclass, field
@@ -242,23 +241,9 @@ def load_event(raw: str | bytes | Mapping[str, Any]) -> EventRecord:
 
 
 def append_event(log_path: Path | str, event: EventRecord) -> None:
-    """Atomic append to the JSONL log, flock-guarded.
-
-    Sentinel pattern: lock a sibling `.lock` file, not the log itself. This
-    is the same lesson encoded by brainstack's _atomic.py (don't lock the
-    data file, lock a sentinel)."""
-    p = Path(log_path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    lock = p.parent / f".{p.name}.lock"
-    lock.touch(exist_ok=True)
-    line = dump_event(event) + "\n"
-    with lock.open("a") as lock_f:
-        fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
-        try:
-            with p.open("a", encoding="utf-8") as f:
-                f.write(line)
-        finally:
-            fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+    """Atomic append to the JSONL log via runtime/core/locking.locked_append."""
+    from runtime.core.locking import locked_append
+    locked_append(log_path, dump_event(event))
 
 
 def load_events(log_path: Path | str) -> list[EventRecord]:
