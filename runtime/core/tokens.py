@@ -12,10 +12,16 @@ Two principles:
    inject it. The runtime never assumes a specific implementation.
 
 Accuracy of the offline default: ~±15% of vendor counts on English text. Wide
-on purpose. The runtime's contract is that *budget enforcement is consistent*,
-not that token counts are exact. If a bucket cap is 4000 offline-tokens, the
-real Claude window may have ~3400-4600 tokens for that bucket. That is a
-deliberate trade for portability and determinism.
+on purpose. When budget enforcement lands in Phase 3, the contract will be
+that *enforcement is consistent across a session* (same counter, same caps,
+same evictions), not that token counts match Anthropic's exactly. If a bucket
+cap is 4000 offline-tokens, the real Claude window may have ~3400-4600 tokens
+for that bucket. That is a deliberate trade for portability and determinism.
+
+The offline counter relies on Python's `re` Unicode classes and `str.isalnum()`,
+both of which are stable across Python 3.10+ but tied to the Unicode database
+the interpreter ships with. Cross-Python-version determinism is best-effort,
+not guaranteed.
 """
 from __future__ import annotations
 

@@ -232,6 +232,91 @@ def test_budget_used_sum_invariant_documented() -> None:
     assert m.budget_used != raw_used
 
 
+def test_per_item_x_extensions_round_trip() -> None:
+    """Codex Skeptic finding #4: per-item x_* fields were silently dropped.
+    They must round-trip just like top-level x_* fields."""
+    src = {
+        "schema_version": SCHEMA_VERSION,
+        "turn": 1, "ts_ms": 1, "session_id": "x",
+        "budget_total": 100, "budget_used": 10,
+        "items": [{
+            "id": "c-1",
+            "bucket": "hot",
+            "source_path": "p",
+            "sha256": "0" * 64,
+            "token_count": 10,
+            "retrieval_reason": "r",
+            "last_touched_turn": 1,
+            "pinned": False,
+            "score": 0.42,
+            "x_tool_specific": {"file_path": "/some/path", "limit": 100},
+        }],
+    }
+    raw = json.dumps(src, sort_keys=True)
+    m = load_manifest(raw)
+    assert m.items[0].extensions == {"x_tool_specific": {"file_path": "/some/path", "limit": 100}}
+    assert m.items[0].score == 0.42
+    out = dump_manifest(m)
+    parsed = json.loads(out)
+    assert "x_tool_specific" in parsed["items"][0]
+
+
+def test_per_item_unknown_non_x_key_rejected() -> None:
+    """Per-item discipline mirrors top-level: non-x_ unknowns rejected."""
+    src = {
+        "schema_version": SCHEMA_VERSION,
+        "turn": 1, "ts_ms": 1, "session_id": "x",
+        "budget_total": 100, "budget_used": 10,
+        "items": [{
+            "id": "c-1",
+            "bucket": "hot",
+            "source_path": "p",
+            "sha256": "0" * 64,
+            "token_count": 10,
+            "retrieval_reason": "r",
+            "last_touched_turn": 1,
+            "pinned": False,
+            "future_per_item_field": "rejected",
+        }],
+    }
+    with pytest.raises(ValueError):
+        load_manifest(json.dumps(src))
+
+
+def test_score_field_default_zero() -> None:
+    """InjectionItemSnapshot.score defaults to 0.0 if not provided. This
+    keeps backward compat with existing fixtures that don't carry score."""
+    src = {
+        "schema_version": SCHEMA_VERSION,
+        "turn": 1, "ts_ms": 1, "session_id": "x",
+        "budget_total": 100, "budget_used": 10,
+        "items": [{
+            "id": "c-1",
+            "bucket": "hot",
+            "source_path": "p",
+            "sha256": "0" * 64,
+            "token_count": 10,
+            "retrieval_reason": "r",
+            "last_touched_turn": 1,
+            "pinned": False,
+        }],
+    }
+    m = load_manifest(json.dumps(src))
+    assert m.items[0].score == 0.0
+
+
+def test_oversized_manifest_extension_rejected() -> None:
+    """Security default per codex BLOCK: x_* values >1 KiB rejected at dump."""
+    m = Manifest(
+        schema_version=SCHEMA_VERSION,
+        turn=1, ts_ms=1, session_id="x",
+        budget_total=100, budget_used=10, items=[],
+        extensions={"x_full_payload": "leak " * 500},
+    )
+    with pytest.raises(ValueError, match="extensions are metadata, not payload"):
+        dump_manifest(m)
+
+
 def test_unicode_in_source_path() -> None:
     m = Manifest(
         schema_version=SCHEMA_VERSION,

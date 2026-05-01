@@ -1,8 +1,10 @@
-"""Manifest schema v1.0 — the runtime's primary artifact.
+"""Manifest schema v1.0 — the runtime's primary artifact (contract; writer in Phase 3).
 
-The manifest is what the runtime writes after every turn: a deterministic,
-machine-readable record of what is in the injected context. It is the
-contract between runtime and consumers (replay, audit, CLI).
+The manifest is the format the runtime writes after every turn: a deterministic,
+machine-readable record of what is in the injected context. This module
+defines the schema and the load/dump round-trip; the actual per-turn writer
+that consumes events and emits manifests lives in Phase 3 (`runtime/core/budget.py`
+and friends).
 
 Key properties:
 
@@ -29,6 +31,11 @@ from typing import Any, Mapping
 
 SCHEMA_VERSION = "1.0"
 
+# Maximum bytes any single x_* extension value may serialize to. Codex security
+# persona BLOCK: x_* keys must not become a backdoor for stuffing raw payloads
+# into default-on synced logs. Mirrors runtime/core/events.MAX_EXTENSION_BYTES.
+MAX_EXTENSION_BYTES = 1024
+
 _ALLOWED_TOP_LEVEL_KEYS = frozenset({
     "schema_version",
     "turn",
@@ -50,6 +57,8 @@ _REQUIRED_ITEM_KEYS = frozenset({
     "pinned",
 })
 
+_OPTIONAL_ITEM_KEYS = frozenset({"score", "extensions"})
+
 
 class SchemaVersionError(ValueError):
     """Raised when a manifest's schema_version is missing or unrecognized."""
@@ -62,6 +71,15 @@ class InjectionItemSnapshot:
     Reference-only: `source_path` + `sha256` identify the content; the
     actual bytes live wherever the storage layer keeps them. The runtime
     never stores raw content here.
+
+    `score` is the value that some policies (e.g., recency-weighted) use
+    for eviction ranking. It is included in the snapshot so replay can
+    reconstruct the policy's input deterministically (codex Skeptic
+    finding #3: RecencyWeightedPolicy was previously unreplayable from
+    manifests because score wasn't snapshotted).
+
+    `extensions` allows per-item x_* fields to round-trip, mirroring the
+    top-level Manifest extensions (codex Skeptic finding #4).
     """
 
     id: str
@@ -72,6 +90,8 @@ class InjectionItemSnapshot:
     retrieval_reason: str
     last_touched_turn: int
     pinned: bool
+    score: float = 0.0
+    extensions: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -89,6 +109,31 @@ class Manifest:
     extensions: dict[str, Any] = field(default_factory=dict)
 
 
+def _item_to_dict(it: InjectionItemSnapshot) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "id": it.id,
+        "bucket": it.bucket,
+        "source_path": it.source_path,
+        "sha256": it.sha256,
+        "token_count": it.token_count,
+        "retrieval_reason": it.retrieval_reason,
+        "last_touched_turn": it.last_touched_turn,
+        "pinned": it.pinned,
+        "score": it.score,
+    }
+    for k, v in it.extensions.items():
+        if not k.startswith("x_"):
+            raise ValueError(f"item extension keys must start with 'x_'; got {k!r}")
+        encoded_v = json.dumps(v, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(encoded_v) > MAX_EXTENSION_BYTES:
+            raise ValueError(
+                f"item extension {k!r} serializes to {len(encoded_v)} bytes; "
+                f"max is {MAX_EXTENSION_BYTES}."
+            )
+        out[k] = v
+    return out
+
+
 def dump_manifest(m: Manifest) -> str:
     """Serialize to deterministic JSON. Sorted keys, no insignificant whitespace."""
     payload: dict[str, Any] = {
@@ -98,11 +143,17 @@ def dump_manifest(m: Manifest) -> str:
         "session_id": m.session_id,
         "budget_total": m.budget_total,
         "budget_used": m.budget_used,
-        "items": [asdict(it) for it in m.items],
+        "items": [_item_to_dict(it) for it in m.items],
     }
     for k, v in m.extensions.items():
         if not k.startswith("x_"):
             raise ValueError(f"extension keys must start with 'x_'; got {k!r}")
+        encoded_v = json.dumps(v, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(encoded_v) > MAX_EXTENSION_BYTES:
+            raise ValueError(
+                f"manifest extension {k!r} serializes to {len(encoded_v)} bytes; "
+                f"max is {MAX_EXTENSION_BYTES}. extensions are metadata, not payload."
+            )
         payload[k] = v
     return json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
 
@@ -145,12 +196,25 @@ def load_manifest(raw: str | bytes | Mapping[str, Any]) -> Manifest:
     if not isinstance(items_raw, list):
         raise ValueError("manifest 'items' must be a list")
     items: list[InjectionItemSnapshot] = []
+    known_item_keys = _REQUIRED_ITEM_KEYS | _OPTIONAL_ITEM_KEYS
     for i, raw_item in enumerate(items_raw):
         if not isinstance(raw_item, dict):
             raise ValueError(f"item {i} must be an object")
         missing_item = _REQUIRED_ITEM_KEYS - set(raw_item.keys())
         if missing_item:
             raise ValueError(f"item {i} missing required fields: {sorted(missing_item)}")
+        # Per-item x_*-prefixed extensions are preserved across round-trip
+        # (codex Skeptic finding #4: silent drop was a forward-compat hole).
+        item_extras: dict[str, Any] = {}
+        for k, v in raw_item.items():
+            if k in known_item_keys:
+                continue
+            if k.startswith("x_"):
+                item_extras[k] = v
+                continue
+            raise ValueError(
+                f"item {i} unknown key {k!r}; non-x_ extensions require a schema_version bump"
+            )
         items.append(InjectionItemSnapshot(
             id=raw_item["id"],
             bucket=raw_item["bucket"],
@@ -160,6 +224,8 @@ def load_manifest(raw: str | bytes | Mapping[str, Any]) -> Manifest:
             retrieval_reason=raw_item["retrieval_reason"],
             last_touched_turn=int(raw_item["last_touched_turn"]),
             pinned=bool(raw_item["pinned"]),
+            score=float(raw_item.get("score", 0.0)),
+            extensions=item_extras,
         ))
 
     return Manifest(

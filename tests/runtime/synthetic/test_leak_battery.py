@@ -10,6 +10,7 @@ runtime/core/events.py + runtime/core/manifest.py don't leak either.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -62,13 +63,10 @@ def test_event_log_does_not_leak_secret_via_summary(tmp_path: Path, secret: str)
 
 
 @pytest.mark.parametrize("secret", FAKE_SECRET_PATTERNS)
-def test_event_log_does_not_leak_via_input_keys(tmp_path: Path, secret: str) -> None:
-    """tool_input_keys is sorted top-level KEY NAMES only. Even if a user
-    puts a secret-shaped string in a key name (silly but possible), it
-    appears verbatim — but never via VALUES."""
+def test_event_log_does_not_leak_via_input_values_when_keys_only_passed(tmp_path: Path, secret: str) -> None:
+    """Realistic case: tool input contains secret as VALUE; runtime is given
+    only the KEYS. Verify no value leaks into the log."""
     log = tmp_path / "events.log.jsonl"
-    # Simulate a tool input where the SECRET is in the value (the realistic case)
-    # We pass only the keys, never the values.
     e = EventRecord(
         schema_version=EVENT_LOG_SCHEMA_VERSION,
         ts_ms=1,
@@ -81,6 +79,34 @@ def test_event_log_does_not_leak_via_input_keys(tmp_path: Path, secret: str) -> 
     append_event(log, e)
     raw = log.read_text(encoding="utf-8")
     assert secret not in raw
+
+
+@pytest.mark.parametrize("secret", FAKE_SECRET_PATTERNS)
+def test_secret_shaped_key_name_round_trips_verbatim(tmp_path: Path, secret: str) -> None:
+    """Documented behavior per data-policy.md: if a caller puts a secret-shaped
+    string IN A KEY NAME, the runtime preserves it verbatim. This test pins
+    the contract — the user is responsible for not naming keys after secrets.
+
+    Codex security persona finding #1: this is the documented threat. We
+    surface it explicitly so any future "redact sensitive key names"
+    mitigation has a concrete contract to flip."""
+    log = tmp_path / "events.log.jsonl"
+    e = EventRecord(
+        schema_version=EVENT_LOG_SCHEMA_VERSION,
+        ts_ms=1,
+        event="PostToolUse",
+        session_id="leak-test",
+        turn=0,
+        tool_name="Bash",
+        tool_input_keys=[secret, "command"],  # secret IS the key name
+    )
+    append_event(log, e)
+    raw = log.read_text(encoding="utf-8").strip()
+    parsed = json.loads(raw)
+    # Pinned contract: secret-shaped KEY NAMES round-trip into the parsed
+    # tool_input_keys. (We check the parsed form, not raw text, because
+    # multi-line secrets are JSON-escaped to \n in the on-disk bytes.)
+    assert secret in parsed["tool_input_keys"]
 
 
 @pytest.mark.parametrize("secret", FAKE_SECRET_PATTERNS)

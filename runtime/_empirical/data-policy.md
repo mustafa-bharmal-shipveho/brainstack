@@ -97,5 +97,66 @@ This policy implements the codex review fix:
 The leak-test in `tests/runtime/test_harness_concurrent_flock.py::
 test_metadata_only_no_raw_content_leak` and the prototype in
 `tests/runtime/test_events.py::test_event_no_raw_input_fields_in_dump`
-codify the contract. Sub-phase 2c will generalize these into a synthetic
-fixture (`leak_test.py`) that runs every commit.
+codify the contract. The synthetic battery at
+`tests/runtime/synthetic/test_leak_battery.py` parametrizes 8 fake-secret
+patterns across 3 surfaces (event log via summary, event log via input
+keys, manifest via path/reason) and asserts none of them leak under
+default settings. Run on every commit.
+
+## Known threats (v0 — accepted with documentation)
+
+Documented here so the threat model is visible to anyone reviewing or
+adopting the runtime.
+
+### sha256 of raw output as a fingerprint
+
+`OutputSummary.sha256` is a SHA-256 of the raw tool output. SHA-256 is
+not invertible, but for known content (publicly-leaked secrets, breach-
+db entries, well-known canary values) the hash is a *fingerprint* a
+sufficiently motivated party could match against a corpus.
+
+Threat: an event log gets exposed and an attacker correlates one or more
+output hashes against a known-leaked-secrets database, confirming that
+secret X passed through this Claude Code session.
+
+Mitigation today: sha256 is computed only when the runtime actually
+holds the output text at hook time. Reference-only manifests don't
+include this field.
+
+Mitigation roadmap: v0.x will support `[tool.recall.runtime] hash_salt`
+that mixes a per-session value into the hash, making cross-session
+fingerprint correlation infeasible. Default would remain plain sha256
+for v0 to keep the contract simple; users in higher-threat environments
+opt in.
+
+### `source_path` PII
+
+Item `source_path` is stored verbatim. A path like
+`/Users/yourname/Projects/secret-project/notes.md` reveals (a) your
+username (b) the project name (c) the directory structure. brainstack's
+hourly git push to your private remote treats these as content; if the
+remote is ever compromised, paths leak.
+
+Mitigation: the runtime does not normalize or hash paths. Producing
+layers (the adapter, the storage layer) choose the convention. If you
+care, normalize paths to a relative-to-`~/.agent/` or hashed-prefix form
+before they reach the manifest.
+
+### Harness `$PWD` capture
+
+`runtime/_empirical/harness/hooks/log_event.sh` captures `$PWD` into the
+event row. This is research-time telemetry only; the production
+`runtime/core/events.py` does NOT capture cwd. The harness data dir is
+gitignored. If you opt to commit harness data manually, redact `cwd`
+fields first.
+
+### Extension key abuse
+
+`x_*`-prefixed keys round-trip through `extensions`. A careless or
+malicious caller can set `x_full_payload` and stuff raw content there.
+The runtime preserves it on round-trip; it does not enforce content
+policy on extension values.
+
+Mitigation: by convention, do not set extension keys you wouldn't be
+willing to commit. v0.x may add a configurable max-bytes-per-extension
+guard.

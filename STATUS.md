@@ -37,15 +37,15 @@ thesis, sub-phase breakdown, persona schedule, and synthetic test catalogue.
 - [ ] 5a-5e — Docs (Night 3)
 - [ ] 6a-6d — Review + PR (Night 3)
 
-## Test counts
+## Test counts (post-review)
 
 | Suite | Tests |
 |---|---|
 | Brainstack pre-existing | 581 |
-| Runtime new | 121 (10 events + 13 manifest + 25 policy + 10 tokens + 5 harness flock + 13 leak + 12 paths + 14 policy stress + 10 budget overflow + 5 timestamp + 4 misc) |
-| Total | 629 (+ 121 new = 702 candidate v0.2 release count) |
+| Runtime new (parametrize-expanded) | 154 (+23 from review fixes) |
+| **Total green** | **730** |
 
-All green.
+Latest `pytest -q` run: 730 passed in 134.05s. No regressions.
 
 ## LOC
 
@@ -77,10 +77,17 @@ to plan, just with a different shape.
 4. Read the most recent sub-phase output file.
 5. Read `HALT.md` for the user-action handoff.
 
-## Reviews dispatched (codex + personas)
+## Reviews
 
-Three `codex exec` calls dispatched in parallel before STATUS.md was
-finalized. Outputs in `/tmp/{codex-runtime-review,persona-skeptic,persona-security}-output.txt`. Findings are committed to the repo at
-`runtime/_review_outputs/` in the final Night-1 commit (`night-1-reviews` tag).
+Three `codex exec` calls completed. Findings + applied fixes are in
+`runtime/_review_outputs/SUMMARY.md`. Verdicts:
 
-If any returned BLOCK, the run halted before this paragraph was written.
+- Codex code review: **APPROVE** (7 of 7 checks pass)
+- Skeptic persona: **BLOCK** — 8 findings; conceptual ones (Phase 1
+  alone is a logger) are by design; structural ones (#3 score in
+  snapshot, #4 per-item x_*) fixed in code; doc tightening landed
+- Security persona: **BLOCK** — 7 findings; the two BLOCKs (sha256
+  fingerprint, x_* extension bypass) fixed: sha256 default-off,
+  MAX_EXTENSION_BYTES=1024 guard
+
+Tag: `night-1-reviews`.
