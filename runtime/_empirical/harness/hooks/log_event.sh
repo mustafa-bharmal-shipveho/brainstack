@@ -6,115 +6,100 @@
 #   $RUNTIME_HARNESS/_data/events.jsonl       (safe-to-share metadata)
 #   $RUNTIME_HARNESS/_data/payload-samples.jsonl  (full stdin payload, gitignored)
 #
-# Data policy:
-#   events.jsonl              : event name + timestamp + session id + pid + payload KEY LIST
-#   payload-samples.jsonl     : full stdin payload (for sub-phase 0b schema analysis)
-# payload-samples.jsonl is gitignored. Never commit it without redaction.
+# Locking is handled by hooks/_atomic_append.py (Python fcntl). macOS bash
+# does not ship `flock`, so we route the actual append through Python.
 #
-# Atomicity: each line is written with `>>` after being assembled in a buffer,
-# preceded by `flock` on a sentinel file. Concurrent hooks do not corrupt JSONL.
+# Hooks must always exit 0; this script never blocks the host (Claude Code)
+# even if telemetry fails internally.
 
 set -euo pipefail
 
 EVENT="${1:-unknown}"
 HARNESS="${RUNTIME_HARNESS:-}"
 if [ -z "$HARNESS" ]; then
-  # Fallback: derive from script location
   HARNESS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fi
 
 DATA_DIR="$HARNESS/_data"
 mkdir -p "$DATA_DIR"
-LOCK="$DATA_DIR/.write.lock"
 
-# Capture stdin (Claude Code hook payload). May be empty.
 STDIN_BUF=""
 if ! [ -t 0 ]; then
   STDIN_BUF="$(cat || true)"
 fi
 
-# Timestamp in ms since epoch
-TS_MS=$(python3 -c 'import time; print(int(time.time()*1000))' 2>/dev/null || echo "0")
+# Build the events row + (optional) payload row in a single python3 invocation,
+# then pipe both (NUL-separated) into _atomic_append.py for locked write.
+python3 - "$EVENT" "$STDIN_BUF" "$$" "${RUNTIME_HARNESS_RUN_TAG:-}" "$PWD" \
+        "$DATA_DIR/events.jsonl" "$DATA_DIR/payload-samples.jsonl" <<'PY' || true
+import json, sys, time, os
 
-# Try to extract session_id from stdin JSON (if present)
-SESSION_ID=""
-if [ -n "$STDIN_BUF" ]; then
-  SESSION_ID=$(python3 -c '
-import json, sys
-try:
-    d = json.loads(sys.argv[1])
-    print(d.get("session_id") or d.get("sessionId") or "")
-except Exception:
-    print("")
-' "$STDIN_BUF" 2>/dev/null || echo "")
-fi
+event       = sys.argv[1]
+stdin_buf   = sys.argv[2]
+pid         = int(sys.argv[3])
+run_tag     = sys.argv[4]
+cwd         = sys.argv[5]
+events_path = sys.argv[6]
+payload_path = sys.argv[7]
 
-# Tool name (PostToolUse-only convenience)
-TOOL_NAME=$(python3 -c '
-import json, sys
-try:
-    d = json.loads(sys.argv[1])
-    print(d.get("tool_name") or d.get("toolName") or "")
-except Exception:
-    print("")
-' "$STDIN_BUF" 2>/dev/null || echo "")
+ts_ms = int(time.time() * 1000)
 
-# Top-level keys in payload (no values, safe metadata)
-PAYLOAD_KEYS=$(python3 -c '
-import json, sys
-try:
-    d = json.loads(sys.argv[1])
-    print(",".join(sorted(d.keys())))
-except Exception:
-    print("")
-' "$STDIN_BUF" 2>/dev/null || echo "")
+session_id = ""
+tool_name = ""
+payload_keys = ""
+parsed_payload = None
+if stdin_buf:
+    try:
+        parsed_payload = json.loads(stdin_buf)
+        if isinstance(parsed_payload, dict):
+            session_id = parsed_payload.get("session_id") or parsed_payload.get("sessionId") or ""
+            tool_name = parsed_payload.get("tool_name") or parsed_payload.get("toolName") or ""
+            payload_keys = ",".join(sorted(parsed_payload.keys()))
+    except Exception:
+        pass
 
-# Approximate payload size in bytes
-PAYLOAD_BYTES=${#STDIN_BUF}
+events_row = json.dumps({
+    "ts_ms":         ts_ms,
+    "event":         event,
+    "session_id":    session_id,
+    "pid":           pid,
+    "tool_name":     tool_name,
+    "payload_keys":  payload_keys,
+    "payload_bytes": len(stdin_buf),
+    "run_tag":       run_tag,
+    "cwd":           cwd,
+}, sort_keys=True)
 
-# Marker passed in via env to correlate this run with a synthetic session
-RUN_TAG="${RUNTIME_HARNESS_RUN_TAG:-}"
+payload_row = ""
+if stdin_buf:
+    payload_row = json.dumps({
+        "ts_ms":     ts_ms,
+        "event":     event,
+        "session_id": session_id,
+        "pid":       pid,
+        "run_tag":   run_tag,
+        "payload":   parsed_payload if parsed_payload is not None else {"_parse_error": True, "raw": stdin_buf[:500]},
+    }, sort_keys=True, default=str)
 
-# Assemble the metadata-only event line
-EVENT_LINE=$(python3 -c '
-import json, sys
-print(json.dumps({
-    "ts_ms": int(sys.argv[1]),
-    "event": sys.argv[2],
-    "session_id": sys.argv[3],
-    "pid": int(sys.argv[4]),
-    "tool_name": sys.argv[5],
-    "payload_keys": sys.argv[6],
-    "payload_bytes": int(sys.argv[7]),
-    "run_tag": sys.argv[8],
-    "cwd": sys.argv[9],
-}, sort_keys=True))
-' "$TS_MS" "$EVENT" "$SESSION_ID" "$$" "$TOOL_NAME" "$PAYLOAD_KEYS" "$PAYLOAD_BYTES" "$RUN_TAG" "$PWD")
+# Pipe into the atomic appender via stdin (NUL-separated).
+combined = events_row
+if payload_row:
+    combined += "\x00" + payload_row
 
-# flock-guarded append
-{
-  flock -x 9
-  echo "$EVENT_LINE" >> "$DATA_DIR/events.jsonl"
-  if [ -n "$STDIN_BUF" ]; then
-    # Wrap full payload with the same metadata header for offline analysis
-    PAYLOAD_LINE=$(python3 -c '
-import json, sys
-try:
-    raw = json.loads(sys.argv[2])
-except Exception:
-    raw = {"_parse_error": True, "raw": sys.argv[2][:500]}
-print(json.dumps({
-    "ts_ms": int(sys.argv[1]),
-    "event": sys.argv[3],
-    "session_id": sys.argv[4],
-    "pid": int(sys.argv[5]),
-    "run_tag": sys.argv[6],
-    "payload": raw,
-}, sort_keys=True, default=str))
-' "$TS_MS" "$STDIN_BUF" "$EVENT" "$SESSION_ID" "$$" "$RUN_TAG")
-    echo "$PAYLOAD_LINE" >> "$DATA_DIR/payload-samples.jsonl"
-  fi
-} 9>"$LOCK"
+import subprocess
+helper = os.path.join(os.path.dirname(os.path.realpath(__file__)) if False else "", "")
+helper_path = os.path.join(os.path.dirname(os.path.abspath(__file__)) if False else os.path.dirname(os.path.realpath(events_path)), "..")
+# Compute helper path off RUNTIME_HARNESS to avoid __file__ ambiguity.
+import os as _os
+harness_root = _os.environ.get("RUNTIME_HARNESS") or _os.path.dirname(_os.path.dirname(events_path))
+helper_path = _os.path.join(harness_root, "hooks", "_atomic_append.py")
 
-# Hooks must always exit 0 unless explicitly trying to block; we never block.
+subprocess.run(
+    ["python3", helper_path, events_path, payload_path],
+    input=combined,
+    text=True,
+    check=False,
+)
+PY
+
 exit 0
