@@ -15,13 +15,14 @@ Translation EventRecord -> Engine events:
   UserPromptSubmit    -> Engine.TurnAdvance
   PostToolUse         -> Engine.AddItem (one per items_added entry)
                        + Engine.EvictItem (one per item_ids_evicted)
-                       + Engine.TouchItem (one per item_ids referenced;
-                         heuristically derived from items_added when not
-                         explicitly recorded)
   Stop, SubagentStop  -> noop (lifecycle markers; the next TurnAdvance
                           handles state)
   PostCompact         -> noop in v0.2 (compaction handling is roadmap)
   Other / unknown     -> noop
+
+TouchItem is NOT emitted by replay today. last_touched_turn is set when
+AddItem fires via Engine._on_add. Explicit touch events are reserved for
+v0.x when adapters can record cross-tool reference chains.
 
 The replay is intentionally tolerant of unknown event names: future
 adapters may emit events the runtime didn't anticipate. Tolerant replay

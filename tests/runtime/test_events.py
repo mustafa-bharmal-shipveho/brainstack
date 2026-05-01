@@ -305,6 +305,30 @@ def test_items_added_round_trip_with_full_snapshots() -> None:
     assert again.items_added[0].source_path == "hot/lessons/foo.md"
 
 
+def test_items_added_rejects_non_snapshot_dicts() -> None:
+    """SECURITY (codex Phase 3 BLOCK): items_added must be
+    InjectionItemSnapshot instances. A raw dict (which an adapter might
+    construct without going through the snapshot type) is rejected at
+    dump time. Prevents smuggling raw payloads via a non-snapshot dict."""
+    e = EventRecord(
+        schema_version=EVENT_LOG_SCHEMA_VERSION,
+        ts_ms=1, event="PostToolUse", session_id="s", turn=0,
+        items_added=[{"id": "evil", "raw_payload": "leak"}],  # not a snapshot
+    )
+    with pytest.raises(ValueError, match="must be InjectionItemSnapshot"):
+        dump_event(e)
+
+
+def test_items_added_rejects_strings() -> None:
+    e = EventRecord(
+        schema_version=EVENT_LOG_SCHEMA_VERSION,
+        ts_ms=1, event="PostToolUse", session_id="s", turn=0,
+        items_added=["just-a-string"],
+    )
+    with pytest.raises(ValueError, match="must be InjectionItemSnapshot"):
+        dump_event(e)
+
+
 def test_items_added_default_empty() -> None:
     """When no snapshots, items_added round-trips as empty list."""
     e = EventRecord(

@@ -1,4 +1,4 @@
-"""Manifest schema v1.0 — the runtime's primary artifact (contract; writer in Phase 3).
+"""Manifest schema v1.1 — the runtime's primary artifact (contract; writer in Phase 3).
 
 The manifest is the format the runtime writes after every turn: a deterministic,
 machine-readable record of what is in the injected context. This module

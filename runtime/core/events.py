@@ -1,4 +1,4 @@
-"""Event log schema v1.0 — the per-hook record stream (contract; writer in Phase 4).
+"""Event log schema v1.1 — the per-hook record stream (contract; writer in Phase 4).
 
 Each hook firing produces one EventRecord. Records are appended to a JSONL
 log (`runtime/.../events.log.jsonl`) under the same flock pattern as the
@@ -139,6 +139,20 @@ def _event_to_dict(e: EventRecord) -> dict[str, Any]:
     # because eviction order matters for replay; that one is preserved as-is.
     from runtime.core.manifest import _item_to_dict, InjectionItemSnapshot
     eid = e.event_id or event_id_for(e.session_id, e.turn, e.ts_ms, e.event)
+    # SECURITY (codex Phase 3 BLOCK #1): items_added MUST be a list of
+    # InjectionItemSnapshot. We previously passed dicts through verbatim,
+    # which let a careless or malicious adapter smuggle raw payloads into
+    # the default-on synced event log. Hard-validate at dump time.
+    items_added_serialized: list[dict[str, Any]] = []
+    for it in e.items_added:
+        if not isinstance(it, InjectionItemSnapshot):
+            raise ValueError(
+                f"items_added must be InjectionItemSnapshot instances; got {type(it).__name__}. "
+                f"This guard prevents raw payloads from being smuggled into the event log "
+                f"via a non-snapshot dict. Construct an InjectionItemSnapshot at the adapter layer."
+            )
+        items_added_serialized.append(_item_to_dict(it))
+
     out: dict[str, Any] = {
         "schema_version": e.schema_version,
         "ts_ms": e.ts_ms,
@@ -151,10 +165,7 @@ def _event_to_dict(e: EventRecord) -> dict[str, Any]:
         "bucket": e.bucket,
         "item_ids_added": list(e.item_ids_added),
         "item_ids_evicted": list(e.item_ids_evicted),
-        "items_added": [
-            _item_to_dict(it) if isinstance(it, InjectionItemSnapshot) else it
-            for it in e.items_added
-        ],
+        "items_added": items_added_serialized,
     }
     if e.tool_output_summary is not None:
         out["tool_output_summary"] = asdict(e.tool_output_summary)
