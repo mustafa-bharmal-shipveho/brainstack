@@ -29,7 +29,9 @@ import json
 from dataclasses import asdict, dataclass, field
 from typing import Any, Mapping
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
+# 1.0 -> 1.1 added per-item `score` and `extensions` fields. Synced with
+# events.EVENT_LOG_SCHEMA_VERSION since events embed item snapshots.
 
 # Maximum bytes any single x_* extension value may serialize to. Codex security
 # persona BLOCK: x_* keys must not become a backdoor for stuffing raw payloads
@@ -107,6 +109,43 @@ class Manifest:
     items: list[InjectionItemSnapshot]
     # Forward-compat passthrough. Keys must start with "x_".
     extensions: dict[str, Any] = field(default_factory=dict)
+
+
+_KNOWN_ITEM_KEYS = _REQUIRED_ITEM_KEYS | _OPTIONAL_ITEM_KEYS
+
+
+def _load_item(raw_item: Any, i: int) -> InjectionItemSnapshot:
+    """Parse one item-shaped dict into an InjectionItemSnapshot.
+
+    Public-ish helper used by both manifest.load_manifest and
+    events.load_event so the parsing rules stay single-source-of-truth."""
+    if not isinstance(raw_item, dict):
+        raise ValueError(f"item {i} must be an object")
+    missing_item = _REQUIRED_ITEM_KEYS - set(raw_item.keys())
+    if missing_item:
+        raise ValueError(f"item {i} missing required fields: {sorted(missing_item)}")
+    item_extras: dict[str, Any] = {}
+    for k, v in raw_item.items():
+        if k in _KNOWN_ITEM_KEYS:
+            continue
+        if k.startswith("x_"):
+            item_extras[k] = v
+            continue
+        raise ValueError(
+            f"item {i} unknown key {k!r}; non-x_ extensions require a schema_version bump"
+        )
+    return InjectionItemSnapshot(
+        id=raw_item["id"],
+        bucket=raw_item["bucket"],
+        source_path=raw_item["source_path"],
+        sha256=raw_item["sha256"],
+        token_count=int(raw_item["token_count"]),
+        retrieval_reason=raw_item["retrieval_reason"],
+        last_touched_turn=int(raw_item["last_touched_turn"]),
+        pinned=bool(raw_item["pinned"]),
+        score=float(raw_item.get("score", 0.0)),
+        extensions=item_extras,
+    )
 
 
 def _item_to_dict(it: InjectionItemSnapshot) -> dict[str, Any]:
@@ -195,38 +234,7 @@ def load_manifest(raw: str | bytes | Mapping[str, Any]) -> Manifest:
     items_raw = data["items"]
     if not isinstance(items_raw, list):
         raise ValueError("manifest 'items' must be a list")
-    items: list[InjectionItemSnapshot] = []
-    known_item_keys = _REQUIRED_ITEM_KEYS | _OPTIONAL_ITEM_KEYS
-    for i, raw_item in enumerate(items_raw):
-        if not isinstance(raw_item, dict):
-            raise ValueError(f"item {i} must be an object")
-        missing_item = _REQUIRED_ITEM_KEYS - set(raw_item.keys())
-        if missing_item:
-            raise ValueError(f"item {i} missing required fields: {sorted(missing_item)}")
-        # Per-item x_*-prefixed extensions are preserved across round-trip
-        # (codex Skeptic finding #4: silent drop was a forward-compat hole).
-        item_extras: dict[str, Any] = {}
-        for k, v in raw_item.items():
-            if k in known_item_keys:
-                continue
-            if k.startswith("x_"):
-                item_extras[k] = v
-                continue
-            raise ValueError(
-                f"item {i} unknown key {k!r}; non-x_ extensions require a schema_version bump"
-            )
-        items.append(InjectionItemSnapshot(
-            id=raw_item["id"],
-            bucket=raw_item["bucket"],
-            source_path=raw_item["source_path"],
-            sha256=raw_item["sha256"],
-            token_count=int(raw_item["token_count"]),
-            retrieval_reason=raw_item["retrieval_reason"],
-            last_touched_turn=int(raw_item["last_touched_turn"]),
-            pinned=bool(raw_item["pinned"]),
-            score=float(raw_item.get("score", 0.0)),
-            extensions=item_extras,
-        ))
+    items: list[InjectionItemSnapshot] = [_load_item(raw_item, i) for i, raw_item in enumerate(items_raw)]
 
     return Manifest(
         schema_version=version,

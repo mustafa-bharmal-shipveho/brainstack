@@ -27,7 +27,10 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
-EVENT_LOG_SCHEMA_VERSION = "1.0"
+EVENT_LOG_SCHEMA_VERSION = "1.1"
+# 1.0 -> 1.1 added items_added: list[InjectionItemSnapshot] so replay can
+# reconstruct manifests deterministically without external state. Phase 3
+# Skeptic finding #2.
 
 
 @dataclass(frozen=True)
@@ -69,10 +72,14 @@ class EventRecord:
     event_id: str = ""  # auto-derived if empty; see event_id_for()
     tool_name: str = ""
     tool_input_keys: list[str] = field(default_factory=list)
-    tool_output_summary: OutputSummary | None = None
+    tool_output_summary: "OutputSummary | None" = None
     bucket: str = ""
     item_ids_added: list[str] = field(default_factory=list)
     item_ids_evicted: list[str] = field(default_factory=list)
+    # Full snapshots of items added at this turn. Enables replay to rebuild
+    # the manifest from events alone (Skeptic finding #2). Forward-typed
+    # to avoid a circular import with manifest.py; the loader resolves it.
+    items_added: list[Any] = field(default_factory=list)
     extensions: dict[str, Any] = field(default_factory=dict)
 
 
@@ -130,6 +137,7 @@ def _event_to_dict(e: EventRecord) -> dict[str, Any]:
     # documented as "sorted top-level key names" but if a caller passes an
     # unsorted list, we fix it here. item_ids_added is order-sensitive
     # because eviction order matters for replay; that one is preserved as-is.
+    from runtime.core.manifest import _item_to_dict, InjectionItemSnapshot
     eid = e.event_id or event_id_for(e.session_id, e.turn, e.ts_ms, e.event)
     out: dict[str, Any] = {
         "schema_version": e.schema_version,
@@ -143,6 +151,10 @@ def _event_to_dict(e: EventRecord) -> dict[str, Any]:
         "bucket": e.bucket,
         "item_ids_added": list(e.item_ids_added),
         "item_ids_evicted": list(e.item_ids_evicted),
+        "items_added": [
+            _item_to_dict(it) if isinstance(it, InjectionItemSnapshot) else it
+            for it in e.items_added
+        ],
     }
     if e.tool_output_summary is not None:
         out["tool_output_summary"] = asdict(e.tool_output_summary)
@@ -170,7 +182,7 @@ _REQUIRED_KEYS = frozenset({
 _OPTIONAL_KEYS = frozenset({
     "event_id",
     "tool_name", "tool_input_keys", "tool_output_summary",
-    "bucket", "item_ids_added", "item_ids_evicted",
+    "bucket", "item_ids_added", "item_ids_evicted", "items_added",
 })
 
 _KNOWN_KEYS = _REQUIRED_KEYS | _OPTIONAL_KEYS
@@ -223,6 +235,15 @@ def load_event(raw: str | bytes | Mapping[str, Any]) -> EventRecord:
             str(data["session_id"]), int(data["turn"]),
             int(data["ts_ms"]), str(data["event"]),
         )
+    # Lazy import to break the circular dependency; manifest's load_item
+    # is the source of truth for InjectionItemSnapshot parsing.
+    from runtime.core.manifest import _load_item
+
+    items_added_raw = data.get("items_added", [])
+    if not isinstance(items_added_raw, list):
+        raise ValueError("'items_added' must be a list")
+    items_added = [_load_item(it, i) for i, it in enumerate(items_added_raw)]
+
     return EventRecord(
         schema_version=data["schema_version"],
         ts_ms=int(data["ts_ms"]),
@@ -236,6 +257,7 @@ def load_event(raw: str | bytes | Mapping[str, Any]) -> EventRecord:
         bucket=str(data.get("bucket", "")),
         item_ids_added=list(data.get("item_ids_added", [])),
         item_ids_evicted=list(data.get("item_ids_evicted", [])),
+        items_added=items_added,
         extensions=extras,
     )
 

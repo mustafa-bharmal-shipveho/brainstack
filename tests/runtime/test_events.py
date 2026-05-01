@@ -34,7 +34,7 @@ from runtime.core.events import (
 
 
 def test_event_log_schema_version_constant() -> None:
-    assert EVENT_LOG_SCHEMA_VERSION == "1.0"
+    assert EVENT_LOG_SCHEMA_VERSION == "1.1"
 
 
 def test_event_round_trip() -> None:
@@ -273,6 +273,47 @@ def test_small_extension_value_accepted() -> None:
     )
     out = dump_event(e)
     assert "x_runtime_version" in out
+
+
+def test_items_added_round_trip_with_full_snapshots() -> None:
+    """v1.1 added: events carry full InjectionItemSnapshot objects so
+    replay can reconstruct the manifest from events alone (no external
+    state). Skeptic finding #2."""
+    from runtime.core.manifest import InjectionItemSnapshot
+
+    snapshot = InjectionItemSnapshot(
+        id="c-001",
+        bucket="hot",
+        source_path="hot/lessons/foo.md",
+        sha256="a" * 64,
+        token_count=100,
+        retrieval_reason="post-tool-use:Read",
+        last_touched_turn=5,
+        pinned=False,
+        score=0.85,
+    )
+    e = EventRecord(
+        schema_version=EVENT_LOG_SCHEMA_VERSION,
+        ts_ms=1, event="PostToolUse", session_id="s", turn=5,
+        items_added=[snapshot],
+    )
+    raw = dump_event(e)
+    again = load_event(raw)
+    assert len(again.items_added) == 1
+    assert again.items_added[0].id == "c-001"
+    assert again.items_added[0].score == 0.85
+    assert again.items_added[0].source_path == "hot/lessons/foo.md"
+
+
+def test_items_added_default_empty() -> None:
+    """When no snapshots, items_added round-trips as empty list."""
+    e = EventRecord(
+        schema_version=EVENT_LOG_SCHEMA_VERSION,
+        ts_ms=1, event="Stop", session_id="s", turn=0,
+    )
+    raw = dump_event(e)
+    again = load_event(raw)
+    assert again.items_added == []
 
 
 def test_event_id_user_supplied_takes_precedence() -> None:
