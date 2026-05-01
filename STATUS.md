@@ -1,86 +1,102 @@
 # STATUS
 
-Long autonomous run on `mustafa/runtime-v0`. v0.2 context runtime.
+Long autonomous run on `mustafa/runtime-v0`. v0.2 context runtime — DONE.
 
 ## Current state
 
-- **Phase:** Night 3 wrap-up (Phase 6 final reviews running)
-- **State:** GREEN-3 pending final review verdicts
-- **Branch:** `mustafa/runtime-v0` (19 commits ahead of `main`)
-- **Last tag:** `phase-3-reviews` (final commit will be `night-3-final` once reviews land)
+- **State:** GREEN-3-FINAL
+- **Branch:** `mustafa/runtime-v0` (24 commits ahead of `main`)
+- **Last commit:** `89f7142 runtime(reviews-phase6): SUMMARY of final Phase 6 reviews + applied fixes`
+- **Last tag:** `night-3-final`
+- **PR draft:** `runtime/_review_outputs/PR_DRAFT.md` (ready to push)
 
 ## Phase progress
 
-- [x] Setup — feature branch + runtime/ skeleton
-- [x] 0a (built; user runs harness for empirical data)
-- [ ] 0b (depends on 0a — user action)
-- [x] 0c — concurrent-hook flock smoke test (5 tests)
-- [x] 0d — phase0-empirical.md template + handoff
-- [x] 1a — manifest schema v1.1 (16 tests)
-- [x] 1b — TokenCounter Protocol + offline default (10 tests)
-- [x] 1c — Policy + LRU/recency/pinned-first (25 tests)
-- [x] 1d — event log schema v1.1 + data policy (13 tests)
-- [x] 2c — synthetic test battery (68 tests)
-- [x] 3a — runtime/core/locking.py (9 tests)
-- [x] 3b — schema bump 1.0->1.1 + items_added (2 tests)
-- [x] 3d — Engine state machine (17 tests)
-- [x] 3f — replay engine + diff (9 tests)
-- [x] 3g/h — integration + control property (3 tests)
-- [x] Phase 3 reviews — 5 codex+personas; BLOCKs addressed
-- [x] 4a/4b — Claude Code adapter + CLI (28 tests)
-- [x] 4d — performance micro-benchmarks (8 tests)
-- [x] 5a-e — README + docs/runtime.md + CHANGELOG + version bump
-- [→] 6a-d — final review + PR draft (running)
+| Phase | Status | Tests added |
+|---|---|---|
+| 0a hook telemetry harness | built (user runs to fill empirical data) | — |
+| 0c flock smoke test | done | 5 |
+| 0d phase0-empirical.md template | done (user fills 0a/0b sections) | — |
+| 1a manifest schema v1.1 | done | 19 |
+| 1b TokenCounter + offline default | done | 10 |
+| 1c Policy + 3 defaults | done | 25 |
+| 1d event log schema + data policy | done | 14 |
+| 2c synthetic test battery | done | 68 |
+| 3a locking primitives | done | 9 |
+| 3b items_added in events | done | 2 |
+| 3d Engine state machine | done | 17 |
+| 3f replay + diff engine | done | 9 |
+| 3g/h integration + control property | done | 3 |
+| 4a/4b adapter + CLI | done | 28 |
+| 4d performance micro-benchmarks | done | 8 |
+| 5 docs + README + CHANGELOG | done | — |
+| 6 final review + PR draft | done | 3 (pin event wiring) |
+| 0b payload sampler (depends on user-run 0a) | deferred — user action | — |
 
-## Test counts
+## Test counts (final)
 
 | Suite | Tests |
 |---|---|
 | Brainstack pre-existing | 581 |
-| Runtime new | 230 |
-| **Total green** | **808** |
+| Runtime new | 233 |
+| **Total green** | **809** |
 
-Latest `pytest -q` run: 808 passed in 136s. No regressions.
+Latest `pytest -q` run: 809 passed in 136s. Zero regressions.
+
+## Reviews
+
+| Phase | Codex | Personas | Outcome |
+|---|---|---|---|
+| 1 | APPROVE (7/7) | Skeptic + Security BLOCK → fixed (sha256 default-off, MAX_EXTENSION_BYTES) | docs/runtime.md + data-policy.md updated |
+| 3 | APPROVE (6/6) | Skeptic retracts "fancy logger" + Security BLOCK on items_added → fixed | per-item validation + score field + x_* preservation |
+| 6 | (running long) | Power-User real bugs caught (pin placebo, install shadowing) + Competing-tool FALSE-POSITIONING → fixed | README hero toned down; pin/unpin wired; installer hardened |
+
+Review trails: `runtime/_review_outputs/{SUMMARY,phase3-SUMMARY,phase6-SUMMARY}.md`.
 
 ## Tags walked through
 
 ```
-night-1-handoff        — Phase 0+1+2 spec done, 730 tests
-night-1-reviews        — codex+skeptic+security applied, +sha256 default-off
-night-1-final          — STATUS reflects post-review state
+night-1-handoff        Phase 0+1+2 spec + 730 tests
+night-1-reviews        codex+skeptic+security applied
+night-1-final          STATUS post-review
 
-subphase-3a-locking    — atomic primitives, +9 tests
-subphase-3b-schema-1.1 — items_added in events, +2 tests
-subphase-3d-engine     — Engine state machine, +17 tests, control property
-subphase-3f-replay     — replay + diff, +9 tests
-subphase-3g-integration— byte-equal live↔replay, +3 tests
+subphase-3a-locking    atomic primitives
+subphase-3b-schema-1.1 items_added in events
+subphase-3d-engine     Engine state machine + control property
+subphase-3f-replay     replay + diff
+subphase-3g-integration byte-equal live↔replay
 
-subphase-4ab-adapter   — claude_code adapter + CLI, +28 tests
-subphase-4d-perf       — perf micro-benchmarks, +8 tests
-subphase-5-docs        — README + docs/runtime.md + CHANGELOG + 0.2.0
-phase-3-reviews        — items_added security validation
+phase-3-reviews        items_added security validation
+
+subphase-4ab-adapter   claude_code adapter + CLI
+subphase-4d-perf       perf micro-benchmarks
+subphase-5-docs        README + docs/runtime.md + CHANGELOG + 0.2.0
+
+night-3-final          ← here (24 commits, 233 runtime tests, all reviews addressed)
 ```
-
-## Final commit (when reviews land)
-
-`night-3-final` will be tagged after Phase 6 reviews are processed and any
-final fixes applied. The PR description draft lives at
-`runtime/_review_outputs/PR_DRAFT.md`.
-
-## Honest scope
-
-The runtime owns the **injection layer**, not the model's KV cache.
-"Eviction" = "demotion-from-injection on the next turn." See
-`docs/runtime.md` and `runtime/_empirical/data-policy.md` for the threat
-model and v0.x roadmap.
 
 ## What you do when you wake up
 
-1. Read `runtime/_review_outputs/PR_DRAFT.md` — that's the PR description
-   ready to push.
-2. Run the hook telemetry harness to fill in Phase 0 empirical answers
-   (one command in `HALT.md`).
-3. Capture a real session for the README demo block (replace the synthetic
-   example).
-4. `git push origin mustafa/runtime-v0` and open the PR using the draft
-   description.
+1. **Read the PR description draft**: `runtime/_review_outputs/PR_DRAFT.md`. Copy into `gh pr create --body`.
+
+2. **Run the empirical harness** (the only blocker on Phase 0):
+   ```bash
+   cd ~/Documents/brainstack
+   bash runtime/_empirical/harness/run_synthetic_sessions.sh 50 mixed
+   python3 runtime/_empirical/harness/aggregator.py --expected expected_runs.json
+   ```
+   Paste the deliverability table into `runtime/_empirical/phase0-empirical.md`. If SessionStart + UserPromptSubmit + PostToolUse + Stop each ≥90%, you're shipping as designed.
+
+3. **Optional: real-session smoke test**. Install hooks via `recall runtime install-hooks`, run a normal Claude Code session, then `recall runtime ls` and `recall runtime replay`. Capture a real `--diff` showing a live "Claude forgot X" moment — that replaces the synthetic demo block in the README.
+
+4. **Push when ready**. Branch is clean, 24 atomic commits, every sub-phase tagged. `git push origin mustafa/runtime-v0`.
+
+## Honest scope (final)
+
+The runtime **records, budgets, and replays** the injected context layer.
+It does NOT yet inject CLAUDE.md content into the live loop. v0.2 ships
+an end-to-end deterministic record + replay system with byte-identical
+audit. v0.x closes the inject loop via PostCompact-driven re-injection.
+
+That boundary is in the README, `runtime/__init__.py`, `docs/runtime.md`,
+and the PR description.
