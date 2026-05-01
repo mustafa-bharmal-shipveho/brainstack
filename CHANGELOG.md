@@ -7,8 +7,10 @@ only memory project shipping all three layers as one tool-agnostic stack.
 
 ### Added
 
-- **`runtime/` module** — host-agnostic core (`runtime/core/`) plus
-  Claude Code adapter (`runtime/adapters/claude_code/`).
+- **`runtime/` module** — host-agnostic core (`runtime/core/`) plus the
+  first per-host adapter, Claude Code (`runtime/adapters/claude_code/`).
+  Cursor and Codex CLI adapters slot into the same core via
+  `runtime/adapters/<host>/`; roadmap, community contributions welcome.
 - **Manifest schema v1.1** (`runtime/core/manifest.py`). Deterministic
   byte-identical round-trip. Per-item `score` field for replay-able
   recency-weighted policy. Per-item `x_*` extension preservation.

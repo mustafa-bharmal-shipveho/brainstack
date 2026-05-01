@@ -6,7 +6,7 @@ Three layers, one stack:
 
 - **Storage.** One global memory at `~/.agent/`. Every tool call → episodic log → nightly dream cycle clusters salient patterns → graduated lessons land in `semantic/` and are auto-loaded on every future session. Mistakes get codified once, never repeated.
 - **Retrieval.** Hybrid recall (Qdrant + BM25) finds the right memory for any query. Tool-agnostic: works with Claude Code, Cursor, Codex CLI.
-- **Runtime (v0.2).** Token budgets per bucket, eviction policy as a forkable Python file, full replay/audit. Answers *"why didn't the model know X?"* from artifacts instead of guesswork. The runtime *records and replays* every injection decision a Claude Code session makes; it does not yet inject CLAUDE.md content itself (Phase 4 of the roadmap wires that). What it controls is the log, the manifest, and the replay — which is enough to debug and prove behavior.
+- **Runtime (v0.2).** Token budgets per bucket, eviction policy as a forkable Python file, full replay/audit. Answers *"why didn't the model know X?"* from artifacts instead of guesswork. **The runtime core is host-agnostic; v0.2 ships with the first adapter, Claude Code. Cursor and Codex CLI adapters slot into the same interface (community contributions welcome).** Today the runtime *records and replays* every injection decision a Claude Code session makes; it does not yet inject CLAUDE.md content itself (the v0.x roadmap wires that). What it controls is the log, the manifest, and the replay — which is enough to debug and prove behavior.
 
 **Constant git sync.** Hourly push to your private remote (with required secret-scanner gate). Reinstall on a new machine and `git pull` brings back every lesson, every preference, every reference.
 
@@ -52,7 +52,7 @@ The runtime layer (new in v0.2) owns the *injected* context — what is pushed i
 - **Token budgets.** Caps per bucket — `claude_md`, `hot`, `retrieved`, `scratchpad`. When a bucket exceeds its cap, the eviction policy fires.
 - **Policy as code.** A single Python file at `runtime/core/policy/defaults/lru.py` that you read, fork, version. No YAML DSL. Defaults: LRU, recency-weighted, pinned-first.
 - **Replay & audit.** Reconstruct turn-by-turn manifest evolution from any past session. Answer *"why didn't the model know X?"* from logs, not vibes.
-- **Host-agnostic core.** `runtime/core/` has zero Claude-specific imports. The Claude Code adapter lives in `runtime/adapters/claude_code/`. Cursor and Codex CLI adapters drop in alongside.
+- **Host-agnostic core; first adapter is Claude Code.** `runtime/core/` has zero Claude-specific imports — manifest, Engine, replay, policies all work for any host. The Claude Code wiring lives in exactly one place: `runtime/adapters/claude_code/`. Cursor and Codex CLI adapters drop in alongside via the same interface (open issue if you want to take one).
 - **Reference-only by default.** Manifests log path + sha256 + token count, never raw content. Audit-by-default-leaks-secrets is the failure mode we engineered around. Raw capture is opt-in.
 
 ### Quickstart
@@ -94,6 +94,26 @@ hot = 2000
 retrieved = 20000
 scratchpad = 10000
 ```
+
+### Adapter status
+
+brainstack is tool-agnostic at the storage and retrieval layers; the
+runtime layer follows the same pattern (host-agnostic core + thin
+per-host adapters), but only the Claude Code adapter ships in v0.2.
+
+| Host | Storage | Retrieval | Runtime adapter |
+|---|---|---|---|
+| Claude Code | shipping | shipping | shipping (v0.2) |
+| Cursor | shipping (`*.plan.md` ingest) | shipping | roadmap |
+| Codex CLI | shipping (`rollout-*.jsonl` ingest) | shipping | roadmap |
+| Aider, Cline, Windsurf, Continue | roadmap | roadmap | roadmap |
+
+We started with Claude Code because it has the richest hook system
+(`SessionStart`, `PostToolUse`, `Stop`, `PostCompact`, etc.) — the
+easiest host to instrument first. Cursor and Codex CLI adapters need
+their own design (different lifecycle models) but slot into the same
+core via `runtime/adapters/<host>/`. Open an issue if you want to take
+one.
 
 ### What it is not
 
