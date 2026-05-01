@@ -2,6 +2,12 @@
 
 **A persistent, git-synced brain for your AI coding agent — with a runtime that records, budgets, and replays what enters your agent's context each turn.**
 
+The core question brainstack measures is simple:
+
+> **Did the agent have the right memory/context when it mattered?**
+
+Everything else is instrumentation for that answer: durable capture, retrieval quality, token budgets, eviction policy, and replay.
+
 Three layers, one stack:
 
 - **Storage.** One global memory at `~/.agent/`. Every tool call → episodic log → nightly dream cycle clusters salient patterns → graduated lessons land in `semantic/` and are auto-loaded on every future session. Mistakes get codified so the next session reuses them.
@@ -68,6 +74,18 @@ Migrating from existing AI-tool memory dirs (Claude Code, Cursor, Codex CLI):
 3. **Graduate (your review).** `graduate.py <id>` promotes a candidate to permanent `semantic/`; `reject.py` discards.
 4. **Sync (hourly).** `sync.sh` runs `trufflehog`/`gitleaks`, scrubs JSONL, pushes to your private brain remote.
 
+### How we measure storage reliability
+
+Storage quality is measured by two questions: did the captured row survive, and did secret-bearing tool output get scrubbed before sync?
+
+```bash
+python3 -m pytest tests/test_concurrent_appends.py tests/test_pipeline_e2e.py -q
+```
+
+The concurrency gate runs **20 appenders x 5 rows** while the dream cycle rewrites the episodic log. Expected result: **100/100 rows survive, 0 lost**, either in the live JSONL or dream-cycle snapshots. That test exists because locking the data file directly previously caused silent loss under `os.replace`; sentinel locking is now the contract.
+
+The redaction pipeline test injects fake AWS/Bearer/Edit secrets into captured tool-call JSONL, runs the JSONL scrubber, then runs the scanner. Expected result: **0 literal secrets remain** and `[REDACTED:...]` markers replace them. A plain auto-memory folder usually has no append-concurrency gate and no scrub-then-scan sync gate.
+
 Set-and-forget multi-tool ingest: `./install.sh --setup-auto-migrate` installs a single hourly LaunchAgent that pulls Cursor + Codex CLI sessions in alongside Claude Code's real-time symlink. `--enable`, `--all`, `--dry-run` for non-interactive runs; `--remove-auto-migrate` to tear down. Details: [`docs/dream-cycle.md`](docs/dream-cycle.md), [`docs/git-sync.md`](docs/git-sync.md), [`docs/memory-model.md`](docs/memory-model.md).
 
 Built on top of [codejunkie99/agentic-stack](https://github.com/codejunkie99/agentic-stack) — vendored dream cycle, clustering, lesson rendering. See [`UPSTREAM.md`](UPSTREAM.md).
@@ -94,6 +112,24 @@ recall forget agent-team    # archives by name or substring; multi-match lists c
 
 `recall remember` writes a markdown lesson to `~/.agent/memory/semantic/lessons/<slug>.md`; it auto-loads on every future session, forever. `recall forget` moves it to `archived/` (recoverable). Both accept natural queries — no cryptic IDs to copy-paste.
 
+### How we measure retrieval quality
+
+Retrieval quality is measured as **recall@5**: when a user asks a question, does the right memory, or the right family of memories, appear in the top five results?
+
+Two benchmarks cover different failure modes:
+
+```bash
+# Public synthetic benchmark: compares recall vs no-recall at 80 / 1k / 5k memories.
+python tests/recall/bench_e2e.py --scale 5000 --report
+
+# Local power-user benchmark: seeds a large private simulation from your own memory.
+python tests/recall/bench_memory_quality.py --simulate-target-docs 5000
+```
+
+The no-Brainstack baseline is what most agents do by default: rely on a static `MEMORY.md` / `CLAUDE.md` index, often truncated by the host, or manually read files after the model already guesses what matters. At 5,000 synthetic lessons, that path gets about **12% paraphrase recall@5** when the index is truncated and about **35%** even with the full index. Brainstack hybrid recall is about **90% paraphrase recall@5** at the same size. Full numbers are in [`tests/recall/BENCH_RESULTS.md`](tests/recall/BENCH_RESULTS.md).
+
+The local power-user simulation answers a different question: if this brain grew to about 5,000 memories, would the current budget shape still surface the right memory? On the current memory style, the expected memory family appeared in the top five **100%** of the time; 4,000 retrieved tokens included it **98%** of the time, and 20,000 retrieved tokens included it **100%** of the time. That suggests the current `retrieved = 20000` budget is enough for memory retrieval; the harder problem is session tool-output churn, which the runtime measures separately with eviction/replay.
+
 Tool-agnostic — runs as CLI, MCP server, or Python import; callable from Claude Code, Cursor, Codex CLI, or your own scripts. Quality numbers (synthetic-corpus, deterministic seed) and per-strategy benchmark in [`recall/README.md`](recall/README.md). PRs touching `recall/` gate on a 5pp recall@5 tolerance.
 
 ---
@@ -110,6 +146,21 @@ Plain English:
 - **Replay** rebuilds the session from the event log so you can see what was in context at each turn and what got dropped.
 
 Example: Claude reads five Postgres notes at 500 tokens each. The `retrieved` bucket has a 2,000-token budget, so the fifth note pushes the bucket to 2,500 tokens. Brainstack records all five reads, runs the eviction policy, drops the oldest unpinned note from the manifest, and keeps the bucket at 2,000 tokens. Later, `recall runtime replay --diff 4:5` can show exactly which note was added and which note was evicted. This does not change Claude's private model memory; it controls and audits the context Brainstack injects.
+
+### How we measure runtime quality
+
+Runtime quality is measured as correctness under pressure, replay honesty, and hook overhead:
+
+```bash
+python3 -m pytest \
+  tests/runtime/test_budget.py \
+  tests/runtime/test_integration_live_replay.py \
+  tests/runtime/test_performance.py -q
+```
+
+The budget gate proves the control property: once an item is evicted, it does **not** reappear unless a later explicit add event brings it back. The replay gate runs a live Engine session, writes an event log, replays it through a fresh Engine, and requires the final manifests to be **byte-identical**. The performance gate keeps the hot path bounded: hook p95 under **100 ms**, `Engine.apply` p95 under **5 ms**, replay of **500+ events under 1 second**, and token counting of about **900 KB under 1 second**.
+
+For real-session quality, `tests/recall/bench_memory_quality.py` also reports eviction pressure from a local runtime log. On the current local log it found **449 events**, **168 Engine evictions**, and **72 same-source re-reads after eviction**. That is the runtime-quality number to improve: fewer regretful evictions, not just more total context.
 
 ```bash
 $ recall runtime timeline
