@@ -1,5 +1,94 @@
 # Changelog
 
+## Unreleased — v0.2.0 context runtime (2026-05-01)
+
+The runtime layer. brainstack is now storage + retrieval + runtime — the
+only memory project shipping all three layers as one tool-agnostic stack.
+
+### Added
+
+- **`runtime/` module** — host-agnostic core (`runtime/core/`) plus
+  Claude Code adapter (`runtime/adapters/claude_code/`).
+- **Manifest schema v1.1** (`runtime/core/manifest.py`). Deterministic
+  byte-identical round-trip. Per-item `score` field for replay-able
+  recency-weighted policy. Per-item `x_*` extension preservation.
+  Schema version validation on load with explicit non-`x_` rejection.
+- **Event log schema v1.1** (`runtime/core/events.py`). Append-only
+  JSONL of typed hook events. Each PostToolUse carries full
+  `InjectionItemSnapshot` records so replay reconstructs manifests
+  from events alone. `event_id` derived from natural key.
+  `tool_input_keys` sorted at dump (PYTHONHASHSEED-safe).
+- **Pluggable token counter** (`runtime/core/tokens.py`). Deterministic
+  offline default (~±15% of vendor counts on English prose); zero
+  external dependencies. Optional Anthropic-validating slot for users
+  who want exactness.
+- **Eviction policies** (`runtime/core/policy/defaults/`). LRU,
+  recency-weighted, pinned-first. Pure functions: events in,
+  evictions out. No I/O, no clock reads, no randomness.
+- **Engine state machine** (`runtime/core/budget.py`). Receives typed
+  events, maintains current injection set, enforces token budgets per
+  bucket, calls `Policy.choose_evictions` when over cap. Pinned items
+  never evicted. The control-property test pins the contract: an
+  evicted item does not reappear without an explicit `AddItem`.
+- **Replay engine** (`runtime/core/replay.py`). Reads `events.log.jsonl`,
+  plays through Engine, emits per-turn manifests. Diff renderer for
+  "what entered and left between turn N and turn N+1". The headline
+  audit feature: integration test proves byte-identical manifests
+  between live run and replay.
+- **Atomic locking primitives** (`runtime/core/locking.py`).
+  `locked_append` and `locked_write` using fcntl flock on a sentinel
+  file (sibling `.name.lock`, never the data file — preserves the
+  brainstack `_atomic.py` lesson).
+- **Claude Code adapter** (`runtime/adapters/claude_code/`).
+  `handle_hook(event)` entrypoint, `RuntimeConfig` loaded from
+  pyproject.toml `[tool.recall.runtime]`, idempotent installer for
+  `~/.claude/settings.json`.
+- **`recall runtime` CLI subcommand group**: `ls`, `pin`, `unpin`,
+  `evict`, `replay [--diff TURN_A:TURN_B]`, `budget`, `install-hooks
+  [--dry-run]`. Wired into the existing `recall` typer app.
+- **228 new tests** under `tests/runtime/` covering schemas, engine
+  state, replay, adapter hooks, CLI, performance micro-benchmarks
+  (p95 thresholds for handle_hook, Engine.apply, locked_append, replay
+  of 500-event log), data leak battery (8 fake-secret patterns x 3
+  surfaces), policy determinism stress (4 seeds x 3 policies x 5 runs
+  byte-identical), timestamp/locale independence, path normalization.
+- **Hook telemetry harness** (`runtime/_empirical/harness/`,
+  research-only, gitignored data dir) for measuring hook deliverability
+  under real Claude Code sessions.
+- **`docs/runtime.md`** — full design + schema reference + roadmap.
+
+### Security
+
+- `OutputSummary.sha256` is **empty by default**. Callers opt in via
+  `summarize_output(text, include_hash=True)`. A stable hash of
+  secret-bearing output is a fingerprint risk against breach DBs.
+  v0.x will add HMAC-keyed alternative.
+- Manifest and event extensions bounded to **1 KiB** per `x_*` value
+  at dump time. Prevents adapters from smuggling raw payload via the
+  extension mechanism.
+- Reference-only by default. Manifests + event log carry path + sha256
+  + token count, never raw content. Opt-in `capture_raw=true` writes
+  to a separate `~/.agent/runtime/logs/raw-payloads.jsonl` that is
+  git-ignored.
+
+### Reviews
+
+- Codex code review APPROVE (7 of 7 checks).
+- Skeptic + Security personas BLOCK on Phase 1 → conceptual issues
+  resolved by Phase 3 (Engine adds control), structural issues fixed
+  in code (per-item `score`, `x_*` preservation, sha256 default-off,
+  extension max-size). Documented in `runtime/_review_outputs/SUMMARY.md`.
+
+### Honest scope
+
+The runtime owns the *injection layer* — what we push through hooks,
+CLAUDE.md, and re-injection. It does NOT own the model's KV cache or
+accumulated conversation history. "Eviction" means
+"demotion-from-injection on the next turn." This boundary is in the
+README and `docs/runtime.md` first 200 words.
+
+---
+
 ## Unreleased — Multi-tool migration series (2026-04-30)
 
 Five PRs (#6 → #10) shipped together, turning brainstack from "Claude Code

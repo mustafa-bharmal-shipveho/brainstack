@@ -1,16 +1,115 @@
 # brainstack
 
-**A persistent, git-synced brain for your AI coding agent.**
+**A persistent, git-synced brain for your AI coding agent — with a runtime that decides what your agent actually remembers each turn.**
 
-One global memory at `~/.agent/`, surviving sessions, machines, and laptop crashes. Every tool call your agent makes becomes a memory. Patterns get distilled into lessons. Lessons compound across every project. Everything pushes to your private git remote on a timer — laptop loss doesn't cost you a single insight.
+Three layers, one stack:
 
-- **Graduation pipeline.** Every tool call → episodic log → nightly dream cycle clusters salient patterns → you review candidates → graduated lessons land in `semantic/` and are auto-loaded on every future session. Mistakes get codified once, never repeated.
-- **Constant git sync.** Hourly `sync.sh` pushes the whole brain to your private remote (with required secret-scanner gate). Reinstall on a new machine and `git pull` brings back every lesson, every preference, every reference.
-- **One brain, every project.** Global `~/.agent/` (not per-repo), so a lesson learned debugging Postgres in repo A is available the next time you touch Postgres in repo Z.
+- **Storage.** One global memory at `~/.agent/`. Every tool call → episodic log → nightly dream cycle clusters salient patterns → graduated lessons land in `semantic/` and are auto-loaded on every future session. Mistakes get codified once, never repeated.
+- **Retrieval.** Hybrid recall (Qdrant + BM25) finds the right memory for any query. Tool-agnostic: works with Claude Code, Cursor, Codex CLI.
+- **Runtime (v0.2).** Token budgets per bucket, eviction policy as a forkable Python file, full replay/audit. Answers *"why didn't the model know X?"* from artifacts instead of guesswork. The layer the rest of the field (mem0, Letta, claude-obsidian, Zep, Cognee) doesn't own.
+
+**Constant git sync.** Hourly push to your private remote (with required secret-scanner gate). Reinstall on a new machine and `git pull` brings back every lesson, every preference, every reference.
+
+**One brain, every project.** Global `~/.agent/` (not per-repo), so a lesson learned debugging Postgres in repo A is available the next time you touch Postgres in repo Z.
 
 The model gets smarter every release. Your agent only gets smarter if its context does. This is the substrate for that.
 
 Built on top of [codejunkie99/agentic-stack](https://github.com/codejunkie99/agentic-stack) — vendored dream cycle, clustering, lesson rendering. See [`UPSTREAM.md`](UPSTREAM.md).
+
+---
+
+## The bug nobody else can show you
+
+You spend 40 minutes debugging a Postgres deadlock. At turn 6 you tell Claude the fix uses `SELECT FOR UPDATE SKIP LOCKED`. Forty turns later, after a context compaction, Claude proposes a fix that locks the whole table. You ask why. Claude doesn't know.
+
+`recall runtime replay --diff 37:38`:
+
+```text
+turn 37 -> turn 38
+
+evicted (1):
+  - c-a3f0294b1c    (retrieved      280 tok) retrieved/turn-6-fix-summary.md
+added (1):
+  + c-77ab19d34e    (retrieved      412 tok) retrieved/postgres-locking-survey.md
+unchanged: 11 items
+```
+
+There it is. The fix you taught Claude at turn 6 dropped out of the injection set on turn 38, evicted by the LRU policy after the compaction event rebuilt the warm tier. Two-line policy fix: pin items tagged `decision` for the session.
+
+> *Synthetic example for illustration. With v0.2 installed, real `recall runtime replay --diff` output looks like this against actual session logs at `~/.agent/runtime/logs/`.*
+
+No other tool can show you this. mem0 stores facts; we manage the working set. claude-obsidian writes a recap; we run the pager. Letta pages internally; we make every paging decision a JSON file you can read, diff, and version.
+
+---
+
+## Context runtime
+
+The runtime layer (new in v0.2) owns the *injected* context — what is pushed into the agent's context window via hooks, CLAUDE.md, and re-injection. It does not own the model's KV cache or accumulated conversation history (those are opaque, no tool can manage them). What we own, we own deterministically and auditably.
+
+### What you get
+
+- **Manifest.** Every turn writes a JSON snapshot of what's in the injection set: bucket, source path, sha256, token count, retrieval reason, last-touched turn. Diffable. Versioned. Stable schema.
+- **Token budgets.** Caps per bucket — `claude_md`, `hot`, `retrieved`, `scratchpad`. When a bucket exceeds its cap, the eviction policy fires.
+- **Policy as code.** A single Python file at `runtime/core/policy/defaults/lru.py` that you read, fork, version. No YAML DSL. Defaults: LRU, recency-weighted, pinned-first.
+- **Replay & audit.** Reconstruct turn-by-turn manifest evolution from any past session. Answer *"why didn't the model know X?"* from logs, not vibes.
+- **Host-agnostic core.** `runtime/core/` has zero Claude-specific imports. The Claude Code adapter lives in `runtime/adapters/claude_code/`. Cursor and Codex CLI adapters drop in alongside.
+- **Reference-only by default.** Manifests log path + sha256 + token count, never raw content. Audit-by-default-leaks-secrets is the failure mode we engineered around. Raw capture is opt-in.
+
+### Quickstart
+
+```bash
+# 1. Edit budgets in pyproject.toml (defaults are sensible)
+# 2. Wire the Claude Code hooks (one-time, idempotent)
+recall runtime install-hooks
+
+# 3. Run any Claude Code session normally — the runtime is silent
+
+# 4. Inspect what's loaded right now
+recall runtime ls
+# > session: my-session
+# > turn:    37
+# > budget:  18420 / 36000 tokens
+# >   hot         1847 /   2000 tok (3 items)
+# >   retrieved  14260 /  20000 tok (12 items)
+# >   ...
+
+# 5. After a session, replay it
+recall runtime replay
+recall runtime replay --diff 37:38
+
+# 6. Pin the things that should never be evicted
+recall runtime pin c-a3f0294b1c
+```
+
+### Configuration
+
+```toml
+[tool.recall.runtime]
+log_dir = "~/.agent/runtime/logs"
+capture_raw = false                 # default: reference-only, no leaks
+
+[tool.recall.runtime.budget]
+claude_md = 4000
+hot = 2000
+retrieved = 20000
+scratchpad = 10000
+```
+
+### What it is not
+
+- Not a vault. ([claude-obsidian](https://github.com/AgriciDaniel/claude-obsidian) does that.)
+- Not a vector store. ([mem0](https://mem0.ai), [Zep](https://www.getzep.com), [Cognee](https://cognee.ai) do that.)
+- Not an agent framework. ([Letta / MemGPT](https://www.letta.com) does that.)
+- Not observability. ([Helicone](https://helicone.ai), [Langfuse](https://langfuse.com), [LangSmith](https://smith.langchain.com) do that.)
+- Not a UI. CLI + JSON only.
+
+It is the layer above storage and retrieval, below the agent loop, owning the budget and the eviction. That layer was empty.
+
+### Honest boundary
+
+We manage the *injection layer* — what we push into the context window via hooks, CLAUDE.md, and re-injection. We do not manage the model's KV cache or accumulated conversation history; those are opaque and cannot be evicted from mid-conversation. "Eviction" in our system means "demotion-from-injection on the next turn." That is the layer Claude Code actually lets you own, transparently and auditably. We do not claim more.
+
+See [`docs/runtime.md`](docs/runtime.md) for the full design, schema reference, and roadmap.
 
 ---
 
