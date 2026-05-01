@@ -102,6 +102,15 @@ Tool-agnostic — runs as CLI, MCP server, or Python import; callable from Claud
 
 The runtime owns the **injection layer**: what is pushed through hooks, `CLAUDE.md`, and `UserPromptSubmit` re-injection. Manifest + token budgets + eviction policy + replay. Host-agnostic core (`runtime/core/`) plus a Claude Code adapter (`runtime/adapters/claude_code/`); planned Cursor + Codex CLI adapters slot into the same interface. Wire it once with `recall runtime install-hooks`, then it runs silently.
 
+Plain English:
+
+- **Manifest** is the runtime's table of contents: the files, tool results, and notes Brainstack believes are currently in the injected context.
+- **Token budgets** are the space limits Brainstack sets for each bucket, such as `retrieved`, `hot`, and `scratchpad`.
+- **Eviction policy** is the rule Brainstack uses when a bucket gets too full. The default is LRU: remove the least-recently-used unpinned item first.
+- **Replay** rebuilds the session from the event log so you can see what was in context at each turn and what got dropped.
+
+Example: Claude reads five Postgres notes at 500 tokens each. The `retrieved` bucket has a 2,000-token budget, so the fifth note pushes the bucket to 2,500 tokens. Brainstack records all five reads, runs the eviction policy, drops the oldest unpinned note from the manifest, and keeps the bucket at 2,000 tokens. Later, `recall runtime replay --diff 4:5` can show exactly which note was added and which note was evicted. This does not change Claude's private model memory; it controls and audits the context Brainstack injects.
+
 ```bash
 $ recall runtime timeline
 Flight recorder for session — 9 turns, 173 events.
