@@ -588,6 +588,11 @@ if [ "$MODE" = "upgrade" ]; then
     chmod +x "$BRAIN_ROOT/tools/"*.sh "$BRAIN_ROOT/tools/"*.py 2>/dev/null || true
     chmod +x "$BRAIN_ROOT/harness/hooks/"*.py 2>/dev/null || true
     chmod +x "$BRAIN_ROOT/memory/"*.py 2>/dev/null || true
+    # Refresh the recall CLI symlink (idempotent; pip-installs into the venv
+    # if the venv exists, otherwise creates it).
+    if [ -x "$REPO_DIR/bin/install-recall-cli.sh" ]; then
+        bash "$REPO_DIR/bin/install-recall-cli.sh" --quiet || true
+    fi
     echo "==> Upgrade complete."
     exit 0
 fi
@@ -693,6 +698,15 @@ if [ -n "$BRAIN_REMOTE" ]; then
         echo "    'cd $BRAIN_ROOT && git push -u origin main' when ready)."
     fi
     cd "$REPO_DIR"
+fi
+
+# Make `recall` available as a bare command (creates venv if missing,
+# pip installs the package, symlinks into ~/.local/bin/). Idempotent.
+if [ -x "$REPO_DIR/bin/install-recall-cli.sh" ]; then
+    echo ""
+    echo "==> Setting up the recall CLI on your PATH"
+    bash "$REPO_DIR/bin/install-recall-cli.sh" || \
+        echo "WARN: recall CLI symlink step failed; run \`bash $REPO_DIR/bin/install-recall-cli.sh\` manually." >&2
 fi
 
 cat <<EOF

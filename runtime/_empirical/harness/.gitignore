@@ -1,0 +1,4 @@
+# Telemetry data may contain captured stdin payloads (payload-samples.jsonl).
+# Never commit raw data; only the harness scripts and the aggregated report.
+_data/
+*.log

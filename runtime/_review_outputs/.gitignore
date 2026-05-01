@@ -1,0 +1,5 @@
+# Raw codex transcripts are bulky reasoning traces (~180KB each).
+# Only the SUMMARY.md (which captures findings + fix status) is committed.
+# Regenerate raw outputs at any time by re-running codex with the prompts
+# from the plan file.
+*-partial.txt

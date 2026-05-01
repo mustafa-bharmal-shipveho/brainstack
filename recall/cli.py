@@ -38,6 +38,15 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 
+# Runtime subcommand group (brainstack v0.2): manifest + budgets + replay.
+# Imported lazily so the runtime/ tree's import errors never break the
+# existing recall CLI.
+try:
+    from runtime.adapters.claude_code.cli import app as _runtime_app
+    app.add_typer(_runtime_app, name="runtime")
+except Exception:  # pragma: no cover
+    pass
+
 
 def _load_or_build(cfg: Config) -> tuple[Optional[object], bool]:
     """Returns (cache, fresh).
@@ -129,6 +138,80 @@ def sources():
             }
         )
     typer.echo(json.dumps(out, indent=2))
+
+
+@app.command()
+def remember(
+    text: str = typer.Argument(..., help="The lesson to write. Plain markdown."),
+    name: str = typer.Option("", "--as", help="explicit slug. Default: derived from first line."),
+    description: str = typer.Option("", "--description", help="one-line summary. Default: first line of text."),
+    overwrite: bool = typer.Option(False, "--overwrite", help="overwrite an existing lesson with the same slug"),
+    brain_root: Path = typer.Option(
+        Path("~/.agent").expanduser(),
+        "--brain-root",
+        help="brainstack memory root. Default: ~/.agent",
+    ),
+):
+    """Permanently remember a lesson — auto-loaded on every future session.
+
+    Writes a markdown file to ~/.agent/memory/semantic/lessons/<slug>.md
+    with frontmatter. Different from `recall runtime add` which is
+    session-scoped (one prompt only).
+
+    Examples:
+        recall remember "always use /agent-team for development"
+        recall remember "use SELECT FOR UPDATE SKIP LOCKED for queue claims" --as postgres-locking
+    """
+    from recall.remember import write_lesson
+    try:
+        path = write_lesson(
+            text=text,
+            name=name or None,
+            description=description or None,
+            brain_root=brain_root,
+            overwrite=overwrite,
+        )
+    except (FileNotFoundError, FileExistsError, ValueError) as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(2)
+    typer.echo(f"remembered: {path}")
+    typer.echo("(brainstack will auto-load this lesson on every future session)")
+
+
+@app.command()
+def forget(
+    query: str = typer.Argument(..., help="lesson name, basename, or substring to forget"),
+    brain_root: Path = typer.Option(
+        Path("~/.agent").expanduser(),
+        "--brain-root",
+        help="brainstack memory root. Default: ~/.agent",
+    ),
+):
+    """Archive a permanent lesson out of brainstack's memory.
+
+    Resolves the query against ~/.agent/memory/semantic/lessons/ (basename
+    then substring), then moves the matched lesson to
+    ~/.agent/memory/semantic/archived/<timestamp>-<name>.md so it's
+    recoverable. Multi-match prints candidates and exits non-zero.
+
+    Examples:
+        recall forget agent-team
+        recall forget postgres-locking
+    """
+    from recall.forget import archive_lesson
+    result = archive_lesson(query, brain_root=brain_root)
+    if result.archived_path:
+        typer.echo(f"forgotten: {result.archived_path.name}")
+        typer.echo(f"  archived to: {result.archived_path}")
+        typer.echo("  (recover with: mv that path back into ~/.agent/memory/semantic/lessons/)")
+        return
+    if result.candidates:
+        typer.echo(f"'{query}' matched {len(result.candidates)} lessons (be more specific):", err=True)
+        for c in result.candidates:
+            typer.echo(f"  {c}", err=True)
+    else:
+        typer.echo(f"no lesson matches '{query}' under {brain_root}/memory/semantic/lessons/", err=True)
+    raise typer.Exit(2)
 
 
 @app.command()

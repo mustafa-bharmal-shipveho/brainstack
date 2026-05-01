@@ -1,0 +1,31 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "bash $RUNTIME_HARNESS/hooks/log_event.sh SessionStart" }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "bash $RUNTIME_HARNESS/hooks/log_event.sh UserPromptSubmit" }] }
+    ],
+    "PreToolUse": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "bash $RUNTIME_HARNESS/hooks/log_event.sh PreToolUse" }] }
+    ],
+    "PostToolUse": [
+      { "matcher": "Read|Glob|Grep|Bash|Edit|Write", "hooks": [{ "type": "command", "command": "bash $RUNTIME_HARNESS/hooks/log_event.sh PostToolUse" }] }
+    ],
+    "Notification": [
+      { "hooks": [{ "type": "command", "command": "bash $RUNTIME_HARNESS/hooks/log_event.sh Notification" }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "bash $RUNTIME_HARNESS/hooks/log_event.sh Stop" }] }
+    ],
+    "SubagentStop": [
+      { "hooks": [{ "type": "command", "command": "bash $RUNTIME_HARNESS/hooks/log_event.sh SubagentStop" }] }
+    ],
+    "PostCompact": [
+      { "hooks": [{ "type": "command", "command": "bash $RUNTIME_HARNESS/hooks/log_event.sh PostCompact" }] }
+    ],
+    "PostToolUseFailure": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "bash $RUNTIME_HARNESS/hooks/log_event.sh PostToolUseFailure" }] }
+    ]
+  }
+}

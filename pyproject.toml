@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "recall-brain"
-version = "0.1.0"
-description = "Tool-agnostic memory retrieval for AI coding assistants"
+version = "0.2.0"
+description = "Tool-agnostic memory storage + retrieval + runtime for AI coding assistants"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -49,7 +49,7 @@ recall = "recall.cli:app"
 recall-mcp = "recall.mcp_server:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["recall"]
+packages = ["recall", "runtime"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -81,3 +81,14 @@ target-version = "py310"
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]
 ignore = ["E501"]
+
+# v0.2 context runtime config. See docs/runtime.md.
+[tool.recall.runtime]
+log_dir = "~/.agent/runtime/logs"
+capture_raw = false
+
+[tool.recall.runtime.budget]
+claude_md = 4000
+hot = 2000
+retrieved = 20000
+scratchpad = 10000
