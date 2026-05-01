@@ -122,38 +122,64 @@ The runtime layer (new in v0.2) owns the *injected* context — what is pushed i
 ### Quickstart
 
 ```bash
-# 1. Edit budgets in pyproject.toml (defaults are sensible)
-# 2. Wire the Claude Code hooks (one-time, idempotent)
+# 1. Wire the Claude Code hooks (one-time, idempotent — preserves any
+#    existing hooks you have)
 recall runtime install-hooks
 
-# 3. Run any Claude Code session normally — the runtime is silent
+# 2. Run any Claude Code session normally — the runtime is silent.
 
-# 4. Flight-recorder summary of the session
-recall runtime timeline
+# 3. Inspect what just happened
+recall runtime tail              # last 10 events in plain English
+recall runtime ls                # current manifest
+recall runtime timeline          # flight-recorder summary
+recall runtime timeline --full   # chronological detail
+recall runtime replay --diff 5:6 # what entered / left between turns
 
-# 5. Inspect what's loaded right now
-recall runtime ls
-# > session: my-session
-# > turn:    37
-# > budget:  18420 / 36000 tokens
-# >   hot         1847 /   2000 tok (3 items)
-# >   retrieved  14260 /  20000 tok (12 items)
-# >   ...
+# 4. Steer the current session: add a file or inline text into the next
+#    prompt's re-injection block (no cryptic IDs — natural queries work)
+recall runtime add ~/.agent/memory/semantic/lessons/postgres-locking.md
+recall runtime add postgres-locking                  # resolves under brain root
+recall runtime add "use /agent-team for this debugging session"  # inline text
+recall runtime add policy --text                     # force text on a single word
 
-# 5. After a session, replay it
-recall runtime replay
-recall runtime replay --diff 37:38
+# 5. Drop something out of the current manifest (same query phrasing)
+recall runtime evict postgres-locking
+recall runtime evict c-77ab                          # id prefix works
+recall runtime evict postgres-locking --intent       # also skip on next re-injection
 
-# 6. Pin the things that should never be evicted
+# 6. Pin items that should never be evicted
 recall runtime pin c-a3f0294b1c
+recall runtime budget                                 # caps + current usage
 ```
+
+> **`recall runtime add` vs `recall remember`**: `runtime add` is *session-scoped* (one prompt, then gone). For permanent memory, use `recall remember` — see the section above.
+
+### How re-injection works (opt-in)
+
+Set `enable_reinjection = true` in `pyproject.toml` to activate the inject loop. On every `UserPromptSubmit`, the hook prepends a delimited block to your prompt summarising what you've added/pinned/evicted:
+
+```text
+<!-- runtime-reinject -->
+User has marked these as always-relevant:
+- postgres-locking.md (id=c-77ab19d3)
+    use SELECT FOR UPDATE SKIP LOCKED for queue claims
+
+User just added these for this turn:
+- <inline-text> (id=c-b14215f4)
+    use /agent-team for this debugging session
+<!-- /runtime-reinject -->
+```
+
+Hard token cap (`reinjection_budget_tokens`, default 1500) prevents the block from blowing your context. The delimiters let you grep your prompts to see exactly what was added — no vendor magic. Default OFF; some Claude Code versions block hook stdout as prompt-injection protection, in which case the loop closes via `recall remember` writing to persistent memory instead.
 
 ### Configuration
 
 ```toml
 [tool.recall.runtime]
 log_dir = "~/.agent/runtime/logs"
-capture_raw = false                 # default: reference-only, no leaks
+capture_raw = false                       # default: reference-only, no leaks
+enable_reinjection = false                # default OFF — opt-in to inject loop
+reinjection_budget_tokens = 1500          # hard cap on the re-injection block
 
 [tool.recall.runtime.budget]
 claude_md = 4000
@@ -321,16 +347,50 @@ Quality numbers (synthetic-corpus, deterministic seed) and per-strategy benchmar
 
 ## What's shipped
 
+**Storage + retrieval (v0.1):**
 - **Multi-tool ingest.** Claude Code (real-time via symlink), Cursor plans, Codex CLI sessions. Pluggable `Adapter` Protocol — see [`docs/multi-tool-migrate.md`](docs/multi-tool-migrate.md) for authoring a new one.
 - **Auto-migrate LaunchAgent.** `./install.sh --setup-auto-migrate` — sets it once, forget it.
 - **Discovery + interactive wizard.** `./install.sh --migrate` (no source) auto-detects what's on disk and lets you pick.
+- **Hybrid retrieval.** Qdrant + BM25 over your global brain.
+
+**Persistent brain edits (v0.4):**
+- **`recall remember "..."`** writes a markdown lesson to `~/.agent/memory/semantic/lessons/` with frontmatter. Auto-loaded forever. `--as <slug>` for explicit names; `--overwrite` for replace.
+- **`recall forget <query>`** archives a lesson (basename / substring match) to `~/.agent/memory/semantic/archived/<ts>-<name>.md`. Recoverable with `mv`. Multi-match lists candidates.
+
+**Context runtime (v0.2 → v0.4):**
+- **Manifest + event log schemas.** Versioned (v1.1), deterministic byte-identical round-trip, byte-equal replay vs live engine.
+- **Engine state machine.** Token budgets per bucket; pluggable eviction policy (LRU, recency-weighted, pinned-first ship as defaults; you write your own as a Python file).
+- **`recall runtime`** subcommand group: `ls`, `timeline` (flight-recorder summary + `--full`), `tail` (recent events plain English), `replay [--diff A:B]`, `add <file-or-text>` (resolves natural queries; supports inline text), `evict <query> [--intent]`, `pin`/`unpin`, `budget`, `install-hooks`.
+- **Re-injection (opt-in).** `enable_reinjection = true` activates a `UserPromptSubmit` hook that prepends a delimited block of pinned + user-added + user-evicted items to the next prompt. Hard token budget; clear delimiters; no vendor magic.
+- **Reference-only by default.** No raw tool output in default-on artifacts; `capture_raw = true` opt-in goes to a separate git-ignored file.
+- **Host-agnostic core.** `runtime/core/` has zero Claude-specific imports. Cursor and Codex CLI adapters drop in alongside.
+- **`recall` on PATH automatically.** `install.sh` symlinks `~/.local/bin/recall` after pip-install into a venv.
 
 ## Roadmap
 
-- **v0.2 polish.** Aider, Cline, Windsurf, Continue adapters when those tools' data shows up on a real user's machine. Brew tap. Linux systemd-timer port (currently macOS launchd only).
-- **v0.3 — Smarter dream cycle.** Per-namespace clusterer so Codex episodes graduate to lessons (today they ingest but stay in `episodic/codex/` because the default clusterer is namespace-default-only). Multi-machine append-conflict resolution. Brain visualization dashboard. LLM-graded salience.
-- **v0.4 — Compounding intelligence.** Opt-in cross-user lesson sharing (auto-redacted). Cross-project retrieval ("when working on repos like this, you learned…"). Active-recall verification.
-- **Hook adapters for Cursor + Codex** (replaces the hourly polling with direct-write capture). Each tool needs its own integration — separate PR per tool when their native hook stories settle.
+**Runtime (next minor versions):**
+- **PostCompact-driven re-injection.** Today the runtime records compaction events but doesn't auto-recover from them. The fix: on `PostCompact`, replay the last N turns and prepend a "minimum viable refresh" block to the next prompt. Closes the compaction-amnesia loop without user intervention.
+- **HMAC-keyed `OutputSummary`.** sha256 is currently a stable fingerprint of tool output (defaults to empty for safety). v0.x adds a per-session HMAC key so users who want correlation across turns can opt in without exposing fingerprints to a breach-DB-style correlator.
+- **Multi-version schema reader.** v1.1 logs become unreadable when the next bump lands. Loaders should accept a range of versions to make schema upgrades non-breaking.
+- **Citation-feedback loop.** Parse responses for which chunks the model actually cited; auto-demote uncited retrievals so retrieval scoring improves with use.
+- **Cross-context contradiction detection.** When two items in the active manifest assert opposite facts, surface a warning before they reach the model.
+
+**Adapters:**
+- **Cursor + Codex CLI hook adapters** at the runtime layer (storage already supports both). Each host has a different hook lifecycle; separate PR per host.
+- **Aider, Cline, Windsurf, Continue adapters** when those tools' data shows up on a real user's machine.
+
+**Brain ergonomics:**
+- **Per-namespace clusterer** so Codex episodes graduate to lessons (today they ingest but stay in `episodic/codex/` because the default clusterer is namespace-default-only).
+- **Brain visualization dashboard.** Today the brain is greppable text; a small read-only UI would help see lesson clusters at a glance.
+- **Active-recall verification** for high-value lessons (does Claude actually apply this? how often?).
+
+**Distribution:**
+- Brew tap so `brew install brainstack` puts `recall` on PATH without the venv shuffle.
+- Linux systemd-timer port (currently macOS launchd only).
+
+**Compounding intelligence (later):**
+- Opt-in cross-user lesson sharing (auto-redacted).
+- Cross-project retrieval — "when working on repos like this, you previously learned X."
 
 Throughline: keep the security posture sharp. The framework's value is proportional to how much you trust putting your tool-call history into a remote.
 
