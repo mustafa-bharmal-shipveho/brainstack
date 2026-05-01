@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased — v0.4.0 brain edits from the CLI (2026-05-01)
+
+The two missing commands brainstack always needed:
+
+- **`recall remember "always use /agent-team for development"`** writes a
+  lesson to `~/.agent/memory/semantic/lessons/<slug>.md` with frontmatter
+  matching the existing `feedback_*.md` convention. Auto-loaded on every
+  future session, forever. Optional `--as <name>` for explicit slugs;
+  `--description` for the one-line summary; `--overwrite` to replace.
+- **`recall forget agent-team`** resolves the lesson by basename or
+  substring (same query phrasing as `recall runtime evict`) and moves it
+  to `~/.agent/memory/semantic/archived/<timestamp>-<name>.md`. Recoverable
+  with `mv`. Multi-match lists candidates and exits non-zero.
+- New modules: `recall/remember.py` (slugify + write_lesson with empty/dup
+  refusals), `recall/forget.py` (archive_lesson reusing
+  `runtime.adapters.claude_code.resolver.resolve_brain_path`).
+- 19 new tests covering slugify edge cases, frontmatter format, name/
+  description options, overwrite semantics, multi-match candidates,
+  missing-brain-root fallback, end-to-end remember→forget round-trip.
+
+### Why this matters
+
+The runtime module shipped in v0.2/0.3 controls the **session** context
+window. v0.4.0 closes the persistent-memory loop too: now the entire CLI
+surface — `runtime add/evict` for the session, `remember/forget` for the
+forever — uses the same natural-query phrasing. No more cryptic ids, no
+editor-required brain edits.
+
 ## Unreleased — v0.2.0 context runtime (2026-05-01)
 
 The runtime layer. brainstack is now storage + retrieval + runtime — the

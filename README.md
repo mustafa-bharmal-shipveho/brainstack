@@ -18,6 +18,43 @@ Built on top of [codejunkie99/agentic-stack](https://github.com/codejunkie99/age
 
 ---
 
+## Edit your second brain in one command
+
+You know that thing where you have to keep telling Claude *"use /agent-team for development"* every. single. session? Or *"use `SELECT FOR UPDATE SKIP LOCKED` for queue claims, not table locks"* — and Claude forgets the moment the session ends?
+
+Stop doing that. Tell brainstack once:
+
+```bash
+recall remember "always use /agent-team for development"
+recall remember "use SELECT FOR UPDATE SKIP LOCKED for queue claims" --as postgres-locking
+```
+
+Both lessons land in `~/.agent/memory/semantic/lessons/` and brainstack auto-loads them on **every future session, forever**. That's the whole point of the second brain.
+
+Changed your mind? Forget it back out by name (no cryptic IDs):
+
+```bash
+recall forget agent-team          # substring match — finds always-use-agent-team-for-development
+recall forget postgres-locking    # exact slug works too
+```
+
+Forgotten lessons get moved to `~/.agent/memory/semantic/archived/<timestamp>-<name>.md` so you can `mv` them back if you want. Multi-match lists candidates rather than guessing.
+
+**Four commands, two scopes:**
+
+| Command | Lasts | Where |
+|---|---|---|
+| `recall remember "text"` | **forever** | `~/.agent/memory/semantic/lessons/` |
+| `recall forget <query>` | **forever** | moves to `archived/` |
+| `recall runtime add <file>` | one prompt (re-injection) | event log |
+| `recall runtime evict <query>` | current session | event log |
+
+The first two edit your **persistent brain** — what brainstack auto-loads forever. The last two control **the current session's context window** — for one-off "include this for this prompt" cases. Both use the same natural-query phrasing (basename, substring, or full path).
+
+Run `recall remember --help` and `recall forget --help` for full options.
+
+---
+
 ## The flight recorder for your AI session
 
 Think of it like a flight recorder summary for one Claude Code session. After a long debugging session you can run `recall runtime timeline` and see *"Claude saw 108 files, but had to drop 76 of them because the memory bucket filled up 39 times."* That's how you know to either raise your budget, pin important items, or change which files you let Claude open.
