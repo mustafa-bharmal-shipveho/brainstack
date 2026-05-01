@@ -1,8 +1,11 @@
 """Index lifecycle for Qdrant-backed recall: build, load, refresh-on-stale.
 
-Documents live in Qdrant collections (one per source). Pre-Qdrant JSON manifests
-at $XDG_CACHE_HOME/recall/files.json and $XDG_CACHE_HOME/recall/<source>/files.json
-are removed on the first new-format reindex so the cache layout stays clean.
+Documents live in Qdrant collections (one per source). A rebuild upserts the
+current source files, then prunes stale points after the upsert succeeds so an
+embedding failure does not destroy the previous usable index. Pre-Qdrant JSON
+manifests at $XDG_CACHE_HOME/recall/files.json and
+$XDG_CACHE_HOME/recall/<source>/files.json are removed on the first new-format
+reindex so the cache layout stays clean.
 """
 
 from __future__ import annotations
@@ -43,7 +46,7 @@ def _legacy_cache_cleanup(base: Path) -> None:
 
 
 def build_index(sources: Iterable[SourceConfig]) -> IndexCache:
-    """Discover docs per source, ensure_collection, upsert into Qdrant."""
+    """Discover docs per source, upsert current docs, then prune stale points."""
     sources_list = list(sources)
     base = cache_dir()
     base.mkdir(parents=True, exist_ok=True)
@@ -55,6 +58,7 @@ def build_index(sources: Iterable[SourceConfig]) -> IndexCache:
         docs = list(discover_documents(source))
         qb.ensure_collection(client, source.name)
         qb.upsert_documents(client, source.name, docs)
+        qb.delete_points_not_in_paths(client, source.name, {d.path for d in docs})
         all_docs.extend(docs)
     return IndexCache(cache_dir=base, documents=all_docs)
 

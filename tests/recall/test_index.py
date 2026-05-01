@@ -54,6 +54,48 @@ class TestBuildIndex:
         # Same FS state → same point count thanks to deterministic ids
         assert qb.count(client, "brain") == len(first.documents) == len(second.documents)
 
+    def test_rebuild_prunes_removed_documents(self, isolated_xdg, auto_memory_brain):
+        from recall import qdrant_backend as qb
+        from recall.config import cache_dir
+
+        sc = _src(auto_memory_brain)
+        first = build_index([sc])
+        target = next(auto_memory_brain.rglob("*.md"))
+        target.unlink()
+
+        second = build_index([sc])
+
+        client = qb._qdrant_client_singleton(cache_dir())
+        assert len(second.documents) == len(first.documents) - 1
+        assert qb.count(client, "brain") == len(second.documents)
+        assert needs_refresh([sc]) is False
+
+    def test_rebuild_failure_preserves_previous_collection(
+        self, isolated_xdg, auto_memory_brain, monkeypatch
+    ):
+        from recall import qdrant_backend as qb
+        from recall.config import cache_dir
+
+        sc = _src(auto_memory_brain)
+        first = build_index([sc])
+        target = next(auto_memory_brain.rglob("*.md"))
+        target_path = str(target)
+        target.unlink()
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("simulated embedding failure")
+
+        monkeypatch.setattr(qb, "upsert_documents", boom)
+
+        with pytest.raises(RuntimeError, match="simulated embedding failure"):
+            build_index([sc])
+
+        client = qb._qdrant_client_singleton(cache_dir())
+        stored = qb.collection_mtimes(client, "brain")
+        assert qb.count(client, "brain") == len(first.documents)
+        assert target_path in stored
+        assert needs_refresh([sc]) is True
+
 
 class TestNeedsRefresh:
     def test_no_collection_means_refresh_needed(self, isolated_xdg, auto_memory_brain):

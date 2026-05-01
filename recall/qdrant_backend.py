@@ -342,3 +342,42 @@ def collection_mtimes(client: QdrantClient, collection: str) -> dict[str, float]
         if next_offset is None:
             break
     return out
+
+
+def delete_points_not_in_paths(
+    client: QdrantClient,
+    collection: str,
+    current_paths: set[str],
+    batch_size: int = 1024,
+) -> int:
+    """Delete indexed points whose payload path is no longer in the source set.
+
+    Reindex uses this after a successful current-doc upsert. That order keeps
+    the previous usable index intact if embedding or upsert fails midway.
+    """
+    if not client.collection_exists(collection):
+        return 0
+    stale_ids: list[int | str] = []
+    next_offset = None
+    while True:
+        points, next_offset = client.scroll(
+            collection_name=collection,
+            limit=1024,
+            with_payload=["path"],
+            with_vectors=False,
+            offset=next_offset,
+        )
+        for p in points:
+            payload = p.payload or {}
+            path = payload.get("path")
+            if isinstance(path, str) and path not in current_paths:
+                stale_ids.append(p.id)
+        if next_offset is None:
+            break
+
+    for i in range(0, len(stale_ids), batch_size):
+        client.delete(
+            collection_name=collection,
+            points_selector=models.PointIdsList(points=stale_ids[i : i + batch_size]),
+        )
+    return len(stale_ids)
