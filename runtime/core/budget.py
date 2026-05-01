@@ -70,6 +70,18 @@ class EvictItem:
     reason: str
 
 
+@dataclass(frozen=True)
+class PinItem:
+    """Marks an existing item as pinned. No-op if the id isn't in state."""
+    id: str
+
+
+@dataclass(frozen=True)
+class UnpinItem:
+    """Removes the pinned mark from an item. No-op if not pinned or absent."""
+    id: str
+
+
 # ---------- the engine ----------
 
 class Engine:
@@ -114,6 +126,10 @@ class Engine:
             self._on_touch(event)
         elif isinstance(event, EvictItem):
             self._on_evict(event)
+        elif isinstance(event, PinItem):
+            self._on_pin(event)
+        elif isinstance(event, UnpinItem):
+            self._on_unpin(event)
         else:
             raise TypeError(f"unknown event type: {type(event).__name__}")
 
@@ -192,6 +208,16 @@ class Engine:
     def _on_evict(self, e: EvictItem) -> None:
         self._items.pop(e.id, None)
 
+    def _on_pin(self, e: PinItem) -> None:
+        if e.id not in self._items:
+            return
+        self._items[e.id] = _replace(self._items[e.id], pinned=True)
+
+    def _on_unpin(self, e: UnpinItem) -> None:
+        if e.id not in self._items:
+            return
+        self._items[e.id] = _replace(self._items[e.id], pinned=False)
+
     # --- enforcement ---
 
     def _enforce_budget(self, bucket: str) -> None:
@@ -255,7 +281,9 @@ __all__ = [
     "AddItem",
     "Engine",
     "EvictItem",
+    "PinItem",
     "SessionStart",
     "TouchItem",
     "TurnAdvance",
+    "UnpinItem",
 ]

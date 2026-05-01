@@ -127,19 +127,23 @@ def cmd_replay(
 
 @app.command("pin")
 def cmd_pin(item_id: str) -> None:
-    """Mark an item as 'always-injected' (no eviction)."""
+    """Mark an item as 'always-injected' (no eviction).
+
+    Writes a synthetic Pin event to the event log so replay picks it up.
+    The Engine handles pinning during replay via PinItem.
+    """
     cfg = _config()
-    pin_file = cfg.log_dir / "pinned.json"
-    pin_file.parent.mkdir(parents=True, exist_ok=True)
-    current: list[str] = []
-    if pin_file.exists():
-        try:
-            current = json.loads(pin_file.read_text())
-        except json.JSONDecodeError:
-            current = []
-    if item_id not in current:
-        current.append(item_id)
-        pin_file.write_text(json.dumps(sorted(set(current)), indent=2))
+    from runtime.core.events import EVENT_LOG_SCHEMA_VERSION, EventRecord, append_event
+    import time
+    record = EventRecord(
+        schema_version=EVENT_LOG_SCHEMA_VERSION,
+        ts_ms=int(time.time() * 1000),
+        event="Pin",
+        session_id="cli",
+        turn=0,
+        item_ids_added=[item_id],  # repurposed: list of ids to pin (see replay._translate)
+    )
+    append_event(cfg.event_log_path, record)
     typer.echo(f"pinned: {item_id}")
 
 
@@ -147,16 +151,17 @@ def cmd_pin(item_id: str) -> None:
 def cmd_unpin(item_id: str) -> None:
     """Remove a 'pinned' marker from an item."""
     cfg = _config()
-    pin_file = cfg.log_dir / "pinned.json"
-    if not pin_file.exists():
-        typer.echo(f"(no pins to remove)")
-        return
-    try:
-        current = json.loads(pin_file.read_text())
-    except json.JSONDecodeError:
-        current = []
-    current = [x for x in current if x != item_id]
-    pin_file.write_text(json.dumps(sorted(set(current)), indent=2))
+    from runtime.core.events import EVENT_LOG_SCHEMA_VERSION, EventRecord, append_event
+    import time
+    record = EventRecord(
+        schema_version=EVENT_LOG_SCHEMA_VERSION,
+        ts_ms=int(time.time() * 1000),
+        event="Unpin",
+        session_id="cli",
+        turn=0,
+        item_ids_evicted=[item_id],  # repurposed: list of ids to unpin
+    )
+    append_event(cfg.event_log_path, record)
     typer.echo(f"unpinned: {item_id}")
 
 

@@ -106,27 +106,41 @@ def test_replay_diff_invalid_format(cli_env: Path) -> None:
 
 # ---------- pin / unpin ----------
 
-def test_pin_then_unpin_roundtrip(cli_env: Path) -> None:
+def test_pin_writes_event_log_entry(cli_env: Path) -> None:
+    """Pin/unpin write Pin/Unpin events to the log so replay applies them."""
     runner = CliRunner()
     result = runner.invoke(app, ["pin", "c-001"])
     assert result.exit_code == 0
-    pin_file = cli_env / "logs" / "pinned.json"
-    assert pin_file.exists()
-    assert "c-001" in json.loads(pin_file.read_text())
+    log = cli_env / "logs" / "events.log.jsonl"
+    assert log.exists()
+    text = log.read_text()
+    assert '"event":"Pin"' in text
+    assert "c-001" in text
 
+
+def test_unpin_writes_event_log_entry(cli_env: Path) -> None:
+    runner = CliRunner()
     result = runner.invoke(app, ["unpin", "c-001"])
     assert result.exit_code == 0
-    assert "c-001" not in json.loads(pin_file.read_text())
+    log = cli_env / "logs" / "events.log.jsonl"
+    text = log.read_text()
+    assert '"event":"Unpin"' in text
+    assert "c-001" in text
 
 
-def test_pin_idempotent(cli_env: Path) -> None:
+def test_pin_event_replay_marks_item_pinned(cli_env: Path) -> None:
+    """Integration: add an item, pin it via CLI, replay shows it pinned."""
+    _populate_log(cli_env)  # adds c-001 (unpinned)
     runner = CliRunner()
-    runner.invoke(app, ["pin", "c-001"])
-    runner.invoke(app, ["pin", "c-001"])
-    runner.invoke(app, ["pin", "c-001"])
-    pin_file = cli_env / "logs" / "pinned.json"
-    parsed = json.loads(pin_file.read_text())
-    assert parsed.count("c-001") == 1
+    result = runner.invoke(app, ["pin", "c-001"])
+    assert result.exit_code == 0
+    # Now ls should show c-001 as pinned (the * marker)
+    result = runner.invoke(app, ["ls"])
+    assert result.exit_code == 0
+    # Find the line with c-001 and check for the pinned marker
+    lines = [ln for ln in result.output.splitlines() if "c-001" in ln]
+    assert lines, "c-001 not found in ls output"
+    assert any("*" in ln for ln in lines), f"no pinned marker in: {lines}"
 
 
 # ---------- evict ----------

@@ -38,8 +38,10 @@ from runtime.core.budget import (
     AddItem,
     Engine,
     EvictItem,
+    PinItem,
     SessionStart,
     TurnAdvance,
+    UnpinItem,
 )
 from runtime.core.events import EventRecord, load_events
 from runtime.core.manifest import InjectionItemSnapshot, Manifest
@@ -190,6 +192,15 @@ def _translate(ev: EventRecord) -> Iterable[object]:
             )
         for eid in ev.item_ids_evicted:
             yield EvictItem(id=eid, reason="adapter-recorded")
+        return
+    # Synthetic pin/unpin events recorded by `recall runtime pin/unpin`.
+    if ev.event == "Pin":
+        for ext_id in ev.item_ids_added:  # repurposed: list of ids to pin
+            yield PinItem(id=ext_id)
+        return
+    if ev.event == "Unpin":
+        for ext_id in ev.item_ids_evicted:  # repurposed: list of ids to unpin
+            yield UnpinItem(id=ext_id)
         return
     # Stop, SubagentStop, PostCompact, Notification, anything else: noop
 
