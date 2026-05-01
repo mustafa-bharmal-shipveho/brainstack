@@ -124,39 +124,59 @@ def _final_bucket_breakdown(cfg, manifest) -> str:
 
 
 def _render_timeline_summary(cfg, steps) -> None:
-    """Compact ~10-line digest. The default."""
-    from collections import Counter
-
+    """Flight-recorder digest. Reads like a paragraph, not a stat block."""
     if not steps:
         return
     last = steps[-1]
-    event_counter: Counter = Counter(s.event.event for s in steps)
     n_added = sum(len(s.added_ids) for s in steps)
     n_evicted = sum(len(s.evicted_ids) for s in steps)
     eviction_steps = [s for s in steps if s.evicted_ids]
-    final_turn = last.manifest.turn
+    n_turns = last.manifest.turn + 1
 
-    typer.echo(f"session: {last.manifest.session_id} ({final_turn + 1} turn{'s' if final_turn else ''})")
-    typer.echo(f"events:  {len(steps)} total")
-    summary = "  ".join(f"{ev}={n}" for ev, n in event_counter.most_common())
-    typer.echo(f"  {summary}")
+    # Header: one-line summary of the session shape
+    turn_word = "turn" if n_turns == 1 else "turns"
+    typer.echo(f"Flight recorder for session \"{last.manifest.session_id}\" — {n_turns} {turn_word}, {len(steps)} events.")
     typer.echo("")
-    typer.echo(f"items added:   {n_added}")
-    typer.echo(f"items evicted: {n_evicted} ({len(eviction_steps)} budget breach{'es' if len(eviction_steps) != 1 else ''})")
+
+    # The headline narrative
+    typer.echo(f"Claude saw {n_added} files/tool results during this session.")
+    if n_evicted:
+        breach_word = "breach" if len(eviction_steps) == 1 else "breaches"
+        typer.echo(f"{n_evicted} were dropped because memory filled up ({len(eviction_steps)} budget {breach_word}).")
+    else:
+        typer.echo("No memory pressure — nothing was dropped.")
+    typer.echo(f"{len(last.manifest.items)} items are still in memory.")
+
+    # Recent breaches (the "why did Claude forget X?" debugging surface)
     if eviction_steps:
-        # Show up to 5 eviction events so the most useful info isn't drowned
+        typer.echo("")
+        typer.echo("Recent budget breaches:")
         for s in eviction_steps[:5]:
             tool = s.event.tool_name or s.event.event
-            ids = ", ".join(eid[:10] for eid in s.evicted_ids[:6])
-            extra = "" if len(s.evicted_ids) <= 6 else f" + {len(s.evicted_ids)-6} more"
-            typer.echo(f"  - turn {s.manifest.turn}  {tool}: evicted {len(s.evicted_ids)} [{ids}{extra}]")
+            n = len(s.evicted_ids)
+            ids = ", ".join(eid[:10] for eid in s.evicted_ids[:4])
+            extra = "" if n <= 4 else f" + {n - 4} more"
+            item_word = "item" if n == 1 else "items"
+            typer.echo(f"  • turn {s.manifest.turn} {tool}: dropped {n} {item_word} [{ids}{extra}]")
         if len(eviction_steps) > 5:
-            typer.echo(f"  - ({len(eviction_steps) - 5} more eviction events; --full to see all)")
+            typer.echo(f"  • …and {len(eviction_steps) - 5} more (run with --full to see every event)")
+
+    # Current state, with % full so it's instantly readable
     typer.echo("")
-    typer.echo(f"final: {len(last.manifest.items)} items total")
-    typer.echo(f"  {_final_bucket_breakdown(cfg, last.manifest)}")
+    typer.echo("Memory now:")
+    by_bucket: dict[str, list[int]] = {}
+    for it in last.manifest.items:
+        slot = by_bucket.setdefault(it.bucket, [0, 0])
+        slot[0] += 1
+        slot[1] += it.token_count
+    for b, (n, t) in sorted(by_bucket.items()):
+        cap = cfg.budgets.get(b, 0)
+        pct = int(round(100 * t / cap)) if cap else 0
+        item_word = "item" if n == 1 else "items"
+        typer.echo(f"  {b:<11} {n:>3} {item_word:<5} {t:>6} / {cap:>6} tokens ({pct}% full)")
+
     typer.echo("")
-    typer.echo("--full to see every event chronologically")
+    typer.echo("Run `recall runtime timeline --full` to see every event chronologically.")
 
 
 def _render_timeline_full(cfg, steps) -> None:

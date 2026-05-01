@@ -113,18 +113,17 @@ def test_timeline_no_log_friendly_message(cli_env: Path) -> None:
     assert "no events" in result.output.lower()
 
 
-def test_timeline_default_is_compact_summary(cli_env: Path) -> None:
-    """Default `recall runtime timeline` is a digest, not a firehose."""
+def test_timeline_default_is_flight_recorder_summary(cli_env: Path) -> None:
+    """Default `recall runtime timeline` is a flight-recorder digest, not a firehose."""
     _populate_log(cli_env)
     runner = CliRunner()
     result = runner.invoke(app, ["timeline"])
     assert result.exit_code == 0
-    # Compact summary keywords
-    assert "session:" in result.output
-    assert "events:" in result.output
-    assert "items added:" in result.output
-    assert "items evicted:" in result.output
-    assert "final:" in result.output
+    # Flight-recorder narrative keywords
+    assert "Flight recorder" in result.output
+    assert "Claude saw" in result.output
+    assert "still in memory" in result.output
+    assert "Memory now:" in result.output
     # Should NOT contain per-event lines like "+ Read"
     assert "+ Read" not in result.output
 
@@ -180,10 +179,10 @@ def test_timeline_summary_mentions_evictions(cli_env: Path) -> None:
     append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=5, event="PostToolUse", session_id="s", turn=1, tool_name="Grep", items_added=[snap(2, 700)]))
 
     runner = CliRunner()
-    # Default summary mode: should mention evictions in the digest
+    # Default summary mode: flight-recorder narrative mentions drops + breaches
     result = runner.invoke(app, ["timeline"])
     assert result.exit_code == 0
-    assert "items evicted" in result.output
+    assert "dropped" in result.output
     assert "budget breach" in result.output
     # --full mode: shows the EVICTS marker inline on the offending event
     result_full = runner.invoke(app, ["timeline", "--full"])

@@ -18,6 +18,33 @@ Built on top of [codejunkie99/agentic-stack](https://github.com/codejunkie99/age
 
 ---
 
+## The flight recorder for your AI session
+
+Think of it like a flight recorder summary for one Claude Code session. After a long debugging session you can run `recall runtime timeline` and see *"Claude saw 108 files, but had to drop 76 of them because the memory bucket filled up 39 times."* That's how you know to either raise your budget, pin important items, or change which files you let Claude open.
+
+```text
+$ recall runtime timeline
+Flight recorder for session "current" — 9 turns, 173 events.
+
+Claude saw 112 files/tool results during this session.
+78 were dropped because memory filled up (40 budget breaches).
+34 items are still in memory.
+
+Recent budget breaches:
+  • turn 1 Read: dropped 5 items [c-02569426, c-08a64eec, c-0c8e88a1, c-16c0448f + 1 more]
+  • turn 1 Read: dropped 1 item [c-3f1fcdc1]
+  • turn 1 Bash: dropped 1 item [c-18c80ceb]
+  • …and 35 more (run with --full to see every event)
+
+Memory now:
+  retrieved    33 items  19207 / 20000 tokens (96% full)
+  scratchpad    1 item    7911 / 10000 tokens (79% full)
+```
+
+That answers "what happened in my session?" in 15 lines instead of 150.
+
+For the deeper question — *which exact item did Claude forget at which exact turn?* — there's `--diff`:
+
 ## The bug nobody else can show you
 
 You spend 40 minutes debugging a Postgres deadlock. At turn 6 you tell Claude the fix uses `SELECT FOR UPDATE SKIP LOCKED`. Forty turns later, after a context compaction, Claude proposes a fix that locks the whole table. You ask why. Claude doesn't know.
@@ -64,7 +91,10 @@ recall runtime install-hooks
 
 # 3. Run any Claude Code session normally — the runtime is silent
 
-# 4. Inspect what's loaded right now
+# 4. Flight-recorder summary of the session
+recall runtime timeline
+
+# 5. Inspect what's loaded right now
 recall runtime ls
 # > session: my-session
 # > turn:    37
