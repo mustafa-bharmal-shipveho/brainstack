@@ -190,6 +190,97 @@ def test_timeline_summary_mentions_evictions(cli_env: Path) -> None:
     assert "EVICTS" in result_full.output
 
 
+def test_timeline_default_scopes_to_most_recent_session(cli_env: Path) -> None:
+    """Event log accumulates across sessions. Default `timeline` shows
+    only the latest session (events from the last SessionStart to end)."""
+    from runtime.core.events import EVENT_LOG_SCHEMA_VERSION, EventRecord, append_event
+    from runtime.core.manifest import InjectionItemSnapshot
+
+    log = cli_env / "logs" / "events.log.jsonl"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    snap = lambda i, sid: InjectionItemSnapshot(
+        id=f"c-{sid}-{i:03d}", bucket="retrieved", source_path=f"{sid}/{i}.md",
+        sha256="0" * 64, token_count=100, retrieval_reason="r",
+        last_touched_turn=0, pinned=False, score=0.0,
+    )
+    # Older session
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=1, event="SessionStart", session_id="old", turn=0))
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=2, event="UserPromptSubmit", session_id="old", turn=1))
+    for i in range(20):
+        append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=10 + i, event="PostToolUse", session_id="old", turn=1, items_added=[snap(i, "old")]))
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=100, event="Stop", session_id="old", turn=1))
+    # Newer session
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=200, event="SessionStart", session_id="new", turn=0))
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=201, event="UserPromptSubmit", session_id="new", turn=1))
+    for i in range(3):
+        append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=210 + i, event="PostToolUse", session_id="new", turn=1, items_added=[snap(i, "new")]))
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=220, event="Stop", session_id="new", turn=1))
+
+    runner = CliRunner()
+    # Default: scope to "new" session (3 PostToolUse, not 23)
+    result = runner.invoke(app, ["timeline"])
+    assert result.exit_code == 0
+    assert "session \"new\"" in result.output
+    assert "Claude saw 3 files" in result.output
+
+
+def test_timeline_all_flag_includes_every_session(cli_env: Path) -> None:
+    from runtime.core.events import EVENT_LOG_SCHEMA_VERSION, EventRecord, append_event
+    from runtime.core.manifest import InjectionItemSnapshot
+
+    log = cli_env / "logs" / "events.log.jsonl"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    snap = lambda i, sid: InjectionItemSnapshot(
+        id=f"c-{sid}-{i:03d}", bucket="retrieved", source_path=f"{sid}/{i}.md",
+        sha256="0" * 64, token_count=100, retrieval_reason="r",
+        last_touched_turn=0, pinned=False, score=0.0,
+    )
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=1, event="SessionStart", session_id="A", turn=0))
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=2, event="PostToolUse", session_id="A", turn=0, items_added=[snap(0, "A")]))
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=3, event="SessionStart", session_id="B", turn=0))
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=4, event="PostToolUse", session_id="B", turn=0, items_added=[snap(0, "B")]))
+
+    runner = CliRunner()
+    # --all should include events from both sessions
+    result = runner.invoke(app, ["timeline", "--all"])
+    assert result.exit_code == 0
+    assert "all sessions" in result.output
+    # Should report 2 PostToolUse adds across the two sessions
+    assert "Claude saw 2 files" in result.output
+
+
+def test_timeline_session_flag_picks_specific_session(cli_env: Path) -> None:
+    from runtime.core.events import EVENT_LOG_SCHEMA_VERSION, EventRecord, append_event
+    from runtime.core.manifest import InjectionItemSnapshot
+
+    log = cli_env / "logs" / "events.log.jsonl"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    snap = lambda sid: InjectionItemSnapshot(
+        id=f"c-{sid}", bucket="retrieved", source_path=f"{sid}.md",
+        sha256="0" * 64, token_count=100, retrieval_reason="r",
+        last_touched_turn=0, pinned=False, score=0.0,
+    )
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=1, event="SessionStart", session_id="alpha", turn=0))
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=2, event="PostToolUse", session_id="alpha", turn=0, items_added=[snap("alpha")]))
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=3, event="SessionStart", session_id="beta", turn=0))
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=4, event="PostToolUse", session_id="beta", turn=0, items_added=[snap("beta")]))
+
+    runner = CliRunner()
+    # Pick the older "alpha" session explicitly
+    result = runner.invoke(app, ["timeline", "--session", "alpha"])
+    assert result.exit_code == 0
+    assert "session 'alpha'" in result.output
+    assert "Claude saw 1" in result.output
+
+
+def test_timeline_session_flag_unknown_session_errors(cli_env: Path) -> None:
+    _populate_log(cli_env)
+    runner = CliRunner()
+    result = runner.invoke(app, ["timeline", "--session", "does-not-exist"])
+    assert result.exit_code != 0
+    assert "no events for session" in result.output
+
+
 def test_timeline_works_on_single_turn_session(cli_env: Path) -> None:
     """The exact case --diff failed on. Should print all events without complaint."""
     from runtime.core.events import EVENT_LOG_SCHEMA_VERSION, EventRecord, append_event

@@ -78,36 +78,87 @@ def cmd_timeline(
         False, "--full",
         help="show every event (chronological firehose). Default is a compact summary.",
     ),
+    session: str = typer.Option(
+        "", "--session",
+        help="show a specific session id. Default is the most recent session.",
+    ),
+    all_sessions: bool = typer.Option(
+        False, "--all",
+        help="show every event across every session in the log (no scoping).",
+    ),
 ) -> None:
-    """Compact summary of the session by default; --full for chronological detail.
+    """Flight-recorder summary of the most recent session by default.
 
-    Default summary shows: lifecycle markers, eviction count + offending IDs,
-    final per-bucket state. Survives the "one big turn" reality of typical
-    Claude Code sessions where `--diff` between turns has nothing to compare.
-
-    Use --full when debugging a specific event ("what added X at minute 23?").
+    The event log accumulates across every Claude Code session. By default
+    `timeline` scopes to the latest session (events from the last
+    SessionStart to the end of the log). Pass --all to see across all
+    sessions, or --session <id> to pick a specific past one.
     """
-    from collections import Counter
-
     from runtime.core.events import load_events
-    from runtime.core.manifest import InjectionItemSnapshot
     from runtime.core.replay import iter_engine_steps
 
     cfg = _config()
     if not cfg.event_log_path.exists():
         typer.echo("(no events recorded yet)")
         raise typer.Exit(0)
-    events = load_events(cfg.event_log_path)
-    if not events:
+    all_events = load_events(cfg.event_log_path)
+    if not all_events:
         typer.echo("(empty log)")
         raise typer.Exit(0)
 
-    rcfg = _replay_config(cfg)
+    if all_sessions:
+        scoped_events = all_events
+        scope_label = f"all sessions ({len(_distinct_session_ids(all_events))} total)"
+        scope_session_id = "all-sessions"
+    elif session:
+        scoped_events = [e for e in all_events if e.session_id == session]
+        if not scoped_events:
+            available = sorted(_distinct_session_ids(all_events))
+            typer.echo(f"no events for session '{session}' (available: {available})", err=True)
+            raise typer.Exit(2)
+        scope_label = f"session '{session}'"
+        scope_session_id = session
+    else:
+        # Default: latest session = events from the LAST SessionStart to end.
+        scoped_events = _latest_session_events(all_events)
+        scope_label = None  # rendered inline by the summary
+        # Use the session_id from the first event in the scoped slice
+        # (which will be SessionStart if a real session boundary was found,
+        # or the first event if the log predates SessionStart wiring).
+        scope_session_id = scoped_events[0].session_id or "current"
+
+    rcfg = _replay_config(cfg, session_id=scope_session_id)
+    steps = list(iter_engine_steps(scoped_events, rcfg))
 
     if full:
-        _render_timeline_full(cfg, list(iter_engine_steps(events, rcfg)))
+        if scope_label:
+            typer.echo(f"# scope: {scope_label}\n")
+        _render_timeline_full(cfg, steps)
     else:
-        _render_timeline_summary(cfg, list(iter_engine_steps(events, rcfg)))
+        if scope_label:
+            typer.echo(f"# scope: {scope_label}\n")
+        _render_timeline_summary(cfg, steps)
+
+
+def _distinct_session_ids(events: list) -> set[str]:
+    return {e.session_id for e in events if e.session_id}
+
+
+def _latest_session_events(events: list) -> list:
+    """Return events from the most recent session.
+
+    Strategy: find the last SessionStart event; return everything from
+    there to end of log. If no SessionStart exists (older logs from
+    before the adapter was wired), fall back to all events.
+    """
+    last_start_idx = None
+    for i in range(len(events) - 1, -1, -1):
+        if events[i].event == "SessionStart":
+            last_start_idx = i
+            break
+    if last_start_idx is None:
+        return events
+    return events[last_start_idx:]
 
 
 def _final_bucket_breakdown(cfg, manifest) -> str:
