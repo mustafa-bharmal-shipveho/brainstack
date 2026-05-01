@@ -106,6 +106,125 @@ def test_replay_diff_invalid_format(cli_env: Path) -> None:
 
 # ---------- pin / unpin ----------
 
+def test_timeline_no_log_friendly_message(cli_env: Path) -> None:
+    runner = CliRunner()
+    result = runner.invoke(app, ["timeline"])
+    assert result.exit_code == 0
+    assert "no events" in result.output.lower()
+
+
+def test_timeline_default_is_compact_summary(cli_env: Path) -> None:
+    """Default `recall runtime timeline` is a digest, not a firehose."""
+    _populate_log(cli_env)
+    runner = CliRunner()
+    result = runner.invoke(app, ["timeline"])
+    assert result.exit_code == 0
+    # Compact summary keywords
+    assert "session:" in result.output
+    assert "events:" in result.output
+    assert "items added:" in result.output
+    assert "items evicted:" in result.output
+    assert "final:" in result.output
+    # Should NOT contain per-event lines like "+ Read"
+    assert "+ Read" not in result.output
+
+
+def test_timeline_full_shows_every_event(cli_env: Path) -> None:
+    """`recall runtime timeline --full` is the chronological firehose."""
+    _populate_log(cli_env)
+    runner = CliRunner()
+    result = runner.invoke(app, ["timeline", "--full"])
+    assert result.exit_code == 0
+    assert "SessionStart" in result.output
+    assert "UserPromptSubmit" in result.output
+    # Per-event lines reappear in --full mode
+    assert "+ Read" in result.output or "200 tok" in result.output
+
+
+def test_timeline_full_shows_tool_invocations_with_token_counts(cli_env: Path) -> None:
+    _populate_log(cli_env)
+    runner = CliRunner()
+    result = runner.invoke(app, ["timeline", "--full"])
+    assert result.exit_code == 0
+    assert "200 tok" in result.output
+    assert "retrieved" in result.output
+
+
+def test_timeline_summary_mentions_evictions(cli_env: Path) -> None:
+    """When the budget is breached, the timeline must mark the offending
+    line with 'EVICTS [...]' so the cause-and-effect is visible."""
+    from runtime.core.events import EVENT_LOG_SCHEMA_VERSION, EventRecord, append_event
+    from runtime.core.manifest import InjectionItemSnapshot
+
+    log = cli_env / "logs" / "events.log.jsonl"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    snap = lambda i, t: InjectionItemSnapshot(
+        id=f"c-{i}", bucket="retrieved", source_path=f"p/{i}.md",
+        sha256="0" * 64, token_count=t, retrieval_reason="r",
+        last_touched_turn=0, pinned=False, score=0.0,
+    )
+    # Tight budget so the third add forces eviction. The cli's _replay_config
+    # uses cfg.budgets which we set to retrieved=10000 in the cli_env fixture.
+    # Override by tightening the fixture inline:
+    pyproject = cli_env / "pyproject.toml"
+    pyproject.write_text(
+        '[tool.recall.runtime]\n'
+        f'log_dir = "{cli_env}/logs"\n'
+        '[tool.recall.runtime.budget]\n'
+        'retrieved = 800\n'
+    )
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=1, event="SessionStart", session_id="s", turn=0))
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=2, event="UserPromptSubmit", session_id="s", turn=1))
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=3, event="PostToolUse", session_id="s", turn=1, tool_name="Read", items_added=[snap(0, 400)]))
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=4, event="PostToolUse", session_id="s", turn=1, tool_name="Read", items_added=[snap(1, 400)]))
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=5, event="PostToolUse", session_id="s", turn=1, tool_name="Grep", items_added=[snap(2, 700)]))
+
+    runner = CliRunner()
+    # Default summary mode: should mention evictions in the digest
+    result = runner.invoke(app, ["timeline"])
+    assert result.exit_code == 0
+    assert "items evicted" in result.output
+    assert "budget breach" in result.output
+    # --full mode: shows the EVICTS marker inline on the offending event
+    result_full = runner.invoke(app, ["timeline", "--full"])
+    assert result_full.exit_code == 0
+    assert "EVICTS" in result_full.output
+
+
+def test_timeline_works_on_single_turn_session(cli_env: Path) -> None:
+    """The exact case --diff failed on. Should print all events without complaint."""
+    from runtime.core.events import EVENT_LOG_SCHEMA_VERSION, EventRecord, append_event
+    from runtime.core.manifest import InjectionItemSnapshot
+
+    log = cli_env / "logs" / "events.log.jsonl"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    snap = lambda i: InjectionItemSnapshot(
+        id=f"c-{i:03d}", bucket="retrieved", source_path=f"p/{i}.md",
+        sha256="0" * 64, token_count=100, retrieval_reason="r",
+        last_touched_turn=0, pinned=False, score=0.0,
+    )
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=1, event="SessionStart", session_id="s", turn=0))
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=2, event="UserPromptSubmit", session_id="s", turn=1))
+    for i in range(33):
+        append_event(log, EventRecord(
+            EVENT_LOG_SCHEMA_VERSION, ts_ms=10 + i, event="PostToolUse",
+            session_id="s", turn=1, tool_name="Read", items_added=[snap(i)],
+        ))
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=100, event="Stop", session_id="s", turn=1))
+
+    runner = CliRunner()
+    # Default summary mode: 33 items aggregated into a digest
+    result = runner.invoke(app, ["timeline"])
+    assert result.exit_code == 0
+    assert "33" in result.output  # appears in events count or items added
+    # --full mode: every event listed
+    result_full = runner.invoke(app, ["timeline", "--full"])
+    assert result_full.exit_code == 0
+    assert result_full.output.count("+ Read") == 33
+    assert "33 items total" in result_full.output
+    assert "retrieved=33items" in result_full.output
+
+
 def test_pin_writes_event_log_entry(cli_env: Path) -> None:
     """Pin/unpin write Pin/Unpin events to the log so replay applies them."""
     runner = CliRunner()

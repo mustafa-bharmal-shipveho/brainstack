@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
 from runtime.core.budget import (
     AddItem,
@@ -73,6 +73,20 @@ class ReplaySummary:
     n_turns: int
     session_id: str
     manifests: list[Manifest]
+
+
+@dataclass
+class TimelineStep:
+    """One step of an event-by-event walk through the session.
+
+    Used by `recall runtime timeline` to render chronological session
+    state. Captures the event itself, the manifest after that event was
+    applied, and the set of item IDs added or evicted by this step.
+    """
+    event: EventRecord
+    manifest: Manifest
+    added_ids: list[str]
+    evicted_ids: list[str]
 
 
 # ---------- public API ----------
@@ -131,6 +145,37 @@ def render_diff(a: Manifest, b: Manifest) -> str:
     if not (d.added or d.removed):
         lines.append("(no items added or removed)")
     return "\n".join(lines) + "\n"
+
+
+# ---------- timeline (event-by-event walk) ----------
+
+def iter_engine_steps(
+    events: list[EventRecord], config: ReplayConfig
+) -> Iterator[TimelineStep]:
+    """Yield one TimelineStep per event in chronological order.
+
+    Drives the same Engine + Policy combo replay() uses, so step state is
+    consistent with `recall runtime ls` / `recall runtime replay` outputs.
+    Snapshots before and after each event to capture eviction decisions
+    that fire inside Engine.apply().
+    """
+    eng = Engine(
+        budgets=config.budgets,
+        policy=config.policy,
+        session_id=config.session_id,
+    )
+    for ev in events:
+        before_ids = {it.id for it in eng.snapshot().items}
+        for engine_event in _translate(ev):
+            eng.apply(engine_event)
+        after = eng.snapshot()
+        after_ids = {it.id for it in after.items}
+        yield TimelineStep(
+            event=ev,
+            manifest=after,
+            added_ids=sorted(after_ids - before_ids),
+            evicted_ids=sorted(before_ids - after_ids),
+        )
 
 
 # ---------- internals ----------
@@ -209,7 +254,9 @@ __all__ = [
     "ManifestDiff",
     "ReplayConfig",
     "ReplaySummary",
+    "TimelineStep",
     "diff_manifests",
+    "iter_engine_steps",
     "render_diff",
     "replay",
     "replay_to_manifests",

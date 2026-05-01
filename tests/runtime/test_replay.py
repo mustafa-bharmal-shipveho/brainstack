@@ -28,6 +28,7 @@ from runtime.core.policy.defaults.lru import LRUPolicy
 from runtime.core.replay import (
     ReplayConfig,
     diff_manifests,
+    iter_engine_steps,
     render_diff,
     replay,
     replay_to_manifests,
@@ -163,6 +164,93 @@ def test_replay_handles_blank_lines_in_log(tmp_path: Path, config: ReplayConfig)
     log.write_text("\n\n" + content + "\n\n")
     manifests = replay_to_manifests(log, config)
     assert len(manifests) >= 1
+
+
+def test_iter_engine_steps_yields_one_per_event(session_log: Path, config: ReplayConfig) -> None:
+    from runtime.core.events import load_events
+
+    events = load_events(session_log)
+    steps = list(iter_engine_steps(events, config))
+    assert len(steps) == len(events)
+
+
+def test_iter_engine_steps_captures_added_ids(session_log: Path, config: ReplayConfig) -> None:
+    from runtime.core.events import load_events
+
+    events = load_events(session_log)
+    steps = list(iter_engine_steps(events, config))
+    # Every PostToolUse step in the fixture adds one item — check the captured IDs match.
+    post_tool_steps = [s for s in steps if s.event.event == "PostToolUse"]
+    assert post_tool_steps
+    for s in post_tool_steps:
+        assert s.added_ids, f"expected at least one added id at PostToolUse step, got {s.added_ids}"
+
+
+def test_iter_engine_steps_captures_evictions_under_tight_budget(tmp_path: Path) -> None:
+    """When budget is tight, an Add forces an Evict in the same Engine.apply
+    call. iter_engine_steps must surface those eviction ids."""
+    from runtime.core.events import EVENT_LOG_SCHEMA_VERSION, EventRecord, append_event
+    from runtime.core.manifest import InjectionItemSnapshot
+    from runtime.core.policy.defaults.lru import LRUPolicy
+
+    log = tmp_path / "events.log.jsonl"
+    snap = lambda i, t: InjectionItemSnapshot(
+        id=f"c-{i}", bucket="retrieved", source_path=f"p/{i}.md",
+        sha256="0" * 64, token_count=t, retrieval_reason="r",
+        last_touched_turn=0, pinned=False, score=0.0,
+    )
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=1, event="SessionStart", session_id="s", turn=0))
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=2, event="UserPromptSubmit", session_id="s", turn=1))
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=3, event="PostToolUse", session_id="s", turn=1, items_added=[snap(0, 400)]))
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=4, event="PostToolUse", session_id="s", turn=1, items_added=[snap(1, 400)]))
+    # This third add (700 tok) blows the 800-tok cap and forces eviction.
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=5, event="PostToolUse", session_id="s", turn=1, items_added=[snap(2, 700)]))
+
+    cfg = ReplayConfig(budgets={"retrieved": 800}, policy=LRUPolicy(), session_id="s")
+    from runtime.core.events import load_events
+    events = load_events(log)
+    steps = list(iter_engine_steps(events, cfg))
+    # The third PostToolUse (last step) should show evictions.
+    last = steps[-1]
+    assert last.event.event == "PostToolUse"
+    assert last.evicted_ids, "expected evictions when adding 700 tok over an 800 tok cap"
+
+
+def test_iter_engine_steps_works_on_single_turn_session(tmp_path: Path) -> None:
+    """The dogfood-revealed case: one turn, many tool calls. iter_engine_steps
+    must produce one step per event without complaint."""
+    from runtime.core.events import EVENT_LOG_SCHEMA_VERSION, EventRecord, append_event
+    from runtime.core.manifest import InjectionItemSnapshot
+    from runtime.core.policy.defaults.lru import LRUPolicy
+
+    log = tmp_path / "events.log.jsonl"
+    snap = lambda i: InjectionItemSnapshot(
+        id=f"c-{i:03d}", bucket="retrieved", source_path=f"p/{i}.md",
+        sha256="0" * 64, token_count=100, retrieval_reason="r",
+        last_touched_turn=0, pinned=False, score=0.0,
+    )
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=1, event="SessionStart", session_id="s", turn=0))
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=2, event="UserPromptSubmit", session_id="s", turn=1))
+    for i in range(33):  # the user's actual count
+        append_event(log, EventRecord(
+            EVENT_LOG_SCHEMA_VERSION, ts_ms=10 + i,
+            event="PostToolUse", session_id="s", turn=1,
+            items_added=[snap(i)],
+        ))
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=100, event="Stop", session_id="s", turn=1))
+
+    cfg = ReplayConfig(
+        budgets={"retrieved": 20000},
+        policy=LRUPolicy(),
+        session_id="s",
+    )
+    from runtime.core.events import load_events
+    events = load_events(log)
+    steps = list(iter_engine_steps(events, cfg))
+    assert len(steps) == 1 + 1 + 33 + 1  # SessionStart + UserPromptSubmit + 33 PostToolUse + Stop
+    # All 33 items should be in the final manifest (under cap, no evictions)
+    final = steps[-1].manifest
+    assert len(final.items) == 33
 
 
 def test_replay_translates_events_to_engine_actions(tmp_path: Path, config: ReplayConfig) -> None:

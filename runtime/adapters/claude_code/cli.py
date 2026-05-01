@@ -72,6 +72,143 @@ def cmd_ls(json_out: bool = typer.Option(False, "--json", help="emit JSON instea
         typer.echo(f"  {flag} {it.id:<22} {it.bucket:<10} {it.token_count:>5} tok  {it.source_path}")
 
 
+@app.command("timeline")
+def cmd_timeline(
+    full: bool = typer.Option(
+        False, "--full",
+        help="show every event (chronological firehose). Default is a compact summary.",
+    ),
+) -> None:
+    """Compact summary of the session by default; --full for chronological detail.
+
+    Default summary shows: lifecycle markers, eviction count + offending IDs,
+    final per-bucket state. Survives the "one big turn" reality of typical
+    Claude Code sessions where `--diff` between turns has nothing to compare.
+
+    Use --full when debugging a specific event ("what added X at minute 23?").
+    """
+    from collections import Counter
+
+    from runtime.core.events import load_events
+    from runtime.core.manifest import InjectionItemSnapshot
+    from runtime.core.replay import iter_engine_steps
+
+    cfg = _config()
+    if not cfg.event_log_path.exists():
+        typer.echo("(no events recorded yet)")
+        raise typer.Exit(0)
+    events = load_events(cfg.event_log_path)
+    if not events:
+        typer.echo("(empty log)")
+        raise typer.Exit(0)
+
+    rcfg = _replay_config(cfg)
+
+    if full:
+        _render_timeline_full(cfg, list(iter_engine_steps(events, rcfg)))
+    else:
+        _render_timeline_summary(cfg, list(iter_engine_steps(events, rcfg)))
+
+
+def _final_bucket_breakdown(cfg, manifest) -> str:
+    by_bucket: dict[str, list[int]] = {}
+    for it in manifest.items:
+        slot = by_bucket.setdefault(it.bucket, [0, 0])
+        slot[0] += 1
+        slot[1] += it.token_count
+    parts = []
+    for b, (n, t) in sorted(by_bucket.items()):
+        cap = cfg.budgets.get(b, 0)
+        parts.append(f"{b}={n}items {t}/{cap}tok")
+    return "  ".join(parts) if parts else "(empty)"
+
+
+def _render_timeline_summary(cfg, steps) -> None:
+    """Compact ~10-line digest. The default."""
+    from collections import Counter
+
+    if not steps:
+        return
+    last = steps[-1]
+    event_counter: Counter = Counter(s.event.event for s in steps)
+    n_added = sum(len(s.added_ids) for s in steps)
+    n_evicted = sum(len(s.evicted_ids) for s in steps)
+    eviction_steps = [s for s in steps if s.evicted_ids]
+    final_turn = last.manifest.turn
+
+    typer.echo(f"session: {last.manifest.session_id} ({final_turn + 1} turn{'s' if final_turn else ''})")
+    typer.echo(f"events:  {len(steps)} total")
+    summary = "  ".join(f"{ev}={n}" for ev, n in event_counter.most_common())
+    typer.echo(f"  {summary}")
+    typer.echo("")
+    typer.echo(f"items added:   {n_added}")
+    typer.echo(f"items evicted: {n_evicted} ({len(eviction_steps)} budget breach{'es' if len(eviction_steps) != 1 else ''})")
+    if eviction_steps:
+        # Show up to 5 eviction events so the most useful info isn't drowned
+        for s in eviction_steps[:5]:
+            tool = s.event.tool_name or s.event.event
+            ids = ", ".join(eid[:10] for eid in s.evicted_ids[:6])
+            extra = "" if len(s.evicted_ids) <= 6 else f" + {len(s.evicted_ids)-6} more"
+            typer.echo(f"  - turn {s.manifest.turn}  {tool}: evicted {len(s.evicted_ids)} [{ids}{extra}]")
+        if len(eviction_steps) > 5:
+            typer.echo(f"  - ({len(eviction_steps) - 5} more eviction events; --full to see all)")
+    typer.echo("")
+    typer.echo(f"final: {len(last.manifest.items)} items total")
+    typer.echo(f"  {_final_bucket_breakdown(cfg, last.manifest)}")
+    typer.echo("")
+    typer.echo("--full to see every event chronologically")
+
+
+def _render_timeline_full(cfg, steps) -> None:
+    """Chronological firehose. Use when summary doesn't tell you enough."""
+    from runtime.core.manifest import InjectionItemSnapshot
+
+    last = None
+    for step in steps:
+        last = step
+        ev = step.event
+
+        if ev.event == "SessionStart":
+            caps = "  ".join(f"{k}={v}" for k, v in sorted(cfg.budgets.items()))
+            typer.echo(f"  SessionStart  budgets: {caps}")
+            continue
+
+        if ev.event == "UserPromptSubmit":
+            typer.echo(f"  UserPromptSubmit  -> turn {step.manifest.turn}")
+            continue
+
+        if ev.event in {"Stop", "SubagentStop", "PostCompact", "Notification"}:
+            typer.echo(f"  {ev.event}")
+            continue
+
+        if ev.event == "PostToolUse":
+            snaps = [s for s in ev.items_added if isinstance(s, InjectionItemSnapshot)]
+            if not snaps:
+                typer.echo(f"  PostToolUse  {ev.tool_name}  (no items added)")
+                continue
+            for s in snaps:
+                bucket_used = sum(
+                    it.token_count for it in step.manifest.items if it.bucket == s.bucket
+                )
+                cap = cfg.budgets.get(s.bucket, 0)
+                src = s.source_path if len(s.source_path) <= 38 else "…" + s.source_path[-37:]
+                line = (
+                    f"  + {ev.tool_name:<6} {src:<38} "
+                    f"{s.token_count:>5} tok  {s.bucket} ({bucket_used}/{cap})"
+                )
+                if step.evicted_ids:
+                    short_ids = ", ".join(eid[:10] for eid in step.evicted_ids)
+                    line += f"  EVICTS [{short_ids}]"
+                typer.echo(line)
+            continue
+
+        typer.echo(f"  {ev.event}")
+
+    if last:
+        typer.echo("")
+        typer.echo(f"  final: {len(last.manifest.items)} items total  [{_final_bucket_breakdown(cfg, last.manifest)}]")
+
+
 @app.command("budget")
 def cmd_budget() -> None:
     """Show budget configuration and current usage."""
