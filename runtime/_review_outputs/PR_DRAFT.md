@@ -63,8 +63,8 @@ adapters drop in alongside.
 | Suite | Tests |
 |---|---|
 | Brainstack pre-existing | 581 |
-| Runtime new | 230 |
-| **Total** | **808 (all green)** |
+| Runtime new | 233 |
+| **Total** | **809 (all green)** |
 
 Notable contracts:
 
