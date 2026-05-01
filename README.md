@@ -39,19 +39,30 @@ cd brainstack
 
 # Make sure ~/.local/bin is on $PATH (installer prints a one-line export tip
 # if it isn't), then wire the runtime hooks. This step IS allowed to edit
-# ~/.claude/settings.json — idempotently, preserving any existing hooks.
+# ~/.claude/settings.json — idempotently, preserving any existing hooks and
+# non-hook keys (theme, permissions, etc.). The file is rewritten with
+# indent=2 + sort_keys=True, so whitespace and key order may change; data
+# is preserved. Re-runs are a no-op (entries marked with a
+# `# brainstack-runtime` sentinel).
 recall runtime install-hooks
 ```
 
 `install.sh` itself never touches `~/.claude/` (that's a separate decision via `recall runtime install-hooks`). Setup details: [`docs/claude-code-setup.md`](docs/claude-code-setup.md). After PATH is set, `recall remember`, `recall forget`, `recall query`, and `recall runtime *` work as bare commands.
 
-Migrating from existing AI-tool memory dirs (Claude Code, Cursor, Codex CLI):
+**Bringing existing memories in (recommended).** A fresh `./install.sh` creates an empty `~/.agent/`. Your existing Claude Code, Cursor, and Codex CLI memories are not auto-imported. The simplest set-and-forget option installs one hourly LaunchAgent that pulls all three tools' new entries into the brain forever:
 
 ```bash
-./install.sh --migrate                        # interactive — discovers + lets you pick
-./install.sh --migrate ~/.claude/projects/<slug>/memory   # explicit source
-./install.sh --setup-auto-migrate              # one-time wizard, then forget it
+./install.sh --setup-auto-migrate              # recommended — interactive: pick which tools
 ```
+
+Or do a one-time snapshot import (Claude Code dirs are also swapped for a symlink so real-time writes keep flowing in; the original is preserved at `<source>.bak.<ts>`. Cursor and Codex CLI imports are snapshot-only — new entries after this won't reach the brain unless you re-run migrate or use `--setup-auto-migrate`):
+
+```bash
+./install.sh --migrate                                    # interactive — discovers + lets you pick
+./install.sh --migrate ~/.claude/projects/<slug>/memory   # explicit source
+```
+
+Tear down the LaunchAgent later with `./install.sh --remove-auto-migrate`.
 
 ---
 
