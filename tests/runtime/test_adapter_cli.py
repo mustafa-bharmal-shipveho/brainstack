@@ -355,18 +355,21 @@ def test_pin_event_replay_marks_item_pinned(cli_env: Path) -> None:
 # ---------- evict ----------
 
 def test_evict_appends_event(cli_env: Path) -> None:
+    _populate_log(cli_env)  # makes c-001 live in the manifest so evict can resolve it
     runner = CliRunner()
     result = runner.invoke(app, ["evict", "c-001"])
     assert result.exit_code == 0
     log = cli_env / "logs" / "events.log.jsonl"
     assert log.exists()
     text = log.read_text()
+    # Both populate-log entries and the new evict entry both contain c-001
     assert "c-001" in text
     assert "item_ids_evicted" in text
 
 
 def test_evict_with_intent_flag_marks_event(cli_env: Path) -> None:
     """--intent stamps the event with intent='user-evict' for re-injection."""
+    _populate_log(cli_env)  # makes c-001 live in the manifest
     runner = CliRunner()
     result = runner.invoke(app, ["evict", "c-001", "--intent"])
     assert result.exit_code == 0
@@ -374,6 +377,110 @@ def test_evict_with_intent_flag_marks_event(cli_env: Path) -> None:
     log = cli_env / "logs" / "events.log.jsonl"
     text = log.read_text()
     assert '"intent":"user-evict"' in text
+
+
+def test_evict_resolves_basename_query(cli_env: Path) -> None:
+    """`recall runtime evict postgres-locking` resolves to a concrete id."""
+    from runtime.core.events import EVENT_LOG_SCHEMA_VERSION, EventRecord, append_event
+    from runtime.core.manifest import InjectionItemSnapshot
+
+    log = cli_env / "logs" / "events.log.jsonl"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    snap = InjectionItemSnapshot(
+        id="c-pg-001", bucket="hot",
+        source_path="hot/lessons/postgres-locking.md",
+        sha256="0" * 64, token_count=200, retrieval_reason="r",
+        last_touched_turn=0, pinned=False, score=0.0,
+    )
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=1, event="SessionStart", session_id="s", turn=0))
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=2, event="UserPromptSubmit", session_id="s", turn=1))
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=3, event="PostToolUse", session_id="s", turn=1, items_added=[snap]))
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["evict", "postgres-locking"])
+    assert result.exit_code == 0
+    assert "c-pg-001" in result.output
+    assert "postgres-locking.md" in result.output
+
+
+def test_evict_resolves_id_prefix(cli_env: Path) -> None:
+    from runtime.core.events import EVENT_LOG_SCHEMA_VERSION, EventRecord, append_event
+    from runtime.core.manifest import InjectionItemSnapshot
+
+    log = cli_env / "logs" / "events.log.jsonl"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    snap = InjectionItemSnapshot(
+        id="c-77ab19d3", bucket="hot", source_path="x.md",
+        sha256="0" * 64, token_count=100, retrieval_reason="r",
+        last_touched_turn=0, pinned=False, score=0.0,
+    )
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=1, event="SessionStart", session_id="s", turn=0))
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=2, event="UserPromptSubmit", session_id="s", turn=1))
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=3, event="PostToolUse", session_id="s", turn=1, items_added=[snap]))
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["evict", "c-77ab"])
+    assert result.exit_code == 0
+    assert "c-77ab19d3" in result.output
+
+
+def test_evict_ambiguous_query_lists_candidates(cli_env: Path) -> None:
+    from runtime.core.events import EVENT_LOG_SCHEMA_VERSION, EventRecord, append_event
+    from runtime.core.manifest import InjectionItemSnapshot
+
+    log = cli_env / "logs" / "events.log.jsonl"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    snaps = [
+        InjectionItemSnapshot(id="c-a", bucket="hot", source_path="a/postgres-locking.md", sha256="0" * 64, token_count=100, retrieval_reason="r", last_touched_turn=0, pinned=False, score=0.0),
+        InjectionItemSnapshot(id="c-b", bucket="hot", source_path="b/postgres-deadlock.md", sha256="0" * 64, token_count=100, retrieval_reason="r", last_touched_turn=0, pinned=False, score=0.0),
+    ]
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=1, event="SessionStart", session_id="s", turn=0))
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=2, event="UserPromptSubmit", session_id="s", turn=1))
+    for s in snaps:
+        append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=3, event="PostToolUse", session_id="s", turn=1, items_added=[s]))
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["evict", "postgres"])
+    assert result.exit_code != 0
+    assert "be more specific" in result.output
+    assert "c-a" in result.output and "c-b" in result.output
+
+
+def test_evict_no_match_errors(cli_env: Path) -> None:
+    _populate_log(cli_env)
+    runner = CliRunner()
+    result = runner.invoke(app, ["evict", "nothing-matches-this"])
+    assert result.exit_code != 0
+    assert "no items match" in result.output
+
+
+def test_add_resolves_query_under_brain_root(cli_env: Path, tmp_path: Path) -> None:
+    """`recall runtime add postgres-locking --brain-root <tmp>` finds the lesson."""
+    brain = tmp_path / "brain"
+    (brain / "semantic" / "lessons").mkdir(parents=True)
+    target = brain / "semantic" / "lessons" / "postgres-locking.md"
+    target.write_text("use SELECT FOR UPDATE SKIP LOCKED")
+
+    runner = CliRunner()
+    result = runner.invoke(app, [
+        "add", "postgres-locking",
+        "--brain-root", str(brain),
+    ])
+    assert result.exit_code == 0
+    assert "added:" in result.output
+    log = cli_env / "logs" / "events.log.jsonl"
+    text = log.read_text()
+    assert '"intent":"user-add"' in text
+    assert "postgres-locking.md" in text
+
+
+def test_add_no_match_errors(cli_env: Path, tmp_path: Path) -> None:
+    brain = tmp_path / "brain"
+    brain.mkdir()
+    runner = CliRunner()
+    result = runner.invoke(app, ["add", "does-not-exist", "--brain-root", str(brain)])
+    assert result.exit_code != 0
+    assert "no file matches" in result.output
 
 
 def test_add_command_writes_event_and_content_file(cli_env: Path, tmp_path: Path) -> None:

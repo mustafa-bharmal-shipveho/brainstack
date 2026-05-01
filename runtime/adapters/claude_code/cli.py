@@ -461,23 +461,61 @@ def cmd_unpin(item_id: str) -> None:
 
 @app.command("evict")
 def cmd_evict(
-    item_id: str,
+    query: str,
     reason: str = typer.Option("user-requested", "--reason"),
     intent: bool = typer.Option(
         False, "--intent",
         help="mark as user-evict so the next UserPromptSubmit re-injection skips this id",
     ),
 ) -> None:
-    """Force-evict an item by appending an explicit eviction event.
+    """Force-evict an item from the current manifest.
 
-    Plain `evict` is informational (the engine drops it from the manifest).
-    `--intent` additionally tags the event with intent="user-evict", which
-    the re-injection composer reads to add the id to a "do not rely on"
-    marker on the next user prompt.
+    `query` can be any of:
+      • exact id            (c-77ab19d3...)
+      • id prefix           (c-77ab)
+      • basename            (postgres-locking)
+      • substring           ("lock fix")
+
+    If the query matches multiple items, the candidates are listed and the
+    command exits non-zero — re-run with a more specific query.
+
+    Plain `evict` removes the item from the manifest. `--intent` additionally
+    tags the event with intent="user-evict" so the re-injection composer
+    skips this id on the next UserPromptSubmit.
     """
-    cfg = _config()
-    from runtime.core.events import EVENT_LOG_SCHEMA_VERSION, EventRecord, append_event
     import time
+
+    from runtime.adapters.claude_code.resolver import resolve_item
+    from runtime.core.events import EVENT_LOG_SCHEMA_VERSION, EventRecord, append_event
+
+    cfg = _config()
+
+    # Replay to get the current manifest so we know what's live to evict
+    if not cfg.event_log_path.exists():
+        typer.echo("(no events recorded yet — nothing to evict)", err=True)
+        raise typer.Exit(1)
+    rcfg = _replay_config(cfg)
+    summary = replay(cfg.event_log_path, rcfg)
+    if not summary.manifests:
+        typer.echo("(empty replay — nothing to evict)", err=True)
+        raise typer.Exit(1)
+
+    result = resolve_item(query, summary.manifests[-1])
+    if result.match is None:
+        if result.candidates:
+            typer.echo(f"'{query}' matched {len(result.candidates)} items (be more specific):", err=True)
+            for cand in result.candidates:
+                # Find the item to show its source_path
+                item = next((it for it in summary.manifests[-1].items if it.id == cand), None)
+                if item:
+                    typer.echo(f"  {cand}  {item.source_path}", err=True)
+                else:
+                    typer.echo(f"  {cand}", err=True)
+        else:
+            typer.echo(f"no items match '{query}'", err=True)
+        raise typer.Exit(2)
+
+    item_id = result.match
     record = EventRecord(
         schema_version=EVENT_LOG_SCHEMA_VERSION,
         ts_ms=int(time.time() * 1000),
@@ -488,29 +526,60 @@ def cmd_evict(
         intent="user-evict" if intent else "",
     )
     append_event(cfg.event_log_path, record)
+    matched_item = next((it for it in summary.manifests[-1].items if it.id == item_id), None)
+    src_hint = f" ({matched_item.source_path})" if matched_item else ""
     suffix = " (will skip on re-injection)" if intent else ""
-    typer.echo(f"evicted: {item_id} (reason: {reason}){suffix}")
+    typer.echo(f"evicted: {item_id}{src_hint} (reason: {reason}){suffix}")
 
 
 @app.command("add")
 def cmd_add(
-    path: Path = typer.Argument(..., exists=True, file_okay=True, dir_okay=False, readable=True),
+    query: str,
     bucket: str = typer.Option("hot", "--bucket", help="which bucket to add to. Default: hot."),
+    brain_root: Path = typer.Option(
+        Path("~/.agent/").expanduser(),
+        "--brain-root",
+        help="root directory to search when query is a name rather than a path. Default: ~/.agent/",
+    ),
 ) -> None:
     """Push a file into the next session's context (re-injection on UserPromptSubmit).
 
-    Reads the file, computes its token count, builds an InjectionItemSnapshot,
-    and writes an AddItem event with intent=user-add. The next UserPromptSubmit
-    (with enable_reinjection=true) will surface it in the re-injection block
-    prepended to your prompt.
+    `query` can be any of:
+      • exact path             (~/path/to/lesson.md or relative)
+      • lesson name (basename) (postgres-locking)
+      • substring              ("postgres locking")
+
+    For names/substrings we search under `--brain-root` (default ~/.agent/).
+    Multi-match is rejected with a candidate list — re-run with a fuller path.
+
+    Reads the resolved file, computes its token count, writes an AddItem
+    event with intent=user-add, and stashes the content under
+    log_dir/added/<id>.txt. The next UserPromptSubmit (with
+    enable_reinjection=true) surfaces it in the re-injection block.
     """
     import hashlib
     import time
+
+    from runtime.adapters.claude_code.resolver import resolve_brain_path
     from runtime.core.events import EVENT_LOG_SCHEMA_VERSION, EventRecord, append_event
     from runtime.core.manifest import InjectionItemSnapshot
     from runtime.core.tokens import OfflineTokenCounter
 
     cfg = _config()
+
+    # Resolve query to a concrete file
+    result = resolve_brain_path(query, brain_root)
+    if result.match is None:
+        if result.candidates:
+            typer.echo(f"'{query}' matched {len(result.candidates)} files (be more specific):", err=True)
+            for c in result.candidates:
+                typer.echo(f"  {c}", err=True)
+        else:
+            typer.echo(f"no file matches '{query}' under {brain_root}", err=True)
+            typer.echo("  (try a full path, or run `recall runtime add ~/full/path.md`)", err=True)
+        raise typer.Exit(2)
+
+    path = Path(result.match)
     content = path.read_text(encoding="utf-8")
     counter = OfflineTokenCounter()
     token_count = counter.count(content)
