@@ -80,6 +80,11 @@ class EventRecord:
     # the manifest from events alone (Skeptic finding #2). Forward-typed
     # to avoid a circular import with manifest.py; the loader resolves it.
     items_added: list[Any] = field(default_factory=list)
+    # Optional marker for who initiated this event. Empty by default
+    # (adapter-recorded). Values: "user-add", "user-evict",
+    # "user-pin", "user-unpin", "adapter-recorded".
+    # Used by reinjection.py to differentiate user-driven items.
+    intent: str = ""
     extensions: dict[str, Any] = field(default_factory=dict)
 
 
@@ -167,6 +172,8 @@ def _event_to_dict(e: EventRecord) -> dict[str, Any]:
         "item_ids_evicted": list(e.item_ids_evicted),
         "items_added": items_added_serialized,
     }
+    if e.intent:
+        out["intent"] = e.intent
     if e.tool_output_summary is not None:
         out["tool_output_summary"] = asdict(e.tool_output_summary)
     else:
@@ -194,6 +201,7 @@ _OPTIONAL_KEYS = frozenset({
     "event_id",
     "tool_name", "tool_input_keys", "tool_output_summary",
     "bucket", "item_ids_added", "item_ids_evicted", "items_added",
+    "intent",  # v0.3.0: optional marker for user-driven actions
 })
 
 _KNOWN_KEYS = _REQUIRED_KEYS | _OPTIONAL_KEYS
@@ -269,6 +277,7 @@ def load_event(raw: str | bytes | Mapping[str, Any]) -> EventRecord:
         item_ids_added=list(data.get("item_ids_added", [])),
         item_ids_evicted=list(data.get("item_ids_evicted", [])),
         items_added=items_added,
+        intent=str(data.get("intent", "")),
         extensions=extras,
     )
 

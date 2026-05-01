@@ -154,7 +154,79 @@ def handle_hook(event_name: str, *, config: RuntimeConfig | None = None) -> int:
         items_added=items_added,
     )
     append_event(config.event_log_path, record)
+
+    # Re-injection: on UserPromptSubmit, when enabled, emit a small text
+    # block to stdout that Claude Code may append to the prompt. This is
+    # the v0.3 inject-loop closure — the runtime stops being purely
+    # observational when this fires.
+    if event_name == "UserPromptSubmit" and config.enable_reinjection:
+        try:
+            block = _build_reinjection_for_session(config)
+        except Exception as e:  # pragma: no cover - defensive
+            print(f"[runtime] re-injection skipped: {e!r}", file=sys.stderr)
+            block = ""
+        if block:
+            print(block)
     return 0
+
+
+def _build_reinjection_for_session(config) -> str:
+    """Replay the event log to current state, then ask the composer to
+    build a re-injection block. Returns empty string if nothing useful."""
+    from runtime.adapters.claude_code.reinjection import (
+        ReinjectionContext,
+        build_reinjection_block,
+        collect_user_intent_events,
+    )
+    from runtime.core.events import load_events
+    from runtime.core.policy.defaults.lru import LRUPolicy
+    from runtime.core.replay import ReplayConfig, replay
+
+    if not config.event_log_path.exists():
+        return ""
+    events = load_events(config.event_log_path)
+    if not events:
+        return ""
+
+    rcfg = ReplayConfig(
+        budgets=dict(config.budgets),
+        policy=LRUPolicy(),
+        session_id="reinjection",
+    )
+    summary = replay(config.event_log_path, rcfg)
+    if not summary.manifests:
+        return ""
+    manifest = summary.manifests[-1]
+
+    # Intent events since the PREVIOUS UserPromptSubmit (the one before the
+    # one we just wrote). The just-written UserPromptSubmit is the LAST in
+    # the list; we want everything between the second-to-last and now.
+    ups_timestamps = [ev.ts_ms for ev in events if ev.event == "UserPromptSubmit"]
+    boundary_ts = ups_timestamps[-2] if len(ups_timestamps) >= 2 else 0
+    user_added, user_evicted = collect_user_intent_events(events, since_ts_ms=boundary_ts)
+
+    # Load content for added/pinned items from disk if available
+    content_by_id: dict[str, str] = {}
+    added_dir = config.log_dir / "added"
+    if added_dir.exists():
+        for it in user_added:
+            f = added_dir / f"{it.id}.txt"
+            if f.exists():
+                content_by_id[it.id] = f.read_text(encoding="utf-8")
+        for it in manifest.items:
+            if it.pinned:
+                f = added_dir / f"{it.id}.txt"
+                if f.exists():
+                    content_by_id[it.id] = f.read_text(encoding="utf-8")
+
+    ctx = ReinjectionContext(
+        manifest=manifest,
+        user_added_items=user_added,
+        user_evicted_ids=user_evicted,
+        item_content_by_id=content_by_id,
+        budget_tokens=config.reinjection_budget_tokens,
+    )
+    return build_reinjection_block(ctx)
 
 
 def main(argv: list[str] | None = None) -> int:

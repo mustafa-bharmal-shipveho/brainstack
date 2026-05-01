@@ -191,3 +191,73 @@ def test_runtime_config_loads_from_pyproject(tmp_path: Path) -> None:
 def test_runtime_config_missing_file_returns_defaults(tmp_path: Path) -> None:
     cfg = RuntimeConfig.load(config_path=tmp_path / "does-not-exist.toml")
     assert cfg.budgets["claude_md"] == 4000
+
+
+def test_runtime_config_loads_reinjection_settings(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "pyproject.toml"
+    cfg_path.write_text(
+        '[tool.recall.runtime]\n'
+        'enable_reinjection = true\n'
+        'reinjection_budget_tokens = 2500\n'
+    )
+    cfg = RuntimeConfig.load(config_path=cfg_path)
+    assert cfg.enable_reinjection is True
+    assert cfg.reinjection_budget_tokens == 2500
+
+
+# ---------- re-injection on UserPromptSubmit ----------
+
+def test_user_prompt_submit_no_reinjection_when_disabled(tmp_config: RuntimeConfig, stdin_with, capsys) -> None:
+    """Default config has enable_reinjection=False; hook emits nothing extra."""
+    stdin_with({"session_id": "s"})
+    handle_hook("UserPromptSubmit", config=tmp_config)
+    captured = capsys.readouterr()
+    assert "<!-- runtime-reinject -->" not in captured.out
+
+
+def test_user_prompt_submit_emits_reinjection_when_enabled(
+    tmp_path: Path, stdin_with, capsys, monkeypatch
+) -> None:
+    """With enable_reinjection=True and a user-add event in the log, the
+    UserPromptSubmit hook should print a re-injection block to stdout."""
+    from runtime.core.events import EVENT_LOG_SCHEMA_VERSION, EventRecord, append_event
+    from runtime.core.manifest import InjectionItemSnapshot
+
+    cfg = RuntimeConfig(
+        log_dir=tmp_path / "logs",
+        enable_reinjection=True,
+        reinjection_budget_tokens=2000,
+    )
+    cfg.log_dir.mkdir(parents=True, exist_ok=True)
+
+    # Pre-seed an AddItem event with a user-add intent
+    snap = InjectionItemSnapshot(
+        id="c-test", bucket="hot", source_path="lesson.md",
+        sha256="0" * 64, token_count=20, retrieval_reason="user-add",
+        last_touched_turn=0, pinned=False, score=0.0,
+    )
+    append_event(
+        cfg.event_log_path,
+        EventRecord(
+            schema_version=EVENT_LOG_SCHEMA_VERSION,
+            ts_ms=1,
+            event="PostToolUse",
+            session_id="s",
+            turn=0,
+            tool_name="user-add",
+            items_added=[snap],
+            intent="user-add",
+        ),
+    )
+    # Stash content so the composer can include it inline
+    content_dir = cfg.log_dir / "added"
+    content_dir.mkdir(parents=True, exist_ok=True)
+    (content_dir / "c-test.txt").write_text("important hint")
+
+    # Now fire UserPromptSubmit
+    stdin_with({"session_id": "s"})
+    handle_hook("UserPromptSubmit", config=cfg)
+    out = capsys.readouterr().out
+    assert "<!-- runtime-reinject -->" in out
+    assert "important hint" in out
+    assert "c-test" in out

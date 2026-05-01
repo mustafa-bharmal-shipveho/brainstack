@@ -280,6 +280,92 @@ def _render_timeline_full(cfg, steps) -> None:
         typer.echo(f"  final: {len(last.manifest.items)} items total  [{_final_bucket_breakdown(cfg, last.manifest)}]")
 
 
+@app.command("tail")
+def cmd_tail(
+    n: int = typer.Argument(10, help="number of recent events to show"),
+    all_sessions: bool = typer.Option(False, "--all", help="across every session in the log"),
+    session: str = typer.Option("", "--session", help="show a specific session id"),
+) -> None:
+    """Last N events in plain English. Quick way to peek at what just happened.
+
+    Same scoping as `timeline`: latest session by default; --all spans
+    every session; --session <id> picks a specific past one.
+    """
+    import time
+
+    from runtime.core.events import load_events
+    from runtime.core.manifest import InjectionItemSnapshot
+
+    cfg = _config()
+    if not cfg.event_log_path.exists():
+        typer.echo("(no events recorded yet)")
+        raise typer.Exit(0)
+    events = load_events(cfg.event_log_path)
+    if not events:
+        typer.echo("(empty log)")
+        raise typer.Exit(0)
+
+    if all_sessions:
+        scoped = events
+    elif session:
+        scoped = [e for e in events if e.session_id == session]
+        if not scoped:
+            available = sorted(_distinct_session_ids(events))
+            typer.echo(f"no events for session '{session}' (available: {available})", err=True)
+            raise typer.Exit(2)
+    else:
+        scoped = _latest_session_events(events)
+
+    tail_slice = scoped[-n:] if n > 0 else scoped
+    now_ms = int(time.time() * 1000)
+    for ev in tail_slice:
+        ago = _human_relative_ms(now_ms - ev.ts_ms)
+        prefix = f"  {ago:<10}"
+
+        if ev.event == "SessionStart":
+            typer.echo(f"{prefix}SessionStart")
+            continue
+        if ev.event == "UserPromptSubmit":
+            typer.echo(f"{prefix}UserPromptSubmit")
+            continue
+        if ev.event in {"Stop", "SubagentStop", "PostCompact", "Notification"}:
+            typer.echo(f"{prefix}{ev.event}")
+            continue
+        if ev.event == "PostToolUse":
+            snaps = [s for s in ev.items_added if isinstance(s, InjectionItemSnapshot)]
+            tool = ev.tool_name or "?"
+            intent_marker = f"  [intent={ev.intent}]" if ev.intent else ""
+            if snaps:
+                for s in snaps:
+                    src = s.source_path if len(s.source_path) <= 36 else "…" + s.source_path[-35:]
+                    line = f"{prefix}PostToolUse {tool:<6} {src:<36} {s.token_count:>5} tok  {s.bucket}"
+                    if ev.item_ids_evicted:
+                        line += f"  EVICTS [{', '.join(eid[:10] for eid in ev.item_ids_evicted[:3])}]"
+                    line += intent_marker
+                    typer.echo(line)
+            elif ev.item_ids_evicted:
+                ids = ", ".join(eid[:10] for eid in ev.item_ids_evicted[:3])
+                typer.echo(f"{prefix}PostToolUse {tool:<6} (evicts only) [{ids}]{intent_marker}")
+            else:
+                typer.echo(f"{prefix}PostToolUse {tool:<6} (no items){intent_marker}")
+            continue
+        # Pin/Unpin and others
+        intent_marker = f"  [intent={ev.intent}]" if ev.intent else ""
+        typer.echo(f"{prefix}{ev.event}{intent_marker}")
+
+
+def _human_relative_ms(delta_ms: int) -> str:
+    if delta_ms < 1500:
+        return "just now"
+    if delta_ms < 60_000:
+        return f"{delta_ms // 1000}s ago"
+    if delta_ms < 3_600_000:
+        return f"{delta_ms // 60_000}m ago"
+    if delta_ms < 86_400_000:
+        return f"{delta_ms // 3_600_000}h ago"
+    return f"{delta_ms // 86_400_000}d ago"
+
+
 @app.command("budget")
 def cmd_budget() -> None:
     """Show budget configuration and current usage."""
@@ -374,8 +460,21 @@ def cmd_unpin(item_id: str) -> None:
 
 
 @app.command("evict")
-def cmd_evict(item_id: str, reason: str = typer.Option("user-requested", "--reason")) -> None:
-    """Force-evict an item by appending an explicit eviction event."""
+def cmd_evict(
+    item_id: str,
+    reason: str = typer.Option("user-requested", "--reason"),
+    intent: bool = typer.Option(
+        False, "--intent",
+        help="mark as user-evict so the next UserPromptSubmit re-injection skips this id",
+    ),
+) -> None:
+    """Force-evict an item by appending an explicit eviction event.
+
+    Plain `evict` is informational (the engine drops it from the manifest).
+    `--intent` additionally tags the event with intent="user-evict", which
+    the re-injection composer reads to add the id to a "do not rely on"
+    marker on the next user prompt.
+    """
     cfg = _config()
     from runtime.core.events import EVENT_LOG_SCHEMA_VERSION, EventRecord, append_event
     import time
@@ -386,9 +485,71 @@ def cmd_evict(item_id: str, reason: str = typer.Option("user-requested", "--reas
         session_id="cli",
         turn=0,
         item_ids_evicted=[item_id],
+        intent="user-evict" if intent else "",
     )
     append_event(cfg.event_log_path, record)
-    typer.echo(f"evicted: {item_id} (reason: {reason})")
+    suffix = " (will skip on re-injection)" if intent else ""
+    typer.echo(f"evicted: {item_id} (reason: {reason}){suffix}")
+
+
+@app.command("add")
+def cmd_add(
+    path: Path = typer.Argument(..., exists=True, file_okay=True, dir_okay=False, readable=True),
+    bucket: str = typer.Option("hot", "--bucket", help="which bucket to add to. Default: hot."),
+) -> None:
+    """Push a file into the next session's context (re-injection on UserPromptSubmit).
+
+    Reads the file, computes its token count, builds an InjectionItemSnapshot,
+    and writes an AddItem event with intent=user-add. The next UserPromptSubmit
+    (with enable_reinjection=true) will surface it in the re-injection block
+    prepended to your prompt.
+    """
+    import hashlib
+    import time
+    from runtime.core.events import EVENT_LOG_SCHEMA_VERSION, EventRecord, append_event
+    from runtime.core.manifest import InjectionItemSnapshot
+    from runtime.core.tokens import OfflineTokenCounter
+
+    cfg = _config()
+    content = path.read_text(encoding="utf-8")
+    counter = OfflineTokenCounter()
+    token_count = counter.count(content)
+    sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    item_id = f"c-{sha[:16]}"
+    snap = InjectionItemSnapshot(
+        id=item_id,
+        bucket=bucket,
+        source_path=str(path),
+        sha256=sha,
+        token_count=token_count,
+        retrieval_reason="user-add",
+        last_touched_turn=0,
+        pinned=False,
+        score=0.0,
+    )
+    record = EventRecord(
+        schema_version=EVENT_LOG_SCHEMA_VERSION,
+        ts_ms=int(time.time() * 1000),
+        event="PostToolUse",
+        session_id="cli",
+        turn=0,
+        tool_name="user-add",
+        items_added=[snap],
+        intent="user-add",
+    )
+    append_event(cfg.event_log_path, record)
+
+    # Also stash the content so re-injection can include it inline.
+    # Stored under log_dir/added/<id>.txt so it survives across CLI invocations.
+    content_dir = cfg.log_dir / "added"
+    content_dir.mkdir(parents=True, exist_ok=True)
+    (content_dir / f"{item_id}.txt").write_text(content, encoding="utf-8")
+
+    typer.echo(f"added: {item_id} ({token_count} tok) -> {bucket} bucket")
+    if cfg.enable_reinjection:
+        typer.echo("will be re-injected on the next user prompt")
+    else:
+        typer.echo("(re-injection is disabled; set [tool.recall.runtime] enable_reinjection = true to activate)")
 
 
 @app.command("install-hooks")

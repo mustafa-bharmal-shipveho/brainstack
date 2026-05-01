@@ -45,7 +45,8 @@ class RuntimeConfig:
         [tool.recall.runtime]
         log_dir = "~/.agent/runtime/logs"
         capture_raw = false
-        schema_version = "1.1"
+        enable_reinjection = false
+        reinjection_budget_tokens = 1500
         [tool.recall.runtime.budget]
         claude_md = 4000
         hot = 2000
@@ -55,6 +56,8 @@ class RuntimeConfig:
 
     log_dir: Path = field(default_factory=lambda: Path("~/.agent/runtime/logs").expanduser())
     capture_raw: bool = False
+    enable_reinjection: bool = False
+    reinjection_budget_tokens: int = 1500
     budgets: dict[str, int] = field(default_factory=lambda: dict(_DEFAULT_BUDGETS))
     tool_bucket_overrides: dict[str, str] = field(default_factory=lambda: dict(_TOOL_BUCKET_OVERRIDES))
     config_path: Path | None = None
@@ -95,6 +98,8 @@ class RuntimeConfig:
         return cls(
             log_dir=log_dir,
             capture_raw=bool(section.get("capture_raw", False)),
+            enable_reinjection=bool(section.get("enable_reinjection", False)),
+            reinjection_budget_tokens=int(section.get("reinjection_budget_tokens", 1500)),
             budgets=budgets,
             config_path=path,
         )

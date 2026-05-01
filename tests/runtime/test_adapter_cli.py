@@ -365,6 +365,102 @@ def test_evict_appends_event(cli_env: Path) -> None:
     assert "item_ids_evicted" in text
 
 
+def test_evict_with_intent_flag_marks_event(cli_env: Path) -> None:
+    """--intent stamps the event with intent='user-evict' for re-injection."""
+    runner = CliRunner()
+    result = runner.invoke(app, ["evict", "c-001", "--intent"])
+    assert result.exit_code == 0
+    assert "skip on re-injection" in result.output
+    log = cli_env / "logs" / "events.log.jsonl"
+    text = log.read_text()
+    assert '"intent":"user-evict"' in text
+
+
+def test_add_command_writes_event_and_content_file(cli_env: Path, tmp_path: Path) -> None:
+    """`recall runtime add <path>` reads file, writes AddItem event, stashes content."""
+    src = tmp_path / "lesson.md"
+    src.write_text("use SELECT FOR UPDATE SKIP LOCKED for the deadlock fix")
+    runner = CliRunner()
+    result = runner.invoke(app, ["add", str(src)])
+    assert result.exit_code == 0
+    assert "added:" in result.output
+    assert "tok" in result.output
+    log = cli_env / "logs" / "events.log.jsonl"
+    text = log.read_text()
+    assert '"intent":"user-add"' in text
+    assert '"tool_name":"user-add"' in text
+    # Content stash file
+    content_dir = cli_env / "logs" / "added"
+    files = list(content_dir.glob("c-*.txt"))
+    assert len(files) == 1
+    assert "SELECT FOR UPDATE" in files[0].read_text()
+
+
+def test_add_command_warns_when_reinjection_disabled(cli_env: Path, tmp_path: Path) -> None:
+    src = tmp_path / "x.md"
+    src.write_text("hello")
+    runner = CliRunner()
+    result = runner.invoke(app, ["add", str(src)])
+    # Default config has enable_reinjection=False
+    assert "re-injection is disabled" in result.output
+
+
+# ---------- recall runtime tail ----------
+
+def test_tail_no_log_friendly(cli_env: Path) -> None:
+    runner = CliRunner()
+    result = runner.invoke(app, ["tail"])
+    assert result.exit_code == 0
+    assert "no events" in result.output.lower()
+
+
+def test_tail_shows_recent_events_in_plain_english(cli_env: Path) -> None:
+    _populate_log(cli_env)
+    runner = CliRunner()
+    result = runner.invoke(app, ["tail"])
+    assert result.exit_code == 0
+    assert "SessionStart" in result.output
+    assert "UserPromptSubmit" in result.output
+    assert "PostToolUse" in result.output
+
+
+def test_tail_default_n_is_10(cli_env: Path) -> None:
+    """Default shows last 10 events."""
+    from runtime.core.events import EVENT_LOG_SCHEMA_VERSION, EventRecord, append_event
+
+    log = cli_env / "logs" / "events.log.jsonl"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=1, event="SessionStart", session_id="s", turn=0))
+    for i in range(20):
+        append_event(log, EventRecord(EVENT_LOG_SCHEMA_VERSION, ts_ms=2 + i, event="Stop", session_id="s", turn=0))
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["tail"])
+    assert result.exit_code == 0
+    # Should print exactly 10 'Stop' lines (the last 10 events)
+    assert result.output.count("Stop") == 10
+
+
+def test_tail_custom_n(cli_env: Path) -> None:
+    _populate_log(cli_env)
+    runner = CliRunner()
+    result = runner.invoke(app, ["tail", "1"])
+    assert result.exit_code == 0
+    # Just one line of meaningful content (plus blank lines may exist)
+    non_blank = [l for l in result.output.splitlines() if l.strip()]
+    assert len(non_blank) == 1
+
+
+def test_tail_intent_marker_visible(cli_env: Path, tmp_path: Path) -> None:
+    """tail surfaces the [intent=user-add] marker on user-driven events."""
+    src = tmp_path / "x.md"
+    src.write_text("hello")
+    runner = CliRunner()
+    runner.invoke(app, ["add", str(src)])
+    result = runner.invoke(app, ["tail", "5"])
+    assert "intent=user-add" in result.output
+
+
 # ---------- install-hooks ----------
 
 def test_installer_idempotent(tmp_path: Path) -> None:
