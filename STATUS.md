@@ -1,93 +1,86 @@
 # STATUS
 
-Long autonomous run on `mustafa/runtime-v0`. Updated after every sub-phase.
+Long autonomous run on `mustafa/runtime-v0`. v0.2 context runtime.
 
 ## Current state
 
-- **Phase:** Night 1 complete
-- **State:** YELLOW-1 (Phase 1 + 2c complete with codex APPROVE; Phase 0 partially blocked on user-triggered Claude sessions; persona BLOCKs addressed in code or documented as Phase 3+4 work)
-- **Last commit:** `26bf25b runtime(reviews): apply codex + persona findings`
-- **Last tag:** `night-1-reviews`
-- **Branch:** `mustafa/runtime-v0` (9 commits ahead of `main`)
-- **Open question:** see `HALT.md` — user runs the harness in the morning, decides go/no-go on Night 2
+- **Phase:** Night 3 wrap-up (Phase 6 final reviews running)
+- **State:** GREEN-3 pending final review verdicts
+- **Branch:** `mustafa/runtime-v0` (19 commits ahead of `main`)
+- **Last tag:** `phase-3-reviews` (final commit will be `night-3-final` once reviews land)
 
-## Plan reference
-
-See `~/.claude/plans/i-ran-into-this-buzzing-rabbit.md` for the full plan,
-thesis, sub-phase breakdown, persona schedule, and synthetic test catalogue.
-
-## Sub-phase progress
+## Phase progress
 
 - [x] Setup — feature branch + runtime/ skeleton
-- [x] 0a (built) — hook telemetry harness — execution blocked, awaits user
-- [ ] 0b — tool-event payload sampler (depends on 0a)
-- [x] 0c — concurrent-hook flock smoke test
-- [ ] 0d — phase0-empirical.md writeup + go/no-go (template in place; user fills in 0a/0b sections after running harness)
-- [x] 1a (partial) — manifest schema v1.0 (tool-specific fields reserved as `x_tool_*` pending 0b)
-- [x] 1b — TokenCounter Protocol + offline default
-- [x] 1c — Policy Protocol + LRU/recency/pinned-first defaults
-- [x] 1d — event log schema + data-policy doc
-- [ ] 2a — record-mode adapter (depends on 0a/0b)
-- [ ] 2b — record real fixtures (depends on 2a)
-- [x] 2c — synthetic test battery (5 of 8 categories; 3 already covered elsewhere)
-- [x] codex review (Phase 1 + 2c diff)
-- [x] persona reviews — Skeptic + Security
-- [ ] 3a-3h — Core impl (Night 2)
-- [ ] 4a-4d — Adapter + dogfood (Night 3)
-- [ ] 5a-5e — Docs (Night 3)
-- [ ] 6a-6d — Review + PR (Night 3)
+- [x] 0a (built; user runs harness for empirical data)
+- [ ] 0b (depends on 0a — user action)
+- [x] 0c — concurrent-hook flock smoke test (5 tests)
+- [x] 0d — phase0-empirical.md template + handoff
+- [x] 1a — manifest schema v1.1 (16 tests)
+- [x] 1b — TokenCounter Protocol + offline default (10 tests)
+- [x] 1c — Policy + LRU/recency/pinned-first (25 tests)
+- [x] 1d — event log schema v1.1 + data policy (13 tests)
+- [x] 2c — synthetic test battery (68 tests)
+- [x] 3a — runtime/core/locking.py (9 tests)
+- [x] 3b — schema bump 1.0->1.1 + items_added (2 tests)
+- [x] 3d — Engine state machine (17 tests)
+- [x] 3f — replay engine + diff (9 tests)
+- [x] 3g/h — integration + control property (3 tests)
+- [x] Phase 3 reviews — 5 codex+personas; BLOCKs addressed
+- [x] 4a/4b — Claude Code adapter + CLI (28 tests)
+- [x] 4d — performance micro-benchmarks (8 tests)
+- [x] 5a-e — README + docs/runtime.md + CHANGELOG + version bump
+- [→] 6a-d — final review + PR draft (running)
 
-## Test counts (post-review)
+## Test counts
 
 | Suite | Tests |
 |---|---|
 | Brainstack pre-existing | 581 |
-| Runtime new (parametrize-expanded) | 154 (+23 from review fixes) |
-| **Total green** | **730** |
+| Runtime new | 230 |
+| **Total green** | **808** |
 
-Latest `pytest -q` run: 730 passed in 134.05s. No regressions.
+Latest `pytest -q` run: 808 passed in 136s. No regressions.
 
-## LOC
+## Tags walked through
 
 ```
-runtime/core/         ~1.0k LOC
-tests/runtime/        ~1.5k LOC + ~200 LOC docs/policy
-runtime/_empirical/   ~400 LOC harness + ~200 LOC docs
-TOTAL                 ~3.3k (under 2k production / 500 test budget for runtime/core/, runtime/adapters/)
+night-1-handoff        — Phase 0+1+2 spec done, 730 tests
+night-1-reviews        — codex+skeptic+security applied, +sha256 default-off
+night-1-final          — STATUS reflects post-review state
+
+subphase-3a-locking    — atomic primitives, +9 tests
+subphase-3b-schema-1.1 — items_added in events, +2 tests
+subphase-3d-engine     — Engine state machine, +17 tests, control property
+subphase-3f-replay     — replay + diff, +9 tests
+subphase-3g-integration— byte-equal live↔replay, +3 tests
+
+subphase-4ab-adapter   — claude_code adapter + CLI, +28 tests
+subphase-4d-perf       — perf micro-benchmarks, +8 tests
+subphase-5-docs        — README + docs/runtime.md + CHANGELOG + 0.2.0
+phase-3-reviews        — items_added security validation
 ```
 
-Production LOC under `runtime/core/` is ~1.0k — well under the 2.0k v0 cap.
+## Final commit (when reviews land)
 
-## Night 1 endpoint adjustment
+`night-3-final` will be tagged after Phase 6 reviews are processed and any
+final fixes applied. The PR description draft lives at
+`runtime/_review_outputs/PR_DRAFT.md`.
 
-The original plan said "Night 1 endpoint = end of Phase 2." Reality:
-- Phase 0 is half done (0a built but unrun, 0c green, 0b/0d pending user)
-- Phase 1 fully done with quality
-- Phase 2c done; 2a/2b need the empirical answers first
+## Honest scope
 
-Net: I am AHEAD on Phase 1 quality and BEHIND on Phase 2 fixtures (which
-need real Claude sessions). Total deliverable for Night 1 is comparable
-to plan, just with a different shape.
+The runtime owns the **injection layer**, not the model's KV cache.
+"Eviction" = "demotion-from-injection on the next turn." See
+`docs/runtime.md` and `runtime/_empirical/data-policy.md` for the threat
+model and v0.x roadmap.
 
-## How to resume after compaction
+## What you do when you wake up
 
-1. Re-read this file.
-2. `git -C ~/Documents/brainstack log --oneline -20` for commit history.
-3. `git -C ~/Documents/brainstack tag -l 'subphase-*'` for sub-phase tags.
-4. Read the most recent sub-phase output file.
-5. Read `HALT.md` for the user-action handoff.
-
-## Reviews
-
-Three `codex exec` calls completed. Findings + applied fixes are in
-`runtime/_review_outputs/SUMMARY.md`. Verdicts:
-
-- Codex code review: **APPROVE** (7 of 7 checks pass)
-- Skeptic persona: **BLOCK** — 8 findings; conceptual ones (Phase 1
-  alone is a logger) are by design; structural ones (#3 score in
-  snapshot, #4 per-item x_*) fixed in code; doc tightening landed
-- Security persona: **BLOCK** — 7 findings; the two BLOCKs (sha256
-  fingerprint, x_* extension bypass) fixed: sha256 default-off,
-  MAX_EXTENSION_BYTES=1024 guard
-
-Tag: `night-1-reviews`.
+1. Read `runtime/_review_outputs/PR_DRAFT.md` — that's the PR description
+   ready to push.
+2. Run the hook telemetry harness to fill in Phase 0 empirical answers
+   (one command in `HALT.md`).
+3. Capture a real session for the README demo block (replace the synthetic
+   example).
+4. `git push origin mustafa/runtime-v0` and open the PR using the draft
+   description.
