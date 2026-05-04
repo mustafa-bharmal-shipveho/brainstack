@@ -487,11 +487,14 @@ class TestSessionStartHook:
         assert rc == 0
         assert capsys.readouterr().out == ""
 
-    def test_emits_content_when_non_empty_summary(
+    def test_emits_json_envelope_when_non_empty_summary(
         self, tmp_path: Path, monkeypatch, capsys
     ):
-        """Multi-line summary gets printed verbatim (or wrapped) to stdout
-        so Claude Code injects it into the session context."""
+        """Claude Code SessionStart hooks expect stdout in a structured
+        JSON shape: {"hookSpecificOutput": {"hookEventName": "SessionStart",
+        "additionalContext": "..."}}. Raw markdown is silently ignored
+        — that was the original bug (banner registered but invisible)."""
+        import json as _json
         body = (
             "# brainstack: pending review\n\n"
             "**21 candidates pending** | drift ok | sync ok\n\n"
@@ -502,8 +505,18 @@ class TestSessionStartHook:
         monkeypatch.setattr(ss, "_resolve_brain_root", lambda: tmp_path)
         rc = ss.main()
         assert rc == 0
-        out = capsys.readouterr().out
-        assert "21 candidates pending" in out
+        out = capsys.readouterr().out.strip()
+        # MUST be valid JSON — Claude Code parses stdout as the hook
+        # response envelope.
+        payload = _json.loads(out)
+        spec = payload.get("hookSpecificOutput", {})
+        assert spec.get("hookEventName") == "SessionStart"
+        ctx = spec.get("additionalContext", "")
+        assert "21 candidates pending" in ctx
+        # The injected content is wrapped in <system-reminder> so Claude
+        # treats it as system context, not user input.
+        assert "<system-reminder>" in ctx
+        assert "</system-reminder>" in ctx
 
     def test_swallows_exception_returns_zero(
         self, tmp_path: Path, monkeypatch, capsys

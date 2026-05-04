@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
 """Claude Code SessionStart hook. Reads <brain>/PENDING_REVIEW.md and
-emits its content to stdout so Claude Code injects it into the session
-context.
+emits a JSON response telling Claude Code to inject the content into
+the session context.
+
+Output format (Claude Code SessionStart hook contract):
+
+    {"hookSpecificOutput": {
+        "hookEventName": "SessionStart",
+        "additionalContext": "<the markdown content>"
+    }}
+
+Raw stdout (without the JSON envelope) is IGNORED by Claude Code —
+that was the original bug Mustafa caught when the banner didn't appear
+on a fresh session despite the hook being correctly registered.
 
 Four behaviors that MUST hold (tests pin them):
   1. Silent on missing file (brain not yet generated).
@@ -14,7 +25,8 @@ Four behaviors that MUST hold (tests pin them):
      (env-poisoning protection from PostToolUse — same threat model).
      Trusting $HOME here would let a project-level .envrc redirect us
      to attacker-controlled content that gets injected verbatim into
-     a <system-reminder> block (Codex 2026-05-04 P1 — prompt injection).
+     the additionalContext field (Codex 2026-05-04 P1 — prompt
+     injection).
 
 The hook lives at <brain>/harness/hooks/session_start.py, so
 `__file__.parent.parent.parent` is always the trusted brain root.
@@ -26,6 +38,7 @@ Wired up via:
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -53,6 +66,23 @@ def _resolve_brain_root() -> Path:
     return Path.home() / ".agent"
 
 
+def _emit_additional_context(content: str) -> None:
+    """Emit the Claude Code SessionStart hook JSON envelope.
+
+    Claude Code reads stdout and expects either a JSON object with
+    hookSpecificOutput.additionalContext set, OR raw text it ignores.
+    Raw text => ignored => banner doesn't appear (the bug Mustafa hit).
+    """
+    payload = {
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": content,
+        }
+    }
+    sys.stdout.write(json.dumps(payload))
+    sys.stdout.write("\n")
+
+
 def main() -> int:
     try:
         brain_root = _resolve_brain_root()
@@ -72,13 +102,11 @@ def main() -> int:
         first_line = stripped.splitlines()[0]
         if "all clear" in first_line.lower() and len(stripped.splitlines()) <= 2:
             return 0
-        # Wrap in <system-reminder> so Claude treats it as system context,
-        # not user content. Matches the existing post_execution.py pattern.
-        sys.stdout.write("<system-reminder>\n")
-        sys.stdout.write(content)
-        if not content.endswith("\n"):
-            sys.stdout.write("\n")
-        sys.stdout.write("</system-reminder>\n")
+        # Wrap the markdown in a <system-reminder> block (so Claude treats
+        # it as system context) and emit via the SessionStart JSON envelope
+        # so Claude Code actually injects it into the session.
+        wrapped = f"<system-reminder>\n{content.rstrip()}\n</system-reminder>"
+        _emit_additional_context(wrapped)
         return 0
     except Exception:
         # Critical contract: NEVER let an exception propagate. SessionStart
