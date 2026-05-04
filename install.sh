@@ -111,6 +111,14 @@ while [ $# -gt 0 ]; do
             MODE="remove-pending-hook"
             shift
             ;;
+        --setup-statusline)
+            MODE="setup-statusline"
+            shift
+            ;;
+        --remove-statusline)
+            MODE="remove-statusline"
+            shift
+            ;;
         --setup-pending-review-all)
             MODE="setup-pending-review-all"
             shift
@@ -1005,6 +1013,79 @@ PYEOF
     exit 0
 fi
 
+# ----- Mode: setup-statusline / remove-statusline -----
+# Configures Claude Code's statusLine to run agent/tools/statusline.py
+# which prints "📥 N pending — recall pending --review" in the persistent
+# UI footer. Visible AS SOON AS the session opens, no user input required.
+# Mustafa 2026-05-04: "can this happen when the user doesnt write anything
+# and as soon as claude starts".
+#
+# Idempotent: re-runs replace the existing statusLine with our config
+# (since settings.json supports only one statusLine; we own that slot).
+# --remove-statusline restores no statusLine (Claude Code's default).
+if [ "$MODE" = "setup-statusline" ] || [ "$MODE" = "remove-statusline" ]; then
+    if [ ! -d "$BRAIN_ROOT" ]; then
+        echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
+        exit 2
+    fi
+    settings="$HOME/.claude/settings.json"
+    if [ ! -f "$settings" ]; then
+        echo "install: $settings not found (Claude Code not installed?). Skipping."
+        exit 0
+    fi
+    statusline_target="$BRAIN_ROOT/tools/statusline.py"
+
+    if [ "$MODE" = "remove-statusline" ]; then
+        "$PYTHON_BIN" - "$settings" "$statusline_target" <<'PYEOF'
+import json, sys
+from pathlib import Path
+p, target = Path(sys.argv[1]), sys.argv[2]
+data = json.loads(p.read_text())
+sl = data.get("statusLine")
+if isinstance(sl, dict) and target in str(sl.get("command", "")):
+    data.pop("statusLine", None)
+    p.write_text(json.dumps(data, indent=2, sort_keys=True))
+    print(f"removed brainstack statusLine from {p}")
+else:
+    print(f"no brainstack statusLine found in {p}")
+PYEOF
+        exit 0
+    fi
+
+    # setup-statusline
+    if [ ! -f "$statusline_target" ]; then
+        echo "install: $statusline_target missing — run ./install.sh --upgrade first." >&2
+        exit 2
+    fi
+    if [ -z "${PYTHON_ABS:-}" ]; then
+        echo "install: PYTHON_ABS not resolved." >&2
+        exit 2
+    fi
+    "$PYTHON_BIN" - "$settings" "$PYTHON_ABS" "$statusline_target" <<'PYEOF'
+import json, sys
+from pathlib import Path
+settings_path, python_abs, target = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+data = json.loads(settings_path.read_text())
+existing = data.get("statusLine")
+if isinstance(existing, dict) and target in str(existing.get("command", "")):
+    print(f"already installed: brainstack statusLine present in {settings_path}")
+    sys.exit(0)
+if existing:
+    print(f"WARN: replacing existing statusLine in {settings_path} "
+          f"(was: {existing.get('command', existing)!r})", file=sys.stderr)
+data["statusLine"] = {
+    "type": "command",
+    "command": f"{python_abs} {target}",
+}
+settings_path.write_text(json.dumps(data, indent=2, sort_keys=True))
+print(f"installed brainstack statusLine into {settings_path}")
+PYEOF
+    echo "==> Statusline installed. Open a fresh Claude Code session — the"
+    echo "    pending count will appear in the UI footer immediately."
+    echo "    Tear down with:  ./install.sh --remove-statusline"
+    exit 0
+fi
+
 # ----- Mode: setup-pending-review-all / remove-pending-review-all -----
 # Umbrella: wires all three pending-review surfaces in one command
 # (Claude Code SessionStart hook + Cursor .cursorrules + shell wrappers).
@@ -1016,26 +1097,32 @@ if [ "$MODE" = "setup-pending-review-all" ] || [ "$MODE" = "remove-pending-revie
         exit 2
     fi
     if [ "$MODE" = "remove-pending-review-all" ]; then
-        echo "==> Removing pending-review surfaces (Claude / Cursor / shell)…"
-        "$0" --remove-pending-hook   2>&1 | sed 's/^/  /'
-        "$0" --remove-cursor-rules   2>&1 | sed 's/^/  /'
-        "$0" --remove-shell-banner   2>&1 | sed 's/^/  /'
+        echo "==> Removing pending-review surfaces (statusline / Claude / Cursor / shell)…"
+        "$0" --remove-statusline      2>&1 | sed 's/^/  /'
+        "$0" --remove-pending-hook    2>&1 | sed 's/^/  /'
+        "$0" --remove-cursor-rules    2>&1 | sed 's/^/  /'
+        "$0" --remove-shell-banner    2>&1 | sed 's/^/  /'
         echo "==> Removal complete."
         exit 0
     fi
 
-    # Setup all three. Pass PYTHON_BIN so each sub-call resolves the same
+    # Setup all four. Pass PYTHON_BIN so each sub-call resolves the same
     # interpreter (avoids "system python3 too old" failures on default).
-    echo "==> Setting up pending-review surfaces (Claude / Cursor / shell)…"
-    PYTHON_BIN="$PYTHON_BIN" "$0" --setup-pending-hook  2>&1 | sed 's/^/  [claude] /'
-    PYTHON_BIN="$PYTHON_BIN" "$0" --setup-cursor-rules  2>&1 | sed 's/^/  [cursor] /'
-    PYTHON_BIN="$PYTHON_BIN" "$0" --setup-shell-banner  2>&1 | sed 's/^/  [shell]  /'
+    # Order: statusline first (most user-visible — appears as soon as
+    # session opens), then directives that fire on first response.
+    echo "==> Setting up pending-review surfaces (statusline / Claude / Cursor / shell)…"
+    PYTHON_BIN="$PYTHON_BIN" "$0" --setup-statusline      2>&1 | sed 's/^/  [statusln] /'
+    PYTHON_BIN="$PYTHON_BIN" "$0" --setup-pending-hook    2>&1 | sed 's/^/  [claude]   /'
+    PYTHON_BIN="$PYTHON_BIN" "$0" --setup-cursor-rules    2>&1 | sed 's/^/  [cursor]   /'
+    PYTHON_BIN="$PYTHON_BIN" "$0" --setup-shell-banner    2>&1 | sed 's/^/  [shell]    /'
     echo
-    echo "==> All three surfaces configured."
-    echo "    To verify Claude:  open a new Claude Code session — banner appears at top"
-    echo "    To verify Cursor:  open Cursor and check ~/.cursor/.cursorrules"
-    echo "    To verify shell:   source ~/.zshrc (or new shell) → type 'claude --version'"
-    echo "    Tear down all:     ./install.sh --remove-pending-review-all"
+    echo "==> All four surfaces configured."
+    echo "    Statusline:   visible in Claude Code UI footer immediately on session open"
+    echo "    Claude greet: Claude proactively says \"📥 N pending — recall pending --review\""
+    echo "                  in its first response (via @-import in CLAUDE.md)"
+    echo "    Cursor:       sentinel block in ~/.cursor/.cursorrules"
+    echo "    Shell:        wrappers for any AI CLI in ~/.agent/banner/wrapped_tools"
+    echo "    Tear down all:    ./install.sh --remove-pending-review-all"
     exit 0
 fi
 

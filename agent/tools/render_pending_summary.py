@@ -244,18 +244,13 @@ def compose_summary(
     # come up" — third diagnostic round confirmed the data WAS being
     # injected, but the model wasn't proactively mentioning it.
     if total > 0:
+        # Terse directive — Mustafa 2026-05-04: "just say to use recall
+        # pending --review". One line, exact wording, no exposition.
         directive_lines = [
             "<system-reminder>",
-            "BRAINSTACK PENDING REVIEW: At the start of your first response in",
-            f"this session, briefly mention to the user: \"📥 You have **{total} "
-            "candidates pending review** in your brain (run /dream or "
-            "`recall pending --review` to triage).\"",
-            "",
-            "Do this ONCE per session, ONLY if total > 0 (which it is). Skip",
-            "if the user has already addressed pending review in their first",
-            "message, or if their first message is clearly an unrelated task",
-            "where the mention would derail focus. Be brief — one line plus",
-            "the count, no exposition.",
+            f"BRAINSTACK: At the start of your first response, tell the user "
+            f"\"📥 {total} pending — run `recall pending --review`\" "
+            f"(once per session, skip if user already addressed it).",
             "</system-reminder>",
             "",
         ]
