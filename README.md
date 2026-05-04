@@ -136,6 +136,22 @@ Brainstack now generates `~/.agent/PENDING_REVIEW.md` on every dream cycle, sync
 
 All three read the same `PENDING_REVIEW.md`. The file is generated locally and gitignored — never synced to your private brain remote.
 
+**Framework, not point-solution.** The shell banner wraps any AI CLI listed in `~/.agent/banner/wrapped_tools` — one tool name per line, `#` comments allowed. Default set covers `claude`, `codex`, `cursor`, `aider`, `continue`, `gemini`, `ollama`, `llm`. Adding a new LLM is a one-line edit; re-source `~/.zshrc` to apply. No code change. The Cursor `.cursorrules` and Claude SessionStart paths similarly rely on each tool's own native injection mechanism — when a new AI tool ships hooks/rules support, brainstack adds an adapter rather than reinventing the surface.
+
+```bash
+# Add a new AI CLI to the shell wrappers
+echo "my-new-llm" >> ~/.agent/banner/wrapped_tools
+source ~/.zshrc                              # re-source to pick it up
+type my-new-llm                              # confirm wrapper defined
+```
+
+One-shot setup of all three surfaces:
+
+```bash
+./install.sh --setup-pending-review-all      # Claude SessionStart + Cursor + shell wrappers
+./install.sh --remove-pending-review-all     # tear down all three
+```
+
 ```bash
 # View the summary on demand
 recall pending                  # print current summary

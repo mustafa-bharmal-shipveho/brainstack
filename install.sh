@@ -103,6 +103,22 @@ while [ $# -gt 0 ]; do
             MODE="remove-shell-banner"
             shift
             ;;
+        --setup-pending-hook)
+            MODE="setup-pending-hook"
+            shift
+            ;;
+        --remove-pending-hook)
+            MODE="remove-pending-hook"
+            shift
+            ;;
+        --setup-pending-review-all)
+            MODE="setup-pending-review-all"
+            shift
+            ;;
+        --remove-pending-review-all)
+            MODE="remove-pending-review-all"
+            shift
+            ;;
         --migrate)
             MODE="migrate"
             # Consume the source path only if the next arg is NOT another
@@ -820,6 +836,15 @@ PYEOF
     mkdir -p "$banner_dir"
     cp "$REPO_DIR/templates/brainstack-shell-banner.sh" "$banner_target"
     chmod +x "$banner_target"
+    # Wrapped-tool list — config-driven so adding a new LLM is a one-line
+    # edit, not a code change (Mustafa 2026-05-04: "framework, not point
+    # solution"). Don't overwrite an existing user-curated list.
+    wrapped_tools_target="$banner_dir/wrapped_tools"
+    if [ ! -f "$wrapped_tools_target" ] && [ -f "$REPO_DIR/templates/brainstack-wrapped-tools.txt" ]; then
+        cp "$REPO_DIR/templates/brainstack-wrapped-tools.txt" "$wrapped_tools_target"
+        echo "==> Default wrapped-tool list seeded at $wrapped_tools_target"
+        echo "    (edit to add/remove LLMs; re-source ~/.zshrc to apply)"
+    fi
     if [ -f "$rc" ] && /usr/bin/grep -qF "$sentinel_start" "$rc"; then
         echo "==> $rc already sources the shell banner."
     else
@@ -833,6 +858,161 @@ PYEOF
     fi
     echo "==> Shell banner installed. Run \`source $rc\` or open a new shell."
     echo "    Tear down with:  ./install.sh --remove-shell-banner"
+    exit 0
+fi
+
+# ----- Mode: setup-pending-hook / remove-pending-hook -----
+# Idempotently registers the SessionStart hook in ~/.claude/settings.json
+# so Claude Code surfaces ~/.agent/PENDING_REVIEW.md on every session
+# start. Hardcodes absolute paths to PYTHON_ABS and the brain-side
+# session_start.py — same env-poisoning posture as the existing
+# PostToolUse hook.
+#
+# We tag the entry with `# brainstack-pending-review` so re-runs detect
+# the existing entry and skip; --remove-pending-hook strips it.
+if [ "$MODE" = "setup-pending-hook" ] || [ "$MODE" = "remove-pending-hook" ]; then
+    if [ ! -d "$BRAIN_ROOT" ]; then
+        echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
+        exit 2
+    fi
+    settings="$HOME/.claude/settings.json"
+    if [ ! -f "$settings" ]; then
+        echo "install: $settings not found (Claude Code not installed?). Skipping."
+        exit 0
+    fi
+    sentinel="# brainstack-pending-review"
+    hook_target="$BRAIN_ROOT/harness/hooks/session_start.py"
+
+    if [ "$MODE" = "remove-pending-hook" ]; then
+        "$PYTHON_BIN" - "$settings" "$sentinel" <<'PYEOF'
+import json, sys
+from pathlib import Path
+settings_path, sentinel = Path(sys.argv[1]), sys.argv[2]
+data = json.loads(settings_path.read_text())
+hooks = data.get("hooks", {})
+ss = hooks.get("SessionStart", []) or []
+new_ss = []
+removed = 0
+for entry in ss:
+    new_hooks = []
+    for h in entry.get("hooks", []) or []:
+        if sentinel in (h.get("command") or ""):
+            removed += 1
+            continue
+        new_hooks.append(h)
+    if new_hooks:
+        new_entry = dict(entry)
+        new_entry["hooks"] = new_hooks
+        new_ss.append(new_entry)
+if removed:
+    if new_ss:
+        hooks["SessionStart"] = new_ss
+    else:
+        hooks.pop("SessionStart", None)
+    data["hooks"] = hooks
+    settings_path.write_text(json.dumps(data, indent=2, sort_keys=True))
+    print(f"removed {removed} brainstack-pending-review hook(s) from {settings_path}")
+else:
+    print(f"no brainstack-pending-review hook found in {settings_path}")
+PYEOF
+        exit 0
+    fi
+
+    # setup-pending-hook
+    if [ ! -f "$hook_target" ]; then
+        echo "install: $hook_target missing — run ./install.sh --upgrade first." >&2
+        exit 2
+    fi
+    if [ -z "${PYTHON_ABS:-}" ]; then
+        echo "install: PYTHON_ABS not resolved." >&2
+        exit 2
+    fi
+    "$PYTHON_BIN" - "$settings" "$PYTHON_ABS" "$hook_target" "$sentinel" <<'PYEOF'
+import json, sys
+from pathlib import Path
+settings_path = Path(sys.argv[1])
+python_abs = sys.argv[2]
+hook_path = sys.argv[3]
+sentinel = sys.argv[4]
+
+data = json.loads(settings_path.read_text())
+hooks = data.setdefault("hooks", {})
+if not isinstance(hooks, dict):
+    print(f"settings.json hooks is not an object — refusing to modify", file=sys.stderr)
+    sys.exit(2)
+
+session_start = hooks.setdefault("SessionStart", [])
+if not isinstance(session_start, list):
+    print(f"hooks.SessionStart is not an array — refusing to modify", file=sys.stderr)
+    sys.exit(2)
+
+# Idempotency: if any existing SessionStart command contains our sentinel, skip.
+already = False
+for entry in session_start:
+    for h in entry.get("hooks", []) or []:
+        if sentinel in (h.get("command") or ""):
+            already = True
+            break
+    if already:
+        break
+
+if already:
+    print(f"already installed: brainstack-pending-review hook present in {settings_path}")
+    sys.exit(0)
+
+# Append a new entry. Absolute paths only — no $HOME, no ~. Same env-
+# poisoning posture as the PostToolUse wrapper. Tag with sentinel for
+# idempotent re-runs and clean removal.
+cmd = f"{python_abs} {hook_path}  {sentinel}"
+new_entry = {
+    "hooks": [{
+        "type": "command",
+        "command": cmd,
+        "timeout": 5000,
+    }]
+}
+session_start.append(new_entry)
+data["hooks"] = hooks
+
+settings_path.write_text(json.dumps(data, indent=2, sort_keys=True))
+print(f"installed brainstack-pending-review hook into {settings_path}")
+PYEOF
+    echo "==> SessionStart hook installed. Open a fresh Claude Code session to see it."
+    echo "    Tear down with:  ./install.sh --remove-pending-hook"
+    exit 0
+fi
+
+# ----- Mode: setup-pending-review-all / remove-pending-review-all -----
+# Umbrella: wires all three pending-review surfaces in one command
+# (Claude Code SessionStart hook + Cursor .cursorrules + shell wrappers).
+# Each sub-mode is idempotent and silently skips its surface if the
+# host tool isn't installed (e.g., no ~/.cursor → cursor step is no-op).
+if [ "$MODE" = "setup-pending-review-all" ] || [ "$MODE" = "remove-pending-review-all" ]; then
+    if [ ! -d "$BRAIN_ROOT" ]; then
+        echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
+        exit 2
+    fi
+    if [ "$MODE" = "remove-pending-review-all" ]; then
+        echo "==> Removing pending-review surfaces (Claude / Cursor / shell)…"
+        "$0" --remove-pending-hook   2>&1 | sed 's/^/  /'
+        "$0" --remove-cursor-rules   2>&1 | sed 's/^/  /'
+        "$0" --remove-shell-banner   2>&1 | sed 's/^/  /'
+        echo "==> Removal complete."
+        exit 0
+    fi
+
+    # Setup all three. Pass PYTHON_BIN so each sub-call resolves the same
+    # interpreter (avoids "system python3 too old" failures on default).
+    echo "==> Setting up pending-review surfaces (Claude / Cursor / shell)…"
+    PYTHON_BIN="$PYTHON_BIN" "$0" --setup-pending-hook  2>&1 | sed 's/^/  [claude] /'
+    PYTHON_BIN="$PYTHON_BIN" "$0" --setup-cursor-rules  2>&1 | sed 's/^/  [cursor] /'
+    PYTHON_BIN="$PYTHON_BIN" "$0" --setup-shell-banner  2>&1 | sed 's/^/  [shell]  /'
+    echo
+    echo "==> All three surfaces configured."
+    echo "    To verify Claude:  open a new Claude Code session — banner appears at top"
+    echo "    To verify Cursor:  open Cursor and check ~/.cursor/.cursorrules"
+    echo "    To verify shell:   source ~/.zshrc (or new shell) → type 'claude --version'"
+    echo "    Tear down all:     ./install.sh --remove-pending-review-all"
     exit 0
 fi
 
@@ -889,8 +1069,8 @@ if [ -d "$BRAIN_ROOT" ]; then
     echo "    To refresh tools/hooks without touching memory: ./install.sh --upgrade"
     echo "    To migrate a flat memory dir:                    ./install.sh --migrate <dir>"
     echo "    To enable hourly Claude transcript + misc sync:  ./install.sh --setup-claude-extras"
-    echo "    To push pending count to Cursor:                 ./install.sh --setup-cursor-rules"
-    echo "    To wrap claude/codex/cursor shell commands:      ./install.sh --setup-shell-banner"
+    echo "    To surface pending review on every session:      ./install.sh --setup-pending-review-all"
+    echo "      (sets up Claude SessionStart + Cursor rules + shell wrappers)"
     exit 0
 fi
 

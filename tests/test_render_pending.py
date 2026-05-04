@@ -549,22 +549,36 @@ class TestSessionStartHook:
 
 
 class TestShellBanner:
-    """The bash wrapper script that intercepts `claude`/`codex`/`cursor`
-    invocations and prints PENDING_REVIEW.md before exec'ing the real binary.
+    """The bash wrapper script that intercepts AI-CLI invocations and
+    prints PENDING_REVIEW.md before exec'ing the real binary.
 
-    Only correctness contract: file exists, syntactically valid bash, uses
-    `command <tool>` (not bare `<tool>`) so wrappers don't self-recurse."""
+    Wrappers are generated dynamically from a config file
+    (~/.agent/banner/wrapped_tools or template default), NOT hardcoded
+    in the .sh — Mustafa 2026-05-04 wanted "framework, not point
+    solution" so adding a new LLM is a config edit.
+
+    Critical contract (still holds): every generated wrapper uses
+    `command <tool> "$@"` (not bare `<tool>`) or it self-recurses
+    infinitely. The eval template enforces that at the source level."""
 
     SCRIPT_PATH = REPO_ROOT / "templates" / "brainstack-shell-banner.sh"
+    WRAPPED_TOOLS_PATH = REPO_ROOT / "templates" / "brainstack-wrapped-tools.txt"
 
     def test_script_file_exists(self):
         assert self.SCRIPT_PATH.is_file(), (
             f"shell banner template missing at {self.SCRIPT_PATH}"
         )
 
+    def test_wrapped_tools_template_exists(self):
+        """The default wrapped-tool list ships with the framework.
+        install.sh seeds it into ~/.agent/banner/wrapped_tools on setup."""
+        assert self.WRAPPED_TOOLS_PATH.is_file(), (
+            f"wrapped-tools template missing at {self.WRAPPED_TOOLS_PATH}"
+        )
+
     def test_script_passes_bash_syntax_check(self):
         """`bash -n` parses the script without executing — catches malformed
-        function definitions, unbalanced quotes, etc."""
+        function definitions, unbalanced quotes, eval errors."""
         if shutil.which("bash") is None:
             pytest.skip("bash not on PATH")
         result = subprocess.run(
@@ -575,16 +589,80 @@ class TestShellBanner:
             f"bash -n failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
         )
 
-    def test_script_defines_wrappers_with_command_prefix(self):
-        """Each wrapper function MUST use `command <tool> "$@"` — not bare
-        `<tool> "$@"` — or it self-recurses infinitely. This is the single
-        most important contract for the shell banner."""
+    def test_eval_template_uses_command_prefix(self):
+        """The dynamic-wrapper template uses `command ${_bs_tool}` (NOT
+        bare `${_bs_tool}`) inside the eval'd function body. This is the
+        single most important contract — failing it produces wrappers
+        that self-recurse infinitely."""
         body = self.SCRIPT_PATH.read_text()
+        # The eval template generates `<name>() { ... command <name> "$@" }`.
+        # Look for the literal `command ${_bs_tool}` substring — this is
+        # what gets eval'd into each generated wrapper.
+        assert "command ${_bs_tool}" in body or 'command "${_bs_tool}"' in body, (
+            "eval template doesn't use `command ${_bs_tool}` — generated "
+            "wrappers would self-recurse"
+        )
+
+    def test_default_tool_list_covers_canonical_set(self):
+        """The default wrapped-tool list ships claude/codex/cursor at
+        minimum (the maintainer's primary tools). Missing any of these
+        means setup goes silently incomplete on first install."""
+        body = self.WRAPPED_TOOLS_PATH.read_text()
         for tool in ("claude", "codex", "cursor"):
-            assert f"{tool}()" in body or f"{tool} ()" in body, (
-                f"missing wrapper function definition for {tool}()"
+            assert tool in body, f"default wrapped-tools list missing `{tool}`"
+
+    def test_default_tool_list_supports_extension(self):
+        """The default file MUST be config-shaped (one tool per line +
+        # comments) so adding a new LLM is a one-line edit. Pin the
+        format so a refactor doesn't accidentally turn it into JSON
+        or YAML and break the simple-edit contract."""
+        body = self.WRAPPED_TOOLS_PATH.read_text()
+        # Comment lines exist (proves the # comment convention is used)
+        assert any(line.startswith("#") for line in body.splitlines())
+        # At least one bare tool name on its own line (proves the format)
+        plain_names = [
+            line.strip() for line in body.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        assert len(plain_names) >= 3
+        # Each is a bare identifier, not JSON/YAML/TOML key-value
+        for name in plain_names:
+            assert "=" not in name and ":" not in name and "{" not in name, (
+                f"unexpected format in wrapped-tools list: {name!r}"
             )
-            assert f"command {tool}" in body, (
-                f"wrapper for {tool} doesn't use `command {tool}` — "
-                f"would self-recurse"
+
+    def test_runtime_eval_produces_working_wrappers(self, tmp_path: Path):
+        """End-to-end: source the script with a custom wrapped_tools
+        config, verify the named functions are defined AND each function
+        body contains the `command <tool>` invocation. This is the only
+        test that actually proves the eval-driven wrapper generation works."""
+        if shutil.which("bash") is None:
+            pytest.skip("bash not on PATH")
+        # Make a fake brain with a custom wrapped_tools config
+        fake_brain = tmp_path / ".agent"
+        (fake_brain / "banner").mkdir(parents=True)
+        (fake_brain / "banner" / "wrapped_tools").write_text(
+            "# test config\nclaude\nfoobar\nmytool\n"
+        )
+        # Source the banner with BRAIN_ROOT pointing at the fake brain,
+        # then ask bash to dump each function's body so we can grep it.
+        cmd = (
+            f"BRAIN_ROOT={fake_brain} source {self.SCRIPT_PATH} && "
+            "type claude && echo --- && type foobar && echo --- && type mytool"
+        )
+        result = subprocess.run(
+            ["bash", "-c", cmd],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0, (
+            f"sourcing banner failed:\nstderr: {result.stderr}"
+        )
+        out = result.stdout
+        # Each tool from the config has its function body printed by `type`
+        for tool in ("claude", "foobar", "mytool"):
+            assert f"{tool} is a function" in out, (
+                f"wrapper for {tool} not generated"
+            )
+            assert f"command {tool}" in out, (
+                f"generated wrapper for {tool} doesn't use `command {tool}`"
             )
