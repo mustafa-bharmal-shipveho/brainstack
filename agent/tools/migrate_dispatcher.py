@@ -1140,6 +1140,15 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.cmd == "auto-migrate-all":
         brain_root = Path(args.brain_root or os.environ.get("BRAIN_ROOT") or os.path.expanduser("~/.agent"))
+        # Drift check — surfaces stale-framework warnings before the
+        # LaunchAgent runs adapters with potentially-outdated dispatcher
+        # code. Silent on in-sync; one-line stderr warning otherwise.
+        try:
+            sys.path.insert(0, str(brain_root / "tools"))
+            import check_freshness  # type: ignore  # noqa: WPS433
+            check_freshness.warn_if_drift(brain_root=brain_root)
+        except Exception:
+            pass  # never fail auto-migrate because of drift check
         result = auto_migrate_all(brain_root=brain_root)
         print(json.dumps(result, indent=2))
         return 0 if not result.get("errors") else 1
