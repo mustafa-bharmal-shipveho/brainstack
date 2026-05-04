@@ -85,6 +85,16 @@ Tear down the LaunchAgent later with `./install.sh --remove-auto-migrate`.
 3. **Graduate (your review).** `graduate.py <id>` promotes a candidate to permanent `semantic/`; `reject.py` discards.
 4. **Sync (hourly).** `sync.sh` runs `trufflehog`/`gitleaks`, scrubs JSONL, pushes to your private brain remote.
 
+**Where new memories land between sessions:**
+
+| Tool | Native write path | Reaches `~/.agent/` via |
+|---|---|---|
+| Claude Code | symlinked from `~/.claude/projects/<slug>/memory` | direct write (symlink) + real-time `PostToolUse` hook |
+| Cursor | `~/.cursor/plans/*.plan.md` | hourly `--setup-auto-migrate` LaunchAgent |
+| Codex CLI | `~/.codex/sessions/...`, `~/.codex/history.jsonl` | hourly `--setup-auto-migrate` LaunchAgent |
+
+So Claude Code memory is in the brain immediately; Cursor and Codex entries arrive on the next hourly tick. All three end up in the same `~/.agent/memory/` tree and feed the same nightly dream cycle.
+
 ### How we measure storage reliability
 
 Storage quality is measured by two questions: did the captured row survive, and did secret-bearing tool output get scrubbed before sync?
