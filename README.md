@@ -64,6 +64,25 @@ Or do a one-time snapshot import (Claude Code dirs are also swapped for a symlin
 
 Tear down the LaunchAgent later with `./install.sh --remove-auto-migrate`.
 
+**Optional: deeper Claude Code mirroring** — `--setup-auto-migrate` covers Cursor + Codex, but doesn't pull Claude's per-session transcripts (`~/.claude/projects/<slug>/*.jsonl`) or the misc dirs Claude writes to (`plans/`, `tasks/`, `sessions/`, `agents/`, etc.). To capture those too without touching the source dirs:
+
+```bash
+./install.sh --setup-claude-extras    # installs com.brainstack.claude-extras LaunchAgent
+```
+
+This adds an hourly LaunchAgent that runs two adapters under the same fcntl lock as auto-migrate-all:
+
+| Adapter | Source | Lands in |
+|---|---|---|
+| `claude_session_adapter.py` | `~/.claude/projects/<slug>/*.jsonl` (top-level + subagent transcripts) | `~/.agent/memory/episodic/claude-sessions/AGENT_LEARNINGS.jsonl` (one episode per `tool_use`/`tool_result` pair) |
+| `claude_misc_adapter.py` | `~/.claude/{plans,tasks,sessions,teams,agents,skills,CLAUDE.md}` + every `~/.claude/projects/<slug>/memory/` not already symlinked + `~/.cursor/skills-cursor/` | `~/.agent/imports/<tool>/...` (mirror, mtime-incremental) |
+
+**Mirror, don't swap.** Unlike `--migrate`, these adapters never modify the source — Claude Code keeps writing to its own folders, and brainstack pulls from there into `~/.agent` on a schedule. Both adapters use SHA-256 / mtime sidecars so re-runs are O(N) stat-only no-ops.
+
+Excluded by policy (privacy/volume): `~/.claude/{history.jsonl,paste-cache,file-history,telemetry}` (clipboard pastes / file backups / telemetry — not memory) and `~/.cursor/ai-tracking` (opaque SQLite blob with high-entropy hits). Audit live coverage with `~/.agent/tools/discover_all_sources.py`.
+
+Tear down with `./install.sh --remove-claude-extras`.
+
 ---
 
 ## Upgrading after a `git pull`

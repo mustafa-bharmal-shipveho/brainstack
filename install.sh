@@ -79,6 +79,14 @@ while [ $# -gt 0 ]; do
             while [ $# -gt 0 ]; do EXTRA_ARGS+=("$1"); shift; done
             break
             ;;
+        --setup-claude-extras)
+            MODE="setup-claude-extras"
+            shift
+            ;;
+        --remove-claude-extras)
+            MODE="remove-claude-extras"
+            shift
+            ;;
         --migrate)
             MODE="migrate"
             # Consume the source path only if the next arg is NOT another
@@ -610,6 +618,78 @@ if [ "$MODE" = "upgrade" ]; then
     exit 0
 fi
 
+# ----- Mode: setup-claude-extras / remove-claude-extras -----
+# Installs the LaunchAgent that runs claude_session_adapter +
+# claude_misc_adapter hourly. These adapters mirror Claude Code's
+# session transcripts and misc dirs into the brain WITHOUT modifying
+# the source — Claude keeps writing to ~/.claude/projects/ as normal,
+# and brainstack pulls from there into ~/.agent/{memory/episodic/
+# claude-sessions, imports/claude/}.
+#
+# Why a separate LaunchAgent (not the dispatcher's auto-migrate-all):
+# the migrate_dispatcher only handles cursor-plans and codex-cli
+# formats. The Claude session-transcript and misc-mirror adapters use
+# their own incremental sidecars and don't fit that interface; running
+# them from a sibling agent under the same fcntl lock keeps them from
+# racing the dispatcher.
+if [ "$MODE" = "setup-claude-extras" ] || [ "$MODE" = "remove-claude-extras" ]; then
+    if [ ! -d "$BRAIN_ROOT" ]; then
+        echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
+        exit 2
+    fi
+    plist_path="$HOME/Library/LaunchAgents/com.brainstack.claude-extras.plist"
+    if [ "$MODE" = "remove-claude-extras" ]; then
+        if [ -f "$plist_path" ]; then
+            launchctl unload "$plist_path" 2>/dev/null || true
+            rm -f "$plist_path"
+            echo "==> com.brainstack.claude-extras LaunchAgent removed."
+        else
+            echo "==> Nothing to remove (no LaunchAgent at $plist_path)."
+        fi
+        exit 0
+    fi
+
+    # setup-claude-extras
+    template="$REPO_DIR/templates/com.brainstack.claude-extras.plist"
+    if [ ! -f "$template" ]; then
+        echo "install: template missing: $template" >&2
+        exit 2
+    fi
+    # Required adapter files must be in place. Without them the
+    # LaunchAgent would just log errors hourly forever.
+    for required in tools/sync_claude_extras.py tools/claude_session_adapter.py tools/claude_misc_adapter.py; do
+        if [ ! -f "$BRAIN_ROOT/$required" ]; then
+            echo "install: $BRAIN_ROOT/$required missing — run ./install.sh --upgrade first." >&2
+            exit 2
+        fi
+    done
+    mkdir -p "$BRAIN_ROOT/runtime/logs"
+    # PYTHON_ABS is resolved earlier in install.sh from the venv. launchd
+    # doesn't honor PATH, so this MUST be an absolute path. Codex
+    # 2026-05-04 P1: previous template hard-coded the maintainer's path,
+    # which broke setup on every other machine.
+    if [ -z "${PYTHON_ABS:-}" ]; then
+        echo "install: PYTHON_ABS not resolved — re-run plain ./install.sh first to bootstrap the venv." >&2
+        exit 2
+    fi
+    sed -e "s|__BRAIN_ROOT__|$BRAIN_ROOT|g" \
+        -e "s|__PYTHON_ABS__|$PYTHON_ABS|g" \
+        "$template" > "$plist_path"
+    # Validate before loading. plutil exits non-zero on malformed plists.
+    if ! plutil -lint "$plist_path" >/dev/null 2>&1; then
+        echo "install: rendered plist failed plutil --lint; not loading. See $plist_path" >&2
+        exit 2
+    fi
+    launchctl unload "$plist_path" 2>/dev/null || true
+    launchctl load "$plist_path"
+    echo "==> com.brainstack.claude-extras LaunchAgent installed."
+    echo "    plist:           $plist_path"
+    echo "    runs every:      3600s"
+    echo "    log:             $BRAIN_ROOT/claude-extras.log"
+    echo "    Tear down with:  ./install.sh --remove-claude-extras"
+    exit 0
+fi
+
 # ----- Mode: install (default) -----
 if [ -d "$BRAIN_ROOT" ]; then
     echo "==> $BRAIN_ROOT already exists. Status:"
@@ -648,6 +728,7 @@ if [ -d "$BRAIN_ROOT" ]; then
     fi
     echo "    To refresh tools/hooks without touching memory: ./install.sh --upgrade"
     echo "    To migrate a flat memory dir:                    ./install.sh --migrate <dir>"
+    echo "    To enable hourly Claude transcript + misc sync:  ./install.sh --setup-claude-extras"
     exit 0
 fi
 
