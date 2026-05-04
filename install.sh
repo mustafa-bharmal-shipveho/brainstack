@@ -87,6 +87,22 @@ while [ $# -gt 0 ]; do
             MODE="remove-claude-extras"
             shift
             ;;
+        --setup-cursor-rules)
+            MODE="setup-cursor-rules"
+            shift
+            ;;
+        --remove-cursor-rules)
+            MODE="remove-cursor-rules"
+            shift
+            ;;
+        --setup-shell-banner)
+            MODE="setup-shell-banner"
+            shift
+            ;;
+        --remove-shell-banner)
+            MODE="remove-shell-banner"
+            shift
+            ;;
         --migrate)
             MODE="migrate"
             # Consume the source path only if the next arg is NOT another
@@ -609,6 +625,13 @@ if [ "$MODE" = "upgrade" ]; then
         printf "\n# Repo path pin — machine-local, do not sync\n.brainstack-repo-path\n" \
             >> "$BRAIN_ROOT/.gitignore"
     fi
+    # PENDING_REVIEW.md is regenerated locally on every dream/sync tick;
+    # cross-machine sync would cause churn.
+    if [ -f "$BRAIN_ROOT/.gitignore" ] && \
+       ! grep -qE "^PENDING_REVIEW\.md\s*$" "$BRAIN_ROOT/.gitignore"; then
+        printf "\n# Pending-review summary — regenerated locally\nPENDING_REVIEW.md\n" \
+            >> "$BRAIN_ROOT/.gitignore"
+    fi
     # Refresh the recall CLI symlink (idempotent; pip-installs into the venv
     # if the venv exists, otherwise creates it).
     if [ -x "$REPO_DIR/bin/install-recall-cli.sh" ]; then
@@ -690,6 +713,129 @@ if [ "$MODE" = "setup-claude-extras" ] || [ "$MODE" = "remove-claude-extras" ]; 
     exit 0
 fi
 
+# ----- Mode: setup-cursor-rules / remove-cursor-rules -----
+# Pushes <brain>/PENDING_REVIEW.md into ~/.cursor/.cursorrules between
+# brainstack-pending-{start,end} sentinels so Cursor surfaces the
+# pending-review summary on every chat session. Idempotent — re-running
+# replaces the bracketed section without disturbing other content.
+if [ "$MODE" = "setup-cursor-rules" ] || [ "$MODE" = "remove-cursor-rules" ]; then
+    if [ ! -d "$BRAIN_ROOT" ]; then
+        echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
+        exit 2
+    fi
+    cursor_dir="$HOME/.cursor"
+    cursorrules="$cursor_dir/.cursorrules"
+    if [ "$MODE" = "remove-cursor-rules" ]; then
+        if [ -f "$cursorrules" ]; then
+            "$PYTHON_BIN" - <<PYEOF
+from pathlib import Path
+p = Path("$cursorrules")
+text = p.read_text()
+START = "<!-- brainstack-pending-start -->"
+END = "<!-- brainstack-pending-end -->"
+if START in text and END in text:
+    s = text.index(START)
+    e = text.index(END) + len(END)
+    new = text[:s].rstrip() + "\n" + text[e:].lstrip()
+    p.write_text(new)
+    print("removed brainstack section from", p)
+else:
+    print("no brainstack section found in", p)
+PYEOF
+        else
+            echo "==> $cursorrules not found; nothing to remove."
+        fi
+        exit 0
+    fi
+
+    # setup-cursor-rules
+    if [ ! -d "$cursor_dir" ]; then
+        echo "install: $cursor_dir does not exist (Cursor not installed?). Skipping."
+        exit 0
+    fi
+    # Generate the summary first if it doesn't exist
+    if [ ! -f "$BRAIN_ROOT/PENDING_REVIEW.md" ]; then
+        "$PYTHON_BIN" "$BRAIN_ROOT/tools/render_pending_summary.py" \
+            --brain "$BRAIN_ROOT" 2>/dev/null || true
+    fi
+    "$PYTHON_BIN" "$BRAIN_ROOT/tools/render_cursor_rules.py" \
+        --brain "$BRAIN_ROOT" --cursor-dir "$cursor_dir"
+    echo "==> Cursor rules updated. Tear down with: ./install.sh --remove-cursor-rules"
+    exit 0
+fi
+
+# ----- Mode: setup-shell-banner / remove-shell-banner -----
+# Sources templates/brainstack-shell-banner.sh from the user's shell rc.
+# Defines wrapper functions for `claude`, `codex`, `cursor` that print
+# <brain>/PENDING_REVIEW.md before exec'ing the real binary. Idempotent
+# (sentinel-marked block in the rc file).
+if [ "$MODE" = "setup-shell-banner" ] || [ "$MODE" = "remove-shell-banner" ]; then
+    if [ ! -d "$BRAIN_ROOT" ]; then
+        echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
+        exit 2
+    fi
+    # Detect user's shell rc (zsh first; fall back to bash)
+    if [ -n "${ZSH_VERSION:-}" ] || [ "$(basename "${SHELL:-/bin/zsh}")" = "zsh" ]; then
+        rc="$HOME/.zshrc"
+    else
+        rc="$HOME/.bashrc"
+    fi
+    # Place the banner OUTSIDE $BRAIN_ROOT/tools/ — that path is
+    # `rsync --delete`-managed by --upgrade, which would wipe the banner
+    # on every upgrade and leave a dangling source line in ~/.zshrc
+    # (Codex 2026-05-04 P2). $BRAIN_ROOT/banner/ is a sibling dir,
+    # untouched by tool rsync.
+    banner_dir="$BRAIN_ROOT/banner"
+    banner_target="$banner_dir/brainstack-shell-banner.sh"
+    sentinel_start="# >>> brainstack-shell-banner >>>"
+    sentinel_end="# <<< brainstack-shell-banner <<<"
+
+    if [ "$MODE" = "remove-shell-banner" ]; then
+        if [ -f "$rc" ] && /usr/bin/grep -qF "$sentinel_start" "$rc"; then
+            "$PYTHON_BIN" - <<PYEOF
+from pathlib import Path
+p = Path("$rc")
+text = p.read_text()
+S = "$sentinel_start"
+E = "$sentinel_end"
+if S in text and E in text:
+    s = text.index(S)
+    e = text.index(E) + len(E)
+    # Trim surrounding whitespace
+    new = text[:s].rstrip() + "\n" + text[e:].lstrip()
+    if not new.endswith("\n"):
+        new += "\n"
+    p.write_text(new)
+    print("removed brainstack-shell-banner block from", p)
+PYEOF
+        else
+            echo "==> $rc has no brainstack-shell-banner block."
+        fi
+        rm -f "$banner_target"
+        echo "==> Shell banner removed."
+        exit 0
+    fi
+
+    # setup-shell-banner
+    mkdir -p "$banner_dir"
+    cp "$REPO_DIR/templates/brainstack-shell-banner.sh" "$banner_target"
+    chmod +x "$banner_target"
+    if [ -f "$rc" ] && /usr/bin/grep -qF "$sentinel_start" "$rc"; then
+        echo "==> $rc already sources the shell banner."
+    else
+        {
+            echo ""
+            echo "$sentinel_start"
+            echo "[ -f \"$banner_target\" ] && source \"$banner_target\""
+            echo "$sentinel_end"
+        } >> "$rc"
+        echo "==> Appended source line to $rc."
+    fi
+    echo "==> Shell banner installed. Run \`source $rc\` or open a new shell."
+    echo "    Tear down with:  ./install.sh --remove-shell-banner"
+    exit 0
+fi
+
 # ----- Mode: install (default) -----
 if [ -d "$BRAIN_ROOT" ]; then
     echo "==> $BRAIN_ROOT already exists. Status:"
@@ -726,9 +872,25 @@ if [ -d "$BRAIN_ROOT" ]; then
             echo ""
         fi
     fi
+    # Surface pending-review count if any candidates are waiting. Single
+    # source of truth for the user's attention queue. Codex 2026-05-04 UX gap.
+    if [ -f "$BRAIN_ROOT/PENDING_REVIEW.md" ]; then
+        first_line="$(head -n 1 "$BRAIN_ROOT/PENDING_REVIEW.md" 2>/dev/null)"
+        case "$first_line" in
+            *"all clear"*) : ;;
+            *)
+                echo ""
+                echo "    📥 Pending review: see $BRAIN_ROOT/PENDING_REVIEW.md"
+                echo "       (run 'recall pending --review' or open Claude Code → /dream)"
+                echo ""
+                ;;
+        esac
+    fi
     echo "    To refresh tools/hooks without touching memory: ./install.sh --upgrade"
     echo "    To migrate a flat memory dir:                    ./install.sh --migrate <dir>"
     echo "    To enable hourly Claude transcript + misc sync:  ./install.sh --setup-claude-extras"
+    echo "    To push pending count to Cursor:                 ./install.sh --setup-cursor-rules"
+    echo "    To wrap claude/codex/cursor shell commands:      ./install.sh --setup-shell-banner"
     exit 0
 fi
 
@@ -764,6 +926,12 @@ echo "$REPO_DIR" > "$BRAIN_ROOT/.brainstack-repo-path"
 if [ -f "$BRAIN_ROOT/.gitignore" ] && \
    ! grep -qE "^\.brainstack-repo-path\s*$" "$BRAIN_ROOT/.gitignore"; then
     printf "\n# Repo path pin — machine-local, do not sync\n.brainstack-repo-path\n" \
+        >> "$BRAIN_ROOT/.gitignore"
+fi
+# PENDING_REVIEW.md is regenerated locally on every dream/sync tick.
+if [ -f "$BRAIN_ROOT/.gitignore" ] && \
+   ! grep -qE "^PENDING_REVIEW\.md\s*$" "$BRAIN_ROOT/.gitignore"; then
+    printf "\n# Pending-review summary — regenerated locally\nPENDING_REVIEW.md\n" \
         >> "$BRAIN_ROOT/.gitignore"
 fi
 

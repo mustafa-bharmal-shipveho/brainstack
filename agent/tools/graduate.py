@@ -214,6 +214,20 @@ def main():
     print(f"graduated {args.candidate_id} → lesson {lesson['id']}")
     print(f"re-rendered: {md_path}")
 
+    # Best-effort refresh of PENDING_REVIEW.md so the user's surfaces
+    # (Claude SessionStart, Cursor, shell banner) reflect the lower count
+    # within seconds. Never fail graduation on a render error.
+    try:
+        import render_pending_summary
+        from pathlib import Path as _Path
+        _brain = _Path(os.path.dirname(os.path.dirname(CANDIDATES)))  # candidates/.. → memory/.. → brain
+        # Walk one more level up if memory is in the path
+        if _brain.name == "memory":
+            _brain = _brain.parent
+        render_pending_summary.render(_brain)
+    except Exception:
+        pass
+
 
 if __name__ == "__main__":
     main()

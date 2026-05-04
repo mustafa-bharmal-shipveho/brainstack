@@ -3,6 +3,7 @@
   "_comment_security": "Replace the placeholders with absolute paths. Do NOT use $HOME or ~ in the command string — Claude Code expands these via the shell, and a hostile $HOME (e.g. set by a project .envrc the user sourced) can redirect the hook to attacker-controlled Python. Hardcoding the full path to your Python interpreter and the wrapper script eliminates the env-poisoning vector.",
   "_comment_python": "PYTHON_PATH must be an absolute path to a Python >= 3.10 interpreter (the wrapper exec's the vendored hook with this same Python). Example: /opt/homebrew/bin/python3.13",
   "_comment_brain": "BRAIN_HOOK is the absolute path to agentic_post_tool_global.py inside your installed brain. After running install.sh, this is <your-home>/.agent/harness/hooks/agentic_post_tool_global.py — substitute literally, no $HOME.",
+  "_comment_session_start": "SessionStart hook surfaces ~/.agent/PENDING_REVIEW.md on every Claude Code session launch so pending-review counts, drift warnings, and stuck-sync alerts aren't silently invisible. The hook MUST swallow exceptions and exit 0 — Claude session start blocks until the hook returns, so any uncaught crash here would brick session launch. The hook is also silent when the file is missing or contains the 'all clear' one-liner, so empty days produce no UI noise. SESSION_START_HOOK is the absolute path to <brain>/harness/hooks/session_start.py — same substitution rule as BRAIN_HOOK above (no $HOME). Timeout 5000ms is the hard ceiling.",
   "hooks": {
     "PostToolUse": [
       {
@@ -11,6 +12,17 @@
           {
             "type": "command",
             "command": "PYTHON_PATH BRAIN_HOOK"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PYTHON_PATH SESSION_START_HOOK",
+            "timeout": 5000
           }
         ]
       }

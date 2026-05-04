@@ -54,6 +54,18 @@ def main():
     print(f"rejected {args.candidate_id} "
           f"(rejection_count={rejected.get('rejection_count', 1)})")
 
+    # Best-effort refresh of PENDING_REVIEW.md so the user's surfaces
+    # reflect the change. Never fail rejection on render error.
+    try:
+        import render_pending_summary
+        from pathlib import Path as _Path
+        _brain = _Path(os.path.dirname(os.path.dirname(CANDIDATES)))
+        if _brain.name == "memory":
+            _brain = _brain.parent
+        render_pending_summary.render(_brain)
+    except Exception:
+        pass
+
 
 if __name__ == "__main__":
     main()

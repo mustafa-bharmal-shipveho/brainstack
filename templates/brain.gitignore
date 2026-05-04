@@ -37,3 +37,8 @@ Thumbs.db
 # the second-brain remote (would break drift detection on every other
 # machine that pulls the brain). Codex 2026-05-04 P2.
 .brainstack-repo-path
+
+# Pending-review summary — regenerated locally on every dream cycle / sync
+# tick. Cross-machine sync would cause churn (each machine would race to
+# overwrite). Local-only by design.
+PENDING_REVIEW.md
