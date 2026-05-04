@@ -119,6 +119,14 @@ while [ $# -gt 0 ]; do
             MODE="remove-statusline"
             shift
             ;;
+        --setup-codex-agents-md)
+            MODE="setup-codex-agents-md"
+            shift
+            ;;
+        --remove-codex-agents-md)
+            MODE="remove-codex-agents-md"
+            shift
+            ;;
         --setup-pending-review-all)
             MODE="setup-pending-review-all"
             shift
@@ -1080,9 +1088,67 @@ data["statusLine"] = {
 settings_path.write_text(json.dumps(data, indent=2, sort_keys=True))
 print(f"installed brainstack statusLine into {settings_path}")
 PYEOF
-    echo "==> Statusline installed. Open a fresh Claude Code session — the"
+    echo "==> Statusline installed. Open a fresh Claude Code session: the"
     echo "    pending count will appear in the UI footer immediately."
     echo "    Tear down with:  ./install.sh --remove-statusline"
+    exit 0
+fi
+
+# ----- Mode: setup-codex-agents-md / remove-codex-agents-md -----
+# Pushes <brain>/PENDING_REVIEW.md into ~/.codex/AGENTS.md between
+# brainstack-pending-{start,end} sentinels. Codex CLI reads AGENTS.md
+# at session start (similar to Claude reading CLAUDE.md). The directive
+# at the top of PENDING_REVIEW.md tells Codex's AI to surface
+# "brainstack: N pending - run `recall pending --review`" in its first
+# response, same as Claude.
+#
+# Idempotent. Preserves user-authored AGENTS.md content above and below.
+if [ "$MODE" = "setup-codex-agents-md" ] || [ "$MODE" = "remove-codex-agents-md" ]; then
+    if [ ! -d "$BRAIN_ROOT" ]; then
+        echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
+        exit 2
+    fi
+    codex_dir="$HOME/.codex"
+    agents_md="$codex_dir/AGENTS.md"
+    if [ "$MODE" = "remove-codex-agents-md" ]; then
+        if [ -f "$agents_md" ]; then
+            "$PYTHON_BIN" - <<PYEOF
+from pathlib import Path
+p = Path("$agents_md")
+text = p.read_text()
+START = "<!-- brainstack-pending-start -->"
+END = "<!-- brainstack-pending-end -->"
+if START in text and END in text:
+    s = text.index(START)
+    e = text.index(END) + len(END)
+    new = text[:s].rstrip() + "\n" + text[e:].lstrip()
+    if not new.endswith("\n"):
+        new += "\n"
+    p.write_text(new)
+    print(f"removed brainstack section from {p}")
+else:
+    print(f"no brainstack section found in {p}")
+PYEOF
+        else
+            echo "==> $agents_md not present; nothing to remove."
+        fi
+        exit 0
+    fi
+
+    # setup-codex-agents-md
+    if [ ! -d "$codex_dir" ]; then
+        echo "install: $codex_dir not found (Codex CLI not installed?). Skipping."
+        exit 0
+    fi
+    if [ ! -f "$BRAIN_ROOT/PENDING_REVIEW.md" ]; then
+        "$PYTHON_BIN" "$BRAIN_ROOT/tools/render_pending_summary.py" \
+            --brain "$BRAIN_ROOT" 2>/dev/null || true
+    fi
+    "$PYTHON_BIN" "$BRAIN_ROOT/tools/render_codex_agents_md.py" \
+        --brain "$BRAIN_ROOT" --codex-dir "$codex_dir"
+    echo "==> Codex AGENTS.md updated. Open a fresh Codex CLI session: its AI"
+    echo "    will greet you with the pending count on first response."
+    echo "    Tear down with:  ./install.sh --remove-codex-agents-md"
     exit 0
 fi
 
@@ -1097,32 +1163,34 @@ if [ "$MODE" = "setup-pending-review-all" ] || [ "$MODE" = "remove-pending-revie
         exit 2
     fi
     if [ "$MODE" = "remove-pending-review-all" ]; then
-        echo "==> Removing pending-review surfaces (statusline / Claude / Cursor / shell)…"
-        "$0" --remove-statusline      2>&1 | sed 's/^/  /'
-        "$0" --remove-pending-hook    2>&1 | sed 's/^/  /'
-        "$0" --remove-cursor-rules    2>&1 | sed 's/^/  /'
-        "$0" --remove-shell-banner    2>&1 | sed 's/^/  /'
+        echo "==> Removing pending-review surfaces (statusline / Claude / Cursor / Codex / shell)…"
+        "$0" --remove-statusline        2>&1 | sed 's/^/  /'
+        "$0" --remove-pending-hook      2>&1 | sed 's/^/  /'
+        "$0" --remove-cursor-rules      2>&1 | sed 's/^/  /'
+        "$0" --remove-codex-agents-md   2>&1 | sed 's/^/  /'
+        "$0" --remove-shell-banner      2>&1 | sed 's/^/  /'
         echo "==> Removal complete."
         exit 0
     fi
 
-    # Setup all four. Pass PYTHON_BIN so each sub-call resolves the same
+    # Setup all five. Pass PYTHON_BIN so each sub-call resolves the same
     # interpreter (avoids "system python3 too old" failures on default).
-    # Order: statusline first (most user-visible — appears as soon as
+    # Order: statusline first (most user-visible: appears as soon as
     # session opens), then directives that fire on first response.
-    echo "==> Setting up pending-review surfaces (statusline / Claude / Cursor / shell)…"
-    PYTHON_BIN="$PYTHON_BIN" "$0" --setup-statusline      2>&1 | sed 's/^/  [statusln] /'
-    PYTHON_BIN="$PYTHON_BIN" "$0" --setup-pending-hook    2>&1 | sed 's/^/  [claude]   /'
-    PYTHON_BIN="$PYTHON_BIN" "$0" --setup-cursor-rules    2>&1 | sed 's/^/  [cursor]   /'
-    PYTHON_BIN="$PYTHON_BIN" "$0" --setup-shell-banner    2>&1 | sed 's/^/  [shell]    /'
+    echo "==> Setting up pending-review surfaces (statusline / Claude / Cursor / Codex / shell)…"
+    PYTHON_BIN="$PYTHON_BIN" "$0" --setup-statusline        2>&1 | sed 's/^/  [statusln] /'
+    PYTHON_BIN="$PYTHON_BIN" "$0" --setup-pending-hook      2>&1 | sed 's/^/  [claude]   /'
+    PYTHON_BIN="$PYTHON_BIN" "$0" --setup-cursor-rules      2>&1 | sed 's/^/  [cursor]   /'
+    PYTHON_BIN="$PYTHON_BIN" "$0" --setup-codex-agents-md   2>&1 | sed 's/^/  [codex]    /'
+    PYTHON_BIN="$PYTHON_BIN" "$0" --setup-shell-banner      2>&1 | sed 's/^/  [shell]    /'
     echo
-    echo "==> All four surfaces configured."
-    echo "    Statusline:   visible in Claude Code UI footer immediately on session open"
-    echo "    Claude greet: Claude proactively says \"📥 N pending — recall pending --review\""
-    echo "                  in its first response (via @-import in CLAUDE.md)"
-    echo "    Cursor:       sentinel block in ~/.cursor/.cursorrules"
-    echo "    Shell:        wrappers for any AI CLI in ~/.agent/banner/wrapped_tools"
-    echo "    Tear down all:    ./install.sh --remove-pending-review-all"
+    echo "==> All five surfaces configured."
+    echo "    Statusline:    Claude Code UI footer, visible immediately on session open"
+    echo "    Claude greet:  via @-import in ~/.claude/CLAUDE.md"
+    echo "    Cursor:        sentinel block in ~/.cursor/.cursorrules"
+    echo "    Codex:         sentinel block in ~/.codex/AGENTS.md"
+    echo "    Shell:         wrappers for any AI CLI in ~/.agent/banner/wrapped_tools"
+    echo "    Tear down all: ./install.sh --remove-pending-review-all"
     exit 0
 fi
 
