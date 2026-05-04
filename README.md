@@ -130,9 +130,11 @@ Brainstack now generates `~/.agent/PENDING_REVIEW.md` on every dream cycle, sync
 
 | Surface | Setup | Where you see it |
 |---|---|---|
-| Claude Code SessionStart hook | merge `adapters/claude-code/settings.snippet.json` SessionStart entry into `~/.claude/settings.json` | Top of every Claude Code session, in a `<system-reminder>` block |
+| Claude Code `@`-import in `~/.claude/CLAUDE.md` | `./install.sh --setup-pending-hook` | Auto-loaded under the `# claudeMd` section of every Claude Code session's system prompt — same mechanism as your existing CLAUDE.md |
 | Cursor `~/.cursor/.cursorrules` | `./install.sh --setup-cursor-rules` | Cursor injects the rules file on every chat session |
-| Shell wrappers (`claude`/`codex`/`cursor`) | `./install.sh --setup-shell-banner` | Cat'd to stdout when you launch any of those tools from a terminal |
+| Shell wrappers (any AI CLI in `~/.agent/banner/wrapped_tools`) | `./install.sh --setup-shell-banner` | Cat'd to stdout when you launch any of those tools from a terminal |
+
+**Why @-import, not a SessionStart hook?** I tried both — registered a `SessionStart` hook in `~/.claude/settings.json` that emits the JSON envelope `{"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "..."}}`. The hook ran cleanly when invoked manually, but Claude Code's SessionStart contract on this build appears to be telemetry-only (stdout doesn't inject context). The user opened a fresh session twice with the hook registered and saw nothing. Switched to `@`-import — Claude Code's documented session-load mechanism — and it works because it's the same path your existing `~/.claude-org/CLAUDE.md` import takes.
 
 All three read the same `PENDING_REVIEW.md`. The file is generated locally and gitignored — never synced to your private brain remote.
 

@@ -862,33 +862,71 @@ PYEOF
 fi
 
 # ----- Mode: setup-pending-hook / remove-pending-hook -----
-# Idempotently registers the SessionStart hook in ~/.claude/settings.json
-# so Claude Code surfaces ~/.agent/PENDING_REVIEW.md on every session
-# start. Hardcodes absolute paths to PYTHON_ABS and the brain-side
-# session_start.py — same env-poisoning posture as the existing
-# PostToolUse hook.
+# Wires Claude Code to surface <brain>/PENDING_REVIEW.md at every
+# session start by appending a sentinel-bracketed `@`-import to
+# ~/.claude/CLAUDE.md.
 #
-# We tag the entry with `# brainstack-pending-review` so re-runs detect
-# the existing entry and skip; --remove-pending-hook strips it.
+# History: an earlier iteration of this mode registered a SessionStart
+# hook in settings.json. That hook ran cleanly but Claude Code's
+# SessionStart contract on this build is telemetry-only — stdout (raw
+# OR JSON-enveloped) does NOT inject context. The user opened a fresh
+# Claude session twice and saw nothing. Switched to CLAUDE.md @-import
+# which IS the documented session-start injection mechanism (the user's
+# CLAUDE.md already uses @-import for the org-level instructions).
+#
+# As a side effect, --remove-pending-hook also strips any leftover
+# SessionStart entry tagged with our sentinel (cleans up post-upgrade
+# from the prior iteration).
 if [ "$MODE" = "setup-pending-hook" ] || [ "$MODE" = "remove-pending-hook" ]; then
     if [ ! -d "$BRAIN_ROOT" ]; then
         echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
         exit 2
     fi
-    settings="$HOME/.claude/settings.json"
-    if [ ! -f "$settings" ]; then
-        echo "install: $settings not found (Claude Code not installed?). Skipping."
+    claude_dir="$HOME/.claude"
+    if [ ! -d "$claude_dir" ]; then
+        echo "install: $claude_dir not found (Claude Code not installed?). Skipping."
         exit 0
     fi
-    sentinel="# brainstack-pending-review"
-    hook_target="$BRAIN_ROOT/harness/hooks/session_start.py"
+    claude_md="$claude_dir/CLAUDE.md"
+    settings="$claude_dir/settings.json"
+    sentinel_start="<!-- brainstack-pending-review-start -->"
+    sentinel_end="<!-- brainstack-pending-review-end -->"
+    pending_path="$BRAIN_ROOT/PENDING_REVIEW.md"
+    legacy_hook_sentinel="# brainstack-pending-review"
 
     if [ "$MODE" = "remove-pending-hook" ]; then
-        "$PYTHON_BIN" - "$settings" "$sentinel" <<'PYEOF'
+        # 1. Strip the @-import block from CLAUDE.md (current mechanism)
+        if [ -f "$claude_md" ]; then
+            "$PYTHON_BIN" - "$claude_md" "$sentinel_start" "$sentinel_end" <<'PYEOF'
+import sys
+from pathlib import Path
+p, S, E = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+text = p.read_text()
+if S in text and E in text:
+    s = text.index(S)
+    e = text.index(E) + len(E)
+    new = text[:s].rstrip() + "\n" + text[e:].lstrip()
+    if not new.endswith("\n"):
+        new += "\n"
+    p.write_text(new)
+    print(f"removed brainstack-pending-review @import block from {p}")
+else:
+    print(f"no brainstack-pending-review block found in {p}")
+PYEOF
+        else
+            echo "==> $claude_md not present; nothing to remove from CLAUDE.md."
+        fi
+        # 2. Also strip any leftover SessionStart hook entry from settings.json
+        # (cleanup for users upgrading from the prior hook-based version)
+        if [ -f "$settings" ]; then
+            "$PYTHON_BIN" - "$settings" "$legacy_hook_sentinel" <<'PYEOF'
 import json, sys
 from pathlib import Path
-settings_path, sentinel = Path(sys.argv[1]), sys.argv[2]
-data = json.loads(settings_path.read_text())
+p, sentinel = Path(sys.argv[1]), sys.argv[2]
+try:
+    data = json.loads(p.read_text())
+except Exception:
+    sys.exit(0)
 hooks = data.get("hooks", {})
 ss = hooks.get("SessionStart", []) or []
 new_ss = []
@@ -901,83 +939,68 @@ for entry in ss:
             continue
         new_hooks.append(h)
     if new_hooks:
-        new_entry = dict(entry)
-        new_entry["hooks"] = new_hooks
-        new_ss.append(new_entry)
+        e = dict(entry); e["hooks"] = new_hooks
+        new_ss.append(e)
 if removed:
     if new_ss:
         hooks["SessionStart"] = new_ss
     else:
         hooks.pop("SessionStart", None)
     data["hooks"] = hooks
-    settings_path.write_text(json.dumps(data, indent=2, sort_keys=True))
-    print(f"removed {removed} brainstack-pending-review hook(s) from {settings_path}")
-else:
-    print(f"no brainstack-pending-review hook found in {settings_path}")
+    p.write_text(json.dumps(data, indent=2, sort_keys=True))
+    print(f"removed {removed} legacy SessionStart hook(s) from {p}")
 PYEOF
+        fi
         exit 0
     fi
 
     # setup-pending-hook
-    if [ ! -f "$hook_target" ]; then
-        echo "install: $hook_target missing — run ./install.sh --upgrade first." >&2
-        exit 2
-    fi
-    if [ -z "${PYTHON_ABS:-}" ]; then
-        echo "install: PYTHON_ABS not resolved." >&2
-        exit 2
-    fi
-    "$PYTHON_BIN" - "$settings" "$PYTHON_ABS" "$hook_target" "$sentinel" <<'PYEOF'
-import json, sys
+    "$PYTHON_BIN" - "$claude_md" "$sentinel_start" "$sentinel_end" "$pending_path" <<'PYEOF'
+import sys
 from pathlib import Path
-settings_path = Path(sys.argv[1])
-python_abs = sys.argv[2]
-hook_path = sys.argv[3]
-sentinel = sys.argv[4]
+p, S, E, pending = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
 
-data = json.loads(settings_path.read_text())
-hooks = data.setdefault("hooks", {})
-if not isinstance(hooks, dict):
-    print(f"settings.json hooks is not an object — refusing to modify", file=sys.stderr)
-    sys.exit(2)
+# The block we maintain inside CLAUDE.md. Absolute path inside the
+# @-import — the @ handler may not expand $HOME / ~. Wrapped in a
+# brief markdown stanza so a user reading their CLAUDE.md knows what
+# the auto-loaded section is.
+block = "\n".join([
+    S,
+    "## brainstack pending review",
+    "",
+    f"@{pending}",
+    "",
+    f"_Auto-loaded by brainstack. Remove with `./install.sh --remove-pending-hook`._",
+    E,
+])
 
-session_start = hooks.setdefault("SessionStart", [])
-if not isinstance(session_start, list):
-    print(f"hooks.SessionStart is not an array — refusing to modify", file=sys.stderr)
-    sys.exit(2)
-
-# Idempotency: if any existing SessionStart command contains our sentinel, skip.
-already = False
-for entry in session_start:
-    for h in entry.get("hooks", []) or []:
-        if sentinel in (h.get("command") or ""):
-            already = True
-            break
-    if already:
-        break
-
-if already:
-    print(f"already installed: brainstack-pending-review hook present in {settings_path}")
+if not p.is_file():
+    p.write_text(block + "\n")
+    print(f"created {p} with pending-review @-import")
     sys.exit(0)
 
-# Append a new entry. Absolute paths only — no $HOME, no ~. Same env-
-# poisoning posture as the PostToolUse wrapper. Tag with sentinel for
-# idempotent re-runs and clean removal.
-cmd = f"{python_abs} {hook_path}  {sentinel}"
-new_entry = {
-    "hooks": [{
-        "type": "command",
-        "command": cmd,
-        "timeout": 5000,
-    }]
-}
-session_start.append(new_entry)
-data["hooks"] = hooks
-
-settings_path.write_text(json.dumps(data, indent=2, sort_keys=True))
-print(f"installed brainstack-pending-review hook into {settings_path}")
+text = p.read_text()
+if S in text and E in text:
+    # Already installed — replace in case the path changed (e.g., $BRAIN_ROOT moved)
+    s = text.index(S)
+    e = text.index(E) + len(E)
+    new_text = text[:s] + block + text[e:]
+    if new_text == text:
+        print(f"already installed: {p} unchanged")
+    else:
+        p.write_text(new_text)
+        print(f"updated brainstack-pending-review @-import in {p}")
+else:
+    # Append the block, preserving the user's existing content above
+    sep = "" if text.endswith("\n") else "\n"
+    if not text.endswith("\n\n"):
+        sep += "\n"
+    p.write_text(text + sep + block + "\n")
+    print(f"appended brainstack-pending-review @-import to {p}")
 PYEOF
-    echo "==> SessionStart hook installed. Open a fresh Claude Code session to see it."
+    echo "==> CLAUDE.md @-import installed. Open a fresh Claude Code session to see it."
+    echo "    The pending-review summary loads under the \"# claudeMd\" section of"
+    echo "    every session's system prompt — same mechanism as your existing CLAUDE.md."
     echo "    Tear down with:  ./install.sh --remove-pending-hook"
     exit 0
 fi
