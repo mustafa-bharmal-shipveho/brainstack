@@ -7,7 +7,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/mustafa.bharmal/Documents/brainstack/.venv/bin/python</string>
+        <string>__PYTHON_ABS__</string>
         <string>__BRAIN_ROOT__/tools/sync_claude_extras.py</string>
     </array>
 

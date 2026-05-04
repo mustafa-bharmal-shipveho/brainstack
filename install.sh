@@ -655,7 +655,17 @@ if [ "$MODE" = "setup-claude-extras" ] || [ "$MODE" = "remove-claude-extras" ]; 
         fi
     done
     mkdir -p "$BRAIN_ROOT/runtime/logs"
-    sed "s|__BRAIN_ROOT__|$BRAIN_ROOT|g" "$template" > "$plist_path"
+    # PYTHON_ABS is resolved earlier in install.sh from the venv. launchd
+    # doesn't honor PATH, so this MUST be an absolute path. Codex
+    # 2026-05-04 P1: previous template hard-coded the maintainer's path,
+    # which broke setup on every other machine.
+    if [ -z "${PYTHON_ABS:-}" ]; then
+        echo "install: PYTHON_ABS not resolved — re-run plain ./install.sh first to bootstrap the venv." >&2
+        exit 2
+    fi
+    sed -e "s|__BRAIN_ROOT__|$BRAIN_ROOT|g" \
+        -e "s|__PYTHON_ABS__|$PYTHON_ABS|g" \
+        "$template" > "$plist_path"
     # Validate before loading. plutil exits non-zero on malformed plists.
     if ! plutil -lint "$plist_path" >/dev/null 2>&1; then
         echo "install: rendered plist failed plutil --lint; not loading. See $plist_path" >&2

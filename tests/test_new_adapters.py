@@ -234,6 +234,80 @@ class TestSessionAdapterIdempotency:
         second_lines = episodic.read_text().count("\n")
         assert second_lines == first_lines
 
+    def test_active_session_append_does_not_duplicate(self, tmp_path: Path):
+        """The exact failure mode Codex caught: a session JSONL that
+        grows between runs must not re-emit already-imported pairs.
+
+        Run 1: write echo 1 → import → 1 episode.
+        Append echo 2 to source.
+        Run 2: import again → must emit echo 2 only. Total 2 episodes.
+
+        Old SHA-keyed sidecar would emit 3 (echo 1 twice + echo 2)."""
+        source = tmp_path / "src"
+        sf = source / "proj" / "session.jsonl"
+        _write_session(sf, [
+            _make_tool_use_event("tu_active_1", "Bash", {"command": "echo 1"}),
+            _make_tool_result_event("tu_active_1", "1"),
+        ])
+        brain = tmp_path / "brain"
+        brain.mkdir()
+
+        argv = ["--source", str(source), "--dst", str(brain)]
+        assert csa.main(argv) == 0
+
+        episodic = brain / "memory" / "episodic" / "claude-sessions" / "AGENT_LEARNINGS.jsonl"
+        first_episodes = [json.loads(l) for l in episodic.read_text().splitlines() if l.strip()]
+        assert len(first_episodes) == 1
+        assert first_episodes[0]["source"]["tool_use_id"] == "tu_active_1"
+
+        # Simulate Claude appending another tool-call to the live JSONL
+        with sf.open("a") as f:
+            f.write("\n".join(json.dumps(e) for e in [
+                _make_tool_use_event("tu_active_2", "Bash", {"command": "echo 2"}),
+                _make_tool_result_event("tu_active_2", "2"),
+            ]) + "\n")
+
+        # Re-run — must emit ONLY the new pair
+        assert csa.main(argv) == 0
+        second_episodes = [json.loads(l) for l in episodic.read_text().splitlines() if l.strip()]
+        assert len(second_episodes) == 2, (
+            f"expected 2 episodes (no dupes), got {len(second_episodes)}: "
+            f"{[e['source']['tool_use_id'] for e in second_episodes]}"
+        )
+        ids = [e["source"]["tool_use_id"] for e in second_episodes]
+        assert ids == ["tu_active_1", "tu_active_2"]
+
+    def test_recovers_from_sidecar_loss_via_episodic_self_load(self, tmp_path: Path):
+        """If the sidecar is deleted but the episodic JSONL is intact,
+        re-running must not double-emit. The pre-load from episodic
+        rebuilds the seen set from the on-disk source of truth."""
+        source = tmp_path / "src"
+        sf = source / "proj" / "s.jsonl"
+        _write_session(sf, [
+            _make_tool_use_event("tu_lost", "Bash", {"command": "echo lost"}),
+            _make_tool_result_event("tu_lost", "lost"),
+        ])
+        brain = tmp_path / "brain"
+        brain.mkdir()
+
+        argv = ["--source", str(source), "--dst", str(brain)]
+        assert csa.main(argv) == 0
+
+        sidecar = brain / "memory" / "episodic" / "claude-sessions" / "_imported.jsonl"
+        episodic = brain / "memory" / "episodic" / "claude-sessions" / "AGENT_LEARNINGS.jsonl"
+        assert sidecar.is_file()
+        before = episodic.read_text()
+
+        # Delete the sidecar — episodic JSONL still exists
+        sidecar.unlink()
+
+        # Re-run — must NOT re-emit the already-imported episode
+        assert csa.main(argv) == 0
+        after = episodic.read_text()
+        assert before.count("\n") == after.count("\n"), (
+            "episode count grew despite identical source — episodic-self-load failed"
+        )
+
 
 # ---------- claude_misc_adapter ----------------------------------------
 

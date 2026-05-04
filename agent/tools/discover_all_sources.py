@@ -49,9 +49,6 @@ _KNOWN_SOURCES = [
         "claude-sessions",          "memory/episodic/claude-sessions",
         2, "claude_session_adapter.py"),
     # tier 3: covered by claude_misc_adapter
-    ("Claude prompt history",       "~/.claude/history.jsonl",
-        "claude-misc",              "imports/claude/history.jsonl",
-        3, "claude_misc_adapter.py"),
     ("Claude plans",                "~/.claude/plans",
         "claude-misc",              "imports/claude/plans",
         3, "claude_misc_adapter.py"),
@@ -76,10 +73,16 @@ _KNOWN_SOURCES = [
     ("Cursor custom skills",        "~/.cursor/skills-cursor",
         "claude-misc",              "imports/cursor/skills-cursor",
         3, "claude_misc_adapter.py"),
+    # tier 4: known but skipped — including paths the misc adapter
+    # explicitly excludes after they leaked verified credentials on the
+    # initial sync (Codex 2026-05-04 P3: keep this list aligned with
+    # claude_misc_adapter._STATIC_SOURCES so the manifest tells the truth).
+    ("Claude prompt history",       "~/.claude/history.jsonl",
+        "(skipped)",                "—",
+        4, "Privacy: TruffleHog flagged 5 verified credentials on initial sync"),
     ("Cursor AI tracking",          "~/.cursor/ai-tracking",
-        "claude-misc",              "imports/cursor/ai-tracking",
-        3, "claude_misc_adapter.py"),
-    # tier 4: known but skipped
+        "(skipped)",                "—",
+        4, "Privacy: opaque SQLite blob with high-entropy hits"),
     ("Claude paste-cache",          "~/.claude/paste-cache",
         "(skipped)",                "—",
         4, "Privacy: clipboard paste contents"),

@@ -82,15 +82,20 @@ def _release_lock(fd) -> None:
     fd.close()
 
 
-def _run_adapter(label: str, script: Path) -> int:
-    """Run one adapter script; capture output to the log. Return exit code."""
+def _run_adapter(label: str, script: Path, extra_args: list[str]) -> int:
+    """Run one adapter script; capture output to the log. Return exit code.
+
+    `extra_args` carries the per-adapter destination flags so the brain
+    root is propagated explicitly. Without this the adapters defaulted
+    to ~/.agent regardless of $BRAIN_ROOT, breaking custom installs
+    (Codex 2026-05-04 P2)."""
     if not script.is_file():
         _log(f"[{label}] FATAL: script not found: {script}")
         return 1
     _log(f"[{label}] starting")
     try:
         proc = subprocess.run(
-            [PYTHON, str(script)],
+            [PYTHON, str(script), *extra_args],
             capture_output=True,
             text=True,
             timeout=600,  # 10 min ceiling per adapter
@@ -126,8 +131,16 @@ def main() -> int:
 
     _log(f"  lock acquired: {LOCK_PATH}")
     try:
-        rc1 = _run_adapter("claude_session_adapter", TOOLS_DIR / "claude_session_adapter.py")
-        rc2 = _run_adapter("claude_misc_adapter", TOOLS_DIR / "claude_misc_adapter.py")
+        rc1 = _run_adapter(
+            "claude_session_adapter",
+            TOOLS_DIR / "claude_session_adapter.py",
+            ["--dst", str(BRAIN_ROOT)],
+        )
+        rc2 = _run_adapter(
+            "claude_misc_adapter",
+            TOOLS_DIR / "claude_misc_adapter.py",
+            ["--brain", str(BRAIN_ROOT)],
+        )
         _log(f"=== sync_claude_extras done (session={rc1}, misc={rc2}) ===\n")
         return 0 if rc1 == 0 and rc2 == 0 else 1
     finally:

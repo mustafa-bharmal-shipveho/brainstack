@@ -25,10 +25,16 @@ Idempotency
 -----------
 
 A sidecar at `<brain>/memory/episodic/claude-sessions/_imported.jsonl`
-records SHA256 of every imported source file. Re-running skips files whose
-hash is in the sidecar. Sessions are append-only-during-write but
-sealed-once-closed; whole-file hash is sufficient (no byte-offset
-required like codex history.jsonl).
+records every imported `tool_use_id` (UUID, globally unique). On each run
+the adapter re-walks every session file but skips any `(tool_use, tool_result)`
+pair whose `tool_use_id` is already in the sidecar. This is correct for
+**still-active** sessions whose JSONL grows between hourly ticks — the
+previous SHA-based scheme reprocessed the whole file once any new line
+was appended, producing duplicate episodes for every prior pair (caught
+by Codex review 2026-05-04). Tool-use IDs are stable per pair regardless
+of how the surrounding file mutates.
+
+Memory: ~16 bytes per ID × 25k pairs ≈ 400KB resident — trivial.
 
 Redaction
 ---------
@@ -92,15 +98,16 @@ _SKIP_EVENT_TYPES = frozenset({
 _LOW_SIGNAL_TOOLS = frozenset({"Read", "Glob"})
 
 
-def _file_hash(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
 def _read_sidecar(sidecar_path: Path) -> set[str]:
+    """Load every previously-imported tool_use_id.
+
+    Backward-compat: legacy sidecars wrote `{"sha256": ...}` rows; these
+    are silently ignored when reading. After a v2 run the sidecar
+    rewrites with tool_use_id rows. If a brain has v1 sidecar entries,
+    the affected sessions get re-walked once and any tool_use_ids
+    already in the on-disk episodic JSONL are also pre-loaded into
+    `seen` (see `_load_seen_from_episodic`) so we don't double-emit.
+    """
     seen: set[str] = set()
     if not sidecar_path.is_file():
         return seen
@@ -112,9 +119,37 @@ def _read_sidecar(sidecar_path: Path) -> set[str]:
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            sha = row.get("sha256")
-            if isinstance(sha, str):
-                seen.add(sha)
+            tuid = row.get("tool_use_id")
+            if isinstance(tuid, str):
+                seen.add(tuid)
+    except OSError:
+        pass
+    return seen
+
+
+def _load_seen_from_episodic(episodic_path: Path) -> set[str]:
+    """Pre-populate the seen set from the brain's episodic JSONL.
+
+    Defends against sidecar loss: if `_imported.jsonl` is deleted but
+    `AGENT_LEARNINGS.jsonl` still has the episodes, reading them gives
+    us the same dedup guarantee a fresh sidecar would.
+    """
+    seen: set[str] = set()
+    if not episodic_path.is_file():
+        return seen
+    try:
+        for line in episodic_path.read_text().splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            src = row.get("source")
+            if isinstance(src, dict):
+                tuid = src.get("tool_use_id")
+                if isinstance(tuid, str):
+                    seen.add(tuid)
     except OSError:
         pass
     return seen
@@ -196,10 +231,18 @@ def _extract_episodes(
     session_path: Path,
     project_slug: str,
     session_id: str,
+    seen_ids: Optional[set[str]] = None,
 ) -> Iterator[dict]:
     """Walk a session JSONL and yield one episode per (tool_use, tool_result)
-    pair. Pairs matched by tool_use_id."""
+    pair. Pairs matched by tool_use_id.
+
+    `seen_ids` (if provided) is a set of tool_use_ids already imported.
+    Pairs whose id is in `seen_ids` are skipped — this is the
+    correctness guarantee for re-walking still-active session JSONLs
+    that have grown since the last run.
+    """
     pending: dict[str, dict] = {}  # tool_use_id -> tool_use info
+    seen_ids = seen_ids or set()
 
     for ev in _walk_session(session_path):
         ev_type = ev.get("type")
@@ -244,6 +287,12 @@ def _extract_episodes(
                 paired = pending.pop(tool_use_id, None)
                 if paired is None:
                     continue  # tool_result without seen tool_use — skip
+                if tool_use_id in seen_ids:
+                    # Already imported on a prior run. Skip — this is the
+                    # correctness fix for active-session SHA churn (Codex
+                    # 2026-05-04 review). DO NOT add to seen_ids here; the
+                    # caller-controlled set already contains it.
+                    continue
 
                 tool_name = paired["name"]
                 tool_input = paired["input"]
@@ -288,6 +337,7 @@ def _extract_episodes(
                         "profile": "transcript-backfill",
                         "session_id": session_id,
                         "project_slug": project_slug,
+                        "tool_use_id": tool_use_id,
                     },
                     "evidence_ids": [],
                     "origin": f"claude.session.{tool_name}",
@@ -371,14 +421,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     episodic_path = brain_root / "memory" / _EPISODIC_REL
     sidecar_path = brain_root / "memory" / _SIDECAR_REL
 
-    seen_hashes = _read_sidecar(sidecar_path)
+    # Pre-load tool_use_ids that are already in the brain — from the
+    # sidecar AND from the on-disk episodic JSONL. The episodic-side
+    # load is a self-recovery for sidecar deletion + a migration path
+    # from the v1 SHA-keyed sidecar.
+    seen_ids = _read_sidecar(sidecar_path)
+    seen_ids |= _load_seen_from_episodic(episodic_path)
     sessions = _enumerate_sessions(source_root)
     if args.limit:
         sessions = sessions[: args.limit]
 
     n_total = len(sessions)
-    n_skipped = 0
-    n_imported = 0
+    n_files_with_new = 0
+    n_files_clean = 0
     n_episodes = 0
     n_redacted = 0
     new_episodes: list[str] = []
@@ -386,42 +441,37 @@ def main(argv: Optional[list[str]] = None) -> int:
     now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
     for i, path in enumerate(sessions):
-        try:
-            sha = _file_hash(path)
-        except OSError as e:
-            print(f"  WARN stat-failed {path}: {e}", file=sys.stderr)
-            continue
-        if sha in seen_hashes:
-            n_skipped += 1
-            continue
-
         slug, sid = _slug_and_session_id(path, source_root)
-        before_count = len(new_episodes)
-        for ep in _extract_episodes(path, slug, sid):
+        added_in_file = 0
+        for ep in _extract_episodes(path, slug, sid, seen_ids=seen_ids):
             n_redacted += ep.pop("_redaction_hits", 0)
+            tuid = ep["source"]["tool_use_id"]
+            seen_ids.add(tuid)  # in-memory set update for this run
             new_episodes.append(json.dumps(ep, ensure_ascii=False))
+            new_sidecar.append({
+                "tool_use_id": tuid,
+                "session_id": sid,
+                "project_slug": slug,
+                "imported_at": now_iso,
+            })
             n_episodes += 1
-        added = len(new_episodes) - before_count
-        n_imported += 1
-        new_sidecar.append({
-            "sha256": sha,
-            "file_path": str(path),
-            "project_slug": slug,
-            "session_id": sid,
-            "episodes_emitted": added,
-            "imported_at": now_iso,
-        })
-        if args.verbose:
-            print(f"  [{i+1}/{n_total}] {slug}/{sid[:8]}: {added} episodes")
+            added_in_file += 1
+        if added_in_file:
+            n_files_with_new += 1
+        else:
+            n_files_clean += 1
+        if args.verbose and added_in_file:
+            print(f"  [{i+1}/{n_total}] {slug}/{sid[:8]}: {added_in_file} new episodes")
 
     print(f"\nClaude session adapter — {'DRY-RUN' if args.dry_run else 'COMPLETE'}")
     print(f"  source:           {source_root}")
     print(f"  dst:              {brain_root}")
-    print(f"  sessions found:   {n_total}")
-    print(f"  already imported: {n_skipped}")
-    print(f"  newly imported:   {n_imported}")
+    print(f"  sessions scanned: {n_total}")
+    print(f"  files with new:   {n_files_with_new}")
+    print(f"  files clean:      {n_files_clean}")
     print(f"  episodes emitted: {n_episodes}")
     print(f"  redaction hits:   {n_redacted}")
+    print(f"  seen tool_use_ids:{len(seen_ids)}")
 
     if args.dry_run:
         # Estimate output bytes
