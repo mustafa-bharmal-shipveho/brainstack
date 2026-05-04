@@ -316,7 +316,8 @@ class TestRenderPendingSummary:
         surface the count in its first response. Without this directive,
         the @-imported content sits silently in the model's context — the
         user never sees the pending count in chat (Mustafa 2026-05-04
-        third-round bug)."""
+        third-round bug). Mustafa fourth-round: directive must be terse —
+        "just say to use recall pending --review"."""
         rps = self._import()
         _seed_candidates(tmp_path, "default", [_make_candidate("d1"), _make_candidate("d2")])
         summary = rps.compose_summary(
@@ -325,13 +326,14 @@ class TestRenderPendingSummary:
             sync_status="ok",
         )
         assert "<system-reminder>" in summary
-        assert "BRAINSTACK PENDING REVIEW" in summary
+        # Tagged so future changes can grep for the directive
+        assert "BRAINSTACK:" in summary
         # Must reference the actual count
         assert "2" in summary
-        # Must give Claude actionable guidance
-        assert "/dream" in summary or "recall pending" in summary
-        # Must scope: ONCE per session, conditional on > 0 (which holds)
-        assert "ONCE" in summary or "once" in summary
+        # Must give Claude actionable guidance — the exact triage command
+        assert "recall pending --review" in summary
+        # Must scope: once per session
+        assert "once" in summary.lower()
 
     def test_compose_summary_no_directive_in_empty_state(self, tmp_path: Path):
         """Empty state returns the all-clear one-liner, no directive."""
