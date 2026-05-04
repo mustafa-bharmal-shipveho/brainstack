@@ -31,3 +31,9 @@ data-layer/exports/
 # OS cruft
 .DS_Store
 Thumbs.db
+
+# Repo path pin — written by install.sh so brain-side check_freshness.py
+# can locate the brainstack repo. Machine-local; must NOT be synced to
+# the second-brain remote (would break drift detection on every other
+# machine that pulls the brain). Codex 2026-05-04 P2.
+.brainstack-repo-path

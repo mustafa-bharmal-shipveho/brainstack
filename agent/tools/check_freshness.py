@@ -136,7 +136,11 @@ def detect_drift(repo_dir: Path, brain_root: Path) -> dict:
             if not (repo_root / rel).is_file():
                 extra.append(str(rel))
 
-    drift_count = len(missing) + len(stale)
+    # `extra` files (deleted upstream but still in the brain) DO count
+    # as drift. Without this, an upstream-removed tool stays in the brain
+    # forever and the CLI exits 0 — exactly the silent-stale state this
+    # tool exists to surface. Codex 2026-05-04 P2.
+    drift_count = len(missing) + len(stale) + len(extra)
     in_sync = drift_count == 0
     if in_sync:
         summary = "in sync"

@@ -88,15 +88,16 @@ class TestDetectDrift:
         assert report["in_sync"] is False
         assert "core.py" in report["stale"]
 
-    def test_extra_file_in_brain_tools(self, tmp_path: Path):
+    def test_extra_file_in_brain_tools_counts_as_drift(self, tmp_path: Path):
+        """A tool deleted upstream but still in the brain IS drift —
+        without this, the brain runs deleted framework code forever and
+        the CLI silently exits 0 (Codex 2026-05-04 P2 fix)."""
         repo, brain = _make_synthetic_repo_and_brain(tmp_path)
-        # Tool removed upstream; still on disk in the brain
         (brain / "tools" / "obsolete.py").write_text("# old tool\n")
         report = check_freshness.detect_drift(repo, brain)
         assert "obsolete.py" in report["extra"]
-        # `extra` does NOT make in_sync false on its own — it's
-        # informational. Only missing/stale count as drift.
-        assert report["in_sync"] is True
+        assert report["in_sync"] is False
+        assert "extra" in report["summary"]
 
     def test_extra_files_in_memory_are_ignored(self, tmp_path: Path):
         """memory/ holds user data subdirs (semantic, candidates, etc.)
