@@ -33,6 +33,17 @@ def main() -> int:
         sys.stderr.write(f"dream_runner: BRAIN_ROOT not found: {brain}\n")
         return 2
 
+    # Drift check — silent on success; one-line warning if framework
+    # code in the brain is older than the pinned repo. Catches the
+    # silent-stale case where `git pull` of brainstack didn't get
+    # propagated via `./install.sh --upgrade`.
+    try:
+        sys.path.insert(0, str(brain / "tools"))
+        import check_freshness  # type: ignore  # noqa: E402
+        check_freshness.warn_if_drift(brain_root=brain)
+    except Exception:
+        pass  # never fail the dream run because the drift check broke
+
     lock_path = brain / ".brain.lock"
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
     try:

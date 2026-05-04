@@ -66,6 +66,43 @@ Tear down the LaunchAgent later with `./install.sh --remove-auto-migrate`.
 
 ---
 
+## Upgrading after a `git pull`
+
+`install.sh` seeds `~/.agent/{tools,memory,harness}/` from the repo at
+install time. After that, **`git pull` of brainstack does NOT propagate
+those updates** — `~/.agent/` keeps running whatever framework code was
+installed originally. Two real-world bugs from forgetting this:
+
+- `~/.agent/tools/auto_migrate_install.py` missing → `--setup-auto-migrate`
+  fails with `tools/...py is missing`
+- `~/.agent/memory/auto_dream.py` stale → dream cycle silently skips
+  whole episodic namespaces
+
+Refresh runtime code without touching user data (episodic, candidates,
+semantic, personal) with:
+
+```bash
+cd /path/to/brainstack && ./install.sh --upgrade
+```
+
+The upgrade is idempotent and rsync-with-`--delete`, so it adds new
+tools, replaces stale ones, and removes upstream-deleted ones — while
+preserving any `*.user.*` helper scripts you've added locally and every
+file under `~/.agent/memory/{episodic,candidates,semantic,personal,working}/`.
+
+**Drift detection.** Re-running plain `./install.sh` on an existing brain
+prints a one-line warning if the brain is out of sync with the repo, and
+the LaunchAgent entry points (`dream_runner.py`, `migrate_dispatcher.py
+auto-migrate-all`) emit the same warning to stderr / their log files on
+every tick. To audit on demand:
+
+```bash
+~/.agent/tools/check_freshness.py            # human report; exits non-zero if drift
+~/.agent/tools/check_freshness.py --json     # machine-parseable
+```
+
+---
+
 ## Storage: capture, distill, graduate
 
 ```

@@ -592,6 +592,15 @@ if [ "$MODE" = "upgrade" ]; then
     chmod +x "$BRAIN_ROOT/tools/"*.sh "$BRAIN_ROOT/tools/"*.py 2>/dev/null || true
     chmod +x "$BRAIN_ROOT/harness/hooks/"*.py 2>/dev/null || true
     chmod +x "$BRAIN_ROOT/memory/"*.py 2>/dev/null || true
+    # Pin the repo path so brain-side tools (check_freshness.py,
+    # dream_runner.py, etc.) can later detect drift relative to the
+    # exact repo this upgrade came from.
+    echo "$REPO_DIR" > "$BRAIN_ROOT/.brainstack-repo-path"
+    if [ -f "$BRAIN_ROOT/.gitignore" ] && \
+       ! grep -qE "^\.brainstack-repo-path\s*$" "$BRAIN_ROOT/.gitignore"; then
+        printf "\n# Repo path pin — machine-local, do not sync\n.brainstack-repo-path\n" \
+            >> "$BRAIN_ROOT/.gitignore"
+    fi
     # Refresh the recall CLI symlink (idempotent; pip-installs into the venv
     # if the venv exists, otherwise creates it).
     if [ -x "$REPO_DIR/bin/install-recall-cli.sh" ]; then
@@ -608,6 +617,35 @@ if [ -d "$BRAIN_ROOT" ]; then
     echo "    hooks:    $(ls "$BRAIN_ROOT/harness/hooks" 2>/dev/null | wc -l | tr -d ' ') file(s)"
     echo "    memory:   $(find "$BRAIN_ROOT/memory" -type f 2>/dev/null | wc -l | tr -d ' ') file(s)"
     echo ""
+    # Drift check: detect when the brain's framework code is older than
+    # the repo we're invoked from. Common after `git pull` of brainstack
+    # without re-running `./install.sh --upgrade`. Two real-world bugs
+    # this catches: (1) `--setup-auto-migrate` failing because
+    # auto_migrate_install.py wasn't seeded, (2) dream_runner.py running
+    # a non-namespace-aware auto_dream.py and silently skipping
+    # codex/claude-sessions episodes.
+    # `[ -x ]` only resolves bare names like `python3` if they're a file
+    # in CWD — useless. Use `command -v` so PATH lookup actually happens
+    # (Codex 2026-05-04 P2). Falls back to PYTHON_ABS once it's set, but
+    # we're in the no-flag status path here so PYTHON_ABS isn't computed
+    # yet; resolve via PATH.
+    _python_for_drift_check=""
+    if command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+        _python_for_drift_check="$PYTHON_BIN"
+    fi
+    if [ -n "$_python_for_drift_check" ] && [ -f "$REPO_DIR/agent/tools/check_freshness.py" ]; then
+        if ! "$_python_for_drift_check" "$REPO_DIR/agent/tools/check_freshness.py" \
+                --repo "$REPO_DIR" --brain "$BRAIN_ROOT" --quiet; then
+            echo ""
+            echo "    ⚠️   Brain framework code is OUT OF SYNC with this repo."
+            # NOTE: do NOT use backticks in echo — they trigger command
+            # substitution and would actually execute --upgrade (Codex
+            # 2026-05-04 P1). Single quotes keep the hint as literal text.
+            echo "    Run './install.sh --upgrade' to refresh tools/, memory/, harness/"
+            echo "    (no user data — episodic, candidates, semantic — is touched)."
+            echo ""
+        fi
+    fi
     echo "    To refresh tools/hooks without touching memory: ./install.sh --upgrade"
     echo "    To migrate a flat memory dir:                    ./install.sh --migrate <dir>"
     exit 0
@@ -635,6 +673,18 @@ touch "$BRAIN_ROOT/memory/episodic/AGENT_LEARNINGS.jsonl"
 chmod +x "$BRAIN_ROOT/tools/"*.sh 2>/dev/null || true
 chmod +x "$BRAIN_ROOT/tools/"*.py 2>/dev/null || true
 chmod +x "$BRAIN_ROOT/harness/hooks/"*.py 2>/dev/null || true
+
+# Pin the repo path so brain-side tools (check_freshness.py, dream_runner,
+# auto-migrate dispatcher) can later detect drift if the user `git pull`s
+# the brainstack repo without re-running `./install.sh --upgrade`.
+echo "$REPO_DIR" > "$BRAIN_ROOT/.brainstack-repo-path"
+# Ensure the pin is gitignored even if the brain's .gitignore was created
+# before this template line shipped. Idempotent. Codex 2026-05-04 P2.
+if [ -f "$BRAIN_ROOT/.gitignore" ] && \
+   ! grep -qE "^\.brainstack-repo-path\s*$" "$BRAIN_ROOT/.gitignore"; then
+    printf "\n# Repo path pin — machine-local, do not sync\n.brainstack-repo-path\n" \
+        >> "$BRAIN_ROOT/.gitignore"
+fi
 
 # Default .gitignore so the brain doesn't accidentally commit logs / lock
 # files / temp files / dashboard exports. Mirrors the contents documented in
