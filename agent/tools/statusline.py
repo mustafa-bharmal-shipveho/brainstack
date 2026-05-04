@@ -54,15 +54,20 @@ def _format_line() -> str:
         if "all clear" in first_line.lower() and len(text.strip().splitlines()) <= 2:
             return ""
         # Find the headline like "**N candidates pending**"
-        # Prefer to show "📥 N pending — recall pending --review"
+        # Show "📥 N pending: recall pending --review"
+        # NOTE: NO em-dash. The user dislikes em-dashes in any output
+        # (feedback_no_emdashes memory). Plus em-dashes render poorly in
+        # some Claude Code statusline width / encoding combinations
+        # ("—n recall ... --rlview" garble seen 2026-05-04). Plain ASCII
+        # is safest in the footer.
         import re
         m = re.search(r"\*\*(\d+)\s+candidates\s+pending\*\*", text)
         if m:
             n = int(m.group(1))
             if n > 0:
-                return f"📥 {n} pending — recall pending --review"
+                return f"brainstack: {n} pending - recall pending --review"
         # Fallback: file exists, has content, but no parseable headline
-        return "📥 pending — recall pending --review"
+        return "brainstack: pending - recall pending --review"
     except Exception:
         return ""
 

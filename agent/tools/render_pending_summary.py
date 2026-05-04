@@ -246,10 +246,12 @@ def compose_summary(
     if total > 0:
         # Terse directive — Mustafa 2026-05-04: "just say to use recall
         # pending --review". One line, exact wording, no exposition.
+        # NO em-dashes (feedback_no_emdashes — user explicitly dislikes
+        # them in any drafts, prose, code, or commit messages).
         directive_lines = [
             "<system-reminder>",
             f"BRAINSTACK: At the start of your first response, tell the user "
-            f"\"📥 {total} pending — run `recall pending --review`\" "
+            f"\"brainstack: {total} pending - run `recall pending --review`\" "
             f"(once per session, skip if user already addressed it).",
             "</system-reminder>",
             "",
@@ -298,11 +300,11 @@ def compose_summary(
                 cluster = c.get("cluster_size", "?")
                 sal = c.get("canonical_salience", 0)
                 lines.append(
-                    f"- `cluster={cluster} sal={sal:.1f}` — {claim} *({ns})*"
+                    f"- `cluster={cluster} sal={sal:.1f}` | {claim} *({ns})*"
                 )
             lines.append("")
         else:
-            lines.append("_(all candidates filtered as test-infra noise — "
+            lines.append("_(all candidates filtered as test-infra noise; "
                          "review queue empty after filter)_")
             lines.append("")
 

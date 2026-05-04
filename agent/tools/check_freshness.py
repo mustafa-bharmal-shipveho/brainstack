@@ -152,7 +152,7 @@ def detect_drift(repo_dir: Path, brain_root: Path) -> dict:
             parts.append(f"{len(stale)} stale")
         if extra:
             parts.append(f"{len(extra)} extra")
-        summary = "drift detected — " + ", ".join(parts) + ". Run `./install.sh --upgrade` from the brainstack repo to refresh."
+        summary = "drift detected: " + ", ".join(parts) + ". Run `./install.sh --upgrade` from the brainstack repo to refresh."
 
     return {
         "in_sync": in_sync,
