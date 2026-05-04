@@ -310,6 +310,42 @@ class TestRenderPendingSummary:
         assert "claude-sessions" in summary or "default" in summary
         assert "2" in summary and "1" in summary  # the counts appear
 
+    def test_compose_summary_emits_directive_for_claude_to_surface(self, tmp_path: Path):
+        """Critical UX contract: when total > 0, the summary MUST start with
+        a <system-reminder> directive instructing Claude to proactively
+        surface the count in its first response. Without this directive,
+        the @-imported content sits silently in the model's context — the
+        user never sees the pending count in chat (Mustafa 2026-05-04
+        third-round bug)."""
+        rps = self._import()
+        _seed_candidates(tmp_path, "default", [_make_candidate("d1"), _make_candidate("d2")])
+        summary = rps.compose_summary(
+            tmp_path,
+            drift_report={"in_sync": True, "summary": "in sync"},
+            sync_status="ok",
+        )
+        assert "<system-reminder>" in summary
+        assert "BRAINSTACK PENDING REVIEW" in summary
+        # Must reference the actual count
+        assert "2" in summary
+        # Must give Claude actionable guidance
+        assert "/dream" in summary or "recall pending" in summary
+        # Must scope: ONCE per session, conditional on > 0 (which holds)
+        assert "ONCE" in summary or "once" in summary
+
+    def test_compose_summary_no_directive_in_empty_state(self, tmp_path: Path):
+        """Empty state returns the all-clear one-liner, no directive."""
+        rps = self._import()
+        summary = rps.compose_summary(
+            tmp_path,
+            drift_report={"in_sync": True, "summary": "in sync"},
+            sync_status="ok",
+        )
+        # All-clear one-liner — no directive overhead
+        assert "all clear" in summary.lower()
+        assert "<system-reminder>" not in summary
+        assert "BRAINSTACK" not in summary
+
     def test_compose_summary_includes_drift_warning_when_present(self, tmp_path: Path):
         """A drift report with in_sync=False must surface in the output."""
         rps = self._import()
