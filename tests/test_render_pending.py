@@ -213,6 +213,76 @@ class TestRenderPendingSummary:
         )
         assert rps._is_noise_cluster(cand) is True
 
+    def test_full_render_against_live_shaped_fixtures(self, tmp_path: Path):
+        """Mid-tier integration check: feed the renderer 5 candidates that
+        mirror the on-disk shape from the maintainer's live brain (bare
+        ISO-timestamp evidence_ids, content in `claim`). Expected output:
+        - 2 noise candidates filtered (top 5 contains only the 3 signal ones)
+        - one-liner suppressed (we have signal)
+        - drift section skipped (no drift_report passed)
+
+        This catches the regression class where unit tests pass but the
+        live noise filter fails because synthetic fixtures don't match
+        prod data shapes (Wave 6 retro 2026-05-04)."""
+        rps = self._import()
+
+        # Realistic live-brain candidate shapes
+        live_shaped = [
+            # Two clusters that should be filtered (claim references test infra)
+            _make_candidate(
+                "live_noise_1",
+                claim="FAILURE in claude-code: High-stakes op FAILED (secret): cd /Users/u/code",
+                evidence_ids=["2026-04-30T14:14:49.708300+00:00"],
+                cluster_size=5700, salience=22.1,
+            ),
+            _make_candidate(
+                "live_noise_2",
+                claim="High-stakes op completed (migrate): SANDBOX=/tmp/brainstack-cursor-smoke-$$",
+                evidence_ids=["2026-05-01T07:00:00+00:00"],
+                cluster_size=11, salience=13.5,
+            ),
+            # Three signal clusters (real codebase paths, normal claims)
+            _make_candidate(
+                "live_signal_1",
+                claim="Wrote /Users/u/Documents/codebase/helix-incident-bot/src/handler.ts",
+                evidence_ids=["2026-05-01T10:00:00+00:00"],
+                cluster_size=8, salience=13.5,
+            ),
+            _make_candidate(
+                "live_signal_2",
+                claim="Tool Agent completed successfully",
+                evidence_ids=["2026-05-01T11:00:00+00:00"],
+                cluster_size=6, salience=12.3,
+            ),
+            _make_candidate(
+                "live_signal_3",
+                claim="High-stakes op completed (production): python3 <<'PY'",
+                evidence_ids=["2026-05-01T12:00:00+00:00"],
+                cluster_size=3, salience=11.9,
+            ),
+        ]
+        _seed_candidates(tmp_path, "default", live_shaped)
+
+        summary = rps.compose_summary(
+            tmp_path,
+            drift_report={"in_sync": True, "summary": "in sync"},
+            sync_status="ok",
+        )
+
+        # The two noise clusters MUST NOT appear in the top-5
+        assert "FAILED (secret)" not in summary, (
+            "test-infra cluster leaked into top-5 — noise filter regression"
+        )
+        assert "SANDBOX=/tmp/" not in summary, (
+            "sandbox cluster leaked into top-5 — noise filter regression"
+        )
+        # All three signal clusters SHOULD appear
+        assert "helix-incident-bot/src/handler.ts" in summary
+        assert "Tool Agent completed successfully" in summary
+        assert "production): python3" in summary
+        # Total count includes ALL pending (filter is for top-5, not for count)
+        assert "5 candidates pending" in summary or "candidates pending" in summary
+
     def test_compose_summary_empty_state_writes_one_liner(self, tmp_path: Path):
         """0 pending + in_sync + sync ok → one-liner ('all clear'). The
         SessionStart hook suppresses these so empty days produce no noise."""

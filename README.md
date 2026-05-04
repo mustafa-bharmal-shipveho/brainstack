@@ -122,6 +122,52 @@ every tick. To audit on demand:
 
 ---
 
+## Knowing what to review
+
+The dream cycle clusters episodes into candidate lessons in `~/.agent/memory/candidates/`. Until you triage them (graduate or reject), they sit there silently. Without surfacing, real work piles up: on the maintainer's brain on 2026-05-04, **21 candidates had been pending for 3 days before anyone noticed**.
+
+Brainstack now generates `~/.agent/PENDING_REVIEW.md` on every dream cycle, sync, graduate, or reject — and surfaces it through three native injection points so you see the count whenever you start a session:
+
+| Surface | Setup | Where you see it |
+|---|---|---|
+| Claude Code SessionStart hook | merge `adapters/claude-code/settings.snippet.json` SessionStart entry into `~/.claude/settings.json` | Top of every Claude Code session, in a `<system-reminder>` block |
+| Cursor `~/.cursor/.cursorrules` | `./install.sh --setup-cursor-rules` | Cursor injects the rules file on every chat session |
+| Shell wrappers (`claude`/`codex`/`cursor`) | `./install.sh --setup-shell-banner` | Cat'd to stdout when you launch any of those tools from a terminal |
+
+All three read the same `PENDING_REVIEW.md`. The file is generated locally and gitignored — never synced to your private brain remote.
+
+```bash
+# View the summary on demand
+recall pending                  # print current summary
+recall pending --refresh        # force regenerate first
+recall pending --review         # interactive triage flow
+
+# Manual regeneration (also runs automatically on dream/graduate/reject/sync)
+python ~/.agent/tools/render_pending_summary.py
+```
+
+The summary includes:
+- pending candidate counts per namespace (default / claude-sessions / codex)
+- top 5 candidates by signal (after a noise filter that rejects test-infra clusters — `/tmp/`, sandbox paths, `FAILED (secret)` patterns)
+- drift status (via `check_freshness`)
+- sync staleness (sync.log mtime > 2h or last-line "refusing to push")
+
+Empty days produce a one-liner (`✅ all clear`) which all three surfaces suppress, so a healthy brain produces zero session-start noise.
+
+### Tearing it down
+
+```bash
+./install.sh --remove-cursor-rules     # strips sentinel block from .cursorrules
+./install.sh --remove-shell-banner     # strips source line from ~/.zshrc + removes script
+# For the SessionStart hook: edit ~/.claude/settings.json and remove the entry
+```
+
+### Security note
+
+The SessionStart hook injects `PENDING_REVIEW.md` content into Claude Code's context inside a `<system-reminder>` block. To prevent a project-level `.envrc` from poisoning `$HOME` or `$BRAIN_ROOT` and redirecting the hook to attacker-controlled content, the hook resolves the brain root from `__file__` (its own install path), not from environment variables. Tests pin this in `tests/test_render_pending.py::test_resolves_brain_from_file_not_env`.
+
+---
+
 ## Storage: capture, distill, graduate
 
 ```
