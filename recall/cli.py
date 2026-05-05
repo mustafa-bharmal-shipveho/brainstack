@@ -394,20 +394,35 @@ def stats(
         False, "--json",
         help="Emit the StatsReport as JSON instead of the human-readable view.",
     ),
+    no_tools: bool = typer.Option(
+        False, "--no-tools",
+        help="Skip Claude Code transcript scanning. Faster on brains with hundreds of session files.",
+    ),
+    transcripts_dir: Optional[Path] = typer.Option(
+        None, "--transcripts-dir",
+        help="Override Claude Code transcripts root (default: ~/.claude/projects).",
+    ),
 ):
-    """Auto-recall ROI: how often recall fired, what it surfaced, latency.
+    """Auto-recall ROI + cross-source visibility.
 
-    Reads ~/.agent/runtime/logs/events.log.jsonl (the runtime hook's append-
-    only log). Counts AutoRecall events and aggregates by outcome (hit /
-    skip / timeout / unavailable). Use --since to scope a window; omit it
-    for all-time. The "Without auto-recall" line at the bottom frames the
-    ROI in absolute terms (turns × surfaced docs).
+    Reads ~/.agent/runtime/logs/events.log.jsonl for AutoRecall events
+    (per-prompt retrieval injections) AND scans Claude Code transcripts
+    at ~/.claude/projects/<slug>/<sid>.jsonl for tool_use blocks
+    (model-driven tool calls — Minerva, NotebookLM, Bash, etc.). Cross-
+    sourcing is what answers 'is the model following the CLAUDE.md
+    routing rules?'.
+
+    Use --no-tools when you only want the auto-recall counters fast (the
+    transcript scan reads many JSONL files per call; cheap but not free
+    on brains with months of history).
     """
     import json as _json
 
     from recall.stats import (
         StatsReport,
         aggregate_events,
+        aggregate_tool_calls,
+        compute_routing_coverage,
         parse_since,
         render_human,
     )
@@ -434,6 +449,15 @@ def stats(
             raise typer.Exit(code=2)
 
     report = aggregate_events(log_path, since_ts_ms=since_ts_ms)
+
+    # Cross-source: scan transcripts for MCP / builtin tool calls in the
+    # same window. Bucket by namespace (mcp__minerva__* etc).
+    if not no_tools:
+        td = transcripts_dir or (Path.home() / ".claude" / "projects")
+        all_calls = aggregate_tool_calls(td, since_ts_ms=since_ts_ms)
+        report.mcp_calls = {k: v for k, v in all_calls.items() if k.startswith("mcp__")}
+        report.tool_calls_other = {k: v for k, v in all_calls.items() if not k.startswith("mcp__")}
+        report.routing_coverage = compute_routing_coverage(td, since_ts_ms=since_ts_ms)
 
     if json_out:
         # Re-key from StatsReport dataclass to plain dict (top_sources tuple
