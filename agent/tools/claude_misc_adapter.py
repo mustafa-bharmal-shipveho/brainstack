@@ -135,9 +135,85 @@ def _discover_project_memory_dirs() -> list[tuple[str, str]]:
     return sources
 
 
-def _build_default_sources() -> list[tuple[str, str]]:
-    """Static sources + auto-discovered Claude project memory dirs."""
-    return list(_STATIC_SOURCES) + _discover_project_memory_dirs()
+_EXTRA_SOURCES_REL = Path("imports") / "extra_sources.txt"
+
+
+def _read_extra_sources(brain_root: Path) -> list[tuple[str, str]]:
+    """User-defined extra sources from <brain>/imports/extra_sources.txt.
+
+    One entry per line: ``SRC=DST_SUB``. Blank lines and ``#`` comments are
+    ignored. ``SRC`` may use ``~`` for $HOME. ``DST_SUB`` is the relative
+    path under ``<brain>/imports/`` where the source is mirrored.
+
+    Example::
+
+        # Personal knowledge base — refreshed daily by hand
+        ~/Documents/Product & Tech Knowledge Base=kb/product-tech
+
+    Why a config file (not just CLI flags): the LaunchAgent invokes this
+    adapter with no arguments. A config file lets users add sources without
+    editing the LaunchAgent or the adapter source. Mirrors the same pattern
+    as ``<brain>/banner/wrapped_tools``.
+    """
+    config = brain_root / _EXTRA_SOURCES_REL
+    if not config.is_file():
+        return []
+    out: list[tuple[str, str]] = []
+    try:
+        text = config.read_text()
+    except OSError:
+        return []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            print(f"WARN: extra_sources.txt line ignored (no '='): {line!r}", file=sys.stderr)
+            continue
+        src, dst = line.split("=", 1)
+        src = src.strip()
+        # Don't lstrip("/") — that would silently turn "/etc/secrets" into
+        # "etc/secrets" (bypassing the absolute-path safety check below).
+        dst = dst.strip()
+        if not src or not dst:
+            print(f"WARN: extra_sources.txt line ignored (empty SRC or DST): {line!r}", file=sys.stderr)
+            continue
+        # Reject path-traversal in DST_SUB. The adapter joins this directly
+        # under <brain>/imports/, so a value like "../../outside" would
+        # silently write outside the brain on every hourly sync. The header
+        # promises DST is *relative under imports*; enforce that.
+        if not _is_safe_dst_sub(dst):
+            print(
+                f"WARN: extra_sources.txt line ignored (unsafe DST — must be a "
+                f"relative path under imports/, no '..' or absolute components): {line!r}",
+                file=sys.stderr,
+            )
+            continue
+        out.append((src, dst))
+    return out
+
+
+def _is_safe_dst_sub(dst: str) -> bool:
+    """True iff DST_SUB is a safe relative path under <brain>/imports/.
+
+    Rejects: empty strings, absolute paths, any component equal to ``..``,
+    any component containing a NUL byte. Accepts both Unix-style ``/`` and
+    OS-native separators.
+    """
+    if not dst or "\x00" in dst:
+        return False
+    p = Path(dst)
+    if p.is_absolute():
+        return False
+    return all(part not in ("", "..") for part in p.parts)
+
+
+def _build_default_sources(brain_root: Optional[Path] = None) -> list[tuple[str, str]]:
+    """Static sources + auto-discovered Claude project memory dirs + user extras."""
+    sources = list(_STATIC_SOURCES) + _discover_project_memory_dirs()
+    if brain_root is not None:
+        sources.extend(_read_extra_sources(brain_root))
+    return sources
 
 
 # Back-compat alias used by older callers
@@ -328,7 +404,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             sources.append((Path(s).expanduser(), d))
     else:
         # Re-discover at runtime so newly-created project memory dirs are picked up
-        sources = [(Path(s).expanduser(), d) for s, d in _build_default_sources()]
+        sources = [(Path(s).expanduser(), d) for s, d in _build_default_sources(brain_root)]
 
     total_files = 0
     total_changed = 0

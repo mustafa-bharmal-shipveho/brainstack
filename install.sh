@@ -135,6 +135,37 @@ while [ $# -gt 0 ]; do
             MODE="remove-pending-review-all"
             shift
             ;;
+        --add-source)
+            MODE="add-source"
+            # Required: SRC path. Optional: --as DST_SUB on a later flag.
+            if [ $# -lt 2 ] || [[ "$2" == --* ]]; then
+                echo "install: --add-source requires a path" >&2
+                exit 2
+            fi
+            ADD_SOURCE_PATH="$2"
+            shift 2
+            ;;
+        --as)
+            ADD_SOURCE_DST="${2:-}"
+            if [ -z "$ADD_SOURCE_DST" ]; then
+                echo "install: --as requires a destination subpath" >&2
+                exit 2
+            fi
+            shift 2
+            ;;
+        --remove-source)
+            MODE="remove-source"
+            if [ $# -lt 2 ] || [[ "$2" == --* ]]; then
+                echo "install: --remove-source requires a path or destination" >&2
+                exit 2
+            fi
+            REMOVE_SOURCE_KEY="$2"
+            shift 2
+            ;;
+        --list-sources)
+            MODE="list-sources"
+            shift
+            ;;
         --migrate)
             MODE="migrate"
             # Consume the source path only if the next arg is NOT another
@@ -1191,6 +1222,178 @@ if [ "$MODE" = "setup-pending-review-all" ] || [ "$MODE" = "remove-pending-revie
     echo "    Codex:         sentinel block in ~/.codex/AGENTS.md"
     echo "    Shell:         wrappers for any AI CLI in ~/.agent/banner/wrapped_tools"
     echo "    Tear down all: ./install.sh --remove-pending-review-all"
+    exit 0
+fi
+
+# ----- Mode: add-source / remove-source / list-sources -----
+# Manage extra import sources for the misc adapter. Each source is a directory
+# (or single file) on disk that brainstack mirrors into <brain>/imports/<dst>/
+# on every hourly LaunchAgent run. Use this to feed external knowledge bases,
+# Obsidian vaults, or any locally-curated notes folder into the brain so it
+# shows up in retrieval and survives across machines via the second-brain repo.
+#
+# Storage: <brain>/imports/extra_sources.txt — one "SRC=DST_SUB" line per
+# source. Edit by hand if you prefer; these flags are just convenience.
+if [ "$MODE" = "add-source" ] || [ "$MODE" = "remove-source" ] || [ "$MODE" = "list-sources" ]; then
+    if [ ! -d "$BRAIN_ROOT" ]; then
+        echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
+        exit 2
+    fi
+    EXTRA_SOURCES_FILE="$BRAIN_ROOT/imports/extra_sources.txt"
+    mkdir -p "$BRAIN_ROOT/imports"
+
+    if [ "$MODE" = "list-sources" ]; then
+        echo "==> Configured extra sources (from $EXTRA_SOURCES_FILE):"
+        if [ ! -f "$EXTRA_SOURCES_FILE" ]; then
+            echo "    (none — file does not exist)"
+            exit 0
+        fi
+        # Strip comments and blank lines for the listing
+        /usr/bin/awk '!/^[[:space:]]*#/ && !/^[[:space:]]*$/ { print "    " $0 }' "$EXTRA_SOURCES_FILE"
+        exit 0
+    fi
+
+    if [ "$MODE" = "add-source" ]; then
+        # Resolve DST_SUB: explicit --as wins; otherwise derive from path basename.
+        # Slug rules: lower-case, spaces → hyphens, drop non-alphanumeric (so
+        # "Product & Tech KB" → "product-tech-kb"), collapse runs of hyphens,
+        # trim leading/trailing hyphens.
+        if [ -z "${ADD_SOURCE_DST:-}" ]; then
+            base="$(/usr/bin/basename "$ADD_SOURCE_PATH")"
+            slug="$(echo "$base" | /usr/bin/tr '[:upper:] ' '[:lower:]-' | /usr/bin/tr -cd '[:alnum:]-_/' | /usr/bin/sed -E 's/-+/-/g; s/^-//; s/-$//')"
+            if [ -z "$slug" ]; then
+                echo "ERROR: could not auto-derive a destination from $ADD_SOURCE_PATH (empty slug after sanitization)." >&2
+                echo "       Pass an explicit --as <DST_SUB>." >&2
+                exit 2
+            fi
+            ADD_SOURCE_DST="kb/$slug"
+            echo "==> No --as given; using auto-derived destination: $ADD_SOURCE_DST"
+        fi
+
+        # Reject path-traversal in DST_SUB. The misc adapter joins this
+        # directly under <brain>/imports/, so a value like "../../outside"
+        # would silently write outside the brain on every hourly sync.
+        # The misc adapter also rejects this at runtime, but failing fast
+        # here gives the user a clear, immediate error.
+        case "$ADD_SOURCE_DST" in
+            /*|*/../*|*/..|../*|..)
+                echo "ERROR: --as $ADD_SOURCE_DST is unsafe — must be a relative path under imports/, no '..' or leading '/'." >&2
+                exit 2
+                ;;
+        esac
+        if [ -z "$ADD_SOURCE_DST" ]; then
+            echo "ERROR: --as cannot be empty." >&2
+            exit 2
+        fi
+
+        # Validate: source must exist (warn but don't fail — user might be
+        # registering ahead of creating the dir)
+        if [ ! -e "$ADD_SOURCE_PATH" ] && [ ! -e "${ADD_SOURCE_PATH/#\~/$HOME}" ]; then
+            echo "WARN: $ADD_SOURCE_PATH does not exist yet. Adding anyway; misc adapter will skip it until it appears." >&2
+        fi
+
+        # Normalize: if SRC is under $HOME, store as ~/<rel> so the file
+        # stays readable + portable across machines with different $HOME.
+        # This also makes idempotency work regardless of whether the user
+        # typed `~/foo` (shell-expanded to absolute) or `$HOME/foo`.
+        case "$ADD_SOURCE_PATH" in
+            "$HOME"/*)
+                ADD_SOURCE_PATH="~${ADD_SOURCE_PATH#$HOME}"
+                ;;
+            "$HOME")
+                ADD_SOURCE_PATH="~"
+                ;;
+        esac
+
+        # Initialize file with header if absent
+        if [ ! -f "$EXTRA_SOURCES_FILE" ]; then
+            cat > "$EXTRA_SOURCES_FILE" <<'HEADER'
+# brainstack: extra import sources for the misc adapter.
+#
+# One entry per line: SRC=DST_SUB
+#   - SRC may use ~ for $HOME (resolved at runtime).
+#   - DST_SUB is the relative path under <brain>/imports/ where SRC is mirrored.
+#   - Lines starting with # are comments. Blank lines are ignored.
+#
+# Manage with: ./install.sh --add-source / --remove-source / --list-sources
+# Or edit this file directly. Changes are picked up on the next hourly sync.
+
+HEADER
+        fi
+
+        # Idempotency: bail if SRC=DST already present
+        new_line="$ADD_SOURCE_PATH=$ADD_SOURCE_DST"
+        if /usr/bin/grep -Fxq "$new_line" "$EXTRA_SOURCES_FILE"; then
+            echo "==> Source already registered: $new_line"
+            exit 0
+        fi
+        # Bail if the SAME destination is already mapped (would cause overwrite).
+        # Match on the literal "=$DST_SUB" suffix without using regex — paths
+        # like "kb/[team]" or "kb/v1.2" would be misinterpreted as ERE patterns
+        # by grep -E (Codex 2026-05-05 P2). Read the file line-by-line and
+        # compare the post-'=' field as a string.
+        existing=""
+        while IFS= read -r _line; do
+            case "$_line" in
+                ""|"#"*) continue ;;
+            esac
+            _line_dst="${_line#*=}"
+            if [ "$_line_dst" = "$ADD_SOURCE_DST" ]; then
+                existing="$_line"
+                break
+            fi
+        done < "$EXTRA_SOURCES_FILE"
+        if [ -n "$existing" ]; then
+            echo "ERROR: destination $ADD_SOURCE_DST already used by: $existing" >&2
+            echo "       Pick a different --as value, or remove the existing entry first." >&2
+            exit 2
+        fi
+
+        echo "$new_line" >> "$EXTRA_SOURCES_FILE"
+        echo "==> Added: $new_line"
+        echo "    Mirrored on next hourly sync to: $BRAIN_ROOT/imports/$ADD_SOURCE_DST"
+        echo "    Backfill now:  $PYTHON_BIN $BRAIN_ROOT/tools/claude_misc_adapter.py"
+        exit 0
+    fi
+
+    # remove-source: match either SRC path or DST_SUB as a LITERAL STRING.
+    # We previously used `grep -E "(^KEY=|=KEY$)"`, but a key like
+    # "kb/v1.2" or "kb/[team]" contains regex metacharacters that would
+    # mis-match (Codex 2026-05-05 P2). Iterate the file line-by-line and
+    # compare each side of the first '=' as a string.
+    if [ ! -f "$EXTRA_SOURCES_FILE" ]; then
+        echo "==> No extra sources configured (file does not exist)."
+        exit 0
+    fi
+    matched=""
+    tmpfile="$(mktemp)"
+    while IFS= read -r _line || [ -n "$_line" ]; do
+        # Always preserve comments + blank lines
+        case "$_line" in
+            ""|"#"*)
+                printf '%s\n' "$_line" >> "$tmpfile"
+                continue
+                ;;
+        esac
+        _lhs="${_line%%=*}"
+        _rhs="${_line#*=}"
+        if [ "$_lhs" = "$REMOVE_SOURCE_KEY" ] || [ "$_rhs" = "$REMOVE_SOURCE_KEY" ]; then
+            matched+="$_line"$'\n'
+        else
+            printf '%s\n' "$_line" >> "$tmpfile"
+        fi
+    done < "$EXTRA_SOURCES_FILE"
+
+    if [ -z "$matched" ]; then
+        rm -f "$tmpfile"
+        echo "==> No source matching '$REMOVE_SOURCE_KEY' found. Run --list-sources to see registered entries." >&2
+        exit 1
+    fi
+    mv "$tmpfile" "$EXTRA_SOURCES_FILE"
+    echo "==> Removed entries matching '$REMOVE_SOURCE_KEY':"
+    printf '%s' "$matched" | /usr/bin/sed 's/^/    /'
+    echo "    Mirrored content under <brain>/imports/ is NOT deleted (could be intentional archive)."
+    echo "    To delete: rm -rf $BRAIN_ROOT/imports/<DST_SUB>"
     exit 0
 fi
 
