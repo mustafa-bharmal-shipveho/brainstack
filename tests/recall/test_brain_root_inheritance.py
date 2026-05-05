@@ -98,12 +98,18 @@ def test_default_config_writes_brain_root_literal(monkeypatch, tmp_path):
 
     cfg = default_config()
 
-    assert len(cfg.sources) == 1
+    # Default config has TWO sources: brain (memory/) and imports (imports/).
+    # This test pins the env-var-literal preservation for the brain source.
+    assert [s.name for s in cfg.sources] == ["brain", "imports"]
     src = cfg.sources[0]
     # `path` preserves the env-var literal so the on-disk config is portable.
     assert src.path == "$BRAIN_ROOT/memory"
     # `resolved_path` does the expansion when an actual filesystem path is needed.
     assert src.resolved_path == str(brain_root / "memory")
+    # The imports source mirrors the brain literal style ($BRAIN_ROOT/imports).
+    imports_src = cfg.sources[1]
+    assert imports_src.path == "$BRAIN_ROOT/imports"
+    assert imports_src.resolved_path == str(brain_root / "imports")
 
 
 def test_default_config_writes_brain_home_literal_when_set(monkeypatch, tmp_path):
