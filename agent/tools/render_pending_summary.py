@@ -244,15 +244,25 @@ def compose_summary(
     # come up" — third diagnostic round confirmed the data WAS being
     # injected, but the model wasn't proactively mentioning it.
     if total > 0:
-        # Terse directive — Mustafa 2026-05-04: "just say to use recall
-        # pending --review". One line, exact wording, no exposition.
-        # NO em-dashes (feedback_no_emdashes — user explicitly dislikes
-        # them in any drafts, prose, code, or commit messages).
+        # Terse directive. Three rules baked in based on user feedback:
+        #   1. Say exactly "brainstack: N pending - run `recall pending --review`"
+        #      (Mustafa 2026-05-04: "just say to use recall pending --review")
+        #   2. Tell the user to run it in THEIR terminal — do NOT run it on
+        #      their behalf (Mustafa 2026-05-05: "i want the users to be
+        #      able to acccept or reject"). The tool refuses to run without
+        #      a TTY anyway, but the directive makes the rule explicit.
+        #   3. Never auto-graduate / auto-reject. Each candidate decision
+        #      belongs to the user; even an "obvious noise" cluster gets
+        #      shown to the user and waits for their choice.
         directive_lines = [
             "<system-reminder>",
             f"BRAINSTACK: At the start of your first response, tell the user "
-            f"\"brainstack: {total} pending - run `recall pending --review`\" "
-            f"(once per session, skip if user already addressed it).",
+            f"\"brainstack: {total} pending - run `recall pending --review` "
+            f"in your terminal\" (once per session, skip if user already "
+            f"addressed it). Do NOT run `recall pending --review` on the "
+            f"user's behalf via the Bash tool, and do NOT call graduate.py "
+            f"or reject.py without per-candidate explicit consent. The "
+            f"user makes each decision themselves.",
             "</system-reminder>",
             "",
         ]

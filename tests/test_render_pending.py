@@ -686,6 +686,109 @@ class TestClaudeMdImportManagement:
         assert "telemetry-only" in body or "@-import" in body or "@import" in body
 
 
+# ---------- TestTriageCandidates ---------------------------------------
+
+
+class TestTriageCandidates:
+    """The interactive REPL that walks staged candidates and prompts the
+    user per-candidate. Mustafa 2026-05-05: a Claude session ran
+    `recall pending --review` and rejected 22 candidates without asking.
+    The tool now refuses to run without a TTY so auto-decision is
+    structurally impossible — the human's keyboard is mandatory."""
+
+    SCRIPT_PATH = REPO_ROOT / "agent" / "tools" / "triage_candidates.py"
+
+    def test_script_file_exists(self):
+        assert self.SCRIPT_PATH.is_file()
+
+    def test_refuses_without_tty(self, tmp_path: Path):
+        """Critical contract: when stdin is not a TTY (e.g. Claude
+        invokes via Bash tool with no PTY), the tool MUST refuse to run.
+        This is the structural guarantee that AI assistants can't
+        auto-decide. Without this, the tool would either hang on
+        input() or read empty lines and treat them as 'skip'."""
+        # Build an empty fake brain
+        (tmp_path / "memory" / "candidates").mkdir(parents=True)
+        result = subprocess.run(
+            [sys.executable, str(self.SCRIPT_PATH), "--brain", str(tmp_path)],
+            stdin=subprocess.DEVNULL,  # explicit non-TTY
+            capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode == 2
+        assert "not a TTY" in result.stderr
+        # Must mention what the AI assistant should do
+        assert "tell the user" in result.stderr.lower()
+        # Must mention the user-facing command they should run
+        assert "recall pending --review" in result.stderr
+
+    def test_refuses_explains_consent_rule(self, tmp_path: Path):
+        """The TTY-refusal message MUST tell AI assistants not to call
+        graduate.py / reject.py on the user's behalf. This is the
+        explicit rule the Mustafa-2026-05-05 incident violated."""
+        (tmp_path / "memory" / "candidates").mkdir(parents=True)
+        result = subprocess.run(
+            [sys.executable, str(self.SCRIPT_PATH), "--brain", str(tmp_path)],
+            stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=10,
+        )
+        msg = result.stderr.lower()
+        assert "graduate.py" in msg or "reject.py" in msg
+        assert "consent" in msg or "behalf" in msg
+
+    def test_empty_queue_exits_zero(self, tmp_path: Path):
+        """No candidates → tool prints a friendly message and exits 0,
+        even with a TTY-piped stdin."""
+        (tmp_path / "memory" / "candidates").mkdir(parents=True)
+        # Use pty so stdin is a TTY
+        import pty
+        master, slave = pty.openpty()
+        proc = subprocess.Popen(
+            [sys.executable, str(self.SCRIPT_PATH), "--brain", str(tmp_path)],
+            stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        os.close(slave)
+        out, err = proc.communicate(timeout=10)
+        assert proc.returncode == 0
+        assert "no staged candidates" in out
+
+    def test_no_auto_decision_without_explicit_keyboard_input(self, tmp_path: Path):
+        """The structural guarantee: no graduate.py / reject.py call ever
+        fires without an explicit g/r keystroke from the user. Even if
+        stdin closes (EOF) mid-prompt, the candidate stays staged.
+        Mustafa 2026-05-05: pin the rule that previously got broken
+        (Claude rejected 22 candidates without prompting)."""
+        cdir = tmp_path / "memory" / "candidates"
+        cdir.mkdir(parents=True)
+        c = {
+            "id": "test01", "key": "k", "name": "n", "claim": "c",
+            "conditions": [], "evidence_ids": ["t"], "cluster_size": 1,
+            "canonical_salience": 1.0, "staged_at": "t", "status": "staged",
+            "decisions": [], "rejection_count": 0,
+        }
+        (cdir / "test01.json").write_text(json.dumps(c))
+
+        # Open a TTY; close stdin without sending g or r. The script must
+        # exit cleanly with NEITHER a graduate NOR a reject applied.
+        import pty
+        master, slave = pty.openpty()
+        proc = subprocess.Popen(
+            [sys.executable, str(self.SCRIPT_PATH), "--brain", str(tmp_path)],
+            stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        # Send EOF immediately — no decision input
+        os.close(master)
+        os.close(slave)
+        out, err = proc.communicate(timeout=10)
+
+        # Critical contract: graduate/reject counts MUST be zero.
+        # That's the whole point — no auto-decision.
+        assert "graduated=0" in out, f"unexpected graduations: {out}"
+        assert "rejected=0" in out, f"unexpected rejections: {out}"
+        # Candidate file unchanged on disk — still staged
+        cand = json.loads((cdir / "test01.json").read_text())
+        assert cand["status"] == "staged"
+
+
 # ---------- TestShellBanner --------------------------------------------
 
 

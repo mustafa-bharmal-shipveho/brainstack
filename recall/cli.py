@@ -353,12 +353,20 @@ def pending(
         except (OSError, subprocess.TimeoutExpired):
             pass  # render failure is non-fatal — fall through to whatever's on disk
 
-    # Review mode: hand off to list_candidates.py
+    # Review mode: hand off to the interactive triage REPL.
+    # The REPL refuses to run without a TTY (structural guarantee that
+    # the user, not an LLM, decides each candidate). Mustafa 2026-05-04:
+    # "i want the users to be able to accept or reject" — a Claude
+    # session previously rejected 22 candidates without prompting; the
+    # REPL makes that structurally impossible.
     if review:
-        list_cands = brain_root / "tools" / "list_candidates.py"
-        if list_cands.is_file():
-            os.execv(sys.executable, [sys.executable, str(list_cands)])
-        typer.echo("recall pending: list_candidates.py missing; run `./install.sh --upgrade`", err=True)
+        triage = brain_root / "tools" / "triage_candidates.py"
+        if triage.is_file():
+            os.execv(sys.executable, [sys.executable, str(triage), "--brain", str(brain_root)])
+        typer.echo(
+            "recall pending: triage_candidates.py missing; run `./install.sh --upgrade`",
+            err=True,
+        )
         raise typer.Exit(code=2)
 
     # Default: print the summary
