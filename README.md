@@ -242,6 +242,8 @@ Storage is a plain text file at `~/.agent/imports/extra_sources.txt` — one `SR
 python3 ~/.agent/tools/claude_misc_adapter.py
 ```
 
+**Retrieval is automatic.** `recall` indexes both `~/.agent/memory/` (graduated lessons + personal notes) and `~/.agent/imports/` (mirrored folders) by default, so KB pages surface in `recall query` without any extra setup. Existing brains migrate on first load: the recall config gains an `imports` source + a `migration_marker` so it's a one-shot patch (idempotent on re-load, doesn't touch user-customized configs). After bulk edits to a source folder, run `recall reindex` to refresh the cache.
+
 Mirrored content **is committed and pushed to your private second-brain remote by default** — that's the point: edits on machine A are available on machine B after the next sync. To keep a particular source local-only, add its destination to `~/.agent/.gitignore` (e.g. `imports/kb/private-notes/`) before the next hourly tick. Everything passes through the same redaction layer (`redact_jsonl.redact_string`) before being written to the brain, so accidentally-pasted secrets in your notes are scrubbed; trufflehog/gitleaks runs on the staged tree before each push as a second gate.
 
 ### How we measure storage reliability
