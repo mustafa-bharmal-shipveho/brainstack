@@ -135,6 +135,14 @@ while [ $# -gt 0 ]; do
             MODE="remove-pending-review-all"
             shift
             ;;
+        --enable-auto-recall)
+            MODE="enable-auto-recall"
+            shift
+            ;;
+        --disable-auto-recall)
+            MODE="disable-auto-recall"
+            shift
+            ;;
         --add-source)
             MODE="add-source"
             # Required: SRC path. Optional: --as DST_SUB on a later flag.
@@ -1394,6 +1402,84 @@ HEADER
     printf '%s' "$matched" | /usr/bin/sed 's/^/    /'
     echo "    Mirrored content under <brain>/imports/ is NOT deleted (could be intentional archive)."
     echo "    To delete: rm -rf $BRAIN_ROOT/imports/<DST_SUB>"
+    exit 0
+fi
+
+# ----- Mode: enable-auto-recall / disable-auto-recall -----
+# Toggle the per-prompt auto-recall feature. When enabled, every Claude
+# Code user-prompt fires recall and injects top-K results as additional
+# context via the existing UserPromptSubmit hook.
+#
+# This mode only flips the TOML flag. The UserPromptSubmit hook itself is
+# already registered as part of the brainstack runtime install (verify by
+# inspecting ~/.claude/settings.json — look for `runtime/adapters/claude_code/hooks.py`).
+# If somehow it isn't, run --setup-claude-extras first.
+if [ "$MODE" = "enable-auto-recall" ] || [ "$MODE" = "disable-auto-recall" ]; then
+    if [ ! -d "$BRAIN_ROOT" ]; then
+        echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
+        exit 2
+    fi
+    runtime_pyproject="$BRAIN_ROOT/runtime/pyproject.toml"
+    mkdir -p "$BRAIN_ROOT/runtime"
+
+    # Initialize the runtime pyproject.toml with the auto-recall section if
+    # missing. Idempotent — Python helper reads + writes preserving any
+    # other [tool.recall.runtime] keys the user may have set by hand.
+    target_value="false"
+    [ "$MODE" = "enable-auto-recall" ] && target_value="true"
+
+    "$PYTHON_BIN" - "$runtime_pyproject" "$target_value" <<'PYEOF'
+import re
+import sys
+from pathlib import Path
+
+target = Path(sys.argv[1])
+value = sys.argv[2]  # "true" or "false"
+
+target.parent.mkdir(parents=True, exist_ok=True)
+text = target.read_text() if target.is_file() else ""
+
+# Ensure [tool.recall.runtime] section exists
+if "[tool.recall.runtime]" not in text:
+    sep = "\n\n" if text and not text.endswith("\n\n") else ""
+    text += f"{sep}[tool.recall.runtime]\nlog_dir = \"~/.agent/runtime/logs\"\n"
+
+# Patch or insert the enable_auto_recall key. Match within the
+# [tool.recall.runtime] section only — don't accidentally hit a sibling
+# section (e.g. [tool.recall.runtime.budget]) or a comment.
+section_re = re.compile(
+    r"(\[tool\.recall\.runtime\][^\[]*?)"  # group 1: section body
+    r"(?=\[|\Z)",                           # until next section or EOF
+    re.DOTALL,
+)
+m = section_re.search(text)
+# We just ensured the section exists above, so the search always matches.
+body = m.group(1)
+key_re = re.compile(r"^enable_auto_recall\s*=.*$", re.MULTILINE)
+if key_re.search(body):
+    new_body = key_re.sub(f"enable_auto_recall = {value}", body)
+else:
+    # Append the key inside the section, preserving trailing whitespace
+    new_body = body.rstrip("\n") + f"\nenable_auto_recall = {value}\n"
+text = text[:m.start(1)] + new_body + text[m.end(1):]
+
+target.write_text(text)
+print(f"  enable_auto_recall = {value} written to {target}")
+PYEOF
+
+    if [ "$MODE" = "enable-auto-recall" ]; then
+        echo "==> Auto-recall ENABLED."
+        echo "    Every UserPromptSubmit hook fire will now query recall and inject top-K"
+        echo "    results into Claude Code's context. Skip filter: prompts < 8 chars,"
+        echo "    slash-commands, common acks (yes/ok/done)."
+        echo ""
+        echo "    See ROI:    recall stats --since 24h"
+        echo "    Disable:    ./install.sh --disable-auto-recall"
+    else
+        echo "==> Auto-recall DISABLED."
+        echo "    The UserPromptSubmit hook stays registered (other features may use it)."
+        echo "    Re-enable with: ./install.sh --enable-auto-recall"
+    fi
     exit 0
 fi
 

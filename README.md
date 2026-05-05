@@ -353,6 +353,55 @@ Answers *"why did Claude forget X at turn 38?"* from artifacts: LRU demoted the 
 
 **Honest boundary:** "eviction" here means demotion-from-the-next-injection, not eviction from the model's KV cache (which is opaque to any tool). What's manifestable, budgetable, and replayable is what we push in — that's the layer brainstack owns. Full design + schema + opt-in re-injection mechanism: [`docs/runtime.md`](docs/runtime.md).
 
+### Auto-recall (opt-in)
+
+When you enable `auto-recall`, every Claude Code user prompt fires `recall` and injects the top-K results as context for that turn. The retrieval is scoped to your prompt, latency-bounded (1.5s default, fail-open on timeout), and skips short prompts, slash commands, and bareword acks (`yes`, `ok`, `done`).
+
+```bash
+./install.sh --enable-auto-recall    # writes enable_auto_recall = true to runtime config
+./install.sh --disable-auto-recall   # flip back; UserPromptSubmit hook stays registered
+```
+
+The hook injects a `<system-reminder>` block on every fire that includes a per-turn metadata line: how many docs surfaced, top scores, sources hit. The model sees it; you can verify it fires by reading the hook log or `recall stats`.
+
+```
+<system-reminder>
+auto-recall: 5 docs surfaced in 38ms · top scores 0.84/0.78/0.72
+sources: brain=3, imports=2
+note: scores are retrieval similarity, not factual accuracy.
+
+## ~/.agent/imports/kb/product-tech/incident-management.md (score 0.84)
+# Incident Management
+This page describes how operational issues get reported, triaged, and resolved...
+</system-reminder>
+```
+
+The "38 ms" is the retrieval call itself. End-to-end (hook subprocess startup + Python import + retrieve) is ~600 ms on a warm cache, ~1500 ms on the first fire after a fresh Claude Code session (embedder cold-start). The 1.5 s default timeout is sized for the cold case; subsequent fires pay only the retrieval cost.
+
+ROI is queryable retrospectively:
+
+```bash
+$ recall stats --since 7d
+brainstack: auto-recall ROI (since 2026-04-28)
+
+  Fired:        47 turns / 53 prompts (89% coverage)
+  Skipped:      6 (4 too_short, 2 slash)
+  Latency:      p50 38ms, p95 89ms
+  Surfaced:     234 docs total (avg 5.0 per fire)
+  Top sources:  imports (89), brain (74), personal (51)
+  Scores:       12 in 0.85+, 47 in 0.70-0.85, 31 in 0.50-0.70
+
+  Without auto-recall, all 47 turns would have started with only static
+  MEMORY.md as memory context. Auto-recall added 234 dynamic docs scoped
+  to each prompt.
+```
+
+**Why opt-in.** Per-prompt retrieval costs latency (see numbers above). The skip filter blocks the no-signal cases, but for users with very short interactive workflows (mostly slash-commands, mostly acks) the value-to-noise ratio may not justify the latency. Easy to toggle.
+
+**Why Claude-Code-only.** This relies on Claude Code's `UserPromptSubmit` hook contract — Cursor and Codex CLI have no equivalent per-turn surface. Cursor + Codex still hit `recall` via the MCP server when the model decides to (model-discretion); auto-recall is the per-turn version, scoped to where the hook exists.
+
+**Privacy.** The injection block contains real paths. The persistent telemetry log records only `x_paths_hash` (16-char digest) plus per-source counts — surfaced paths are not logged across runs, so the events log can be synced via your second-brain remote without leaking project structure.
+
 ---
 
 ## Architecture

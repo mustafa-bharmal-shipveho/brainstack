@@ -380,6 +380,81 @@ def pending(
         typer.echo("recall pending: no summary file (brain may be brand new)")
 
 
+@app.command()
+def stats(
+    since: str = typer.Option(
+        "", "--since",
+        help="Window: '7d', '24h', '30m', '60s', or YYYY-MM-DD. Default: all-time.",
+    ),
+    session_current: bool = typer.Option(
+        False, "--session-current",
+        help="Override --since: window starts at the most recent SessionStart event.",
+    ),
+    json_out: bool = typer.Option(
+        False, "--json",
+        help="Emit the StatsReport as JSON instead of the human-readable view.",
+    ),
+):
+    """Auto-recall ROI: how often recall fired, what it surfaced, latency.
+
+    Reads ~/.agent/runtime/logs/events.log.jsonl (the runtime hook's append-
+    only log). Counts AutoRecall events and aggregates by outcome (hit /
+    skip / timeout / unavailable). Use --since to scope a window; omit it
+    for all-time. The "Without auto-recall" line at the bottom frames the
+    ROI in absolute terms (turns × surfaced docs).
+    """
+    import json as _json
+
+    from recall.stats import (
+        StatsReport,
+        aggregate_events,
+        parse_since,
+        render_human,
+    )
+    from runtime.adapters.claude_code.config import RuntimeConfig
+
+    runtime_cfg = RuntimeConfig.load()
+    log_path = runtime_cfg.event_log_path
+    if not log_path.exists():
+        typer.echo(
+            f"recall stats: no event log at {log_path}\n"
+            "  Auto-recall has never fired on this brain. "
+            "Enable with: ./install.sh --enable-auto-recall",
+            err=True,
+        )
+        raise typer.Exit(code=0)  # Not an error — just no data yet
+
+    if session_current:
+        since_ts_ms = _session_current_ts_ms(log_path)
+    else:
+        try:
+            since_ts_ms = parse_since(since)
+        except ValueError as e:
+            typer.echo(f"recall stats: {e}", err=True)
+            raise typer.Exit(code=2)
+
+    report = aggregate_events(log_path, since_ts_ms=since_ts_ms)
+
+    if json_out:
+        # Re-key from StatsReport dataclass to plain dict (top_sources tuple
+        # → list[list] for stable JSON serialization).
+        from dataclasses import asdict
+        data = asdict(report)
+        data["top_sources"] = [list(t) for t in data["top_sources"]]
+        data["top_paths"] = [list(t) for t in data["top_paths"]]
+        typer.echo(_json.dumps(data, indent=2))
+        return
+    typer.echo(render_human(report))
+
+
+def _session_current_ts_ms(log_path: "Path") -> int | None:
+    """Find the most recent SessionStart event's timestamp."""
+    from runtime.core.events import load_events
+    events = load_events(log_path)
+    starts = [e.ts_ms for e in events if e.event == "SessionStart"]
+    return max(starts) if starts else None
+
+
 def main():
     app()
 
