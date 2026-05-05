@@ -167,7 +167,128 @@ def handle_hook(event_name: str, *, config: RuntimeConfig | None = None) -> int:
             block = ""
         if block:
             print(block)
+
+    # Auto-recall: sibling to the reinjection branch above. Fail-open on
+    # every error path — never block a user's prompt.
+    if event_name == "UserPromptSubmit" and config.enable_auto_recall:
+        _handle_auto_recall(payload, config, str(session_id))
     return 0
+
+
+def _handle_auto_recall(payload: dict[str, Any], config: RuntimeConfig,
+                        session_id: str) -> None:
+    """Run the auto-recall flow + emit the injection block + AutoRecall
+    telemetry event. Catches all exceptions; never raises to the hook
+    entrypoint. Failure modes (skip / timeout / unavailable / error) are
+    distinguished in telemetry so `recall stats` can report them."""
+    from runtime.adapters.claude_code import auto_recall
+
+    prompt = str(
+        payload.get("prompt") or payload.get("user_prompt")
+        or payload.get("text") or ""
+    )
+
+    skip, reason = auto_recall.should_skip(
+        prompt, min_chars=config.auto_recall_min_chars
+    )
+    if skip:
+        _append_auto_recall_event(
+            config, session_id,
+            extensions={"x_outcome": "skip", "x_skip_reason": reason or "unknown"},
+        )
+        return
+
+    # Build block under a hard timeout. CRITICAL: a `ThreadPoolExecutor`
+    # spawns *non-daemon* workers, which keep the interpreter alive on
+    # `atexit` even after `shutdown(wait=False)` — defeating the timeout
+    # for downstream callers (Claude Code blocks waiting for the hook
+    # subprocess to actually exit). Use a daemon thread instead so the
+    # abandoned worker dies with the hook process. Codex 2026-05-05 HIGH.
+    #
+    # Retriever construction (embedder + qdrant cold-start) happens INSIDE
+    # the worker so it's bounded by the same timeout. Otherwise a 2-second
+    # embedder load would block the hook before the timer started, breaking
+    # the latency contract on first-fire. Codex 2026-05-05 P2.
+    import queue
+    import threading
+
+    timeout_s = max(0.05, config.auto_recall_timeout_ms / 1000.0)
+    result_q: "queue.Queue[tuple[str, dict]]" = queue.Queue(maxsize=1)
+    error_q: "queue.Queue[BaseException]" = queue.Queue(maxsize=1)
+    unavailable_q: "queue.Queue[BaseException]" = queue.Queue(maxsize=1)
+
+    def _worker() -> None:
+        try:
+            try:
+                retriever = auto_recall._load_retriever()
+            except Exception as load_exc:
+                # ImportError / qdrant missing / cold-start crash — fail open
+                unavailable_q.put(load_exc)
+                return
+            result_q.put(auto_recall.build_recall_block(
+                prompt, retriever,
+                k=config.auto_recall_k,
+                budget_tokens=config.auto_recall_budget_tokens,
+                min_score=config.auto_recall_min_score,
+            ))
+        except BaseException as exc:  # noqa: BLE001 — pass to main thread
+            error_q.put(exc)
+
+    t = threading.Thread(target=_worker, daemon=True, name="auto-recall")
+    t.start()
+    t.join(timeout=timeout_s)
+
+    if t.is_alive():
+        # Worker still running. It's a daemon thread, so it'll be killed
+        # when this process exits. Don't wait.
+        _append_auto_recall_event(
+            config, session_id,
+            extensions={"x_outcome": "timeout"},
+        )
+        return
+    if not unavailable_q.empty():
+        exc = unavailable_q.get_nowait()
+        print(f"[runtime] auto-recall unavailable: {exc!r}", file=sys.stderr)
+        _append_auto_recall_event(
+            config, session_id,
+            extensions={"x_outcome": "unavailable"},
+        )
+        return
+    if not error_q.empty():
+        exc = error_q.get_nowait()
+        print(f"[runtime] auto-recall error: {exc!r}", file=sys.stderr)
+        _append_auto_recall_event(
+            config, session_id,
+            extensions={"x_outcome": "error"},
+        )
+        return
+
+    block, telemetry = result_q.get_nowait()
+    if block:
+        print(block)
+    _append_auto_recall_event(config, session_id, extensions=telemetry)
+
+
+def _append_auto_recall_event(config: RuntimeConfig, session_id: str,
+                              *, extensions: dict[str, Any]) -> None:
+    """Write a single AutoRecall EventRecord. AutoRecall is NOT in
+    `_KNOWN_HOOK_EVENTS` (which whitelists Claude-Code-driven events);
+    it's a runtime-emitted event with its own name. The events.py loader
+    accepts arbitrary `event` strings — only the routing in `handle_hook`
+    cares about the whitelist."""
+    record = EventRecord(
+        schema_version=EVENT_LOG_SCHEMA_VERSION,
+        ts_ms=_now_ms(),
+        event="AutoRecall",
+        session_id=session_id,
+        turn=0,
+        extensions=extensions,
+    )
+    try:
+        append_event(config.event_log_path, record)
+    except Exception as e:  # pragma: no cover - defensive
+        # Log but don't propagate — telemetry failure must not break the prompt
+        print(f"[runtime] auto-recall telemetry write failed: {e!r}", file=sys.stderr)
 
 
 def _build_reinjection_for_session(config) -> str:
