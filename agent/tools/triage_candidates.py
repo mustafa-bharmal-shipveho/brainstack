@@ -103,13 +103,20 @@ def _print_full_evidence(data: dict) -> None:
     print("--- end ---")
 
 
-def _prompt_for_text(prompt: str) -> str:
-    """Read a non-empty single-line input. Loop until non-empty."""
+def _prompt_for_text(prompt: str) -> Optional[str]:
+    """Read a non-empty single-line input. Loop until non-empty.
+
+    Returns None on EOF (Ctrl-D, closed stdin). Caller MUST treat None
+    as cancel — do NOT pass an empty string to graduate.py / reject.py.
+    Codex 2026-05-05 P2: previously returned "" on EOF, caller invoked
+    graduate.py with --rationale "" (argparse accepts it), candidate
+    moved without required rationale → defeated the no-auto-decide
+    contract by another route. Now EOF here = no decision applied."""
     while True:
         try:
             text = input(prompt).strip()
         except EOFError:
-            return ""
+            return None
         if text:
             return text
         print("  (required, try again)")
@@ -155,47 +162,23 @@ def _apply_reject(brain: Path, namespace: str, cid: str, reason: str) -> bool:
     return True
 
 
-def main(argv: Optional[list[str]] = None) -> int:
-    p = argparse.ArgumentParser(prog="triage_candidates",
-                                 description=__doc__.split("\n")[0])
-    p.add_argument("--brain", default=None)
-    p.add_argument("--namespace", default="default",
-                   help="default | claude-sessions | codex (default: default)")
-    args = p.parse_args(argv)
+_NAMESPACES = ("default", "claude-sessions", "codex")
 
-    brain = _resolve_brain(args.brain)
-    candidates_dir = _candidate_dir(brain, args.namespace)
 
-    # CRITICAL: refuse to run if stdin isn't interactive. This is the
-    # structural enforcement of "user decides per candidate" — without
-    # a TTY, there's no user to prompt. If Claude is calling this via
-    # the Bash tool without a PTY, we exit with a clear message rather
-    # than blocking on input() (which would either hang or read an
-    # empty line and treat it as "skip", neither of which is right).
-    if not sys.stdin.isatty():
-        sys.stderr.write(
-            "triage_candidates: stdin is not a TTY. This tool requires an "
-            "interactive terminal so the user can decide per candidate.\n"
-            "\n"
-            "If you're an AI assistant: tell the user to open their terminal\n"
-            "and run `recall pending --review` themselves. Do NOT call\n"
-            "graduate.py or reject.py on their behalf without per-candidate\n"
-            "explicit consent.\n"
-        )
-        return 2
-
-    candidates = _list_candidates(candidates_dir)
+def _triage_one_namespace(brain: Path, namespace: str) -> tuple[dict, bool]:
+    """Run the interactive REPL over one namespace's candidates queue.
+    Returns (decisions_counts_dict, quit_requested_bool)."""
+    candidates = _list_candidates(_candidate_dir(brain, namespace))
+    decisions = {"graduated": 0, "rejected": 0, "skipped": 0}
     if not candidates:
-        print(f"triage: no staged candidates in {candidates_dir}")
-        return 0
+        return decisions, False
 
-    print(f"triage: {len(candidates)} staged candidate(s) in namespace={args.namespace}")
+    print()
+    print(f"triage: {len(candidates)} staged candidate(s) in namespace={namespace}")
     print(f"        commands: g=graduate r=reject s=skip e=evidence q=quit")
     print(f"        each decision requires an explicit keyboard input.")
 
-    decisions = {"graduated": 0, "rejected": 0, "skipped": 0}
     quit_requested = False
-
     for idx, path in enumerate(candidates):
         if quit_requested:
             break
@@ -226,27 +209,94 @@ def main(argv: Optional[list[str]] = None) -> int:
 
             if choice in ("e", "evidence"):
                 _print_full_evidence(data)
-                # Re-prompt — `e` is non-terminal
-                continue
+                continue  # re-prompt
 
             if choice in ("g", "graduate"):
                 rationale = _prompt_for_text("  rationale (required): ")
-                if _apply_graduate(brain, args.namespace, cid, rationale):
+                if rationale is None:
+                    print("  (cancelled — no decision applied; quitting)")
+                    quit_requested = True
+                    break
+                if _apply_graduate(brain, namespace, cid, rationale):
                     decisions["graduated"] += 1
                 break
 
             if choice in ("r", "reject"):
                 reason = _prompt_for_text("  reason (required): ")
-                if _apply_reject(brain, args.namespace, cid, reason):
+                if reason is None:
+                    print("  (cancelled — no decision applied; quitting)")
+                    quit_requested = True
+                    break
+                if _apply_reject(brain, namespace, cid, reason):
                     decisions["rejected"] += 1
                 break
 
             print(f"  unknown choice: {choice!r}. Try g / r / s / e / q.")
 
+    return decisions, quit_requested
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    p = argparse.ArgumentParser(prog="triage_candidates",
+                                 description=__doc__.split("\n")[0])
+    p.add_argument("--brain", default=None)
+    p.add_argument(
+        "--namespace", default=None,
+        help=("default | claude-sessions | codex. If omitted, triage walks "
+              "ALL namespaces with pending candidates in turn."),
+    )
+    args = p.parse_args(argv)
+
+    brain = _resolve_brain(args.brain)
+
+    # CRITICAL: refuse to run if stdin isn't interactive. This is the
+    # structural enforcement of "user decides per candidate". Codex
+    # 2026-05-04 bug: previously, an AI assistant calling this via Bash
+    # tool without a PTY would either hang or treat the empty stdin as
+    # "skip" — both wrong. Exit 2 with explicit instructions instead.
+    if not sys.stdin.isatty():
+        sys.stderr.write(
+            "triage_candidates: stdin is not a TTY. This tool requires an "
+            "interactive terminal so the user can decide per candidate.\n"
+            "\n"
+            "If you're an AI assistant: tell the user to open their terminal\n"
+            "and run `recall pending --review` themselves. Do NOT call\n"
+            "graduate.py or reject.py on their behalf without per-candidate\n"
+            "explicit consent.\n"
+        )
+        return 2
+
+    # Determine which namespaces to walk. With no --namespace, iterate
+    # default + claude-sessions + codex (Codex 2026-05-05 P2: previously
+    # only default was scanned, so claude-sessions/codex pending counts
+    # in the summary couldn't be triaged through the advertised command).
+    if args.namespace:
+        namespaces_to_walk = [args.namespace]
+    else:
+        # Auto: walk every namespace that has pending candidates
+        namespaces_to_walk = [
+            ns for ns in _NAMESPACES
+            if _list_candidates(_candidate_dir(brain, ns))
+        ]
+
+    if not namespaces_to_walk:
+        print(f"triage: no staged candidates in any namespace under {brain}")
+        return 0
+
+    totals = {"graduated": 0, "rejected": 0, "skipped": 0}
+    early_quit = False
+    for ns in namespaces_to_walk:
+        if early_quit:
+            print(f"triage: skipping namespace={ns} (user quit earlier)")
+            continue
+        decisions, early_quit = _triage_one_namespace(brain, ns)
+        for k, v in decisions.items():
+            totals[k] += v
+
     print()
-    print(f"triage: graduated={decisions['graduated']} "
-          f"rejected={decisions['rejected']} skipped={decisions['skipped']}"
-          + (" (quit early)" if quit_requested else ""))
+    print(f"triage: total graduated={totals['graduated']} "
+          f"rejected={totals['rejected']} skipped={totals['skipped']}"
+          + (" (quit early)" if early_quit else ""))
     return 0
 
 

@@ -72,12 +72,19 @@ _NOISE_SUBSTRINGS = (
 
 
 def _is_noise_evidence(eid: str) -> bool:
-    """One evidence_id is noise if it's a path under a tmp/sandbox prefix
-    OR contains a test/smoke/sandbox substring. Bare ISO timestamps are
-    never noise (they're the live-hook capture format)."""
+    """One evidence_id (or claim/conditions blob) is noise if it contains
+    a tmp/sandbox path prefix OR a test/smoke/sandbox substring. Bare ISO
+    timestamps are never noise (they're the live-hook capture format).
+
+    Codex 2026-05-05 P2: the path-prefix check used to be `startswith()`,
+    which missed claims like "Command failed: cd /tmp/brainstack-run"
+    (path is mid-string, not at the start). Switched to substring match
+    so embedded tmp paths in claim text are caught. The user-facing
+    consequence is that test-fixture clusters with /tmp/ in the claim
+    string are now filtered from the top-5 review list."""
     if not isinstance(eid, str):
         return False
-    if eid.startswith(_NOISE_PATH_PREFIXES):
+    if any(prefix in eid for prefix in _NOISE_PATH_PREFIXES):
         return True
     if any(sub in eid for sub in _NOISE_SUBSTRINGS):
         return True
@@ -183,11 +190,24 @@ def _load_candidates(brain_root: Path) -> list[tuple[str, dict]]:
 # ---------- sync staleness -------------------------------------------
 
 
+_SYNC_BLOCKED_MARKERS = (
+    # sync.sh writes one of these lines when push is blocked OR fails
+    "refusing to push",
+    "push failed",
+    "commit blocked",
+    "trufflehog flagged",
+)
+
+
 def _check_sync_status(brain_root: Path) -> str:
     """Return 'ok', 'stale', 'blocked', or 'missing'.
 
     - missing: sync.log doesn't exist (sync never ran)
-    - blocked: last meaningful line says 'refusing to push' (TruffleHog hit)
+    - blocked: last meaningful line indicates push failed or was refused
+      (Codex 2026-05-05 P2: the parser used to match only "refusing to
+      push", so "commit succeeded but push failed..." and "commit blocked..."
+      were silently classified as ok until the log went stale. All
+      sync.sh failure markers are now matched.)
     - stale: last sync line is > 2 hours old
     - ok: otherwise
     """
@@ -199,7 +219,7 @@ def _check_sync_status(brain_root: Path) -> str:
     except OSError:
         return "missing"
     tail_lines = [ln for ln in text.splitlines()[-100:] if "sync:" in ln]
-    if tail_lines and "refusing to push" in tail_lines[-1]:
+    if tail_lines and any(m in tail_lines[-1] for m in _SYNC_BLOCKED_MARKERS):
         return "blocked"
     try:
         mtime = log.stat().st_mtime

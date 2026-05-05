@@ -213,6 +213,84 @@ class TestRenderPendingSummary:
         )
         assert rps._is_noise_cluster(cand) is True
 
+    def test_noise_filter_catches_tmp_path_mid_claim(self):
+        """Codex 2026-05-05 P2: the path-prefix check used .startswith(),
+        so a claim like 'Command failed: cd /tmp/brainstack-run' (where
+        /tmp/ is mid-string, not at the start) wasn't caught. Now uses
+        substring match; tmp paths anywhere in the claim are noise."""
+        rps = self._import()
+        cand = _make_candidate(
+            "embedded_tmp",
+            claim="Command failed: cd /tmp/brainstack-run-xyz && make test",
+            evidence_ids=["2026-05-01T10:00:00+00:00"],
+        )
+        assert rps._is_noise_cluster(cand) is True
+
+
+class TestSyncStatusParser:
+    """Codex 2026-05-05 P2: _check_sync_status used to only match
+    'refusing to push' as a blocked marker. Other failure markers that
+    sync.sh writes — 'commit succeeded but push failed', 'commit blocked',
+    'trufflehog flagged' — were silently classified as 'ok' until the
+    log went stale (>2h). Tests pin all the markers."""
+
+    def _import(self):
+        import importlib
+        import render_pending_summary
+        importlib.reload(render_pending_summary)
+        return render_pending_summary
+
+    def _seed_log(self, brain: Path, last_lines: list[str]) -> None:
+        """Write a sync.log whose tail is the given lines, fresh mtime."""
+        log = brain / "sync.log"
+        log.write_text("\n".join(last_lines) + "\n")
+        # Force fresh mtime so it doesn't get classified as stale
+        import time
+        os.utime(log, (time.time(), time.time()))
+
+    def test_classifies_push_failed_as_blocked(self, tmp_path: Path):
+        rps = self._import()
+        self._seed_log(tmp_path, [
+            "2026-05-05T13:00:00Z sync: commit succeeded but push failed; "
+            "brain is committed locally",
+        ])
+        assert rps._check_sync_status(tmp_path) == "blocked"
+
+    def test_classifies_commit_blocked_as_blocked(self, tmp_path: Path):
+        rps = self._import()
+        self._seed_log(tmp_path, [
+            "2026-05-05T13:00:00Z sync: commit blocked (likely by redact "
+            "pre-commit hook)",
+        ])
+        assert rps._check_sync_status(tmp_path) == "blocked"
+
+    def test_classifies_trufflehog_flagged_as_blocked(self, tmp_path: Path):
+        rps = self._import()
+        self._seed_log(tmp_path, [
+            "2026-05-05T13:00:00Z sync: trufflehog flagged secrets; "
+            "refusing to push",
+        ])
+        assert rps._check_sync_status(tmp_path) == "blocked"
+
+    def test_classifies_pushed_as_ok(self, tmp_path: Path):
+        rps = self._import()
+        self._seed_log(tmp_path, [
+            "2026-05-05T13:00:00Z sync: pushed",
+        ])
+        assert rps._check_sync_status(tmp_path) == "ok"
+
+    def test_classifies_no_changes_as_ok(self, tmp_path: Path):
+        rps = self._import()
+        self._seed_log(tmp_path, [
+            "2026-05-05T13:00:00Z sync: no changes",
+        ])
+        assert rps._check_sync_status(tmp_path) == "ok"
+
+    def test_missing_log_returns_missing(self, tmp_path: Path):
+        rps = self._import()
+        # No sync.log at all
+        assert rps._check_sync_status(tmp_path) == "missing"
+
     def test_full_render_against_live_shaped_fixtures(self, tmp_path: Path):
         """Mid-tier integration check: feed the renderer 5 candidates that
         mirror the on-disk shape from the maintainer's live brain (bare
@@ -750,6 +828,88 @@ class TestTriageCandidates:
         out, err = proc.communicate(timeout=10)
         assert proc.returncode == 0
         assert "no staged candidates" in out
+
+    def test_eof_at_rationale_does_not_apply_decision(self, tmp_path: Path):
+        """Codex 2026-05-05 P2: previously, EOF at the rationale prompt
+        (Ctrl-D after pressing 'g') caused _prompt_for_text to return ''
+        and graduate.py to be invoked with --rationale ''. argparse
+        accepts the empty value, so the candidate moved without a
+        rationale, defeating the no-auto-decide contract by another route.
+
+        Fix: EOF at rationale → return None → caller treats as cancel.
+        Pin: type 'g\\n' then EOF; assert graduated=0 and candidate
+        stays staged."""
+        cdir = tmp_path / "memory" / "candidates"
+        cdir.mkdir(parents=True)
+        c = {
+            "id": "test02", "key": "k", "name": "n", "claim": "c",
+            "conditions": [], "evidence_ids": ["t"], "cluster_size": 1,
+            "canonical_salience": 1.0, "staged_at": "t", "status": "staged",
+            "decisions": [], "rejection_count": 0,
+        }
+        (cdir / "test02.json").write_text(json.dumps(c))
+
+        import pty
+        master, slave = pty.openpty()
+        proc = subprocess.Popen(
+            [sys.executable, str(self.SCRIPT_PATH), "--brain", str(tmp_path),
+             "--namespace", "default"],
+            stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        # User presses 'g' at the choice prompt — moves to rationale prompt
+        os.write(master, b"g\n")
+        # Then EOF (Ctrl-D) at rationale prompt
+        os.close(master)
+        os.close(slave)
+        out, err = proc.communicate(timeout=10)
+
+        # Critical: NO graduate decision applied
+        assert "graduated=0" in out, (
+            f"EOF at rationale led to a graduate call: {out}"
+        )
+        assert "rejected=0" in out
+        # Candidate must still be staged on disk
+        cand = json.loads((cdir / "test02.json").read_text())
+        assert cand["status"] == "staged"
+
+    def test_iterates_namespaces_with_pending(self, tmp_path: Path):
+        """Codex 2026-05-05 P2: when default is empty but claude-sessions
+        has pending, `recall pending --review` (which exec's this tool)
+        used to say 'no staged candidates' because it only scanned
+        default. Fix: walk all three namespaces; visit only those with
+        pending. Pin by seeding claude-sessions only and verifying the
+        triage banner mentions claude-sessions."""
+        # Empty default
+        (tmp_path / "memory" / "candidates").mkdir(parents=True)
+        # Seed claude-sessions
+        cs_dir = tmp_path / "memory" / "candidates" / "claude-sessions"
+        cs_dir.mkdir(parents=True)
+        c = {
+            "id": "cs01", "key": "k", "name": "n", "claim": "c",
+            "conditions": [], "evidence_ids": ["t"], "cluster_size": 1,
+            "canonical_salience": 1.0, "staged_at": "t", "status": "staged",
+            "decisions": [], "rejection_count": 0,
+        }
+        (cs_dir / "cs01.json").write_text(json.dumps(c))
+
+        import pty
+        master, slave = pty.openpty()
+        proc = subprocess.Popen(
+            [sys.executable, str(self.SCRIPT_PATH), "--brain", str(tmp_path)],
+            # No --namespace → auto-iterate
+            stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        # User immediately quits — we just want to confirm the tool found
+        # the claude-sessions namespace
+        os.write(master, b"q\n")
+        os.close(master)
+        os.close(slave)
+        out, err = proc.communicate(timeout=10)
+
+        # Output must mention claude-sessions (the namespace it found)
+        assert "claude-sessions" in out, (
+            f"triage didn't iterate to claude-sessions: {out}"
+        )
 
     def test_no_auto_decision_without_explicit_keyboard_input(self, tmp_path: Path):
         """The structural guarantee: no graduate.py / reject.py call ever

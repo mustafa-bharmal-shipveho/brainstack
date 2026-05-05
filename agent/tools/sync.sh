@@ -201,6 +201,11 @@ git add -A
 # Anything to commit?
 if git diff --cached --quiet; then
     echo "$(date -u +%FT%TZ) sync: no changes" >> "$LOG_FILE"
+    # Refresh after writing the final log line so PENDING_REVIEW.md picks
+    # up the new "ok" sync status — without this, a previous "blocked" /
+    # "stale" warning persists until some other render trigger fires
+    # (Codex 2026-05-05 P2).
+    _refresh_pending_summary
     exit 0
 fi
 
