@@ -347,6 +347,92 @@ class TestMiscAdapterSourceDiscovery:
                 f"ai-tracking re-added: {src} — opaque SQLite with 77 high-entropy hits"
             )
 
+    def test_extra_sources_config_unions_with_defaults(self, tmp_path: Path,
+                                                       monkeypatch):
+        """`<brain>/imports/extra_sources.txt` adds user-defined sources to
+        the default list without replacing them. Comments and blank lines
+        are skipped; malformed lines are warned about and ignored."""
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+
+        brain = tmp_path / "brain"
+        (brain / "imports").mkdir(parents=True)
+        config = brain / "imports" / "extra_sources.txt"
+        config.write_text(
+            "# Personal notes\n"
+            "\n"
+            "~/Documents/My Notes=kb/personal\n"
+            "  ~/Other=kb/other  \n"
+            "no-equals-line\n"
+            "=missing-src\n"
+            "/abs/path=\n"
+        )
+
+        sources = cma._build_default_sources(brain)
+        # Defaults still present (sample one)
+        assert any(d == "claude/CLAUDE.md" for _, d in sources)
+        # Extras appended
+        srcs_dsts = [(s, d) for s, d in sources]
+        assert ("~/Documents/My Notes", "kb/personal") in srcs_dsts
+        assert ("~/Other", "kb/other") in srcs_dsts
+        # Malformed lines were skipped
+        assert not any(d == "missing-src" for _, d in sources)
+        assert not any(s == "no-equals-line" for s, _ in sources)
+        assert not any(s == "/abs/path" and d == "" for s, d in sources)
+
+    def test_extra_sources_missing_config_is_no_op(self, tmp_path: Path,
+                                                    monkeypatch):
+        """When extra_sources.txt is absent, the source list is unchanged
+        — no exception, no warning."""
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+
+        brain = tmp_path / "brain"
+        brain.mkdir()
+        # No imports/extra_sources.txt file
+        sources_with = cma._build_default_sources(brain)
+        sources_without = cma._build_default_sources()
+        assert sources_with == sources_without
+
+    def test_extra_sources_rejects_path_traversal_in_dst(self, tmp_path: Path,
+                                                         monkeypatch, capsys):
+        """A line like SRC=../../outside must NOT be returned — the misc
+        adapter joins DST with <brain>/imports/, so traversal silently
+        writes outside the brain on every hourly sync. Codex 2026-05-05 P2."""
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+
+        brain = tmp_path / "brain"
+        (brain / "imports").mkdir(parents=True)
+        config = brain / "imports" / "extra_sources.txt"
+        config.write_text(
+            "~/safe=kb/safe\n"
+            "~/escape=../../outside\n"
+            "~/abs=/etc/secrets\n"
+            "~/dotdot=..\n"
+            "~/embedded=kb/foo/../../etc\n"
+            "~/empty=\n"
+            "~/null=kb/foo\x00bar\n"
+        )
+        sources = cma._read_extra_sources(brain)
+        # Only the safe entry survives
+        assert sources == [("~/safe", "kb/safe")]
+
+    def test_is_safe_dst_sub_unit(self):
+        """Direct unit test for the DST validator — pin its semantics so a
+        future refactor doesn't accidentally widen what's accepted."""
+        accepts = ["kb/foo", "kb/team-a/notes", "personal_notes",
+                   "kb/v1.2", "kb-with-dots.txt"]
+        rejects = ["", "..", "../foo", "kb/../foo", "/abs", "kb/foo/..",
+                   "foo\x00bar"]
+        for d in accepts:
+            assert cma._is_safe_dst_sub(d), f"should accept {d!r}"
+        for d in rejects:
+            assert not cma._is_safe_dst_sub(d), f"should reject {d!r}"
+
 
 class TestMiscAdapterIncremental:
     def test_unchanged_file_is_skipped_on_rerun(self, tmp_path: Path):

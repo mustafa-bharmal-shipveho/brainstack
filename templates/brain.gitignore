@@ -42,3 +42,9 @@ Thumbs.db
 # tick. Cross-machine sync would cause churn (each machine would race to
 # overwrite). Local-only by design.
 PENDING_REVIEW.md
+
+# Obsidian per-machine config — created when the user opens <brain>/memory/
+# (or any subtree) as a vault. Contains workspace layout, installed
+# plugins, hotkeys, and graph state, all of which are machine-specific.
+# Syncing across machines would cause noisy conflicts.
+.obsidian/

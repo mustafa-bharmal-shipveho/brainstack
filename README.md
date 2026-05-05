@@ -177,6 +177,7 @@ Empty days produce a one-liner (`✅ all clear`) which all three surfaces suppre
 ```bash
 ./install.sh --remove-cursor-rules     # strips sentinel block from .cursorrules
 ./install.sh --remove-shell-banner     # strips source line from ~/.zshrc + removes script
+./install.sh --remove-source <key>     # drop a custom input source (mirror data preserved)
 # For the SessionStart hook: edit ~/.claude/settings.json and remove the entry
 ```
 
@@ -214,6 +215,34 @@ The SessionStart hook injects `PENDING_REVIEW.md` content into Claude Code's con
 | Codex CLI | `~/.codex/sessions/...`, `~/.codex/history.jsonl` | hourly `--setup-auto-migrate` LaunchAgent |
 
 So Claude Code memory is in the brain immediately; Cursor and Codex entries arrive on the next hourly tick. All three end up in the same `~/.agent/memory/` tree and feed the same nightly dream cycle.
+
+### Adding your own input sources
+
+Beyond the three auto-detected AI tools, brainstack can mirror any folder on disk into the brain on the same hourly schedule. Use this for hand-curated knowledge bases, Obsidian vaults, team notes, anything you want available to retrieval and synced to your private brain remote.
+
+```bash
+# Register a folder. Auto-derives a destination namespace from the basename.
+./install.sh --add-source ~/Documents/Product\ &\ Tech\ Knowledge\ Base
+# → kb/product-tech-knowledge-base
+
+# Or pass an explicit destination.
+./install.sh --add-source ~/Documents/Engineering-Notes --as kb/eng-notes
+
+# Inspect / remove
+./install.sh --list-sources
+./install.sh --remove-source kb/eng-notes        # match by SRC path or DST
+```
+
+Each source mirrors to `~/.agent/imports/<DST_SUB>/`. Backfill is instant for the first run; after that the existing hourly `claude-extras` LaunchAgent handles incremental updates (mtime-based — O(N) stat-only when nothing changed). No new schedule, no new daemon.
+
+Storage is a plain text file at `~/.agent/imports/extra_sources.txt` — one `SRC=DST_SUB` per line, `#` comments allowed. Edit by hand if you prefer. Same config-driven pattern as `wrapped_tools` for the shell banner: framework, not hardcode.
+
+```bash
+# Backfill immediately after adding a source (otherwise it lands on the next hourly tick)
+python3 ~/.agent/tools/claude_misc_adapter.py
+```
+
+Mirrored content **is committed and pushed to your private second-brain remote by default** — that's the point: edits on machine A are available on machine B after the next sync. To keep a particular source local-only, add its destination to `~/.agent/.gitignore` (e.g. `imports/kb/private-notes/`) before the next hourly tick. Everything passes through the same redaction layer (`redact_jsonl.redact_string`) before being written to the brain, so accidentally-pasted secrets in your notes are scrubbed; trufflehog/gitleaks runs on the staged tree before each push as a second gate.
 
 ### How we measure storage reliability
 
