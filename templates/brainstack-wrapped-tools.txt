@@ -1,0 +1,30 @@
+# brainstack: wrapped-tool list for the shell banner.
+#
+# One tool name per line. Each tool gets a shell wrapper function that
+# prints ~/.agent/PENDING_REVIEW.md before exec'ing the real binary.
+# Lines starting with # are comments. Blank lines are ignored.
+#
+# Adding a new LLM CLI: just append the binary name. Re-source the
+# banner (`source ~/.zshrc`) or open a fresh shell to pick it up.
+# No code change needed; the shell banner reads this file at source-time.
+#
+# Removing a tool: comment it out or delete the line.
+#
+# Default set covers the major AI CLIs as of 2026-05. Add yours.
+
+# Code agents
+claude
+codex
+cursor
+aider
+
+# IDE/editor agents (CLI launchers — the GUI launches bypass shell wrappers,
+# so these only fire when invoked from a terminal)
+continue
+
+# Local + provider clients
+gemini
+ollama
+llm
+
+# Add your own AI CLI below

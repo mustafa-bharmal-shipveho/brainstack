@@ -90,6 +90,24 @@ fi
 
 cd "$BRAIN_ROOT"
 
+# Reusable refresh helper — called both before AND after the sync. The
+# pre-sync call refreshes the candidate count for surfaces; the post-sync
+# call updates the sync-status field after we've written the final log
+# line (so a successful push clears a stale "blocked"/"stale" warning that
+# was true at the start of the run — Codex 2026-05-04 P2).
+_refresh_pending_summary() {
+    if [ -f "$BRAIN_ROOT/tools/render_pending_summary.py" ]; then
+        PYTHON_BIN_FOR_RENDER="${PYTHON_BIN:-python3}"
+        if command -v "$PYTHON_BIN_FOR_RENDER" >/dev/null 2>&1; then
+            "$PYTHON_BIN_FOR_RENDER" "$BRAIN_ROOT/tools/render_pending_summary.py" \
+                --brain "$BRAIN_ROOT" 2>/dev/null || true
+        fi
+    fi
+}
+
+# Pre-sync refresh: candidate counts (drift, sync stat) before scrubbing
+_refresh_pending_summary
+
 # ---- Sync-time JSONL scrubber (overwrites secrets in episodic JSONL) ----
 JSONL_SCRUBBER="$BRAIN_ROOT/tools/redact_jsonl.py"
 if [ -x "$JSONL_SCRUBBER" ] || [ -f "$JSONL_SCRUBBER" ]; then
@@ -183,6 +201,11 @@ git add -A
 # Anything to commit?
 if git diff --cached --quiet; then
     echo "$(date -u +%FT%TZ) sync: no changes" >> "$LOG_FILE"
+    # Refresh after writing the final log line so PENDING_REVIEW.md picks
+    # up the new "ok" sync status — without this, a previous "blocked" /
+    # "stale" warning persists until some other render trigger fires
+    # (Codex 2026-05-05 P2).
+    _refresh_pending_summary
     exit 0
 fi
 
@@ -193,9 +216,17 @@ if git commit -q -m "auto: $TS" 2>>"$LOG_FILE"; then
         echo "$TS sync: pushed" >> "$LOG_FILE"
     else
         echo "$TS sync: commit succeeded but push failed; brain is committed locally" >> "$LOG_FILE"
+        # Refresh after writing the final log line so PENDING_REVIEW.md
+        # reflects the new "blocked" / "stale" state (Codex 2026-05-04 P2).
+        _refresh_pending_summary
         exit 1
     fi
 else
     echo "$TS sync: commit blocked (likely by redact pre-commit hook)" >> "$LOG_FILE"
+    _refresh_pending_summary
     exit 1
 fi
+
+# Post-sync refresh on success — clears any stale "blocked"/"stale"
+# warning from the previous run by re-reading the now-updated sync.log.
+_refresh_pending_summary

@@ -122,6 +122,70 @@ every tick. To audit on demand:
 
 ---
 
+## Knowing what to review
+
+The dream cycle clusters episodes into candidate lessons in `~/.agent/memory/candidates/`. Until you triage them (graduate or reject), they sit there silently. Without surfacing, real work piles up: on the maintainer's brain on 2026-05-04, **21 candidates had been pending for 3 days before anyone noticed**.
+
+Brainstack now generates `~/.agent/PENDING_REVIEW.md` on every dream cycle, sync, graduate, or reject — and surfaces it through three native injection points so you see the count whenever you start a session:
+
+| Surface | Setup | Where you see it |
+|---|---|---|
+| Claude Code `@`-import in `~/.claude/CLAUDE.md` | `./install.sh --setup-pending-hook` | Auto-loaded under the `# claudeMd` section of every Claude Code session's system prompt — same mechanism as your existing CLAUDE.md |
+| Cursor `~/.cursor/.cursorrules` | `./install.sh --setup-cursor-rules` | Cursor injects the rules file on every chat session |
+| Shell wrappers (any AI CLI in `~/.agent/banner/wrapped_tools`) | `./install.sh --setup-shell-banner` | Cat'd to stdout when you launch any of those tools from a terminal |
+
+**Why @-import, not a SessionStart hook?** I tried both — registered a `SessionStart` hook in `~/.claude/settings.json` that emits the JSON envelope `{"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "..."}}`. The hook ran cleanly when invoked manually, but Claude Code's SessionStart contract on this build appears to be telemetry-only (stdout doesn't inject context). The user opened a fresh session twice with the hook registered and saw nothing. Switched to `@`-import — Claude Code's documented session-load mechanism — and it works because it's the same path your existing `~/.claude-org/CLAUDE.md` import takes.
+
+All three read the same `PENDING_REVIEW.md`. The file is generated locally and gitignored — never synced to your private brain remote.
+
+**Framework, not point-solution.** The shell banner wraps any AI CLI listed in `~/.agent/banner/wrapped_tools` — one tool name per line, `#` comments allowed. Default set covers `claude`, `codex`, `cursor`, `aider`, `continue`, `gemini`, `ollama`, `llm`. Adding a new LLM is a one-line edit; re-source `~/.zshrc` to apply. No code change. The Cursor `.cursorrules` and Claude SessionStart paths similarly rely on each tool's own native injection mechanism — when a new AI tool ships hooks/rules support, brainstack adds an adapter rather than reinventing the surface.
+
+```bash
+# Add a new AI CLI to the shell wrappers
+echo "my-new-llm" >> ~/.agent/banner/wrapped_tools
+source ~/.zshrc                              # re-source to pick it up
+type my-new-llm                              # confirm wrapper defined
+```
+
+One-shot setup of all three surfaces:
+
+```bash
+./install.sh --setup-pending-review-all      # Claude SessionStart + Cursor + shell wrappers
+./install.sh --remove-pending-review-all     # tear down all three
+```
+
+```bash
+# View the summary on demand
+recall pending                  # print current summary
+recall pending --refresh        # force regenerate first
+recall pending --review         # interactive triage flow
+
+# Manual regeneration (also runs automatically on dream/graduate/reject/sync)
+python ~/.agent/tools/render_pending_summary.py
+```
+
+The summary includes:
+- pending candidate counts per namespace (default / claude-sessions / codex)
+- top 5 candidates by signal (after a noise filter that rejects test-infra clusters — `/tmp/`, sandbox paths, `FAILED (secret)` patterns)
+- drift status (via `check_freshness`)
+- sync staleness (sync.log mtime > 2h or last-line "refusing to push")
+
+Empty days produce a one-liner (`✅ all clear`) which all three surfaces suppress, so a healthy brain produces zero session-start noise.
+
+### Tearing it down
+
+```bash
+./install.sh --remove-cursor-rules     # strips sentinel block from .cursorrules
+./install.sh --remove-shell-banner     # strips source line from ~/.zshrc + removes script
+# For the SessionStart hook: edit ~/.claude/settings.json and remove the entry
+```
+
+### Security note
+
+The SessionStart hook injects `PENDING_REVIEW.md` content into Claude Code's context inside a `<system-reminder>` block. To prevent a project-level `.envrc` from poisoning `$HOME` or `$BRAIN_ROOT` and redirecting the hook to attacker-controlled content, the hook resolves the brain root from `__file__` (its own install path), not from environment variables. Tests pin this in `tests/test_render_pending.py::test_resolves_brain_from_file_not_env`.
+
+---
+
 ## Storage: capture, distill, graduate
 
 ```

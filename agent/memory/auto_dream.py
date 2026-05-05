@@ -269,6 +269,34 @@ def _heuristic_prefilter(candidates_dir, semantic_dir):
     return rejected
 
 
+def _refresh_pending_summary(brain_root=None):
+    """Best-effort regeneration of <brain>/PENDING_REVIEW.md after the
+    dream cycle changes the candidate set. Called at the end of both
+    run_dream_cycle() and run(). NEVER raises — any failure is swallowed
+    so it can't break the dream cycle.
+
+    Wired here (vs only in sync.sh) so the user's surfaces (Claude Code
+    SessionStart hook, Cursor rules, shell banner) reflect the new
+    candidate set within seconds of dreaming, not on the next hourly tick.
+    """
+    try:
+        if brain_root is None:
+            brain_root = _resolve_brain_root(None)
+        # Lazy import — render_pending_summary lives in tools/, not memory/.
+        # Path insertion is the same pattern dream_runner.py uses.
+        import sys as _sys
+        tools_dir = os.path.join(brain_root, "tools")
+        if tools_dir not in _sys.path:
+            _sys.path.insert(0, tools_dir)
+        try:
+            import render_pending_summary  # type: ignore
+            render_pending_summary.render(__import__("pathlib").Path(brain_root))
+        except Exception:
+            pass  # never fail the dream cycle on render failure
+    except Exception:
+        pass
+
+
 def run_dream_cycle():
     # Hold the lock across the FULL read-modify-write window. Any
     # append_jsonl() call from another harness blocks until we release.
@@ -283,6 +311,7 @@ def run_dream_cycle():
             # hides real work.
             pending = write_review_queue_summary(CANDIDATES, REVIEW_QUEUE)
             print(f"dream cycle: no entries (queue has {pending} pending)")
+            _refresh_pending_summary()
             return
 
         patterns = cluster_and_extract(entries, threshold=CLUSTER_SIMILARITY)
@@ -306,6 +335,7 @@ def run_dream_cycle():
         f"prefiltered_out={prefiltered} pending_review={pending} "
         f"archived={len(archived)} kept={len(kept)}"
     )
+    _refresh_pending_summary()
 
 
 def run(brain_root=None, namespace="default", dry_run=False):
@@ -347,6 +377,13 @@ def run(brain_root=None, namespace="default", dry_run=False):
                     write_review_queue_summary(candidates_dir, review_queue)
                 except Exception:
                     pass
+            # Even on the empty-entries early-return path, refresh
+            # PENDING_REVIEW.md — there may be staged candidates from a
+            # prior cycle (still pending review) whose drift/sync state
+            # changed. Without this the surfaces stay stale until the
+            # next hourly sync (Codex 2026-05-04 P2).
+            if not dry_run:
+                _refresh_pending_summary(brain_root)
             return result
 
         patterns = cluster_and_extract(entries, threshold=CLUSTER_SIMILARITY)
@@ -375,6 +412,7 @@ def run(brain_root=None, namespace="default", dry_run=False):
         result["rejected"] = prefiltered
         result["decayed"] = len(archived)
 
+    _refresh_pending_summary(brain_root)
     return result
 
 

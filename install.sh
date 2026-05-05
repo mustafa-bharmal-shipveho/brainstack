@@ -87,6 +87,54 @@ while [ $# -gt 0 ]; do
             MODE="remove-claude-extras"
             shift
             ;;
+        --setup-cursor-rules)
+            MODE="setup-cursor-rules"
+            shift
+            ;;
+        --remove-cursor-rules)
+            MODE="remove-cursor-rules"
+            shift
+            ;;
+        --setup-shell-banner)
+            MODE="setup-shell-banner"
+            shift
+            ;;
+        --remove-shell-banner)
+            MODE="remove-shell-banner"
+            shift
+            ;;
+        --setup-pending-hook)
+            MODE="setup-pending-hook"
+            shift
+            ;;
+        --remove-pending-hook)
+            MODE="remove-pending-hook"
+            shift
+            ;;
+        --setup-statusline)
+            MODE="setup-statusline"
+            shift
+            ;;
+        --remove-statusline)
+            MODE="remove-statusline"
+            shift
+            ;;
+        --setup-codex-agents-md)
+            MODE="setup-codex-agents-md"
+            shift
+            ;;
+        --remove-codex-agents-md)
+            MODE="remove-codex-agents-md"
+            shift
+            ;;
+        --setup-pending-review-all)
+            MODE="setup-pending-review-all"
+            shift
+            ;;
+        --remove-pending-review-all)
+            MODE="remove-pending-review-all"
+            shift
+            ;;
         --migrate)
             MODE="migrate"
             # Consume the source path only if the next arg is NOT another
@@ -609,6 +657,13 @@ if [ "$MODE" = "upgrade" ]; then
         printf "\n# Repo path pin — machine-local, do not sync\n.brainstack-repo-path\n" \
             >> "$BRAIN_ROOT/.gitignore"
     fi
+    # PENDING_REVIEW.md is regenerated locally on every dream/sync tick;
+    # cross-machine sync would cause churn.
+    if [ -f "$BRAIN_ROOT/.gitignore" ] && \
+       ! grep -qE "^PENDING_REVIEW\.md\s*$" "$BRAIN_ROOT/.gitignore"; then
+        printf "\n# Pending-review summary — regenerated locally\nPENDING_REVIEW.md\n" \
+            >> "$BRAIN_ROOT/.gitignore"
+    fi
     # Refresh the recall CLI symlink (idempotent; pip-installs into the venv
     # if the venv exists, otherwise creates it).
     if [ -x "$REPO_DIR/bin/install-recall-cli.sh" ]; then
@@ -690,6 +745,455 @@ if [ "$MODE" = "setup-claude-extras" ] || [ "$MODE" = "remove-claude-extras" ]; 
     exit 0
 fi
 
+# ----- Mode: setup-cursor-rules / remove-cursor-rules -----
+# Pushes <brain>/PENDING_REVIEW.md into ~/.cursor/.cursorrules between
+# brainstack-pending-{start,end} sentinels so Cursor surfaces the
+# pending-review summary on every chat session. Idempotent — re-running
+# replaces the bracketed section without disturbing other content.
+if [ "$MODE" = "setup-cursor-rules" ] || [ "$MODE" = "remove-cursor-rules" ]; then
+    if [ ! -d "$BRAIN_ROOT" ]; then
+        echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
+        exit 2
+    fi
+    cursor_dir="$HOME/.cursor"
+    cursorrules="$cursor_dir/.cursorrules"
+    if [ "$MODE" = "remove-cursor-rules" ]; then
+        if [ -f "$cursorrules" ]; then
+            "$PYTHON_BIN" - <<PYEOF
+from pathlib import Path
+p = Path("$cursorrules")
+text = p.read_text()
+START = "<!-- brainstack-pending-start -->"
+END = "<!-- brainstack-pending-end -->"
+if START in text and END in text:
+    s = text.index(START)
+    e = text.index(END) + len(END)
+    new = text[:s].rstrip() + "\n" + text[e:].lstrip()
+    p.write_text(new)
+    print("removed brainstack section from", p)
+else:
+    print("no brainstack section found in", p)
+PYEOF
+        else
+            echo "==> $cursorrules not found; nothing to remove."
+        fi
+        exit 0
+    fi
+
+    # setup-cursor-rules
+    if [ ! -d "$cursor_dir" ]; then
+        echo "install: $cursor_dir does not exist (Cursor not installed?). Skipping."
+        exit 0
+    fi
+    # Generate the summary first if it doesn't exist
+    if [ ! -f "$BRAIN_ROOT/PENDING_REVIEW.md" ]; then
+        "$PYTHON_BIN" "$BRAIN_ROOT/tools/render_pending_summary.py" \
+            --brain "$BRAIN_ROOT" 2>/dev/null || true
+    fi
+    "$PYTHON_BIN" "$BRAIN_ROOT/tools/render_cursor_rules.py" \
+        --brain "$BRAIN_ROOT" --cursor-dir "$cursor_dir"
+    echo "==> Cursor rules updated. Tear down with: ./install.sh --remove-cursor-rules"
+    exit 0
+fi
+
+# ----- Mode: setup-shell-banner / remove-shell-banner -----
+# Sources templates/brainstack-shell-banner.sh from the user's shell rc.
+# Defines wrapper functions for `claude`, `codex`, `cursor` that print
+# <brain>/PENDING_REVIEW.md before exec'ing the real binary. Idempotent
+# (sentinel-marked block in the rc file).
+if [ "$MODE" = "setup-shell-banner" ] || [ "$MODE" = "remove-shell-banner" ]; then
+    if [ ! -d "$BRAIN_ROOT" ]; then
+        echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
+        exit 2
+    fi
+    # Detect user's shell rc (zsh first; fall back to bash)
+    if [ -n "${ZSH_VERSION:-}" ] || [ "$(basename "${SHELL:-/bin/zsh}")" = "zsh" ]; then
+        rc="$HOME/.zshrc"
+    else
+        rc="$HOME/.bashrc"
+    fi
+    # Place the banner OUTSIDE $BRAIN_ROOT/tools/ — that path is
+    # `rsync --delete`-managed by --upgrade, which would wipe the banner
+    # on every upgrade and leave a dangling source line in ~/.zshrc
+    # (Codex 2026-05-04 P2). $BRAIN_ROOT/banner/ is a sibling dir,
+    # untouched by tool rsync.
+    banner_dir="$BRAIN_ROOT/banner"
+    banner_target="$banner_dir/brainstack-shell-banner.sh"
+    sentinel_start="# >>> brainstack-shell-banner >>>"
+    sentinel_end="# <<< brainstack-shell-banner <<<"
+
+    if [ "$MODE" = "remove-shell-banner" ]; then
+        if [ -f "$rc" ] && /usr/bin/grep -qF "$sentinel_start" "$rc"; then
+            "$PYTHON_BIN" - <<PYEOF
+from pathlib import Path
+p = Path("$rc")
+text = p.read_text()
+S = "$sentinel_start"
+E = "$sentinel_end"
+if S in text and E in text:
+    s = text.index(S)
+    e = text.index(E) + len(E)
+    # Trim surrounding whitespace
+    new = text[:s].rstrip() + "\n" + text[e:].lstrip()
+    if not new.endswith("\n"):
+        new += "\n"
+    p.write_text(new)
+    print("removed brainstack-shell-banner block from", p)
+PYEOF
+        else
+            echo "==> $rc has no brainstack-shell-banner block."
+        fi
+        rm -f "$banner_target"
+        echo "==> Shell banner removed."
+        exit 0
+    fi
+
+    # setup-shell-banner
+    mkdir -p "$banner_dir"
+    cp "$REPO_DIR/templates/brainstack-shell-banner.sh" "$banner_target"
+    chmod +x "$banner_target"
+    # Wrapped-tool list — config-driven so adding a new LLM is a one-line
+    # edit, not a code change (Mustafa 2026-05-04: "framework, not point
+    # solution"). Don't overwrite an existing user-curated list.
+    wrapped_tools_target="$banner_dir/wrapped_tools"
+    if [ ! -f "$wrapped_tools_target" ] && [ -f "$REPO_DIR/templates/brainstack-wrapped-tools.txt" ]; then
+        cp "$REPO_DIR/templates/brainstack-wrapped-tools.txt" "$wrapped_tools_target"
+        echo "==> Default wrapped-tool list seeded at $wrapped_tools_target"
+        echo "    (edit to add/remove LLMs; re-source ~/.zshrc to apply)"
+    fi
+    if [ -f "$rc" ] && /usr/bin/grep -qF "$sentinel_start" "$rc"; then
+        echo "==> $rc already sources the shell banner."
+    else
+        {
+            echo ""
+            echo "$sentinel_start"
+            echo "[ -f \"$banner_target\" ] && source \"$banner_target\""
+            echo "$sentinel_end"
+        } >> "$rc"
+        echo "==> Appended source line to $rc."
+    fi
+    echo "==> Shell banner installed. Run \`source $rc\` or open a new shell."
+    echo "    Tear down with:  ./install.sh --remove-shell-banner"
+    exit 0
+fi
+
+# ----- Mode: setup-pending-hook / remove-pending-hook -----
+# Wires Claude Code to surface <brain>/PENDING_REVIEW.md at every
+# session start by appending a sentinel-bracketed `@`-import to
+# ~/.claude/CLAUDE.md.
+#
+# History: an earlier iteration of this mode registered a SessionStart
+# hook in settings.json. That hook ran cleanly but Claude Code's
+# SessionStart contract on this build is telemetry-only — stdout (raw
+# OR JSON-enveloped) does NOT inject context. The user opened a fresh
+# Claude session twice and saw nothing. Switched to CLAUDE.md @-import
+# which IS the documented session-start injection mechanism (the user's
+# CLAUDE.md already uses @-import for the org-level instructions).
+#
+# As a side effect, --remove-pending-hook also strips any leftover
+# SessionStart entry tagged with our sentinel (cleans up post-upgrade
+# from the prior iteration).
+if [ "$MODE" = "setup-pending-hook" ] || [ "$MODE" = "remove-pending-hook" ]; then
+    if [ ! -d "$BRAIN_ROOT" ]; then
+        echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
+        exit 2
+    fi
+    claude_dir="$HOME/.claude"
+    if [ ! -d "$claude_dir" ]; then
+        echo "install: $claude_dir not found (Claude Code not installed?). Skipping."
+        exit 0
+    fi
+    claude_md="$claude_dir/CLAUDE.md"
+    settings="$claude_dir/settings.json"
+    sentinel_start="<!-- brainstack-pending-review-start -->"
+    sentinel_end="<!-- brainstack-pending-review-end -->"
+    pending_path="$BRAIN_ROOT/PENDING_REVIEW.md"
+    legacy_hook_sentinel="# brainstack-pending-review"
+
+    if [ "$MODE" = "remove-pending-hook" ]; then
+        # 1. Strip the @-import block from CLAUDE.md (current mechanism)
+        if [ -f "$claude_md" ]; then
+            "$PYTHON_BIN" - "$claude_md" "$sentinel_start" "$sentinel_end" <<'PYEOF'
+import sys
+from pathlib import Path
+p, S, E = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+text = p.read_text()
+if S in text and E in text:
+    s = text.index(S)
+    e = text.index(E) + len(E)
+    new = text[:s].rstrip() + "\n" + text[e:].lstrip()
+    if not new.endswith("\n"):
+        new += "\n"
+    p.write_text(new)
+    print(f"removed brainstack-pending-review @import block from {p}")
+else:
+    print(f"no brainstack-pending-review block found in {p}")
+PYEOF
+        else
+            echo "==> $claude_md not present; nothing to remove from CLAUDE.md."
+        fi
+        # 2. Also strip any leftover SessionStart hook entry from settings.json
+        # (cleanup for users upgrading from the prior hook-based version)
+        if [ -f "$settings" ]; then
+            "$PYTHON_BIN" - "$settings" "$legacy_hook_sentinel" <<'PYEOF'
+import json, sys
+from pathlib import Path
+p, sentinel = Path(sys.argv[1]), sys.argv[2]
+try:
+    data = json.loads(p.read_text())
+except Exception:
+    sys.exit(0)
+hooks = data.get("hooks", {})
+ss = hooks.get("SessionStart", []) or []
+new_ss = []
+removed = 0
+for entry in ss:
+    new_hooks = []
+    for h in entry.get("hooks", []) or []:
+        if sentinel in (h.get("command") or ""):
+            removed += 1
+            continue
+        new_hooks.append(h)
+    if new_hooks:
+        e = dict(entry); e["hooks"] = new_hooks
+        new_ss.append(e)
+if removed:
+    if new_ss:
+        hooks["SessionStart"] = new_ss
+    else:
+        hooks.pop("SessionStart", None)
+    data["hooks"] = hooks
+    p.write_text(json.dumps(data, indent=2, sort_keys=True))
+    print(f"removed {removed} legacy SessionStart hook(s) from {p}")
+PYEOF
+        fi
+        exit 0
+    fi
+
+    # setup-pending-hook
+    "$PYTHON_BIN" - "$claude_md" "$sentinel_start" "$sentinel_end" "$pending_path" <<'PYEOF'
+import sys
+from pathlib import Path
+p, S, E, pending = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+
+# The block we maintain inside CLAUDE.md. Absolute path inside the
+# @-import — the @ handler may not expand $HOME / ~. Wrapped in a
+# brief markdown stanza so a user reading their CLAUDE.md knows what
+# the auto-loaded section is.
+block = "\n".join([
+    S,
+    "## brainstack pending review",
+    "",
+    f"@{pending}",
+    "",
+    f"_Auto-loaded by brainstack. Remove with `./install.sh --remove-pending-hook`._",
+    E,
+])
+
+if not p.is_file():
+    p.write_text(block + "\n")
+    print(f"created {p} with pending-review @-import")
+    sys.exit(0)
+
+text = p.read_text()
+if S in text and E in text:
+    # Already installed — replace in case the path changed (e.g., $BRAIN_ROOT moved)
+    s = text.index(S)
+    e = text.index(E) + len(E)
+    new_text = text[:s] + block + text[e:]
+    if new_text == text:
+        print(f"already installed: {p} unchanged")
+    else:
+        p.write_text(new_text)
+        print(f"updated brainstack-pending-review @-import in {p}")
+else:
+    # Append the block, preserving the user's existing content above
+    sep = "" if text.endswith("\n") else "\n"
+    if not text.endswith("\n\n"):
+        sep += "\n"
+    p.write_text(text + sep + block + "\n")
+    print(f"appended brainstack-pending-review @-import to {p}")
+PYEOF
+    echo "==> CLAUDE.md @-import installed. Open a fresh Claude Code session to see it."
+    echo "    The pending-review summary loads under the \"# claudeMd\" section of"
+    echo "    every session's system prompt — same mechanism as your existing CLAUDE.md."
+    echo "    Tear down with:  ./install.sh --remove-pending-hook"
+    exit 0
+fi
+
+# ----- Mode: setup-statusline / remove-statusline -----
+# Configures Claude Code's statusLine to run agent/tools/statusline.py
+# which prints "📥 N pending — recall pending --review" in the persistent
+# UI footer. Visible AS SOON AS the session opens, no user input required.
+# Mustafa 2026-05-04: "can this happen when the user doesnt write anything
+# and as soon as claude starts".
+#
+# Idempotent: re-runs replace the existing statusLine with our config
+# (since settings.json supports only one statusLine; we own that slot).
+# --remove-statusline restores no statusLine (Claude Code's default).
+if [ "$MODE" = "setup-statusline" ] || [ "$MODE" = "remove-statusline" ]; then
+    if [ ! -d "$BRAIN_ROOT" ]; then
+        echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
+        exit 2
+    fi
+    settings="$HOME/.claude/settings.json"
+    if [ ! -f "$settings" ]; then
+        echo "install: $settings not found (Claude Code not installed?). Skipping."
+        exit 0
+    fi
+    statusline_target="$BRAIN_ROOT/tools/statusline.py"
+
+    if [ "$MODE" = "remove-statusline" ]; then
+        "$PYTHON_BIN" - "$settings" "$statusline_target" <<'PYEOF'
+import json, sys
+from pathlib import Path
+p, target = Path(sys.argv[1]), sys.argv[2]
+data = json.loads(p.read_text())
+sl = data.get("statusLine")
+if isinstance(sl, dict) and target in str(sl.get("command", "")):
+    data.pop("statusLine", None)
+    p.write_text(json.dumps(data, indent=2, sort_keys=True))
+    print(f"removed brainstack statusLine from {p}")
+else:
+    print(f"no brainstack statusLine found in {p}")
+PYEOF
+        exit 0
+    fi
+
+    # setup-statusline
+    if [ ! -f "$statusline_target" ]; then
+        echo "install: $statusline_target missing — run ./install.sh --upgrade first." >&2
+        exit 2
+    fi
+    if [ -z "${PYTHON_ABS:-}" ]; then
+        echo "install: PYTHON_ABS not resolved." >&2
+        exit 2
+    fi
+    "$PYTHON_BIN" - "$settings" "$PYTHON_ABS" "$statusline_target" <<'PYEOF'
+import json, sys
+from pathlib import Path
+settings_path, python_abs, target = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+data = json.loads(settings_path.read_text())
+existing = data.get("statusLine")
+if isinstance(existing, dict) and target in str(existing.get("command", "")):
+    print(f"already installed: brainstack statusLine present in {settings_path}")
+    sys.exit(0)
+if existing:
+    print(f"WARN: replacing existing statusLine in {settings_path} "
+          f"(was: {existing.get('command', existing)!r})", file=sys.stderr)
+data["statusLine"] = {
+    "type": "command",
+    "command": f"{python_abs} {target}",
+}
+settings_path.write_text(json.dumps(data, indent=2, sort_keys=True))
+print(f"installed brainstack statusLine into {settings_path}")
+PYEOF
+    echo "==> Statusline installed. Open a fresh Claude Code session: the"
+    echo "    pending count will appear in the UI footer immediately."
+    echo "    Tear down with:  ./install.sh --remove-statusline"
+    exit 0
+fi
+
+# ----- Mode: setup-codex-agents-md / remove-codex-agents-md -----
+# Pushes <brain>/PENDING_REVIEW.md into ~/.codex/AGENTS.md between
+# brainstack-pending-{start,end} sentinels. Codex CLI reads AGENTS.md
+# at session start (similar to Claude reading CLAUDE.md). The directive
+# at the top of PENDING_REVIEW.md tells Codex's AI to surface
+# "brainstack: N pending - run `recall pending --review`" in its first
+# response, same as Claude.
+#
+# Idempotent. Preserves user-authored AGENTS.md content above and below.
+if [ "$MODE" = "setup-codex-agents-md" ] || [ "$MODE" = "remove-codex-agents-md" ]; then
+    if [ ! -d "$BRAIN_ROOT" ]; then
+        echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
+        exit 2
+    fi
+    codex_dir="$HOME/.codex"
+    agents_md="$codex_dir/AGENTS.md"
+    if [ "$MODE" = "remove-codex-agents-md" ]; then
+        if [ -f "$agents_md" ]; then
+            "$PYTHON_BIN" - <<PYEOF
+from pathlib import Path
+p = Path("$agents_md")
+text = p.read_text()
+START = "<!-- brainstack-pending-start -->"
+END = "<!-- brainstack-pending-end -->"
+if START in text and END in text:
+    s = text.index(START)
+    e = text.index(END) + len(END)
+    new = text[:s].rstrip() + "\n" + text[e:].lstrip()
+    if not new.endswith("\n"):
+        new += "\n"
+    p.write_text(new)
+    print(f"removed brainstack section from {p}")
+else:
+    print(f"no brainstack section found in {p}")
+PYEOF
+        else
+            echo "==> $agents_md not present; nothing to remove."
+        fi
+        exit 0
+    fi
+
+    # setup-codex-agents-md
+    if [ ! -d "$codex_dir" ]; then
+        echo "install: $codex_dir not found (Codex CLI not installed?). Skipping."
+        exit 0
+    fi
+    if [ ! -f "$BRAIN_ROOT/PENDING_REVIEW.md" ]; then
+        "$PYTHON_BIN" "$BRAIN_ROOT/tools/render_pending_summary.py" \
+            --brain "$BRAIN_ROOT" 2>/dev/null || true
+    fi
+    "$PYTHON_BIN" "$BRAIN_ROOT/tools/render_codex_agents_md.py" \
+        --brain "$BRAIN_ROOT" --codex-dir "$codex_dir"
+    echo "==> Codex AGENTS.md updated. Open a fresh Codex CLI session: its AI"
+    echo "    will greet you with the pending count on first response."
+    echo "    Tear down with:  ./install.sh --remove-codex-agents-md"
+    exit 0
+fi
+
+# ----- Mode: setup-pending-review-all / remove-pending-review-all -----
+# Umbrella: wires all three pending-review surfaces in one command
+# (Claude Code SessionStart hook + Cursor .cursorrules + shell wrappers).
+# Each sub-mode is idempotent and silently skips its surface if the
+# host tool isn't installed (e.g., no ~/.cursor → cursor step is no-op).
+if [ "$MODE" = "setup-pending-review-all" ] || [ "$MODE" = "remove-pending-review-all" ]; then
+    if [ ! -d "$BRAIN_ROOT" ]; then
+        echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
+        exit 2
+    fi
+    if [ "$MODE" = "remove-pending-review-all" ]; then
+        echo "==> Removing pending-review surfaces (statusline / Claude / Cursor / Codex / shell)…"
+        "$0" --remove-statusline        2>&1 | sed 's/^/  /'
+        "$0" --remove-pending-hook      2>&1 | sed 's/^/  /'
+        "$0" --remove-cursor-rules      2>&1 | sed 's/^/  /'
+        "$0" --remove-codex-agents-md   2>&1 | sed 's/^/  /'
+        "$0" --remove-shell-banner      2>&1 | sed 's/^/  /'
+        echo "==> Removal complete."
+        exit 0
+    fi
+
+    # Setup all five. Pass PYTHON_BIN so each sub-call resolves the same
+    # interpreter (avoids "system python3 too old" failures on default).
+    # Order: statusline first (most user-visible: appears as soon as
+    # session opens), then directives that fire on first response.
+    echo "==> Setting up pending-review surfaces (statusline / Claude / Cursor / Codex / shell)…"
+    PYTHON_BIN="$PYTHON_BIN" "$0" --setup-statusline        2>&1 | sed 's/^/  [statusln] /'
+    PYTHON_BIN="$PYTHON_BIN" "$0" --setup-pending-hook      2>&1 | sed 's/^/  [claude]   /'
+    PYTHON_BIN="$PYTHON_BIN" "$0" --setup-cursor-rules      2>&1 | sed 's/^/  [cursor]   /'
+    PYTHON_BIN="$PYTHON_BIN" "$0" --setup-codex-agents-md   2>&1 | sed 's/^/  [codex]    /'
+    PYTHON_BIN="$PYTHON_BIN" "$0" --setup-shell-banner      2>&1 | sed 's/^/  [shell]    /'
+    echo
+    echo "==> All five surfaces configured."
+    echo "    Statusline:    Claude Code UI footer, visible immediately on session open"
+    echo "    Claude greet:  via @-import in ~/.claude/CLAUDE.md"
+    echo "    Cursor:        sentinel block in ~/.cursor/.cursorrules"
+    echo "    Codex:         sentinel block in ~/.codex/AGENTS.md"
+    echo "    Shell:         wrappers for any AI CLI in ~/.agent/banner/wrapped_tools"
+    echo "    Tear down all: ./install.sh --remove-pending-review-all"
+    exit 0
+fi
+
 # ----- Mode: install (default) -----
 if [ -d "$BRAIN_ROOT" ]; then
     echo "==> $BRAIN_ROOT already exists. Status:"
@@ -726,9 +1230,25 @@ if [ -d "$BRAIN_ROOT" ]; then
             echo ""
         fi
     fi
+    # Surface pending-review count if any candidates are waiting. Single
+    # source of truth for the user's attention queue. Codex 2026-05-04 UX gap.
+    if [ -f "$BRAIN_ROOT/PENDING_REVIEW.md" ]; then
+        first_line="$(head -n 1 "$BRAIN_ROOT/PENDING_REVIEW.md" 2>/dev/null)"
+        case "$first_line" in
+            *"all clear"*) : ;;
+            *)
+                echo ""
+                echo "    📥 Pending review: see $BRAIN_ROOT/PENDING_REVIEW.md"
+                echo "       (run 'recall pending --review' or open Claude Code → /dream)"
+                echo ""
+                ;;
+        esac
+    fi
     echo "    To refresh tools/hooks without touching memory: ./install.sh --upgrade"
     echo "    To migrate a flat memory dir:                    ./install.sh --migrate <dir>"
     echo "    To enable hourly Claude transcript + misc sync:  ./install.sh --setup-claude-extras"
+    echo "    To surface pending review on every session:      ./install.sh --setup-pending-review-all"
+    echo "      (sets up Claude SessionStart + Cursor rules + shell wrappers)"
     exit 0
 fi
 
@@ -764,6 +1284,12 @@ echo "$REPO_DIR" > "$BRAIN_ROOT/.brainstack-repo-path"
 if [ -f "$BRAIN_ROOT/.gitignore" ] && \
    ! grep -qE "^\.brainstack-repo-path\s*$" "$BRAIN_ROOT/.gitignore"; then
     printf "\n# Repo path pin — machine-local, do not sync\n.brainstack-repo-path\n" \
+        >> "$BRAIN_ROOT/.gitignore"
+fi
+# PENDING_REVIEW.md is regenerated locally on every dream/sync tick.
+if [ -f "$BRAIN_ROOT/.gitignore" ] && \
+   ! grep -qE "^PENDING_REVIEW\.md\s*$" "$BRAIN_ROOT/.gitignore"; then
+    printf "\n# Pending-review summary — regenerated locally\nPENDING_REVIEW.md\n" \
         >> "$BRAIN_ROOT/.gitignore"
 fi
 
