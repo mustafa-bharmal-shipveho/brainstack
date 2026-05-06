@@ -318,8 +318,11 @@ def run_dream_cycle():
             return
 
         burst_telemetry = []
+        activity_log_telemetry = []
         patterns = cluster_and_extract(
-            entries, threshold=CLUSTER_SIMILARITY, telemetry=burst_telemetry,
+            entries, threshold=CLUSTER_SIMILARITY,
+            telemetry=burst_telemetry,
+            activity_log_telemetry=activity_log_telemetry,
         )
         promotable = {k: p for k, p in patterns.items()
                       if p.get("canonical_salience", 0) >= PROMOTION_THRESHOLD}
@@ -340,7 +343,8 @@ def run_dream_cycle():
         f"dream cycle: patterns={len(patterns)} staged={staged} "
         f"prefiltered_out={prefiltered} pending_review={pending} "
         f"archived={len(archived)} kept={len(kept)} "
-        f"burst_skipped={len(burst_telemetry)}"
+        f"burst_skipped={len(burst_telemetry)} "
+        f"activity_log_skipped={len(activity_log_telemetry)}"
     )
     _refresh_pending_summary()
 
@@ -394,8 +398,11 @@ def run(brain_root=None, namespace="default", dry_run=False):
             return result
 
         burst_telemetry = []
+        activity_log_telemetry = []
         patterns = cluster_and_extract(
-            entries, threshold=CLUSTER_SIMILARITY, telemetry=burst_telemetry,
+            entries, threshold=CLUSTER_SIMILARITY,
+            telemetry=burst_telemetry,
+            activity_log_telemetry=activity_log_telemetry,
         )
         promotable = {k: p for k, p in patterns.items()
                       if p.get("canonical_salience", 0) >= PROMOTION_THRESHOLD}
@@ -403,6 +410,7 @@ def run(brain_root=None, namespace="default", dry_run=False):
         if dry_run:
             result["candidates_written"] = len(promotable)
             result["burst_skipped"] = len(burst_telemetry)
+            result["activity_log_skipped"] = len(activity_log_telemetry)
             return result
 
         staged = write_candidates(promotable, candidates_dir)
@@ -423,6 +431,7 @@ def run(brain_root=None, namespace="default", dry_run=False):
         result["rejected"] = prefiltered
         result["decayed"] = len(archived)
         result["burst_skipped"] = len(burst_telemetry)
+        result["activity_log_skipped"] = len(activity_log_telemetry)
 
     _refresh_pending_summary(brain_root)
     return result

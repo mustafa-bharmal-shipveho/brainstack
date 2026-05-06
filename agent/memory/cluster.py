@@ -343,6 +343,48 @@ def _is_burst_cluster(
     )
 
 
+# Verbatim narrator outputs from claude_code_post_tool._build_action and
+# on_failure._refl. When a cluster's canonical claim matches one of these
+# shapes it's per-tool-call activity log, not a learned pattern, and must
+# never be staged. Field-graded against `Edited <plan>.md: replaced ...`,
+# `Wrote <plan>.md (N lines)`, `High-stakes op (migrate): cat ...`, and
+# `FAILURE in claude-code: High-stakes op FAILED (secret): ...` — all
+# rejected by the user multiple times before this filter existed.
+_ACTIVITY_LOG_CLAIM_RE = re.compile(
+    r"^("
+    r"Edited \S"
+    r"|Wrote \S.*? \(\d+ lines?\)"
+    r"|(Edit|Write) failed\b"
+    r"|High-stakes op (completed|FAILED) \([^)]*\):"
+    r"|Command failed: "
+    r"|Ran: "
+    r"|Completed todo: "
+    r"|Now working on: "
+    r"|Updated todo list \(\d+"
+    r"|Tool \w+ completed (successfully|with failure)"
+    r"|FAILURE in [\w.-]+: "
+    r")"
+)
+
+
+def _is_activity_log_claim(claim):
+    """True when the claim is a verbatim per-tool narration string with
+    no learned content. Returns (is_activity, reason); reason is a stable
+    short token identifying the shape (e.g. `activity_log:edited`) so
+    telemetry distinguishes which narrator escaped containment.
+
+    Pure function — no env reads, no I/O.
+    """
+    if not claim:
+        return False, ""
+    c = claim.strip()
+    m = _ACTIVITY_LOG_CLAIM_RE.match(c)
+    if not m:
+        return False, ""
+    head = c.split(None, 1)[0].lower().rstrip(":")
+    return True, f"activity_log:{head}"
+
+
 def extract_pattern(cluster):
     """Extractive summarization from a cluster of episodes.
 

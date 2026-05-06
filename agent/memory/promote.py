@@ -14,7 +14,12 @@ import json
 import os
 
 from _atomic import atomic_write_json
-from cluster import _is_burst_cluster, content_cluster, extract_pattern
+from cluster import (
+    _is_activity_log_claim,
+    _is_burst_cluster,
+    content_cluster,
+    extract_pattern,
+)
 from validate import check_exact_duplicate, extract_lesson_lines
 
 
@@ -64,7 +69,7 @@ def _burst_thresholds_from_env():
 
 
 def cluster_and_extract(entries, threshold=0.3, group_by_origin=True,
-                        telemetry=None):
+                        telemetry=None, activity_log_telemetry=None):
     """Cluster entries by content similarity, extract a pattern per cluster.
 
     PR1: `group_by_origin=True` (default) buckets entries by their
@@ -81,11 +86,21 @@ def cluster_and_extract(entries, threshold=0.3, group_by_origin=True,
 
     DREAM_BURST_* env vars override defaults; DREAM_BURST_DISABLED=1
     bypasses the detector entirely (forensic mode).
+
+    Activity-log filter (post-extraction): each surviving cluster's
+    pattern claim is checked against `_is_activity_log_claim`. Verbatim
+    narrator strings like `Edited <plan>.md: replaced ...` and
+    `Wrote <path> (78 lines)` are dropped — they're per-tool-call
+    activity log, never a learned lesson. Caller passes
+    `activity_log_telemetry=[]` to receive per-skip
+    `{"reason": "activity_log:<shape>", "cluster_size": N, "claim_prefix": str}`
+    entries. DREAM_ACTIVITY_LOG_DISABLED=1 bypasses the detector.
     """
     clusters = content_cluster(
         entries, threshold=threshold, group_by_origin=group_by_origin
     )
     burst_kwargs = _burst_thresholds_from_env()
+    activity_log_active = not _env_bool("DREAM_ACTIVITY_LOG_DISABLED", False)
 
     patterns = {}
     for c in clusters:
@@ -99,6 +114,16 @@ def cluster_and_extract(entries, threshold=0.3, group_by_origin=True,
                     })
                 continue
         p = extract_pattern(c)
+        if activity_log_active:
+            is_activity, alog_reason = _is_activity_log_claim(p.get("claim"))
+            if is_activity:
+                if activity_log_telemetry is not None:
+                    activity_log_telemetry.append({
+                        "reason": alog_reason,
+                        "cluster_size": len(c),
+                        "claim_prefix": (p.get("claim") or "")[:80],
+                    })
+                continue
         patterns[p["name"]] = p
     return patterns
 
