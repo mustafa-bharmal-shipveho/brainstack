@@ -408,9 +408,12 @@ def stats(
     Reads ~/.agent/runtime/logs/events.log.jsonl for AutoRecall events
     (per-prompt retrieval injections) AND scans Claude Code transcripts
     at ~/.claude/projects/<slug>/<sid>.jsonl for tool_use blocks
-    (model-driven tool calls — Minerva, NotebookLM, Bash, etc.). Cross-
-    sourcing is what answers 'is the model following the CLAUDE.md
-    routing rules?'.
+    (model-driven tool calls — MCP servers, Bash, Edit, etc.).
+
+    The MCP-call breakdown is raw counts, namespaced by server. We don't
+    try to infer "is the model calling the right MCP for this question
+    type" — that's org-specific (your CLAUDE.md routing rules vary) and
+    a generic regex classifier proved unreliable in practice.
 
     Use --no-tools when you only want the auto-recall counters fast (the
     transcript scan reads many JSONL files per call; cheap but not free
@@ -422,7 +425,6 @@ def stats(
         StatsReport,
         aggregate_events,
         aggregate_tool_calls,
-        compute_routing_coverage,
         parse_since,
         render_human,
     )
@@ -449,13 +451,14 @@ def stats(
         report = StatsReport(window_start_ts_ms=since_ts_ms)
 
     # Cross-source: scan transcripts for MCP / builtin tool calls in the
-    # same window. Bucket by namespace (mcp__minerva__* etc).
+    # same window. Bucket by namespace (mcp__minerva__* etc). Raw counts
+    # only — interpretation (e.g. "should the model have called X here")
+    # is org-specific and intentionally not computed here.
     if not no_tools:
         td = transcripts_dir or (Path.home() / ".claude" / "projects")
         all_calls = aggregate_tool_calls(td, since_ts_ms=since_ts_ms)
         report.mcp_calls = {k: v for k, v in all_calls.items() if k.startswith("mcp__")}
         report.tool_calls_other = {k: v for k, v in all_calls.items() if not k.startswith("mcp__")}
-        report.routing_coverage = compute_routing_coverage(td, since_ts_ms=since_ts_ms)
 
     if json_out:
         # Re-key from StatsReport dataclass to plain dict (top_sources tuple

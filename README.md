@@ -378,7 +378,7 @@ This page describes how operational issues get reported, triaged, and resolved..
 
 The "38 ms" is the retrieval call itself. End-to-end (hook subprocess startup + Python import + retrieve) is ~600 ms on a warm cache, ~1500 ms on the first fire after a fresh Claude Code session (embedder cold-start). The 1.5 s default timeout is sized for the cold case; subsequent fires pay only the retrieval cost.
 
-ROI is queryable retrospectively, with cross-source visibility into model-driven tool calls (Minerva, NotebookLM, etc.) and a "coverage check" that compares your prompt patterns against the CLAUDE.md routing rules:
+ROI is queryable retrospectively, with cross-source visibility into model-driven tool calls (Minerva, NotebookLM, etc.) — raw counts of which MCP servers and built-in tools the model actually invoked in the same window:
 
 ```bash
 $ recall stats --since 7d
@@ -397,18 +397,14 @@ brainstack: auto-recall ROI (since 2026-04-28)
     mcp__claude_ai_Linear__*  : 18 calls
     builtins                  : Bash (287), Read (154), Edit (89)
 
-  Coverage check (CLAUDE.md routing rules):
-    System-level questions    : 12 detected, 5 of those triggered notebooklm (42%)
-    Code-level questions      : 8 detected, 6 of those triggered minerva (75%)
-
   Without auto-recall, all 47 turns would have started with only static
   MEMORY.md as memory context. Auto-recall added 234 dynamic docs scoped
   to each prompt.
 ```
 
-The "Coverage check" answers a specific question: **does the model actually follow the CLAUDE.md routing rules** ("call NotebookLM for system-level questions; call Minerva for code-level questions")? Low coverage on a category is signal that the rule isn't being followed — informs whether tool-discovery hints in CLAUDE.md need sharpening, or whether selective federation (auto-firing the right MCP on matching prompts) is justified.
+The MCP-call breakdown lets you see, for the same window, what the model reached for on its own — useful when paired with the auto-recall surfaces above to reason about which retrieval strategy the model actually preferred per question type. **Interpretation is intentionally left to you.** An earlier version of this report tried to compute "is the model following the CLAUDE.md routing rules?" coverage percentages, but a generic regex classifier had ~0% precision on real prompts, and any classifier that would actually work needs an org-specific keyword list (your internal service names, ticket prefixes, etc.) — wrong shape for an open-source tool. If you want per-org routing coverage, build it on top of the raw counts in `--json` output.
 
-Heuristic detection is regex-based and intentionally narrow: prefers false negatives over false positives, since coverage of zero on a few detected questions is more useful than 80% coverage of 1000 false-positive matches. Pass `--no-tools` to skip the transcript scan entirely (faster on brains with hundreds of session files).
+Pass `--no-tools` to skip the transcript scan entirely (faster on brains with hundreds of session files).
 
 **Why opt-in.** Per-prompt retrieval costs latency (see numbers above). The skip filter blocks the no-signal cases, but for users with very short interactive workflows (mostly slash-commands, mostly acks) the value-to-noise ratio may not justify the latency. Easy to toggle.
 

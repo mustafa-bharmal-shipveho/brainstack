@@ -13,12 +13,15 @@ Never:
   - promotion to LESSONS.md (graduate.py does that)
   - git commit (unattended repo writes are dangerous on a host hook)
 """
-import contextlib, json, os
-from promote import cluster_and_extract, write_candidates
-from validate import heuristic_check
-from review_state import mark_rejected, write_review_queue_summary
-from decay import decay_old_entries
+import contextlib
+import json
+import os
+
 from archive import archive_stale_workspace
+from decay import decay_old_entries
+from promote import cluster_and_extract, write_candidates
+from review_state import mark_rejected, write_review_queue_summary
+from validate import heuristic_check
 
 # fcntl is POSIX-only. On Windows the dream cycle is best-effort: concurrent
 # writers there are rare (no shutdown hook = no parallel exits), and the lack
@@ -314,7 +317,10 @@ def run_dream_cycle():
             _refresh_pending_summary()
             return
 
-        patterns = cluster_and_extract(entries, threshold=CLUSTER_SIMILARITY)
+        burst_telemetry = []
+        patterns = cluster_and_extract(
+            entries, threshold=CLUSTER_SIMILARITY, telemetry=burst_telemetry,
+        )
         promotable = {k: p for k, p in patterns.items()
                       if p.get("canonical_salience", 0) >= PROMOTION_THRESHOLD}
 
@@ -333,7 +339,8 @@ def run_dream_cycle():
     print(
         f"dream cycle: patterns={len(patterns)} staged={staged} "
         f"prefiltered_out={prefiltered} pending_review={pending} "
-        f"archived={len(archived)} kept={len(kept)}"
+        f"archived={len(archived)} kept={len(kept)} "
+        f"burst_skipped={len(burst_telemetry)}"
     )
     _refresh_pending_summary()
 
@@ -386,12 +393,16 @@ def run(brain_root=None, namespace="default", dry_run=False):
                 _refresh_pending_summary(brain_root)
             return result
 
-        patterns = cluster_and_extract(entries, threshold=CLUSTER_SIMILARITY)
+        burst_telemetry = []
+        patterns = cluster_and_extract(
+            entries, threshold=CLUSTER_SIMILARITY, telemetry=burst_telemetry,
+        )
         promotable = {k: p for k, p in patterns.items()
                       if p.get("canonical_salience", 0) >= PROMOTION_THRESHOLD}
 
         if dry_run:
             result["candidates_written"] = len(promotable)
+            result["burst_skipped"] = len(burst_telemetry)
             return result
 
         staged = write_candidates(promotable, candidates_dir)
@@ -411,6 +422,7 @@ def run(brain_root=None, namespace="default", dry_run=False):
         result["candidates_written"] = staged
         result["rejected"] = prefiltered
         result["decayed"] = len(archived)
+        result["burst_skipped"] = len(burst_telemetry)
 
     _refresh_pending_summary(brain_root)
     return result
