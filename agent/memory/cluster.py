@@ -353,7 +353,7 @@ def _is_burst_cluster(
 _ACTIVITY_LOG_CLAIM_RE = re.compile(
     r"^("
     r"Edited \S"
-    r"|Wrote \S+ \(\d+"
+    r"|Wrote \S.*? \(\d+ lines?\)"
     r"|(Edit|Write) failed\b"
     r"|High-stakes op (completed|FAILED) \([^)]*\):"
     r"|Command failed: "

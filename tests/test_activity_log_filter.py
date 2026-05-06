@@ -91,6 +91,12 @@ class TestIsActivityLogClaim:
         "Wrote /Users/me/.claude/plans/foo.md (78 lines)",
         "Wrote /tmp/x.py (1 line)",
         "Wrote ./out.json (200 lines)",
+        # Codex 2026-05-06 P2: paths can contain spaces. The original
+        # `\S+` anchor missed `Wrote /Users/me/My File.md (10 lines)` and
+        # let it leak through. Match must allow spaces up to the
+        # `(N lines)` suffix.
+        "Wrote /Users/me/My File.md (10 lines)",
+        "Wrote /Users/me/Documents/has multiple spaces here.md (42 lines)",
     ])
     def test_wrote_shapes_detected(self, claim):
         is_log, reason = cluster._is_activity_log_claim(claim)
