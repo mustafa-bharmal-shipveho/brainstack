@@ -430,17 +430,9 @@ def stats(
 
     runtime_cfg = RuntimeConfig.load()
     log_path = runtime_cfg.event_log_path
-    if not log_path.exists():
-        typer.echo(
-            f"recall stats: no event log at {log_path}\n"
-            "  Auto-recall has never fired on this brain. "
-            "Enable with: ./install.sh --enable-auto-recall",
-            err=True,
-        )
-        raise typer.Exit(code=0)  # Not an error — just no data yet
 
     if session_current:
-        since_ts_ms = _session_current_ts_ms(log_path)
+        since_ts_ms = _session_current_ts_ms(log_path) if log_path.exists() else None
     else:
         try:
             since_ts_ms = parse_since(since)
@@ -448,7 +440,13 @@ def stats(
             typer.echo(f"recall stats: {e}", err=True)
             raise typer.Exit(code=2)
 
-    report = aggregate_events(log_path, since_ts_ms=since_ts_ms)
+    # Auto-recall events: optional. A user who hasn't enabled auto-recall
+    # but has Claude Code transcripts should still see the tool-call /
+    # coverage breakdown. Codex 2026-05-05 P2.
+    if log_path.exists():
+        report = aggregate_events(log_path, since_ts_ms=since_ts_ms)
+    else:
+        report = StatsReport(window_start_ts_ms=since_ts_ms)
 
     # Cross-source: scan transcripts for MCP / builtin tool calls in the
     # same window. Bucket by namespace (mcp__minerva__* etc).

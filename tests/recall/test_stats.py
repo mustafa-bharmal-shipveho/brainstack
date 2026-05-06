@@ -481,6 +481,18 @@ class TestRenderCrossSourceSection:
         out = render_human(report)
         assert "Model-driven tool calls" not in out
 
+    def test_render_empty_routing_coverage_does_not_suppress_no_events(self):
+        """`compute_routing_coverage` returns an all-zero dict (not {})
+        when no qualifying prompts/calls exist. That non-empty-but-zero
+        dict must NOT be treated as "we have data" — otherwise the
+        no-events message gets suppressed on genuinely empty brains.
+        Codex 2026-05-05 P2."""
+        from recall.stats import StatsReport, _empty_coverage, render_human
+        report = StatsReport(routing_coverage=_empty_coverage())
+        out = render_human(report)
+        # All-zero coverage = no data → bail to the no-events message
+        assert "no auto-recall events" in out.lower()
+
     def test_renders_when_only_cross_source_data(self):
         """User has auto-recall disabled (zero AutoRecall events) but the
         transcript scan found tool calls — render must NOT bail to the

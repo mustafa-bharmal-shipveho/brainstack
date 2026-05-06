@@ -233,7 +233,16 @@ def render_human(report: StatsReport) -> str:
     """
     other_total = sum(report.other_outcomes.values())
     grand_total = report.fired_count + report.skipped_count + other_total
-    has_cross_source = bool(report.mcp_calls or report.tool_calls_other or report.routing_coverage)
+    # `has_cross_source` checks for ACTUAL data, not just dict presence.
+    # `compute_routing_coverage` always returns an all-zero dict (rather
+    # than {}), so `bool(report.routing_coverage)` is True even when
+    # there's nothing to show — that would suppress the "no events"
+    # message on a genuinely empty brain. Codex 2026-05-05 P2.
+    has_cross_source = (
+        bool(report.mcp_calls)
+        or bool(report.tool_calls_other)
+        or any(int(v) > 0 for v in report.routing_coverage.values())
+    )
     # Only fully bail when there's NOTHING to report — including no
     # cross-source tool calls. A user with auto-recall disabled but
     # active Claude Code transcripts should still see the tool-call
