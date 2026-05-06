@@ -227,3 +227,308 @@ class TestRenderHuman:
         out = render_human(empty)
         # Some indication that there's nothing to report — anti-empty-output guard
         assert "no" in out.lower() or "0 turns" in out.lower() or "0 fires" in out.lower()
+
+
+# ---------------------------------------------------------------------------
+# Cross-source observability — Phase 1 of "should we federate?"
+# ---------------------------------------------------------------------------
+
+
+def _write_transcript_entry(path: Path, *, ts_iso: str, kind: str = "tool_use",
+                             tool_name: str = "Bash", text: str = "") -> None:
+    """Append one transcript entry. Mimics the shape of Claude Code's
+    `~/.claude/projects/<slug>/<sid>.jsonl` files. Each entry is a JSON
+    line with a `message.content` array of either tool_use blocks (with
+    `name`) or text blocks. We only need to mock what the aggregator reads.
+    """
+    if kind == "tool_use":
+        content = [{"type": "tool_use", "name": tool_name, "input": {}}]
+    elif kind == "user_text":
+        content = [{"type": "text", "text": text}]
+    else:
+        raise ValueError(f"unknown kind: {kind}")
+    entry = {
+        "type": "user" if kind == "user_text" else "assistant",
+        "timestamp": ts_iso,
+        "message": {"content": content},
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+class TestToolCallAggregation:
+    """`aggregate_tool_calls(transcripts_dir, since_ts_ms=...)` walks
+    Claude Code session transcripts and counts `tool_use` blocks by name,
+    grouped by MCP namespace. The data source is different from the
+    AutoRecall events log — we read raw transcripts because the runtime
+    PostToolUse hook only captures Bash/Edit/Read/Write (most MCP and
+    builtin tool calls don't surface in events.log.jsonl)."""
+
+    def test_aggregate_groups_mcp_calls_by_namespace(self, tmp_path: Path):
+        """`mcp__minerva__search_code` and `mcp__minerva__get_file` both
+        roll up into the `mcp__minerva__*` bucket. Different MCP servers
+        get separate buckets so the user can see which one is being used."""
+        from recall.stats import aggregate_tool_calls
+        proj = tmp_path / "projects" / "-Users-foo-codebase"
+        ts = "2026-05-05T12:00:00.000Z"
+        _write_transcript_entry(
+            proj / "session-a.jsonl", ts_iso=ts, tool_name="mcp__minerva__search_code"
+        )
+        _write_transcript_entry(
+            proj / "session-a.jsonl", ts_iso=ts, tool_name="mcp__minerva__get_file"
+        )
+        _write_transcript_entry(
+            proj / "session-a.jsonl", ts_iso=ts, tool_name="mcp__notebooklm__ask_question"
+        )
+        _write_transcript_entry(
+            proj / "session-a.jsonl", ts_iso=ts, tool_name="Bash"
+        )
+        result = aggregate_tool_calls(tmp_path / "projects")
+        assert result["mcp__minerva__*"] == 2
+        assert result["mcp__notebooklm__*"] == 1
+        assert result["Bash"] == 1
+
+    def test_since_window_filters_old_calls(self, tmp_path: Path):
+        """tool_use entries before `since_ts_ms` are excluded."""
+        from recall.stats import aggregate_tool_calls
+        proj = tmp_path / "projects" / "-Users-foo-codebase"
+        old_ts = "2026-04-01T00:00:00.000Z"
+        recent_ts = "2026-05-05T12:00:00.000Z"
+        _write_transcript_entry(
+            proj / "s.jsonl", ts_iso=old_ts, tool_name="mcp__minerva__search_code"
+        )
+        _write_transcript_entry(
+            proj / "s.jsonl", ts_iso=recent_ts, tool_name="mcp__minerva__search_code"
+        )
+        # Window starting May 1 → only the recent call counts
+        import datetime
+        cutoff = int(datetime.datetime(2026, 5, 1,
+                                        tzinfo=datetime.timezone.utc).timestamp() * 1000)
+        result = aggregate_tool_calls(tmp_path / "projects", since_ts_ms=cutoff)
+        assert result["mcp__minerva__*"] == 1
+
+    def test_missing_dir_returns_empty(self, tmp_path: Path):
+        """No projects/ directory yet (fresh user / wrong path) → empty
+        result, no exception."""
+        from recall.stats import aggregate_tool_calls
+        result = aggregate_tool_calls(tmp_path / "nonexistent")
+        assert result == {}
+
+    def test_malformed_lines_are_skipped(self, tmp_path: Path):
+        """Real transcripts sometimes have non-JSON lines (debug output,
+        truncated writes). Aggregator must not crash."""
+        from recall.stats import aggregate_tool_calls
+        proj = tmp_path / "projects" / "-Users-foo"
+        proj.mkdir(parents=True)
+        (proj / "s.jsonl").write_text(
+            "{\"this\": \"is\", \"valid\": true}\n"  # but no message.content
+            "this is not json\n"
+            "{\"truncated\":\n"  # incomplete
+        )
+        # Plus one valid entry
+        _write_transcript_entry(
+            proj / "s.jsonl", ts_iso="2026-05-05T12:00:00.000Z",
+            tool_name="mcp__minerva__search_code"
+        )
+        result = aggregate_tool_calls(tmp_path / "projects")
+        assert result["mcp__minerva__*"] == 1
+
+
+class TestRoutingCoverage:
+    """The model is supposed to call `mcp__notebooklm__ask_question` for
+    system-level questions and `mcp__minerva__*` for code-level ones (per
+    CLAUDE.md routing rules). `routing_coverage()` computes how often that
+    actually happened.
+
+    Heuristic: simple keyword/regex match on the user's prompt text.
+    Imperfect — produces false positives — but a useful signal."""
+
+    def test_detects_system_level_question(self):
+        from recall.stats import classify_prompt
+        for prompt in [
+            "How does the WMS architecture work end-to-end?",
+            "Who owns the package routing service?",
+            "What's the difference between PrOps and DMS?",
+            "walk me through how facility orchestration handles inbound",
+        ]:
+            assert classify_prompt(prompt) == "system-level", (
+                f"misclassified: {prompt!r}"
+            )
+
+    def test_detects_code_level_question(self):
+        from recall.stats import classify_prompt
+        for prompt in [
+            "Where is FacilityProfile used in the monorepo?",
+            "What repos depend on the inventory-management package?",
+            "What events does the sort service emit?",
+            "blast radius of changing this column in package_handling",
+        ]:
+            assert classify_prompt(prompt) == "code-level", (
+                f"misclassified: {prompt!r}"
+            )
+
+    def test_neither_classification_for_random_prompts(self):
+        """Most prompts in a coding session aren't system-level or
+        code-level — they're task-specific. Don't force a classification."""
+        from recall.stats import classify_prompt
+        for prompt in [
+            "fix the failing test",
+            "thanks",
+            "let's commit and push",
+            "/dream",
+        ]:
+            assert classify_prompt(prompt) is None, (
+                f"shouldn't classify: {prompt!r}"
+            )
+
+    def test_string_user_message_classified(self, tmp_path: Path):
+        """Real Claude Code transcripts encode user turns with `content`
+        as a plain string, not a content-block list. Without handling
+        this shape, routing coverage misses the bulk of real prompts.
+        Codex 2026-05-05 P2."""
+        from recall.stats import compute_routing_coverage
+        proj = tmp_path / "projects" / "-Users-foo"
+        proj.mkdir(parents=True)
+        ts = "2026-05-05T12:00:00.000Z"
+        # User turn with STRING content (the common shape)
+        entry_user = {
+            "type": "user", "timestamp": ts,
+            "message": {"role": "user", "content": "How does the WMS architecture work end-to-end?"},
+        }
+        # Assistant turn with notebooklm tool_use
+        entry_assistant = {
+            "type": "assistant", "timestamp": ts,
+            "message": {"content": [
+                {"type": "tool_use", "name": "mcp__notebooklm__ask_question"}
+            ]},
+        }
+        with (proj / "s.jsonl").open("w") as f:
+            f.write(json.dumps(entry_user) + "\n")
+            f.write(json.dumps(entry_assistant) + "\n")
+        coverage = compute_routing_coverage(tmp_path / "projects")
+        assert coverage["system_level_total"] == 1
+        assert coverage["system_level_notebooklm"] == 1
+        assert coverage["system_level_coverage"] == 1.0
+
+    def test_routing_coverage_computes_per_category_rates(self, tmp_path: Path):
+        """Given a window where the user asked 4 system-level questions
+        and 2 of them triggered notebooklm, coverage should be 0.5."""
+        from recall.stats import compute_routing_coverage
+
+        proj = tmp_path / "projects" / "-Users-foo"
+        ts = "2026-05-05T12:00:00.000Z"
+        # 4 system-level user prompts
+        for q in ["how does X work", "who owns Y", "what's the difference between A and B", "walk me through Z"]:
+            _write_transcript_entry(proj / "s.jsonl", ts_iso=ts, kind="user_text", text=q)
+        # 2 of those windows had notebooklm calls; emulate by interleaving
+        _write_transcript_entry(
+            proj / "s.jsonl", ts_iso=ts,
+            tool_name="mcp__notebooklm__ask_question"
+        )
+        _write_transcript_entry(
+            proj / "s.jsonl", ts_iso=ts,
+            tool_name="mcp__notebooklm__ask_question"
+        )
+        coverage = compute_routing_coverage(tmp_path / "projects")
+        # 4 system-level questions, 2 notebooklm calls.
+        # Implementation rounds to 1 decimal: 2/4 = 0.5
+        assert coverage["system_level_total"] == 4
+        assert coverage["system_level_notebooklm"] == 2
+        assert coverage["system_level_coverage"] == 0.5
+
+
+class TestStatsCliNoToolsFlag:
+    """`recall stats --no-tools` is the perf escape hatch: when the user
+    has hundreds of transcripts and only wants the auto-recall stats fast,
+    skip the transcript scan entirely."""
+
+    def test_aggregate_events_alone_does_not_touch_transcripts(self, tmp_path: Path,
+                                                                monkeypatch):
+        """The base `aggregate_events(log_path)` (existing API) must keep
+        working with no transcripts dir at all — guards against regressions
+        from the new file readers."""
+        from recall.stats import aggregate_events
+        log = tmp_path / "events.log.jsonl"
+        log.touch()
+        # No transcripts at all — should not raise
+        report = aggregate_events(log)
+        assert report.fired_count == 0
+
+
+class TestRenderCrossSourceSection:
+    """`render_human()` must include the new "Model-driven tool calls" and
+    "Coverage check" sections when the report has the relevant fields
+    populated. Empty fields → omit the section (don't print empty headers)."""
+
+    def test_renders_mcp_calls_section(self):
+        from recall.stats import StatsReport, render_human
+        report = StatsReport(
+            fired_count=10,
+            mcp_calls={"mcp__minerva__*": 23, "mcp__notebooklm__*": 5},
+            tool_calls_other={"Bash": 287, "Edit": 45},
+        )
+        out = render_human(report)
+        assert "Model-driven tool calls" in out
+        assert "mcp__minerva__*" in out and "23" in out
+        assert "mcp__notebooklm__*" in out and "5" in out
+
+    def test_omits_section_when_no_tool_calls(self):
+        from recall.stats import StatsReport, render_human
+        report = StatsReport(
+            fired_count=10, mcp_calls={}, tool_calls_other={},
+        )
+        out = render_human(report)
+        assert "Model-driven tool calls" not in out
+
+    def test_render_empty_routing_coverage_does_not_suppress_no_events(self):
+        """`compute_routing_coverage` returns an all-zero dict (not {})
+        when no qualifying prompts/calls exist. That non-empty-but-zero
+        dict must NOT be treated as "we have data" — otherwise the
+        no-events message gets suppressed on genuinely empty brains.
+        Codex 2026-05-05 P2."""
+        from recall.stats import StatsReport, _empty_coverage, render_human
+        report = StatsReport(routing_coverage=_empty_coverage())
+        out = render_human(report)
+        # All-zero coverage = no data → bail to the no-events message
+        assert "no auto-recall events" in out.lower()
+
+    def test_renders_when_only_cross_source_data(self):
+        """User has auto-recall disabled (zero AutoRecall events) but the
+        transcript scan found tool calls — render must NOT bail to the
+        'no events' message. Codex 2026-05-05 P2."""
+        from recall.stats import StatsReport, render_human
+        report = StatsReport(
+            fired_count=0,
+            skipped_count=0,
+            other_outcomes={},  # zero AutoRecall events
+            mcp_calls={"mcp__minerva__*": 12},
+            tool_calls_other={"Bash": 100},
+        )
+        out = render_human(report)
+        # Must NOT be the "no events" bail
+        assert "no auto-recall events" not in out.lower()
+        # Cross-source data still surfaces
+        assert "mcp__minerva__*" in out
+        assert "12" in out
+        # And we don't emit meaningless "p50 0ms" lines
+        assert "p50 0" not in out and "p95 0" not in out
+
+    def test_renders_coverage_section_with_percentages(self):
+        from recall.stats import StatsReport, render_human
+        report = StatsReport(
+            fired_count=10,
+            routing_coverage={
+                "system_level_total": 12,
+                "system_level_notebooklm": 5,
+                "system_level_coverage": 0.42,
+                "code_level_total": 8,
+                "code_level_minerva": 6,
+                "code_level_coverage": 0.75,
+            },
+        )
+        out = render_human(report)
+        assert "Coverage check" in out
+        # Both rates surface
+        assert "42%" in out or "0.42" in out
+        assert "75%" in out or "0.75" in out
