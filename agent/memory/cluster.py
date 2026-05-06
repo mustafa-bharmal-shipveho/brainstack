@@ -5,11 +5,15 @@ similarity is Jaccard on word_set, and extraction picks a canonical episode
 rather than synthesizing a new claim. Structured candidates flow through the
 Phase 1 validation gate — if no LLM is available, they defer as before.
 """
-import os, re, sys, hashlib
+import hashlib
+import os
+import re
+import sys
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "harness"))
-from text import word_set, jaccard
 from salience import salience_score
+from text import jaccard, word_set
 
 
 def _normalize_claim(text):
@@ -183,6 +187,160 @@ def content_cluster(entries, threshold=0.3, min_size=2, group_by_origin=True):
     for bucket in buckets.values():
         out.extend(_cluster_one_bucket(bucket, threshold, min_size))
     return out
+
+
+def _parse_iso_to_aware(iso):
+    """Parse an ISO-8601 timestamp string to a tz-aware datetime.
+
+    Returns None on missing/malformed input rather than raising — the
+    caller decides whether bad timestamps disqualify a cluster. Naive
+    timestamps are treated as UTC, matching `_age_factor` and
+    `_count_recent_failures` elsewhere in brainstack.
+    """
+    if not iso or not isinstance(iso, str):
+        return None
+    try:
+        if iso.endswith("Z"):
+            iso = iso[:-1] + "+00:00"
+        dt = datetime.fromisoformat(iso)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _is_burst_cluster(
+    cluster,
+    *,
+    max_evidence_count: int = 500,
+    max_window_seconds: int = 1800,
+    require_single_bucket: bool = True,
+    chronic_evidence_count: int = 2000,
+    min_dominant_bucket_fraction: float = 0.95,
+):
+    """Detect a noise cluster. Returns (is_burst, reason).
+
+    Two detection paths, OR'd. Either trips → cluster is dropped.
+
+    **Path A — time burst** (the original signal): a tight, dense, single-
+    bucket spike. All three of:
+      - count > max_evidence_count (default 500)
+      - window < max_window_seconds (default 1800, strict)
+      - single bucket (when require_single_bucket=True; see dominance below)
+
+    **Path B — chronic single-bucket dominance**: a single (skill, result)
+    pair has accumulated extreme volume regardless of time window.
+    Field-graded against a real candidate that escaped earlier designs
+    by mixing 7,021 success events with 76 failure events from the same
+    skill — the dominant bucket holds 99% of events. Trips when:
+      - count > chronic_evidence_count (default 2000, well above any
+        legitimate single-skill+result cluster observed in practice)
+      - single bucket (when require_single_bucket=True; see dominance below)
+      - no window constraint
+
+    **Dominant-bucket relaxation.** When `require_single_bucket=True`
+    AND the largest bucket holds ≥ `min_dominant_bucket_fraction` of
+    events (default 0.95), the cluster is TREATED as effectively
+    single-bucket for both paths above. This catches the real-world
+    case where a tiny minority of off-pattern events (e.g. 76 failures
+    in a 7,000-event success spam) shouldn't shield the cluster from
+    the detector. The reason string includes the dominance percentage
+    when this relaxation triggers, so logs distinguish strict-single
+    from dominant-single.
+
+    `reason` is "" on a non-burst, and a compact stable string on
+    a burst:
+      - Path A strict-single: "burst: n=N window_s=S bucket=skill/result"
+      - Path A dominant-single: "burst_dominant: n=N window_s=S bucket=skill/result frac=0.99"
+      - Path A multi-bucket (relaxed): "burst_multi_bucket: ..."
+      - Path B strict-single: "chronic_noise: n=N bucket=skill/result"
+      - Path B dominant-single: "chronic_dominant: n=N bucket=skill/result frac=0.99"
+      - Path B multi-bucket (relaxed): "chronic_multi_bucket: ..."
+
+    Defensive on bad data: events with missing or malformed `timestamp`
+    are excluded from the window calc but still counted toward evidence.
+    If fewer than 2 valid timestamps remain the window is undefined —
+    Path A bails, Path B may still trip on count alone.
+
+    Pure function — no env reads, no I/O. Env-var integration lives in
+    the caller (cluster_and_extract).
+    """
+    n = len(cluster)
+    if n == 0:
+        return False, ""
+
+    # Bucket distribution: (skill, result) tuple → count
+    bucket_counts = {}
+    for e in cluster:
+        key = (e.get("skill"), e.get("result"))
+        bucket_counts[key] = bucket_counts.get(key, 0) + 1
+    bucket_count = len(bucket_counts)
+    dominant_bucket, dominant_n = max(bucket_counts.items(), key=lambda kv: kv[1])
+    dominant_fraction = dominant_n / n if n > 0 else 0.0
+    is_effectively_single = (
+        bucket_count == 1
+        or dominant_fraction >= min_dominant_bucket_fraction
+    )
+
+    if require_single_bucket and not is_effectively_single:
+        return False, ""
+
+    def _bucket_label():
+        skill, result = dominant_bucket
+        return f"{skill or '?'}/{result or '?'}"
+
+    def _dominant_suffix():
+        # Only annotate dominance when it triggered the relaxation
+        # (i.e. bucket_count > 1 but fraction was high enough). Pure
+        # single-bucket clusters get the simpler reason form.
+        if bucket_count > 1:
+            return "_dominant"
+        return ""
+
+    def _dominant_frac_suffix():
+        if bucket_count > 1:
+            return f" frac={dominant_fraction:.2f}"
+        return ""
+
+    # Path B — chronic dominance (no window constraint).
+    # Checked first because it's strictly stronger on count: any cluster
+    # tripping B will also trip A's count threshold (chronic > max).
+    if n > chronic_evidence_count:
+        if is_effectively_single:
+            return True, (
+                f"chronic{_dominant_suffix() or '_noise'}: n={n} "
+                f"bucket={_bucket_label()}{_dominant_frac_suffix()}"
+            )
+        return True, (
+            f"chronic_multi_bucket: n={n} bucket_count={bucket_count}"
+        )
+
+    # Path A — time burst.
+    if n <= max_evidence_count:
+        return False, ""
+
+    parsed = []
+    for e in cluster:
+        dt = _parse_iso_to_aware(e.get("timestamp"))
+        if dt is not None:
+            parsed.append(dt)
+    if len(parsed) < 2:
+        return False, ""
+    span_seconds = (max(parsed) - min(parsed)).total_seconds()
+    if span_seconds >= max_window_seconds:
+        return False, ""
+
+    if is_effectively_single:
+        prefix = "burst" + _dominant_suffix()
+        return True, (
+            f"{prefix}: n={n} window_s={int(span_seconds)} "
+            f"bucket={_bucket_label()}{_dominant_frac_suffix()}"
+        )
+    return True, (
+        f"burst_multi_bucket: n={n} bucket_count={bucket_count} "
+        f"window_s={int(span_seconds)}"
+    )
 
 
 def extract_pattern(cluster):

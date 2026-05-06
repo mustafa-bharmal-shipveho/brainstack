@@ -8,26 +8,99 @@ Every staged candidate carries lifecycle metadata (status, decisions,
 rejection_count) from birth so repeated churn is visible rather than looking
 fresh each time the pattern recurs.
 """
-import os, json, datetime, hashlib
-from cluster import content_cluster, extract_pattern
-from review_state import _lessons_sha
-from validate import extract_lesson_lines, check_exact_duplicate
+import datetime
+import hashlib
+import json
+import os
+
 from _atomic import atomic_write_json
+from cluster import _is_burst_cluster, content_cluster, extract_pattern
+from validate import check_exact_duplicate, extract_lesson_lines
 
 
-def cluster_and_extract(entries, threshold=0.3, group_by_origin=True):
+def _env_bool(name, default):
+    """Robust bool parsing. Empty / missing → default. Recognized
+    falsy: '0', 'false', 'no', 'off' (case- and whitespace-insensitive).
+    Anything else truthy. Used by both the kill switch and feature flags
+    so behavior is consistent."""
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    v = v.strip().lower()
+    if v == "":
+        return default
+    return v not in ("0", "false", "no", "off")
+
+
+def _burst_thresholds_from_env():
+    """Read burst-detector tunables from env. Garbage values fall back
+    to defaults so a malformed env var can't break a dream cycle.
+
+    DREAM_BURST_DISABLED follows _env_bool semantics (truthy → kill
+    switch, falsy → detector active). Returns None when the kill
+    switch is on; the caller treats None as "skip the detector entirely."
+    """
+    if _env_bool("DREAM_BURST_DISABLED", False):
+        return None
+    def _int(name, default):
+        try:
+            return int(os.environ.get(name, default))
+        except (TypeError, ValueError):
+            return default
+    def _float(name, default):
+        try:
+            return float(os.environ.get(name, default))
+        except (TypeError, ValueError):
+            return default
+    return {
+        "max_evidence_count": _int("DREAM_BURST_MAX_EVIDENCE", 500),
+        "max_window_seconds": _int("DREAM_BURST_MAX_WINDOW_SECONDS", 1800),
+        "require_single_bucket":
+            _env_bool("DREAM_BURST_REQUIRE_SINGLE_BUCKET", True),
+        "chronic_evidence_count": _int("DREAM_BURST_CHRONIC_COUNT", 2000),
+        "min_dominant_bucket_fraction":
+            _float("DREAM_BURST_DOMINANT_FRACTION", 0.95),
+    }
+
+
+def cluster_and_extract(entries, threshold=0.3, group_by_origin=True,
+                        telemetry=None):
     """Cluster entries by content similarity, extract a pattern per cluster.
 
     PR1: `group_by_origin=True` (default) buckets entries by their
     `origin` field before clustering, so cross-origin events with
-    identical text never end up in the same cluster. Pass False to
-    fall back to the prior cross-origin behaviour (e.g., for a one-off
-    diagnostic dream pass).
+    identical text never end up in the same cluster.
+
+    Burst filter: each cluster runs through `_is_burst_cluster` before
+    pattern extraction. Bursts are skipped — the candidate never reaches
+    `write_candidates` and never gets an id persisted, so the recurring
+    rejection-history loophole (cluster regenerates with new id every
+    cycle) becomes irrelevant. When `telemetry=[]` is passed, each skip
+    appends a `{"reason": str, "cluster_size": int}` entry so callers
+    can render `burst_skipped=N` in the dream-cycle log.
+
+    DREAM_BURST_* env vars override defaults; DREAM_BURST_DISABLED=1
+    bypasses the detector entirely (forensic mode).
     """
     clusters = content_cluster(
         entries, threshold=threshold, group_by_origin=group_by_origin
     )
-    return {p["name"]: p for p in (extract_pattern(c) for c in clusters)}
+    burst_kwargs = _burst_thresholds_from_env()
+
+    patterns = {}
+    for c in clusters:
+        if burst_kwargs is not None:
+            is_burst, reason = _is_burst_cluster(c, **burst_kwargs)
+            if is_burst:
+                if telemetry is not None:
+                    telemetry.append({
+                        "reason": reason,
+                        "cluster_size": len(c),
+                    })
+                continue
+        p = extract_pattern(c)
+        patterns[p["name"]] = p
+    return patterns
 
 
 def _slug(pattern_or_key):
