@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased — routing-coverage classifier removal (2026-05-06)
+
+### Removed (breaking)
+
+- **`recall stats` "Coverage check (CLAUDE.md routing rules)" section.** The
+  underlying regex-based classifier (`classify_prompt`,
+  `compute_routing_coverage`) had measured 0% precision and 0% recall on
+  system-level prompts when graded against 50 hand-labeled real prompts.
+  Generic English patterns ("how does X work", "who owns Y") fire on
+  conversational text, compaction summaries, and assistant-quoted text —
+  while missing real domain prompts that use any other phrasing.
+- **`StatsReport.routing_coverage`** dataclass field is gone. The
+  `recall stats --json` output no longer contains a `routing_coverage`
+  key. Consumers that read this key need to either drop the dependency
+  (the coverage numbers were unreliable anyway) or compute their own
+  classifier on top of the raw `mcp_calls` / `tool_calls_other` counts
+  that remain in the JSON output.
+
+### Why
+
+The classifier was Veho-leaning by accident — its patterns described how
+*one organization's* CLAUDE.md routing rules read, not how prompts
+actually look in the wild. Any classifier that would work needs an
+org-specific keyword list (internal service names, ticket prefixes,
+etc.), which is wrong for an open-source tool. The right shape is a
+config-driven feature added on top — declare your org's keywords + the
+expected MCP per rule in user config — but that's not necessary for the
+open-source tool to ship without.
+
+The raw MCP-call counts (`mcp_calls`, `tool_calls_other`) are unchanged
+and remain useful as-is.
+
 ## Unreleased — v0.4.0 brain edits from the CLI (2026-05-01)
 
 The two missing commands brainstack always needed:

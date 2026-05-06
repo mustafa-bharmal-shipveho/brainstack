@@ -30,12 +30,12 @@ class StatsReport:
     add an opt-in path-emission flag later, this field becomes populated.
     Documenting it now keeps the schema forward-compatible.
 
-    The cross-source fields (``mcp_calls``, ``tool_calls_other``,
-    ``routing_coverage``) come from a different data source than the
-    auto-recall fields — they're parsed from Claude Code transcripts
-    rather than ``events.log.jsonl``. The runtime PostToolUse hook only
-    captures Bash/Edit/Read/Write tool names today, so the events log
-    isn't a reliable source for MCP / Agent / Skill usage.
+    The cross-source fields (``mcp_calls``, ``tool_calls_other``) come
+    from a different data source than the auto-recall fields — they're
+    parsed from Claude Code transcripts rather than ``events.log.jsonl``.
+    The runtime PostToolUse hook only captures Bash/Edit/Read/Write tool
+    names today, so the events log isn't a reliable source for MCP /
+    Agent / Skill usage.
     """
 
     fired_count: int = 0
@@ -52,11 +52,16 @@ class StatsReport:
     # outcomes other than hit/skip — surfaced for diagnostics. Includes
     # timeout, unavailable, error counts when present.
     other_outcomes: dict[str, int] = field(default_factory=dict)
-    # Cross-source observability (Phase 1). Populated when the CLI was
-    # invoked with transcript scanning enabled.
+    # Cross-source observability. Populated when the CLI was invoked with
+    # transcript scanning enabled. We surface RAW MCP / builtin call
+    # counts here — interpretation (e.g. "is the model calling the right
+    # MCP for this question type") is deliberately punted to the user
+    # because that decision is org-specific (CLAUDE.md routing rules
+    # vary), and a regex-based classifier inside this open-source repo
+    # had ~0% precision on the only category that mattered. See
+    # CHANGELOG entry on routing-coverage removal.
     mcp_calls: dict[str, int] = field(default_factory=dict)
     tool_calls_other: dict[str, int] = field(default_factory=dict)
-    routing_coverage: dict[str, int | float] = field(default_factory=dict)
 
 
 def aggregate_events(
@@ -233,15 +238,14 @@ def render_human(report: StatsReport) -> str:
     """
     other_total = sum(report.other_outcomes.values())
     grand_total = report.fired_count + report.skipped_count + other_total
-    # `has_cross_source` checks for ACTUAL data, not just dict presence.
-    # `compute_routing_coverage` always returns an all-zero dict (rather
-    # than {}), so `bool(report.routing_coverage)` is True even when
-    # there's nothing to show — that would suppress the "no events"
-    # message on a genuinely empty brain. Codex 2026-05-05 P2.
+    # Use any-positive-value check (not bool(dict)) so a programmatically
+    # constructed all-zero dict doesn't suppress the no-events message.
+    # Today aggregate_tool_calls only returns positive counts so the dict
+    # form would be safe, but pinning the invariant keeps render_human
+    # robust against future producers.
     has_cross_source = (
-        bool(report.mcp_calls)
-        or bool(report.tool_calls_other)
-        or any(int(v) > 0 for v in report.routing_coverage.values())
+        any(int(v) > 0 for v in report.mcp_calls.values())
+        or any(int(v) > 0 for v in report.tool_calls_other.values())
     )
     # Only fully bail when there's NOTHING to report — including no
     # cross-source tool calls. A user with auto-recall disabled but
@@ -301,25 +305,6 @@ def render_human(report: StatsReport) -> str:
             top = sorted(report.tool_calls_other.items(), key=lambda kv: -kv[1])[:6]
             summary = ", ".join(f"{k} ({v})" for k, v in top)
             lines.append(f"    {'builtins':<26}: {summary}")
-
-    if report.routing_coverage and report.routing_coverage.get("system_level_total", 0) + \
-       report.routing_coverage.get("code_level_total", 0) > 0:
-        lines.append("")
-        lines.append("  Coverage check (CLAUDE.md routing rules):")
-        rc = report.routing_coverage
-        if rc.get("system_level_total", 0):
-            pct = int(rc.get("system_level_coverage", 0.0) * 100)
-            lines.append(
-                f"    System-level questions    : {rc['system_level_total']} detected, "
-                f"{rc.get('system_level_notebooklm', 0)} of those triggered notebooklm "
-                f"({pct}%)"
-            )
-        if rc.get("code_level_total", 0):
-            pct = int(rc.get("code_level_coverage", 0.0) * 100)
-            lines.append(
-                f"    Code-level questions      : {rc['code_level_total']} detected, "
-                f"{rc.get('code_level_minerva', 0)} of those triggered minerva ({pct}%)"
-            )
 
     lines.append("")
     lines.append("  Without auto-recall, all "
@@ -440,168 +425,25 @@ def _parse_iso_to_ms(iso: str | None) -> int | None:
         return None
 
 
-# Heuristic regexes for routing coverage. Tunable; will produce false
-# positives. The point is signal, not precision.
-_SYSTEM_LEVEL_PATTERNS = [
-    re.compile(r"\bhow does\b.*\bwork\b", re.IGNORECASE),
-    re.compile(r"\bwho owns\b", re.IGNORECASE),
-    re.compile(r"\bwhat'?s the difference\b", re.IGNORECASE),
-    re.compile(r"\bwalk me through\b", re.IGNORECASE),
-    re.compile(r"\bend[- ]to[- ]end\b", re.IGNORECASE),
-    re.compile(r"\bhow do .* communicate\b", re.IGNORECASE),
-    re.compile(r"\barchitecture\b", re.IGNORECASE),
-]
-_CODE_LEVEL_PATTERNS = [
-    re.compile(r"\bwhere is\b.*\bused\b", re.IGNORECASE),
-    re.compile(r"\bwhat repos depend on\b", re.IGNORECASE),
-    re.compile(r"\bwhat events does\b.*\bemit\b", re.IGNORECASE),
-    re.compile(r"\bblast radius\b", re.IGNORECASE),
-    re.compile(r"\bcross[- ]repo\b", re.IGNORECASE),
-    re.compile(r"\bwhich repos? (call|use|reference|depend)\b", re.IGNORECASE),
-]
-
-
-def classify_prompt(text: str) -> str | None:
-    """Classify a user prompt as system-level, code-level, or neither.
-
-    Returns ``"system-level"``, ``"code-level"``, or ``None``. Heuristic-
-    based — regex patterns derived from the CLAUDE.md routing rules.
-    Code-level is checked first because it's the more specific category;
-    a prompt like "what events does the package service emit" matches
-    code-level even though it could also kind-of match "how does X work".
-    """
-    if not text or not isinstance(text, str):
-        return None
-    for pat in _CODE_LEVEL_PATTERNS:
-        if pat.search(text):
-            return "code-level"
-    for pat in _SYSTEM_LEVEL_PATTERNS:
-        if pat.search(text):
-            return "system-level"
-    return None
-
-
-def compute_routing_coverage(
-    transcripts_dir: Path | str,
-    *,
-    since_ts_ms: int | None = None,
-) -> dict[str, int | float]:
-    """For each session, count user prompts by category and check whether
-    the appropriate MCP got called. Returns a dict with totals + coverage
-    rates per category.
-
-    Per-session pairing: a "session" is one transcript file. If the user
-    asked a system-level question in the session and ``mcp__notebooklm__*``
-    was called anywhere in the same session, we count that as covered.
-    Imperfect (the call might have been for a different question), but
-    the grain is sessions-with-the-pattern, not turn-level pairing.
-    """
-    root = Path(transcripts_dir)
-    if not root.is_dir():
-        return _empty_coverage()
-    sys_total = 0
-    sys_covered = 0
-    code_total = 0
-    code_covered = 0
-    for jsonl in root.rglob("*.jsonl"):
-        sys_in_session, code_in_session, n_notebook, n_minerva = _classify_session(
-            jsonl, since_ts_ms
-        )
-        sys_total += sys_in_session
-        # Per-session pairing capped at the number of relevant calls:
-        # 4 sys-level questions + 2 notebooklm calls → 2 covered, not 4.
-        # Reflects "how many qualifying questions actually got the right
-        # tool fired alongside them" without trying to do turn-level
-        # pairing (which would need ts ordering and is brittle).
-        sys_covered += min(sys_in_session, n_notebook)
-        code_total += code_in_session
-        code_covered += min(code_in_session, n_minerva)
-    return {
-        "system_level_total": sys_total,
-        "system_level_notebooklm": sys_covered,
-        "system_level_coverage": round(sys_covered / sys_total, 2) if sys_total else 0.0,
-        "code_level_total": code_total,
-        "code_level_minerva": code_covered,
-        "code_level_coverage": round(code_covered / code_total, 2) if code_total else 0.0,
-    }
-
-
-def _empty_coverage() -> dict[str, int | float]:
-    return {
-        "system_level_total": 0,
-        "system_level_notebooklm": 0,
-        "system_level_coverage": 0.0,
-        "code_level_total": 0,
-        "code_level_minerva": 0,
-        "code_level_coverage": 0.0,
-    }
-
-
-def _classify_session(jsonl: Path, since_ts_ms: int | None) -> tuple[int, int, int, int]:
-    """Walk one transcript. Return (sys_q_count, code_q_count,
-    notebooklm_call_count, minerva_call_count).
-
-    Only USER-role text is classified — without this, assistant
-    explanations and tool-result text get counted as user prompts,
-    inflating the totals 10x+ on a real transcript (every "the WMS
-    architecture works like..." in an assistant reply matches the
-    system-level pattern).
-    """
-    sys_q = 0
-    code_q = 0
-    notebook = 0
-    minerva = 0
-    try:
-        with jsonl.open() as f:
-            for line in f:
-                try:
-                    rec = json.loads(line)
-                except (json.JSONDecodeError, ValueError):
-                    continue
-                if not isinstance(rec, dict):
-                    continue
-                if since_ts_ms is not None:
-                    ts_ms = _parse_iso_to_ms(rec.get("timestamp"))
-                    if ts_ms is None or ts_ms < since_ts_ms:
-                        continue
-                role = rec.get("type")
-                msg = rec.get("message") or {}
-                content = msg.get("content") if isinstance(msg, dict) else None
-                # Real Claude Code transcripts encode user turns two ways:
-                # (a) `content` is a plain string with the prompt text;
-                # (b) `content` is a list of blocks (tool_use, text, etc).
-                # Without handling (a), routing coverage reports zero
-                # qualifying questions even on transcripts with hundreds.
-                # Codex 2026-05-05 P2.
-                if isinstance(content, str) and role == "user":
-                    cls = classify_prompt(content)
-                    if cls == "system-level":
-                        sys_q += 1
-                    elif cls == "code-level":
-                        code_q += 1
-                    continue
-                if not isinstance(content, list):
-                    continue
-                for block in content:
-                    if not isinstance(block, dict):
-                        continue
-                    btype = block.get("type")
-                    # Only count user-authored text as prompts. Assistant
-                    # text is the model's reply (which may discuss how X
-                    # works), and tool_result is search output — neither
-                    # is a user "question."
-                    if btype == "text" and role == "user":
-                        cls = classify_prompt(block.get("text", ""))
-                        if cls == "system-level":
-                            sys_q += 1
-                        elif cls == "code-level":
-                            code_q += 1
-                    elif btype == "tool_use":
-                        name = block.get("name") or ""
-                        if name.startswith("mcp__notebooklm__"):
-                            notebook += 1
-                        elif name.startswith("mcp__minerva__"):
-                            minerva += 1
-    except OSError:
-        pass
-    return sys_q, code_q, notebook, minerva
+# NOTE: an earlier version of this module included a regex-based
+# `classify_prompt()` and `compute_routing_coverage()` that scanned
+# transcripts to compute "is the model calling the right MCP for this
+# kind of question" coverage percentages.
+#
+# That feature was removed because:
+#   1. The regex classifier had 0% precision and 0% recall on the only
+#      category that mattered when measured against 50 hand-labeled
+#      prompts. Generic English patterns like "how does X work" don't
+#      identify domain-specific questions; they fire on chitchat, on
+#      compaction summaries, on assistant-quoted text — and miss real
+#      domain prompts that happen to use different phrasing.
+#   2. Any classifier that could work would be org-specific (Veho-
+#      specific keyword list, internal-tool-name lexicon, etc.) and
+#      this is an open-source tool.
+#   3. The raw MCP call counts (above, in StatsReport.mcp_calls) are
+#      already useful and org-agnostic — we leave the interpretation to
+#      the operator.
+#
+# If a future user wants per-org routing coverage, the right shape is a
+# config-driven feature (declare keywords + expected MCP per rule in a
+# user-owned config file) rather than hardcoded patterns in this repo.

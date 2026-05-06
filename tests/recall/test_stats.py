@@ -335,109 +335,6 @@ class TestToolCallAggregation:
         assert result["mcp__minerva__*"] == 1
 
 
-class TestRoutingCoverage:
-    """The model is supposed to call `mcp__notebooklm__ask_question` for
-    system-level questions and `mcp__minerva__*` for code-level ones (per
-    CLAUDE.md routing rules). `routing_coverage()` computes how often that
-    actually happened.
-
-    Heuristic: simple keyword/regex match on the user's prompt text.
-    Imperfect — produces false positives — but a useful signal."""
-
-    def test_detects_system_level_question(self):
-        from recall.stats import classify_prompt
-        for prompt in [
-            "How does the WMS architecture work end-to-end?",
-            "Who owns the package routing service?",
-            "What's the difference between PrOps and DMS?",
-            "walk me through how facility orchestration handles inbound",
-        ]:
-            assert classify_prompt(prompt) == "system-level", (
-                f"misclassified: {prompt!r}"
-            )
-
-    def test_detects_code_level_question(self):
-        from recall.stats import classify_prompt
-        for prompt in [
-            "Where is FacilityProfile used in the monorepo?",
-            "What repos depend on the inventory-management package?",
-            "What events does the sort service emit?",
-            "blast radius of changing this column in package_handling",
-        ]:
-            assert classify_prompt(prompt) == "code-level", (
-                f"misclassified: {prompt!r}"
-            )
-
-    def test_neither_classification_for_random_prompts(self):
-        """Most prompts in a coding session aren't system-level or
-        code-level — they're task-specific. Don't force a classification."""
-        from recall.stats import classify_prompt
-        for prompt in [
-            "fix the failing test",
-            "thanks",
-            "let's commit and push",
-            "/dream",
-        ]:
-            assert classify_prompt(prompt) is None, (
-                f"shouldn't classify: {prompt!r}"
-            )
-
-    def test_string_user_message_classified(self, tmp_path: Path):
-        """Real Claude Code transcripts encode user turns with `content`
-        as a plain string, not a content-block list. Without handling
-        this shape, routing coverage misses the bulk of real prompts.
-        Codex 2026-05-05 P2."""
-        from recall.stats import compute_routing_coverage
-        proj = tmp_path / "projects" / "-Users-foo"
-        proj.mkdir(parents=True)
-        ts = "2026-05-05T12:00:00.000Z"
-        # User turn with STRING content (the common shape)
-        entry_user = {
-            "type": "user", "timestamp": ts,
-            "message": {"role": "user", "content": "How does the WMS architecture work end-to-end?"},
-        }
-        # Assistant turn with notebooklm tool_use
-        entry_assistant = {
-            "type": "assistant", "timestamp": ts,
-            "message": {"content": [
-                {"type": "tool_use", "name": "mcp__notebooklm__ask_question"}
-            ]},
-        }
-        with (proj / "s.jsonl").open("w") as f:
-            f.write(json.dumps(entry_user) + "\n")
-            f.write(json.dumps(entry_assistant) + "\n")
-        coverage = compute_routing_coverage(tmp_path / "projects")
-        assert coverage["system_level_total"] == 1
-        assert coverage["system_level_notebooklm"] == 1
-        assert coverage["system_level_coverage"] == 1.0
-
-    def test_routing_coverage_computes_per_category_rates(self, tmp_path: Path):
-        """Given a window where the user asked 4 system-level questions
-        and 2 of them triggered notebooklm, coverage should be 0.5."""
-        from recall.stats import compute_routing_coverage
-
-        proj = tmp_path / "projects" / "-Users-foo"
-        ts = "2026-05-05T12:00:00.000Z"
-        # 4 system-level user prompts
-        for q in ["how does X work", "who owns Y", "what's the difference between A and B", "walk me through Z"]:
-            _write_transcript_entry(proj / "s.jsonl", ts_iso=ts, kind="user_text", text=q)
-        # 2 of those windows had notebooklm calls; emulate by interleaving
-        _write_transcript_entry(
-            proj / "s.jsonl", ts_iso=ts,
-            tool_name="mcp__notebooklm__ask_question"
-        )
-        _write_transcript_entry(
-            proj / "s.jsonl", ts_iso=ts,
-            tool_name="mcp__notebooklm__ask_question"
-        )
-        coverage = compute_routing_coverage(tmp_path / "projects")
-        # 4 system-level questions, 2 notebooklm calls.
-        # Implementation rounds to 1 decimal: 2/4 = 0.5
-        assert coverage["system_level_total"] == 4
-        assert coverage["system_level_notebooklm"] == 2
-        assert coverage["system_level_coverage"] == 0.5
-
-
 class TestStatsCliNoToolsFlag:
     """`recall stats --no-tools` is the perf escape hatch: when the user
     has hundreds of transcripts and only wants the auto-recall stats fast,
@@ -457,9 +354,9 @@ class TestStatsCliNoToolsFlag:
 
 
 class TestRenderCrossSourceSection:
-    """`render_human()` must include the new "Model-driven tool calls" and
-    "Coverage check" sections when the report has the relevant fields
-    populated. Empty fields → omit the section (don't print empty headers)."""
+    """`render_human()` must include the "Model-driven tool calls" section
+    when the report has tool-call data populated. Empty fields → omit the
+    section (don't print empty headers)."""
 
     def test_renders_mcp_calls_section(self):
         from recall.stats import StatsReport, render_human
@@ -480,18 +377,6 @@ class TestRenderCrossSourceSection:
         )
         out = render_human(report)
         assert "Model-driven tool calls" not in out
-
-    def test_render_empty_routing_coverage_does_not_suppress_no_events(self):
-        """`compute_routing_coverage` returns an all-zero dict (not {})
-        when no qualifying prompts/calls exist. That non-empty-but-zero
-        dict must NOT be treated as "we have data" — otherwise the
-        no-events message gets suppressed on genuinely empty brains.
-        Codex 2026-05-05 P2."""
-        from recall.stats import StatsReport, _empty_coverage, render_human
-        report = StatsReport(routing_coverage=_empty_coverage())
-        out = render_human(report)
-        # All-zero coverage = no data → bail to the no-events message
-        assert "no auto-recall events" in out.lower()
 
     def test_renders_when_only_cross_source_data(self):
         """User has auto-recall disabled (zero AutoRecall events) but the
@@ -514,21 +399,46 @@ class TestRenderCrossSourceSection:
         # And we don't emit meaningless "p50 0ms" lines
         assert "p50 0" not in out and "p95 0" not in out
 
-    def test_renders_coverage_section_with_percentages(self):
+    def test_all_zero_tool_call_dicts_do_not_suppress_no_events(self):
+        """A programmatically constructed report with all-zero counts
+        in mcp_calls / tool_calls_other (rather than empty dicts) must
+        NOT be treated as 'we have data' — otherwise the no-events
+        message gets suppressed when nothing real happened.
+        Codex 2026-05-06 review of routing-coverage removal."""
         from recall.stats import StatsReport, render_human
         report = StatsReport(
-            fired_count=10,
-            routing_coverage={
-                "system_level_total": 12,
-                "system_level_notebooklm": 5,
-                "system_level_coverage": 0.42,
-                "code_level_total": 8,
-                "code_level_minerva": 6,
-                "code_level_coverage": 0.75,
-            },
+            mcp_calls={"mcp__minerva__*": 0},
+            tool_calls_other={"Bash": 0},
         )
         out = render_human(report)
-        assert "Coverage check" in out
-        # Both rates surface
-        assert "42%" in out or "0.42" in out
-        assert "75%" in out or "0.75" in out
+        # All-zero counts = no data → bail to the no-events message
+        assert "no auto-recall events" in out.lower()
+
+
+class TestStatsJsonContract:
+    """Regression tests for `recall stats --json` output shape. These
+    pin the schema after the routing-coverage removal so a future change
+    that re-introduces the field (or removes another) gets caught."""
+
+    def test_routing_coverage_key_absent(self):
+        from dataclasses import asdict
+        from recall.stats import StatsReport
+        data = asdict(StatsReport())
+        assert "routing_coverage" not in data, (
+            "routing_coverage was removed from the schema in 2026-05-06; "
+            "re-introducing it would silently change the --json contract"
+        )
+
+    def test_expected_keys_present(self):
+        """The fields downstream consumers actually depend on."""
+        from dataclasses import asdict
+        from recall.stats import StatsReport
+        data = asdict(StatsReport())
+        for required in [
+            "fired_count", "skipped_count", "skip_reasons",
+            "latency_p50_ms", "latency_p95_ms", "surfaced_count",
+            "top_sources", "top_paths", "score_distribution",
+            "window_start_ts_ms", "window_end_ts_ms",
+            "other_outcomes", "mcp_calls", "tool_calls_other",
+        ]:
+            assert required in data, f"missing schema field: {required}"
