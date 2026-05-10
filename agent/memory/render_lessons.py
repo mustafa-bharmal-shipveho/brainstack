@@ -122,6 +122,55 @@ def load_lessons(semantic_dir):
     return out
 
 
+def remove_lesson(lesson_id, semantic_dir):
+    """Rewrite lessons.jsonl with `lesson_id` filtered out.
+
+    Inverse of append_lesson. Used by demote.py to undo a graduation: the
+    candidate moves back to rejected/ AND the lesson row disappears from
+    the source of truth. Re-rendering LESSONS.md after is the caller's
+    responsibility (so this stays a pure data-layer op).
+
+    Returns the removed lesson dict (or None if not found). Idempotent: a
+    second call with the same id is a no-op that returns None. Holds the
+    same exclusive flock as append_lesson so a concurrent appender can't
+    land a row mid-rewrite.
+
+    File rewrite is in-place under the lock — atomic_write would break
+    out of the flock-protected fd. For a single-user brain on local disk
+    that's safe; a crash mid-write leaves a truncated lessons.jsonl that
+    `load_lessons` recovers from line-by-line (json.JSONDecodeError on the
+    half-written tail line is silently skipped).
+    """
+    path = os.path.join(semantic_dir, LESSONS_JSONL)
+    if not os.path.exists(path):
+        return None
+    removed = None
+    with _locked_jsonl(path) as f:
+        f.seek(0)
+        kept = []
+        for line in f:
+            line = line.rstrip("\n")
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                kept.append(line)
+                continue
+            if row.get("id") == lesson_id and removed is None:
+                removed = row
+                continue
+            kept.append(line)
+        if removed is None:
+            return None
+        f.seek(0)
+        f.truncate()
+        for line in kept:
+            f.write(line + "\n")
+        f.flush()
+    return removed
+
+
 def _bullet_for(lesson, superseded_by):
     claim = lesson.get("claim", "")
     conf = lesson.get("confidence", "?")
@@ -269,13 +318,21 @@ def _dedupe_by_id(lessons):
     return [latest[lid] for lid in order]
 
 
-def render_lessons(semantic_dir):
+def render_lessons(semantic_dir, *, skip_migrate=False):
     """Re-render LESSONS.md. Preserves hand-curated content above the sentinel.
 
     Auto-migrates legacy auto-promoted bullets below the sentinel into
     lessons.jsonl before rendering, so upgrades from the old markdown-only
     format don't silently erase past promotions. Deduplicates entries by
     lesson id so a provisional-then-accepted lesson renders once, not twice.
+
+    `skip_migrate=True` bypasses the legacy-bullet migration. demote.py
+    needs this: it just removed a row from lessons.jsonl, and the bullet
+    for that row is still in LESSONS.md until we re-render. Running the
+    migration in between would notice the bullet-without-jsonl-row and
+    helpfully reimport it as a new `lesson_legacy_*` entry — exactly the
+    state demote is trying to undo. Default stays False so the post-upgrade
+    safety-net keeps working for every other caller.
 
     Concurrency-safe: the entire read-render-write cycle runs under an
     exclusive flock on lessons.jsonl. A concurrent append_lesson() either
@@ -290,7 +347,8 @@ def render_lessons(semantic_dir):
     # deadlock (two fds on the same file within one process each want
     # LOCK_EX). Migration is idempotent and only does real work on first
     # run after an upgrade, so the ordering is safe.
-    migrate_legacy_bullets(semantic_dir)
+    if not skip_migrate:
+        migrate_legacy_bullets(semantic_dir)
 
     jsonl_path = os.path.join(semantic_dir, LESSONS_JSONL)
     md_path = os.path.join(semantic_dir, LESSONS_MD)

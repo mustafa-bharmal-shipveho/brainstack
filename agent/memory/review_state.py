@@ -155,6 +155,40 @@ def mark_rejected(candidate_id, reviewer, reason, candidates_dir, **extra_stamp)
     return cand
 
 
+def mark_demoted(candidate_id, reviewer, reason, candidates_dir, **extra_stamp):
+    """Move a graduated candidate back to candidates/rejected/ — the
+    inverse of mark_graduated. Used when a lesson promoted before a
+    filter shipped (or a manual graduation in retrospect) needs to be
+    pulled from semantic memory: demote.py removes the lessons.jsonl
+    row + re-renders LESSONS.md, then calls this to flip the on-disk
+    status.
+
+    The decision history keeps both the original `graduated` entry and
+    the new `demoted` entry, so the reviewer can see the round-trip.
+    `rejection_count` is incremented to match mark_rejected's contract:
+    if the same id resurfaces in a future cluster, it shows up as
+    previously rejected (the demote IS a retrospective rejection).
+    """
+    src = os.path.join(candidates_dir, "graduated", f"{candidate_id}.json")
+    if not os.path.exists(src):
+        raise FileNotFoundError(
+            f"graduated candidate not found: {candidate_id}"
+        )
+    cand = load_candidate(src)
+    cand["status"] = "rejected"
+    cand["rejection_count"] = cand.get("rejection_count", 0) + 1
+    _touch(cand, "demoted", reviewer, notes=reason, **extra_stamp)
+    _stamp_evidence_and_lessons(cand, candidates_dir)
+
+    rejected_dir = os.path.join(candidates_dir, "rejected")
+    os.makedirs(rejected_dir, exist_ok=True)
+    dst = os.path.join(rejected_dir, f"{candidate_id}.json")
+    save_candidate(cand, dst)
+    os.remove(src)
+    _refresh_queue(candidates_dir)
+    return cand
+
+
 def mark_reopened(candidate_id, reviewer, candidates_dir):
     """Move a rejected candidate back to the staged pool with history intact."""
     src = os.path.join(candidates_dir, "rejected", f"{candidate_id}.json")

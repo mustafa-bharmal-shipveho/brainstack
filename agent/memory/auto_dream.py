@@ -18,8 +18,9 @@ import json
 import os
 
 from archive import archive_stale_workspace
+from cluster import _is_activity_log_claim
 from decay import decay_old_entries
-from promote import cluster_and_extract, write_candidates
+from promote import _env_bool, cluster_and_extract, write_candidates
 from review_state import mark_rejected, write_review_queue_summary
 from validate import heuristic_check
 
@@ -237,6 +238,63 @@ def _write_entries(entries):
         _write_entries_locked(fd, entries)
 
 
+def _sweep_activity_log_residue(candidates_dir):
+    """Retroactively reject already-staged candidates whose claim matches
+    the activity-log filter from cluster.py.
+
+    The activity-log filter in promote.cluster_and_extract drops noise at
+    staging time, but candidates staged BEFORE the filter shipped (PR #28,
+    2026-05-06) or by a pre-filter dream run sit on disk forever — every
+    subsequent dream run just bumps their `staged` timestamp without
+    re-checking. This sweep closes that gap by running the same regex
+    against every still-staged *.json on each dream run.
+
+    DREAM_ACTIVITY_LOG_DISABLED=1 bypasses (matches the upstream filter's
+    kill switch so a forensic-mode run leaves both pipes untouched).
+
+    Returns a list of {"id", "reason", "claim_prefix"} for telemetry.
+    """
+    swept = []
+    if _env_bool("DREAM_ACTIVITY_LOG_DISABLED", False):
+        return swept
+    if not os.path.isdir(candidates_dir):
+        return swept
+    for fname in sorted(os.listdir(candidates_dir)):
+        if not fname.endswith(".json"):
+            continue
+        path = os.path.join(candidates_dir, fname)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path) as f:
+                cand = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if cand.get("status") != "staged":
+            continue
+        is_activity, reason = _is_activity_log_claim(cand.get("claim"))
+        if not is_activity:
+            continue
+        # _is_activity_log_claim returns e.g. "activity_log:edited" — drop
+        # the outer namespace so the swept reason reads cleanly as
+        # `activity_log_sweep:edited`, not `activity_log_sweep:activity_log:edited`.
+        shape = reason.split(":", 1)[1] if ":" in reason else reason
+        sweep_reason = f"activity_log_sweep:{shape}"
+        try:
+            mark_rejected(
+                cand["id"], "auto_dream_sweep",
+                sweep_reason, candidates_dir,
+            )
+        except (FileNotFoundError, KeyError):
+            continue
+        swept.append({
+            "id": cand.get("id"),
+            "reason": sweep_reason,
+            "claim_prefix": (cand.get("claim") or "")[:80],
+        })
+    return swept
+
+
 def _heuristic_prefilter(candidates_dir, semantic_dir):
     """Move obvious junk (too-short, exact duplicate) to rejected/ automatically.
 
@@ -328,6 +386,7 @@ def run_dream_cycle():
                       if p.get("canonical_salience", 0) >= PROMOTION_THRESHOLD}
 
         staged = write_candidates(promotable, CANDIDATES)
+        swept = _sweep_activity_log_residue(CANDIDATES)
         prefiltered = _heuristic_prefilter(CANDIDATES, SEMANTIC)
 
         kept, archived = decay_old_entries(
@@ -344,7 +403,8 @@ def run_dream_cycle():
         f"prefiltered_out={prefiltered} pending_review={pending} "
         f"archived={len(archived)} kept={len(kept)} "
         f"burst_skipped={len(burst_telemetry)} "
-        f"activity_log_skipped={len(activity_log_telemetry)}"
+        f"activity_log_skipped={len(activity_log_telemetry)} "
+        f"activity_log_swept={len(swept)}"
     )
     _refresh_pending_summary()
 
@@ -414,6 +474,7 @@ def run(brain_root=None, namespace="default", dry_run=False):
             return result
 
         staged = write_candidates(promotable, candidates_dir)
+        swept = _sweep_activity_log_residue(candidates_dir)
         prefiltered = _heuristic_prefilter(candidates_dir, semantic_dir)
 
         kept, archived = decay_old_entries(entries, archive_dir=snapshots_dir)
@@ -432,6 +493,7 @@ def run(brain_root=None, namespace="default", dry_run=False):
         result["decayed"] = len(archived)
         result["burst_skipped"] = len(burst_telemetry)
         result["activity_log_skipped"] = len(activity_log_telemetry)
+        result["activity_log_swept"] = len(swept)
 
     _refresh_pending_summary(brain_root)
     return result

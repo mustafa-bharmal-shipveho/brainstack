@@ -361,3 +361,151 @@ class TestClusterAndExtractFiltersActivityLog:
         ]
         result = promote.cluster_and_extract(entries)  # no telemetry kwarg
         assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# Retroactive sweep: re-check ALREADY-staged candidates on disk
+# ---------------------------------------------------------------------------
+
+import auto_dream  # noqa: E402
+
+
+def _stage_candidate(candidates_dir: Path, cid: str, claim: str,
+                     *, status: str = "staged") -> Path:
+    """Write a minimal candidate JSON to candidates_dir/<cid>.json.
+
+    Mirrors the on-disk shape produced by `write_candidates` — only the
+    fields that mark_rejected reads (id, decisions list) are populated.
+    Skips the dream-cycle plumbing so the test stays focused on the sweep.
+    """
+    import json as _json
+    cand = {
+        "id": cid,
+        "claim": claim,
+        "status": status,
+        "cluster_size": 2,
+        "canonical_salience": 10.0,
+        "evidence_ids": ["2026-05-06T12:00:00+00:00"],
+        "staged_at": "2026-05-06T12:00:00+00:00",
+        "decisions": [
+            {"ts": "2026-05-06T12:00:00+00:00",
+             "action": status, "reviewer": "test"}
+        ],
+        "rejection_count": 0,
+    }
+    path = candidates_dir / f"{cid}.json"
+    path.write_text(_json.dumps(cand))
+    return path
+
+
+class TestSweepActivityLogResidue:
+    """The upstream filter blocks new activity-log clusters from staging,
+    but pre-filter residue (PR #28 grandfathered candidates) sits on disk
+    forever. `_sweep_activity_log_residue` is the retroactive pass that
+    re-checks already-staged JSONs against the same regex on every dream
+    run, plus once-shot via the CLI tool of the same name."""
+
+    def test_sweeps_edit_narration_residue(self, tmp_path):
+        """The exact pending candidate shape (id 365e74886152): an
+        `Edited <plan>.md: replaced...` claim staged before the filter
+        existed. Sweep must move it to candidates/rejected/."""
+        candidates_dir = tmp_path / "candidates"
+        candidates_dir.mkdir()
+        _stage_candidate(
+            candidates_dir, "edit01",
+            "Edited /Users/me/.claude/plans/foo.md: replaced 'A' with 'B'",
+        )
+        swept = auto_dream._sweep_activity_log_residue(str(candidates_dir))
+        assert len(swept) == 1
+        assert swept[0]["id"] == "edit01"
+        assert swept[0]["reason"].startswith("activity_log_sweep:edited")
+        assert not (candidates_dir / "edit01.json").exists()
+        assert (candidates_dir / "rejected" / "edit01.json").exists()
+
+    def test_sweeps_tool_completed_residue(self, tmp_path):
+        """The other pending shape (id b7a70e9e9488): `Tool <name>
+        completed successfully` fallback narrator."""
+        candidates_dir = tmp_path / "candidates"
+        candidates_dir.mkdir()
+        _stage_candidate(
+            candidates_dir, "tool01",
+            "Tool Agent completed successfully",
+        )
+        swept = auto_dream._sweep_activity_log_residue(str(candidates_dir))
+        assert len(swept) == 1
+        assert swept[0]["reason"].startswith("activity_log_sweep:tool")
+
+    def test_real_lesson_not_swept(self, tmp_path):
+        """Prose claims that don't match the narrator regex must stay
+        staged. Without this guarantee the sweep silently eats real work."""
+        candidates_dir = tmp_path / "candidates"
+        candidates_dir.mkdir()
+        _stage_candidate(
+            candidates_dir, "lesson01",
+            "Always run trufflehog before pushing to a private remote",
+        )
+        swept = auto_dream._sweep_activity_log_residue(str(candidates_dir))
+        assert swept == []
+        assert (candidates_dir / "lesson01.json").exists()
+
+    def test_kill_switch_disables_sweep(self, tmp_path, monkeypatch):
+        """`DREAM_ACTIVITY_LOG_DISABLED=1` is the same escape hatch the
+        upstream filter honors. Forensic-mode runs leave residue alone
+        so the operator can inspect it raw."""
+        monkeypatch.setenv("DREAM_ACTIVITY_LOG_DISABLED", "1")
+        candidates_dir = tmp_path / "candidates"
+        candidates_dir.mkdir()
+        _stage_candidate(
+            candidates_dir, "edit01",
+            "Edited /Users/me/.claude/plans/foo.md: replaced 'A' with 'B'",
+        )
+        swept = auto_dream._sweep_activity_log_residue(str(candidates_dir))
+        assert swept == []
+        assert (candidates_dir / "edit01.json").exists()
+
+    def test_missing_dir_returns_empty(self, tmp_path):
+        """Brand-new namespace with no candidates dir yet: no-op,
+        no exception. Defends against the path-not-yet-created race
+        on first-ever dream cycle in a fresh namespace."""
+        swept = auto_dream._sweep_activity_log_residue(
+            str(tmp_path / "does-not-exist"))
+        assert swept == []
+
+    def test_rejected_candidates_untouched(self, tmp_path):
+        """Already-rejected candidates live in candidates/rejected/.
+        The sweep only walks the top level of candidates_dir, so a
+        rejected file with a matching claim must NOT be re-processed
+        (no double-decisions, no churn in rejection_count)."""
+        candidates_dir = tmp_path / "candidates"
+        candidates_dir.mkdir()
+        (candidates_dir / "rejected").mkdir()
+        # Put a junk-claim file in rejected/ — must be left alone.
+        _stage_candidate(
+            candidates_dir / "rejected", "old01",
+            "Edited /tmp/old.md: replaced 'foo' with 'bar'",
+            status="rejected",
+        )
+        swept = auto_dream._sweep_activity_log_residue(str(candidates_dir))
+        assert swept == []
+        assert (candidates_dir / "rejected" / "old01.json").exists()
+
+    def test_mixed_pool_only_residue_swept(self, tmp_path):
+        """Stage one narration claim + one real lesson side-by-side.
+        Sweep must reject only the narration; the lesson must remain
+        staged. This is the realistic state after a dream cycle that
+        introduced new signal alongside residue."""
+        candidates_dir = tmp_path / "candidates"
+        candidates_dir.mkdir()
+        _stage_candidate(
+            candidates_dir, "junk01",
+            "Wrote /Users/me/.claude/plans/note.md (78 lines)",
+        )
+        _stage_candidate(
+            candidates_dir, "lesson01",
+            "Field names are contracts: rename HourUtc when it holds local time",
+        )
+        swept = auto_dream._sweep_activity_log_residue(str(candidates_dir))
+        assert [s["id"] for s in swept] == ["junk01"]
+        assert not (candidates_dir / "junk01.json").exists()
+        assert (candidates_dir / "rejected" / "junk01.json").exists()
+        assert (candidates_dir / "lesson01.json").exists()
