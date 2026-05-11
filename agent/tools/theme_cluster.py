@@ -41,10 +41,19 @@ def cluster_themes(digests: list[dict], *, min_size: int = 3) -> list[dict]:
         tags = d.get("domain_tags") or []
         if not isinstance(tags, list):
             continue
+        # Per-digest dedup: a session listing the same tag in multiple
+        # casings ("auth-rewrite", "Auth-Rewrite", " auth-rewrite ")
+        # must count ONCE for that tag, not three times. Without this,
+        # a single noisy digest can fabricate a 3-member theme on its
+        # own and survive the min_size=3 filter.
+        seen_keys: set[str] = set()
         for raw in tags:
             if not isinstance(raw, str) or not raw.strip():
                 continue
             key = raw.strip().lower()
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
             by_tag[key].append(d)
             case_for_tag.setdefault(key, raw.strip())
 

@@ -724,6 +724,14 @@ if [ "$MODE" = "upgrade" ]; then
         printf "\n# Pending-review summary — regenerated locally\nPENDING_REVIEW.md\n" \
             >> "$BRAIN_ROOT/.gitignore"
     fi
+    # .obsidian/ contains per-machine workspace state (layout, plugins, hotkeys, graph).
+    # Syncing causes noisy conflicts. Append on upgrade so existing brains don't
+    # stage workspace files on the next sync (Codex 2026-05-05 P3).
+    if [ -f "$BRAIN_ROOT/.gitignore" ] && \
+       ! grep -qE "^\.obsidian/\s*$" "$BRAIN_ROOT/.gitignore"; then
+        printf "\n# Obsidian per-machine config — workspace state, plugins, hotkeys\n.obsidian/\n" \
+            >> "$BRAIN_ROOT/.gitignore"
+    fi
     # Refresh the recall CLI symlink (idempotent; pip-installs into the venv
     # if the venv exists, otherwise creates it).
     if [ -x "$REPO_DIR/bin/install-recall-cli.sh" ]; then

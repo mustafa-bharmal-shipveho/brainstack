@@ -288,6 +288,32 @@ class TestResilience:
 # ---------------------------------------------------------------------------
 
 class TestFrameworkPurity:
+    def test_parser_handles_block_style_yaml_list(self, profile_mod):
+        """LLM-emitted YAML may use block-style `key:\\n  - item\\n`
+        instead of flow `key: [item]`. The original flow-only parser
+        silently dropped this to '', breaking downstream consumers
+        that expected a list.
+
+        Codex review caught this. Test pins the contract."""
+        body = (
+            "---\n"
+            "session_id: s1\n"
+            "domain_tags:\n"
+            "  - auth-rewrite\n"
+            "  - security\n"
+            "  - \"quoted item with spaces\"\n"
+            "outcome: completed\n"
+            "---\n"
+            "# Title\n"
+        )
+        front, _rest = profile_mod._parse_simple_yaml_front(body)
+        assert front["domain_tags"] == [
+            "auth-rewrite", "security", "quoted item with spaces",
+        ]
+        # Other keys still parse normally
+        assert front["session_id"] == "s1"
+        assert front["outcome"] == "completed"
+
     def test_no_hardcoded_org_in_system_prompt(self, profile_mod):
         """The system prompt must not encode any specific company,
         domain, or stack — the profile should reflect what's in the

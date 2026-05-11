@@ -101,6 +101,21 @@ class TestClustering:
         tags = sorted([t["tag"] for t in themes])
         assert tags == ["topic-a", "topic-b"]
 
+    def test_same_tag_variants_in_one_digest_count_once(self, theme_mod):
+        """A digest listing the same tag in multiple casings/whitespace
+        variants ("auth-rewrite", " Auth-Rewrite ", "AUTH-rewrite") must
+        count ONCE for that tag. Without per-digest dedup a single
+        noisy digest can fabricate a 3-member theme on its own.
+
+        Codex review caught this — bug was that case_for_tag and
+        seen_keys were not per-digest scoped."""
+        digests = [
+            _d("s1", ["auth-rewrite", "Auth-Rewrite", " auth-rewrite "]),
+        ]
+        themes = theme_mod.cluster_themes(digests, min_size=3)
+        # Single digest cannot form a theme by self-multiplying its tags
+        assert themes == []
+
     def test_empty_tags_dont_cluster(self, theme_mod):
         """A digest with an empty domain_tags list contributes nothing
         — the clustering keys on tags, not titles."""

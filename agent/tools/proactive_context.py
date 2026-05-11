@@ -87,7 +87,13 @@ def _load_digest_for_search(path: Path) -> dict | None:
     except OSError:
         return None
     front, body = _parse_simple_yaml_front(raw)
-    if front.get("archived", "").lower() in ("true", "yes", "1"):
+    # Defensive: `archived` may be a string, bool-ish, or even an
+    # unexpected list — coerce to str before comparing. A raising
+    # comparison here would silently drop digests from search results.
+    archived = front.get("archived", "")
+    if not isinstance(archived, str):
+        archived = str(archived)
+    if archived.lower() in ("true", "yes", "1"):
         return None
     title_m = re.search(r"^#\s+(.+)$", body, re.MULTILINE)
     title = title_m.group(1).strip() if title_m else path.stem

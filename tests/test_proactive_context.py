@@ -141,6 +141,34 @@ class TestSearch:
         )
         assert hits == []
 
+    def test_non_string_archived_value_does_not_crash(self, proactive_mod,
+                                                     tmp_path):
+        """An LLM that writes `archived: [false]` (list) or
+        `archived: 0` (int) into front-matter must not crash search().
+        Original code called `.lower()` on the raw value and raised
+        AttributeError when it was a list.
+
+        Codex review caught this. Pin the contract: any shape is OK,
+        only the string 'true'/'yes'/'1' means archived."""
+        md_dir = tmp_path / "memory" / "semantic" / "digests"
+        md_dir.mkdir(parents=True)
+        (md_dir / "weird.md").write_text(
+            "---\n"
+            "session_id: s1\n"
+            "archived: [false]\n"
+            "domain_tags: [topic]\n"
+            "started_at: 2026-05-10\n"
+            "---\n"
+            "# Topic\n\n"
+            "## What was learned\n\nTopic thing.\n"
+        )
+        # Must not raise
+        hits = proactive_mod.search(
+            "topic", brain_root=tmp_path, k=3,
+        )
+        # And the digest IS returned (treat malformed archived as "not archived")
+        assert len(hits) == 1
+
     def test_caps_to_k(self, proactive_mod, tmp_path):
         for i in range(10):
             _seed_digest(tmp_path, f"s{i}",

@@ -86,31 +86,73 @@ _FRONT_MATTER_RE = re.compile(
 
 
 def _parse_simple_yaml_front(body: str) -> tuple[dict, str]:
-    """Return ({key: str or list[str]}, rest_of_markdown). Tolerates
-    common shapes:
+    """Return ({key: str | list[str]}, rest_of_markdown). Tolerates
+    common shapes (flow scalar/array AND block-style multi-line list):
+
         key: value
         key: "quoted value with spaces"
         key: [a, b, c]
         key: ["a", "b"]
-    Anything more exotic gets skipped — the profile builder doesn't
-    actually need full YAML, just the digest's tag list + dates."""
+        key:
+          - item-a
+          - item-b
+          - "item with spaces"
+
+    Anything more exotic falls back to the raw string — the profile
+    builder doesn't need full YAML, just the digest's tag list +
+    dates. Defends against the LLM emitting block-style array syntax
+    that the original flow-only parser silently dropped to '' (which
+    then crashed downstream consumers expecting a list)."""
     m = _FRONT_MATTER_RE.match(body)
     if not m:
         return {}, body
     front, rest = m.group(1), m.group(2)
     out: dict = {}
-    for line in front.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
+    lines = front.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            i += 1
             continue
-        if ":" not in line:
+        if ":" not in stripped:
+            i += 1
             continue
-        k, v = line.split(":", 1)
+        k, v = stripped.split(":", 1)
         k = k.strip()
         v = v.strip()
         if not k:
+            i += 1
             continue
-        # Flow array: [a, b, c]
+        if v == "":
+            # Possible block-style: peek at indented `- item` lines
+            # following this key. Consumes them.
+            items: list[str] = []
+            j = i + 1
+            while j < len(lines):
+                nxt = lines[j]
+                if not nxt.strip():
+                    break
+                if not nxt.startswith(" ") and not nxt.startswith("\t"):
+                    break
+                item = nxt.lstrip(" \t")
+                if not item.startswith("- "):
+                    break
+                val = item[2:].strip()
+                if val.startswith('"') and val.endswith('"'):
+                    val = val[1:-1]
+                elif val.startswith("'") and val.endswith("'"):
+                    val = val[1:-1]
+                items.append(val)
+                j += 1
+            if items:
+                out[k] = items
+                i = j
+                continue
+            out[k] = ""
+            i += 1
+            continue
         if v.startswith("[") and v.endswith("]"):
             inner = v[1:-1].strip()
             if not inner:
@@ -128,6 +170,7 @@ def _parse_simple_yaml_front(body: str) -> tuple[dict, str]:
                 out[k] = v[1:-1]
         else:
             out[k] = v
+        i += 1
     return out, rest
 
 
@@ -144,8 +187,12 @@ def _iter_digests(md_dir: Path):
         except (OSError, ValueError):
             continue
         # Skip explicit archived flag for future-proofing (Phase 2e
-        # decay marks old digests `archived: true`).
-        if str(front.get("archived", "")).lower() in ("true", "yes", "1"):
+        # decay marks old digests `archived: true`). Coerce to string
+        # since the LLM may emit anything; never raise on shape.
+        archived = front.get("archived", "")
+        if not isinstance(archived, str):
+            archived = str(archived)
+        if archived.lower() in ("true", "yes", "1"):
             continue
         yield path, front, body
 
