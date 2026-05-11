@@ -150,7 +150,7 @@ type my-new-llm                              # confirm wrapper defined
 One-shot setup of all three surfaces:
 
 ```bash
-./install.sh --setup-pending-review-all      # Claude SessionStart + Cursor + shell wrappers
+./install.sh --setup-pending-review-all      # Claude @-import + Cursor + shell wrappers
 ./install.sh --remove-pending-review-all     # tear down all three
 ```
 
@@ -175,14 +175,28 @@ Empty days produce a one-liner (`✅ all clear`) which all three surfaces suppre
 ### Tearing it down
 
 ```bash
-./install.sh --remove-cursor-rules     # strips sentinel block from .cursorrules
-./install.sh --remove-shell-banner     # strips source line from ~/.zshrc + removes script
-# For the SessionStart hook: edit ~/.claude/settings.json and remove the entry
+./install.sh --remove-pending-hook      # strips @-import block from ~/.claude/CLAUDE.md
+./install.sh --remove-cursor-rules      # strips sentinel block from .cursorrules
+./install.sh --remove-shell-banner      # strips source line from ~/.zshrc + removes script
 ```
 
-### Security note
+### How the @-import works
 
-The SessionStart hook injects `PENDING_REVIEW.md` content into Claude Code's context inside a `<system-reminder>` block. To prevent a project-level `.envrc` from poisoning `$HOME` or `$BRAIN_ROOT` and redirecting the hook to attacker-controlled content, the hook resolves the brain root from `__file__` (its own install path), not from environment variables. Tests pin this in `tests/test_render_pending.py::test_resolves_brain_from_file_not_env`.
+`./install.sh --setup-pending-hook` appends a sentinel-bracketed block to `~/.claude/CLAUDE.md`:
+
+```markdown
+<!-- brainstack-pending-review-start -->
+## brainstack pending review
+
+@/absolute/path/to/.agent/PENDING_REVIEW.md
+
+_Auto-loaded by brainstack. Remove with `./install.sh --remove-pending-hook`._
+<!-- brainstack-pending-review-end -->
+```
+
+Claude Code's `@` handler transcludes the imported file at session-init time, injecting the pending-review content into the system prompt's `# claudeMd` section. The path is always absolute — Claude Code's `@` handler may not expand `$HOME` or `~`. The absolute path is resolved at install time, so if you move `$BRAIN_ROOT`, re-run `./install.sh --setup-pending-hook` to update the path.
+
+**No SessionStart hook needed.** Earlier iterations registered a SessionStart hook in `~/.claude/settings.json`. The hook ran cleanly but Claude Code's SessionStart contract on this build is telemetry-only — context injection via stdout doesn't work. Switched to `@`-import, which is Claude Code's documented session-start mechanism.
 
 ---
 
