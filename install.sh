@@ -311,7 +311,19 @@ maybe_install_scanner() {
 }
 
 # ----- Python version check -----
+# Auto-detect: if the default `python3` isn't >= 3.10, walk preferred
+# versions (matches sync.sh's behavior). Codex QA caught that
+# `--verify` on macOS hit the bundled CommandLineTools python 3.9
+# and aborted before even reaching the digest checks.
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+if ! "$PYTHON_BIN" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
+    for cand in python3.13 python3.12 python3.11 python3.10; do
+        if command -v "$cand" >/dev/null 2>&1; then
+            PYTHON_BIN="$cand"
+            break
+        fi
+    done
+fi
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
     echo "install: $PYTHON_BIN not found in PATH" >&2
     exit 1

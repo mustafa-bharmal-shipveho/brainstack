@@ -154,9 +154,17 @@ def _score(prompt_tokens: set[str], doc: dict) -> float:
 # ---------------------------------------------------------------------------
 
 def search(prompt: str, *, brain_root: Path, k: int = 5,
-           score_threshold: float = 0.05) -> list[ProactiveHit]:
+           score_threshold: float = 0.02) -> list[ProactiveHit]:
     """Return the top-k digest hits for `prompt`. Empty list when the
-    digest corpus is empty or all matches fall below `score_threshold`."""
+    digest corpus is empty or all matches fall below `score_threshold`.
+
+    Threshold defaults to 0.02 (lowered from 0.05). With Jaccard
+    scoring + 0.2 tag-match boost, a single shared tag scores ~0.02-0.1
+    depending on prompt length. The earlier 0.05 floor excluded
+    legitimate tag-driven matches like "looking into activity-log
+    filter issues" → an activity-log-filter digest. Codex QA caught
+    this — pin the contract: a single domain-tag match must be
+    surfaced even on a short prompt."""
     md_dir = Path(brain_root) / "memory" / "semantic" / "digests"
     if not md_dir.is_dir():
         return []

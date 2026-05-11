@@ -372,9 +372,13 @@ def build(
         provider = resolve_provider()
 
     prompt = _build_prompt(digests)
+    # 300s timeout: the profile prompt carries content from N sessions
+    # so it's naturally larger than a single-session digest. Codex QA
+    # caught the prior 180s default timing out on a real backfill
+    # corpus.
     result = provider.invoke(
         SYSTEM_PROMPT, prompt,
-        json_schema=PROFILE_SCHEMA, timeout_s=180,
+        json_schema=PROFILE_SCHEMA, timeout_s=300,
     )
     if result.parsed_json is None:
         # Surface LLMError to caller; do NOT overwrite an existing
