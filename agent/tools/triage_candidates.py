@@ -22,9 +22,10 @@ The user runs this in their own terminal. Each iteration:
   1. One-screen summary of the next candidate
   2. Prompt `[g]raduate / [r]eject / [s]kip / [e]vidence / [q]uit:`
   3. Wait for keyboard input
-  4. On g/r: ask for required rationale, then invoke graduate.py /
-     reject.py (those tools enforce the rationale field, so empty
-     input fails).
+  4. On g/r: invoke graduate.py / reject.py with an auto-generated
+     rationale ("graduated via interactive triage"). The keypress IS
+     the decision; the TTY check at startup is what enforces that a
+     human (not an AI agent) made it.
   5. Loop until queue is empty or user quits.
 """
 from __future__ import annotations
@@ -422,23 +423,24 @@ def _triage_one_namespace(brain: Path, namespace: str) -> tuple[dict, bool]:
                 _print_full_evidence(data)
                 continue  # re-prompt
 
+            # The keypress IS the user's decision (Mustafa 2026-05-11
+            # "remove rationale (required)"). The no-auto-decide
+            # contract is still enforced by the TTY check at startup,
+            # which refuses to run without an interactive terminal, so
+            # an AI agent calling this loop via Bash cannot rubber-stamp
+            # candidates regardless of what rationale string is passed.
+            # graduate.py / reject.py still record a rationale field;
+            # we fill it with an auto-string that captures the source
+            # of the decision rather than prompting the user.
             if choice in ("g", "graduate"):
-                rationale = _prompt_for_text("  rationale (required): ")
-                if rationale is None:
-                    print("  (cancelled — no decision applied; quitting)")
-                    quit_requested = True
-                    break
-                if _apply_graduate(brain, namespace, cid, rationale):
+                if _apply_graduate(brain, namespace, cid,
+                                    "graduated via interactive triage"):
                     decisions["graduated"] += 1
                 break
 
             if choice in ("r", "reject"):
-                reason = _prompt_for_text("  reason (required): ")
-                if reason is None:
-                    print("  (cancelled — no decision applied; quitting)")
-                    quit_requested = True
-                    break
-                if _apply_reject(brain, namespace, cid, reason):
+                if _apply_reject(brain, namespace, cid,
+                                  "rejected via interactive triage"):
                     decisions["rejected"] += 1
                 break
 
