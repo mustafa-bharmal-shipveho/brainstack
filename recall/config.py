@@ -143,7 +143,13 @@ def _xdg(env_var: str, fallback_subdir: str) -> Path:
     raw = os.environ.get(env_var)
     if raw:
         return _expand(raw)
-    home = os.environ.get("HOME") or str(Path.home())
+    home = os.environ.get("HOME")
+    if not home:
+        home = str(Path.home())
+    if not home:
+        raise EnvironmentError(
+            f"$HOME not set and Path.home() failed; cannot resolve {env_var} fallback {fallback_subdir}"
+        )
     return Path(home) / fallback_subdir
 
 

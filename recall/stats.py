@@ -238,12 +238,12 @@ def render_human(report: StatsReport) -> str:
     """
     other_total = sum(report.other_outcomes.values())
     grand_total = report.fired_count + report.skipped_count + other_total
-    # Use any-positive-value check (not bool(dict)) so a programmatically
-    # constructed all-zero dict doesn't suppress the no-events message.
-    # Today aggregate_tool_calls only returns positive counts so the dict
-    # form would be safe, but pinning the invariant keeps render_human
-    # robust against future producers.
-    has_cross_source = (
+    # Check if cross-source tool-call data is populated. Use any-positive-value
+    # check (not bool(dict)) so a programmatically constructed all-zero dict
+    # doesn't suppress the no-events message. Today aggregate_tool_calls only
+    # returns positive counts so the dict form would be safe, but pinning the
+    # invariant keeps render_human robust against future producers.
+    cross_source_populated = (
         any(int(v) > 0 for v in report.mcp_calls.values())
         or any(int(v) > 0 for v in report.tool_calls_other.values())
     )
@@ -251,7 +251,7 @@ def render_human(report: StatsReport) -> str:
     # cross-source tool calls. A user with auto-recall disabled but
     # active Claude Code transcripts should still see the tool-call
     # breakdown. Codex 2026-05-05 P2.
-    if grand_total == 0 and not has_cross_source:
+    if grand_total == 0 and not cross_source_populated:
         return (
             "brainstack: no auto-recall events recorded in this window.\n"
             "  Enable with: ./install.sh --enable-auto-recall\n"
