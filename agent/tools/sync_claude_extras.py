@@ -141,8 +141,24 @@ def main() -> int:
             TOOLS_DIR / "claude_misc_adapter.py",
             ["--brain", str(BRAIN_ROOT)],
         )
-        _log(f"=== sync_claude_extras done (session={rc1}, misc={rc2}) ===\n")
-        return 0 if rc1 == 0 and rc2 == 0 else 1
+        # Digest layer: only run when the user has opted in via
+        # `./install.sh --setup-digests` (which writes the marker file).
+        # Unconfigured installs skip silently — no surprise LLM calls.
+        rc3 = 0
+        if (BRAIN_ROOT / ".digests-enabled").is_file():
+            rc3 = _run_adapter(
+                "digest_cli_incremental",
+                TOOLS_DIR / "digest_cli.py",
+                ["incremental"],
+            )
+        else:
+            _log("  digest layer not enabled (no .digests-enabled marker); "
+                 "run `./install.sh --setup-digests` to opt in")
+        _log(
+            f"=== sync_claude_extras done "
+            f"(session={rc1}, misc={rc2}, digests={rc3}) ===\n"
+        )
+        return 0 if rc1 == 0 and rc2 == 0 and rc3 == 0 else 1
     finally:
         _release_lock(lock_fd)
 

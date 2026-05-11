@@ -5,6 +5,9 @@
 #   ./install.sh              -- install fresh ~/.agent/ if missing, else show status
 #   ./install.sh --upgrade    -- refresh tools + hooks; leave memory/ untouched
 #   ./install.sh --verify     -- self-check: confirm brain is healthy
+#   ./install.sh --setup-digests
+#                             -- check LLM providers, wire digest sync into
+#                                LaunchAgent, optionally run initial backfill
 #   ./install.sh --migrate <flat-memory-dir>
 #                             -- run tools/migrate.py against the given dir
 #
@@ -109,6 +112,10 @@ while [ $# -gt 0 ]; do
             ;;
         --remove-pending-hook)
             MODE="remove-pending-hook"
+            shift
+            ;;
+        --setup-digests)
+            MODE="setup-digests"
             shift
             ;;
         --setup-statusline)
@@ -629,6 +636,11 @@ if [ "$MODE" = "verify" ]; then
     check "global wrapper hook present" "test -f '$BRAIN_ROOT/harness/hooks/agentic_post_tool_global.py'"
     check "vendored hook present" "test -f '$BRAIN_ROOT/harness/hooks/claude_code_post_tool.py'"
     check "redact-private.txt present" "test -f '$BRAIN_ROOT/redact-private.txt'"
+    # Digest layer (Phase 1)
+    check "memory/episodic/digests/ present" "test -d '$BRAIN_ROOT/memory/episodic/digests'"
+    check "memory/semantic/digests/ present" "test -d '$BRAIN_ROOT/memory/semantic/digests'"
+    check "digest_cli.py present" "test -f '$BRAIN_ROOT/tools/digest_cli.py'"
+    check "llm_providers/ present" "test -d '$BRAIN_ROOT/tools/llm_providers'"
 
     # Optional but informative
     if command -v trufflehog >/dev/null 2>&1; then
@@ -680,6 +692,15 @@ if [ "$MODE" = "upgrade" ]; then
     # mkdir -p first so a partial brain (where memory/ doesn't exist yet)
     # doesn't break the cp loop with "No such file or directory".
     mkdir -p "$BRAIN_ROOT/memory"
+    # Backfill: ensure digest dirs exist for brains installed before the
+    # digest layer shipped. Existing files (including the sidecar) are
+    # never overwritten — only created when missing.
+    mkdir -p "$BRAIN_ROOT/memory/episodic/digests"
+    mkdir -p "$BRAIN_ROOT/memory/semantic/digests"
+    [ -f "$BRAIN_ROOT/memory/episodic/digests/AGENT_LEARNINGS.jsonl" ] \
+        || touch "$BRAIN_ROOT/memory/episodic/digests/AGENT_LEARNINGS.jsonl"
+    [ -f "$BRAIN_ROOT/memory/episodic/digests/_imported.jsonl" ] \
+        || touch "$BRAIN_ROOT/memory/episodic/digests/_imported.jsonl"
     for src in "$REPO_DIR/agent/memory/"*.py; do
         [ -f "$src" ] || continue
         cp -f "$src" "$BRAIN_ROOT/memory/$(basename "$src")"
@@ -932,6 +953,50 @@ fi
 # As a side effect, --remove-pending-hook also strips any leftover
 # SessionStart entry tagged with our sentinel (cleans up post-upgrade
 # from the prior iteration).
+# ----- Mode: setup-digests -----
+# Checks LLM provider availability (claude -p / codex exec) and prints
+# the exact fix command if no provider is ready. Also creates a marker
+# so subsequent --upgrade runs know the user opted into digests.
+# Auth uses the user's existing subscription/login — never an API key.
+if [ "$MODE" = "setup-digests" ]; then
+    if [ ! -d "$BRAIN_ROOT" ]; then
+        echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
+        exit 2
+    fi
+    if [ ! -f "$BRAIN_ROOT/tools/digest_cli.py" ]; then
+        echo "install: $BRAIN_ROOT/tools/digest_cli.py is missing" >&2
+        echo "         run: ./install.sh --upgrade   to refresh tools" >&2
+        exit 2
+    fi
+    echo "==> Checking LLM providers for the digest layer:"
+    if ! "$PYTHON_BIN" "$BRAIN_ROOT/tools/digest_cli.py" provider list; then
+        echo
+        echo "No provider is ready. Set one up and re-run ./install.sh --setup-digests."
+        exit 2
+    fi
+    # Mark the brain as digest-enabled. sync_claude_extras.py checks for
+    # this marker on every run and skips the digest pass when it's absent
+    # — so users who haven't opted in never incur surprise LLM calls.
+    touch "$BRAIN_ROOT/.digests-enabled"
+    echo
+    echo "==> Digest layer is enabled."
+    echo "    To run an initial backfill of historical sessions now:"
+    echo "        python3 $BRAIN_ROOT/tools/digest_cli.py backfill"
+    # Honesty: hourly incremental ONLY works if the LaunchAgent is wired.
+    # Detect the plist and tell the user the truth either way.
+    plist="$HOME/Library/LaunchAgents/com.brainstack.claude-extras.plist"
+    if [ -f "$plist" ]; then
+        echo "    Hourly LaunchAgent already installed — incremental "
+        echo "        pickup will run on the next tick."
+    else
+        echo "    Hourly incremental pickup requires the LaunchAgent:"
+        echo "        ./install.sh --setup-claude-extras"
+        echo "    Until you run that, only manual ./tools/digest_cli.py "
+        echo "        invocations will produce new digests."
+    fi
+    exit 0
+fi
+
 if [ "$MODE" = "setup-pending-hook" ] || [ "$MODE" = "remove-pending-hook" ]; then
     if [ ! -d "$BRAIN_ROOT" ]; then
         echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
@@ -1536,6 +1601,8 @@ if [ -d "$BRAIN_ROOT" ]; then
     echo "    To refresh tools/hooks without touching memory: ./install.sh --upgrade"
     echo "    To migrate a flat memory dir:                    ./install.sh --migrate <dir>"
     echo "    To enable hourly Claude transcript + misc sync:  ./install.sh --setup-claude-extras"
+    echo "    To enable session-digest memory (recall across past sessions):"
+    echo "        ./install.sh --setup-digests"
     echo "    To surface pending review on every session:      ./install.sh --setup-pending-review-all"
     echo "      (sets up Claude SessionStart + Cursor rules + shell wrappers)"
     exit 0
@@ -1550,7 +1617,9 @@ rsync -a --exclude '__pycache__' --exclude '.pytest_cache' --exclude '*.pyc' "$R
 # Seed empty memory layers
 mkdir -p "$BRAIN_ROOT/memory/working"
 mkdir -p "$BRAIN_ROOT/memory/episodic"
+mkdir -p "$BRAIN_ROOT/memory/episodic/digests"
 mkdir -p "$BRAIN_ROOT/memory/semantic/lessons"
+mkdir -p "$BRAIN_ROOT/memory/semantic/digests"
 mkdir -p "$BRAIN_ROOT/memory/personal/profile"
 mkdir -p "$BRAIN_ROOT/memory/personal/notes"
 mkdir -p "$BRAIN_ROOT/memory/personal/references"
@@ -1558,6 +1627,9 @@ mkdir -p "$BRAIN_ROOT/memory/candidates"
 
 # Empty episodic JSONL (touched so the hook can append)
 touch "$BRAIN_ROOT/memory/episodic/AGENT_LEARNINGS.jsonl"
+# Digest layer: episodic line file + content-SHA dedup sidecar.
+touch "$BRAIN_ROOT/memory/episodic/digests/AGENT_LEARNINGS.jsonl"
+touch "$BRAIN_ROOT/memory/episodic/digests/_imported.jsonl"
 
 # Permissions
 chmod +x "$BRAIN_ROOT/tools/"*.sh 2>/dev/null || true
