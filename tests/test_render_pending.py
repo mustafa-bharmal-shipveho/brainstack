@@ -3,12 +3,14 @@
 Today's audit (2026-05-04) found 21 candidate lessons sitting in
 `~/.agent/memory/candidates/` since 2026-05-01-02. The user had no idea —
 brainstack writes them silently and nothing surfaces the count in any
-tool's session UI. The 4 modules under test fix that:
+tool's session UI. The 3 modules under test fix that:
 
   - `agent/tools/render_pending_summary.py`   — generates ~/.agent/PENDING_REVIEW.md
   - `agent/tools/render_cursor_rules.py`      — pushes summary into ~/.cursor/.cursorrules
-  - `agent/harness/hooks/session_start.py`    — Claude Code SessionStart hook
   - `templates/brainstack-shell-banner.sh`    — wrapper functions for `claude`/`codex`/`cursor`
+
+Plus: `install.sh --setup-pending-hook` injects a `@`-import of PENDING_REVIEW.md
+into `~/.claude/CLAUDE.md` so Claude Code auto-loads it on every session.
 
 These tests pin the contracts BEFORE the modules exist (TDD-red phase).
 Imports are lazy (inside each test method) so `pytest --collect-only`
@@ -35,7 +37,6 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "agent" / "tools"))
 sys.path.insert(0, str(REPO_ROOT / "agent" / "memory"))
-sys.path.insert(0, str(REPO_ROOT / "agent" / "harness" / "hooks"))
 
 
 # ---------- helpers ----------------------------------------------------
@@ -362,8 +363,8 @@ class TestSyncStatusParser:
         assert "5 candidates pending" in summary or "candidates pending" in summary
 
     def test_compose_summary_empty_state_writes_one_liner(self, tmp_path: Path):
-        """0 pending + in_sync + sync ok → one-liner ('all clear'). The
-        SessionStart hook suppresses these so empty days produce no noise."""
+        """0 pending + in_sync + sync ok → one-liner ('all clear'). CLAUDE.md
+        @-import transclubes this; empty days produce minimal noise."""
         rps = self._import()
         summary = rps.compose_summary(
             tmp_path,

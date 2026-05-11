@@ -175,15 +175,28 @@ Empty days produce a one-liner (`✅ all clear`) which all three surfaces suppre
 ### Tearing it down
 
 ```bash
+./install.sh --remove-pending-hook     # strips @-import from ~/.claude/CLAUDE.md
 ./install.sh --remove-cursor-rules     # strips sentinel block from .cursorrules
 ./install.sh --remove-shell-banner     # strips source line from ~/.zshrc + removes script
 ./install.sh --remove-source <key>     # drop a custom input source (mirror data preserved)
-# For the SessionStart hook: edit ~/.claude/settings.json and remove the entry
 ```
 
-### Security note
+### Troubleshooting
 
-The SessionStart hook injects `PENDING_REVIEW.md` content into Claude Code's context inside a `<system-reminder>` block. To prevent a project-level `.envrc` from poisoning `$HOME` or `$BRAIN_ROOT` and redirecting the hook to attacker-controlled content, the hook resolves the brain root from `__file__` (its own install path), not from environment variables. Tests pin this in `tests/test_render_pending.py::test_resolves_brain_from_file_not_env`.
+**The pending banner doesn't appear in Claude Code.** Claude Code auto-loads `~/.claude/CLAUDE.md` on session start. Check that the brainstack block is present:
+
+```bash
+grep -A 2 "brainstack-pending-review-start" ~/.claude/CLAUDE.md
+# expect: the @-import line pointing to ~/.agent/PENDING_REVIEW.md
+```
+
+If it's missing or the import path is wrong, re-run:
+
+```bash
+./install.sh --setup-pending-hook
+```
+
+The @-import uses an absolute path (e.g., `/Users/you/.agent/PENDING_REVIEW.md`). If you move your brain to a different `$BRAIN_ROOT`, re-run `--setup-pending-hook` to update the path.
 
 ---
 

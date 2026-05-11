@@ -961,6 +961,128 @@ fi
 # As a side effect, --remove-pending-hook also strips any leftover
 # SessionStart entry tagged with our sentinel (cleans up post-upgrade
 # from the prior iteration).
+if [ "$MODE" = "setup-pending-hook" ] || [ "$MODE" = "remove-pending-hook" ]; then
+    if [ ! -d "$BRAIN_ROOT" ]; then
+        echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
+        exit 2
+    fi
+    claude_md="$HOME/.claude/CLAUDE.md"
+    pending_review="$BRAIN_ROOT/PENDING_REVIEW.md"
+    sentinel_start="<!-- brainstack-pending-review-start -->"
+    sentinel_end="<!-- brainstack-pending-review-end -->"
+
+    if [ "$MODE" = "remove-pending-hook" ]; then
+        if [ ! -f "$claude_md" ]; then
+            echo "install: $claude_md not found. Nothing to remove."
+            exit 0
+        fi
+        "$PYTHON_BIN" - "$claude_md" "$sentinel_start" "$sentinel_end" <<'PYEOF'
+import sys
+from pathlib import Path
+claude_md = Path(sys.argv[1])
+sentinel_start = sys.argv[2]
+sentinel_end = sys.argv[3]
+if not claude_md.is_file():
+    print(f"not found: {claude_md}")
+    sys.exit(0)
+text = claude_md.read_text()
+if sentinel_start not in text or sentinel_end not in text:
+    print(f"no brainstack-pending-review block found in {claude_md}")
+    sys.exit(0)
+s = text.index(sentinel_start)
+e = text.index(sentinel_end) + len(sentinel_end)
+new = text[:s].rstrip() + "\n" + text[e:].lstrip()
+if not new.endswith("\n"):
+    new += "\n"
+claude_md.write_text(new)
+print(f"removed brainstack-pending-review block from {claude_md}")
+sys.exit(0)
+
+# Also remove any leftover SessionStart entry from settings.json (cleanup
+# from the prior iteration when we tried the SessionStart hook approach)
+settings = Path.home() / ".claude" / "settings.json"
+if settings.is_file():
+    import json
+    try:
+        data = json.loads(settings.read_text())
+        hooks = data.get("hooks", {})
+        ss = hooks.get("SessionStart", []) or []
+        new_ss = [e for e in ss if "brainstack-pending-review" not in str(e.get("hooks"))]
+        if len(new_ss) < len(ss):
+            if new_ss:
+                hooks["SessionStart"] = new_ss
+            else:
+                hooks.pop("SessionStart", None)
+            data["hooks"] = hooks
+            settings.write_text(json.dumps(data, indent=2, sort_keys=True))
+            print(f"also cleaned up leftover SessionStart hook from {settings}")
+    except Exception:
+        pass  # silent if cleanup fails; the main CLAUDE.md removal succeeded
+PYEOF
+        exit 0
+    fi
+
+    # setup-pending-hook: wire Claude Code via CLAUDE.md @-import
+    if [ ! -f "$pending_review" ]; then
+        echo "install: $pending_review not found. Run ./install.sh --upgrade first." >&2
+        exit 2
+    fi
+
+    # Ensure ~/.claude/ exists (Claude Code may not be installed yet)
+    mkdir -p "$(dirname "$claude_md")"
+
+    "$PYTHON_BIN" - "$claude_md" "$pending_review" "$sentinel_start" "$sentinel_end" <<'PYEOF'
+import sys
+from pathlib import Path
+claude_md = Path(sys.argv[1])
+pending_review = sys.argv[2]
+sentinel_start = sys.argv[3]
+sentinel_end = sys.argv[4]
+
+block = "\n".join([
+    sentinel_start,
+    "## brainstack pending review",
+    "",
+    f"@{pending_review}",
+    "",
+    "_Auto-loaded by brainstack. Remove with `./install.sh --remove-pending-hook`._",
+    sentinel_end,
+])
+
+if not claude_md.is_file():
+    # Create new CLAUDE.md with the block
+    claude_md.write_text(block + "\n")
+    print(f"created {claude_md} with brainstack-pending-review import")
+    sys.exit(0)
+
+text = claude_md.read_text()
+if sentinel_start in text and sentinel_end in text:
+    # Replace existing block
+    s = text.index(sentinel_start)
+    e = text.index(sentinel_end) + len(sentinel_end)
+    new = text[:s] + block + text[e:]
+    if new != text:
+        claude_md.write_text(new)
+        print(f"updated brainstack-pending-review block in {claude_md}")
+    else:
+        print(f"already installed: {claude_md} is current")
+    sys.exit(0)
+
+# Append new block
+sep = "" if text.endswith("\n") else "\n"
+if not text.endswith("\n\n"):
+    sep += "\n"
+claude_md.write_text(text + sep + block + "\n")
+print(f"appended brainstack-pending-review block to {claude_md}")
+sys.exit(0)
+PYEOF
+
+    echo "==> Claude Code setup complete."
+    echo "    Open a fresh Claude Code session to see the pending-review banner."
+    echo "    Tear down with:  ./install.sh --remove-pending-hook"
+    exit 0
+fi
+
 # ----- Mode: setup-digests -----
 # Checks LLM provider availability (claude -p / codex exec) and prints
 # the exact fix command if no provider is ready. Also creates a marker
