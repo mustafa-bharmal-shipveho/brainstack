@@ -69,10 +69,12 @@ from redact_jsonl import redact_string  # type: ignore
 # map-reduce. Module-level so tests can monkeypatch a lower threshold.
 SINGLE_PASS_TOKEN_LIMIT = 60_000
 
-# Per-chunk target when splitting. Tunable but conservative — well
-# below Haiku's 200K context to leave room for the system prompt + the
-# digest output schema instructions.
-CHUNK_TOKEN_TARGET = 30_000
+# Per-chunk target when splitting. Set to 120K so even multi-MB outlier
+# sessions land in a small number of chunks. Originally 30K, which made
+# the 14MB outlier need ~120 chunks → cumulative wall time hours.
+# Haiku's context is 200K so 120K leaves headroom for system prompt +
+# schema instructions.
+CHUNK_TOKEN_TARGET = 120_000
 
 
 # ---------------------------------------------------------------------------
