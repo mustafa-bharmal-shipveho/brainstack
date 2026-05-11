@@ -31,6 +31,76 @@ def adapter_mod():
 
 
 # ---------------------------------------------------------------------------
+# _normalize_digest — post-LLM output coercion
+# ---------------------------------------------------------------------------
+
+class TestNormalizeDigest:
+    """Even with --json-schema enum enforcement, claude -p sometimes
+    returns `outcome` as a full sentence rather than one of the 4
+    valid values. theme_cluster + recall then render gibberish like
+    `outcome=1 Successfully shipped 10 improvements to ...`. Pin the
+    contract: bad shapes get coerced; valid shapes pass through."""
+
+    def test_full_sentence_outcome_with_keyword_coerces(self, adapter_mod):
+        bad = {
+            "outcome": "1 in-progress: still refactoring",
+            "salience": 5, "title": "x", "domain_tags": [],
+            "what_user_did": "a", "what_was_learned": "b",
+            "decisions": [], "files_touched": [],
+        }
+        out = adapter_mod._normalize_digest(bad)
+        assert out["outcome"] == "in-progress"
+
+    def test_full_sentence_with_no_keyword_defaults_completed(self,
+                                                              adapter_mod):
+        bad = {
+            "outcome": "shipped 10 improvements via PR #12",
+            "salience": 5, "title": "x", "domain_tags": [],
+            "what_user_did": "a", "what_was_learned": "b",
+            "decisions": [], "files_touched": [],
+        }
+        out = adapter_mod._normalize_digest(bad)
+        assert out["outcome"] in adapter_mod.VALID_OUTCOMES
+
+    def test_oversize_salience_clamps_to_10(self, adapter_mod):
+        out = adapter_mod._normalize_digest({
+            "outcome": "completed", "salience": 100,
+            "title": "x", "domain_tags": [], "what_user_did": "",
+            "what_was_learned": "", "decisions": [], "files_touched": [],
+        })
+        assert out["salience"] == 10
+
+    def test_undersize_salience_clamps_to_1(self, adapter_mod):
+        out = adapter_mod._normalize_digest({
+            "outcome": "completed", "salience": -5,
+            "title": "x", "domain_tags": [], "what_user_did": "",
+            "what_was_learned": "", "decisions": [], "files_touched": [],
+        })
+        assert out["salience"] == 1
+
+    def test_non_list_tags_coerce_to_list(self, adapter_mod):
+        out = adapter_mod._normalize_digest({
+            "outcome": "completed", "salience": 5, "title": "x",
+            "domain_tags": "auth-rewrite",  # accidentally a string
+            "what_user_did": "", "what_was_learned": "",
+            "decisions": [], "files_touched": [],
+        })
+        assert out["domain_tags"] == ["auth-rewrite"]
+
+    def test_valid_passthrough_unchanged(self, adapter_mod):
+        valid = {
+            "title": "t", "domain_tags": ["x"],
+            "what_user_did": "a", "what_was_learned": "b",
+            "decisions": ["d"], "files_touched": ["/p.py"],
+            "outcome": "blocked", "salience": 8,
+        }
+        out = adapter_mod._normalize_digest(valid)
+        assert out["outcome"] == "blocked"
+        assert out["salience"] == 8
+        assert out["domain_tags"] == ["x"]
+
+
+# ---------------------------------------------------------------------------
 # Fake provider — deterministic + inspectable
 # ---------------------------------------------------------------------------
 

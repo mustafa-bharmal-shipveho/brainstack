@@ -90,14 +90,54 @@ DIGEST_SCHEMA: dict = {
         "what_was_learned": {"type": "string"},
         "decisions": {"type": "array", "items": {"type": "string"}},
         "files_touched": {"type": "array", "items": {"type": "string"}},
-        "outcome": {"type": "string"},
-        "salience": {"type": "integer"},
+        "outcome": {"type": "string",
+                    "enum": ["completed", "abandoned", "blocked",
+                             "in-progress"]},
+        "salience": {"type": "integer", "minimum": 1, "maximum": 10},
     },
     "required": [
         "title", "domain_tags", "what_user_did", "what_was_learned",
         "decisions", "files_touched", "outcome", "salience",
     ],
 }
+
+VALID_OUTCOMES = ("completed", "abandoned", "blocked", "in-progress")
+
+
+def _normalize_digest(payload: dict) -> dict:
+    """Post-LLM normalization. claude -p's --json-schema enforces
+    `required` + types but enum validation is lightweight — some
+    responses still return outcome as a full sentence. Coerce so
+    themes / profile / recall don't render gibberish like
+    `outcome=1 Successfully shipped 10 improvements to ...`.
+
+    Pure function — no I/O. Always returns a dict, never raises."""
+    out = dict(payload) if isinstance(payload, dict) else {}
+    raw = str(out.get("outcome", "") or "").strip().lower()
+    norm = None
+    for valid in VALID_OUTCOMES:
+        if valid in raw:
+            norm = valid
+            break
+    out["outcome"] = norm or "completed"
+
+    sal = out.get("salience", 5)
+    if isinstance(sal, bool) or not isinstance(sal, (int, float)):
+        sal = 5
+    out["salience"] = max(1, min(10, int(sal)))
+
+    for k in ("title", "what_user_did", "what_was_learned"):
+        v = out.get(k, "")
+        if not isinstance(v, str):
+            v = str(v) if v is not None else ""
+        out[k] = v.strip()
+
+    for k in ("domain_tags", "decisions", "files_touched"):
+        v = out.get(k, [])
+        if not isinstance(v, list):
+            v = [v] if v else []
+        out[k] = [str(item) for item in v if item]
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -379,7 +419,7 @@ def _summarize_single(
     )
     if result.parsed_json is None:
         raise LLMError("provider returned no parsed digest")
-    return result.parsed_json
+    return _normalize_digest(result.parsed_json)
 
 
 def _summarize_chunks(
@@ -410,7 +450,7 @@ def _summarize_chunks(
         )
         if result.parsed_json is None:
             raise LLMError(f"chunk {i+1} returned no parsed digest")
-        chunk_digests.append(result.parsed_json)
+        chunk_digests.append(_normalize_digest(result.parsed_json))
 
     # Final merge
     merge_prompt = (
@@ -424,7 +464,7 @@ def _summarize_chunks(
     )
     if merged.parsed_json is None:
         raise LLMError("merge call returned no parsed digest")
-    return merged.parsed_json
+    return _normalize_digest(merged.parsed_json)
 
 
 # ---------------------------------------------------------------------------
