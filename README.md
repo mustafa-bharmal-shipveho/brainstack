@@ -427,6 +427,57 @@ Pass `--no-tools` to skip the transcript scan entirely (faster on brains with hu
 
 ---
 
+## Integration v0.3 — episode schema unification + stats CLI
+
+**v0.3 unifies the episodic schema so coding and agentry events cluster together, and introduces a `brain stats` CLI for visibility across namespaces.**
+
+### Episode schema evolution
+
+Every episode now carries two metadata fields:
+
+- **`origin`** (string, auto-defaulted to `"coding.tool_call"` if omitted): where the episode came from. Examples: `coding.tool_call`, `agentry.inbox.action`, `agentry.mustafa-agent.review_decision`. Used by the dream cycle to bucket episodes before clustering — events from different origins cluster separately.
+- **`summary`** (string): the canonical text used for clustering. The feature extractor reads `summary` first; for legacy episodes lacking it, falls back to `action + reflection + detail` (backward compatible).
+
+```json
+{
+  "action": "pnpm install",
+  "reflection": "team standardized on pnpm, not npm",
+  "summary": "prefer pnpm over npm in this project",
+  "origin": "coding.tool_call",
+  "pain_score": 5,
+  "importance": 7,
+  "timestamp": "2026-04-29T20:00:00+00:00"
+}
+```
+
+Writers (Claude Code hooks, agentry providers) stamp both fields at write time. Missing `origin` is treated as `coding.tool_call` for backward compat. The 3712-line existing `AGENT_LEARNINGS.jsonl` requires no migration — a one-shot helper `agent/tools/backfill_origin.py` (idempotent, sentinel-locked) stamps missing fields during the next dream cycle.
+
+### Stats CLI
+
+New `python -m agent.tools.sdk_cli stats` subcommand provides visibility into the brain:
+
+```bash
+$ python -m agent.tools.sdk_cli stats --json
+{
+  "namespaces": ["default", "mustafa-agent"],
+  "episodeCount": 4,
+  "lessonCount": 1,
+  "candidateCount": 2,
+  "perNamespace": {
+    "default": {"episodes": 3, "lessons": 1, "candidates": 1},
+    "mustafa-agent": {"episodes": 1, "lessons": 0, "candidates": 1}
+  }
+}
+```
+
+Supports `--namespace NS` to filter to a single namespace. Human-readable by default; `--json` for machine parsing. Powers the agentry-side `agentry brain stats` CLI (see [`mustafa-agents`](https://github.com/mustafa-bharmal-shipveho/agentry) README v0.3 section).
+
+### External consumers (v0.2-rc1+)
+
+External agent frameworks can read and write the brain through `agent/memory/sdk.py` using namespaces. The SDK exposes `append_episodic`, `query_semantic`, `read_policy`, `write_policy`, and `register_clusterer` — each takes a `namespace` arg matching `^[a-z][a-z0-9_-]{0,31}$`. Pluggable per-namespace dream-cycle clusterers live in `agent/dream/registry.py` (`run_all` aggregates results across namespaces). Backward compatibility is preserved: `namespace="default"` maps to the v0.1 paths (no extra subdir under `episodic/`, `semantic/`, `candidates/`), so existing v0.1 brains do not need migration. New CLI flags `--namespace NS` are now available on `graduate.py` / `reject.py`, and two new tools (`promote.py`, `rollback.py`) manage tier policy + audit log per namespace. See [`mustafa-agents`](https://github.com/mustafa-bharmal-shipveho/agentry) (companion repo) for the reference TypeScript runtime that consumes this SDK.
+
+---
+
 ## Architecture
 
 ```
