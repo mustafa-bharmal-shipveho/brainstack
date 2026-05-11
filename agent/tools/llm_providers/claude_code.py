@@ -130,8 +130,16 @@ class ClaudeCodeProvider(LLMProvider):
     def invoke(self, system: str, prompt: str, *,
                model: str | None = None,
                json_schema: dict | None = None,
-               max_budget_usd: float = 0.10,
+               max_budget_usd: float = 5.0,
                timeout_s: int = 60) -> LLMResult:
+        # Default budget is generous (5 USD/call) because the user is
+        # subscription-billed via CLAUDE_CODE_OAUTH_TOKEN — total_cost_usd
+        # is the API-equivalent estimate, not a real charge. A modest
+        # ceiling (the 0.10 we'd inherited from "minimize per-call cost"
+        # thinking) actually triggers `error_max_budget_usd` on calls
+        # with normal Claude Code cache-creation overhead (~70K cache
+        # tokens just for project context). Set it tight only if you've
+        # opted out of subscription auth and want a real-money guardrail.
         model = model or self.default_model
         cmd = self._build_cmd(model, json_schema, max_budget_usd)
         # `system` is concatenated into stdin as a leading directive so it
@@ -146,12 +154,22 @@ class ClaudeCodeProvider(LLMProvider):
 
         parsed: dict | None = None
         if json_schema is not None:
-            try:
-                cand = json.loads(result_text)
-                if self._validate_schema(cand, json_schema):
-                    parsed = cand
-            except json.JSONDecodeError:
-                parsed = None
+            # With --json-schema, claude -p returns the structured object
+            # in `structured_output`, not `result` (verified empirically:
+            # `result` becomes a status message like "Done." in that
+            # mode). Try structured_output first, then fall back to
+            # parsing `result` for older CLI versions that may not have
+            # this split.
+            so = envelope.get("structured_output")
+            if isinstance(so, dict) and self._validate_schema(so, json_schema):
+                parsed = so
+            elif result_text:
+                try:
+                    cand = json.loads(result_text)
+                    if self._validate_schema(cand, json_schema):
+                        parsed = cand
+                except json.JSONDecodeError:
+                    parsed = None
 
             if parsed is None:
                 # Retry once with a stricter directive. Different prompt
@@ -168,12 +186,17 @@ class ClaudeCodeProvider(LLMProvider):
                 result_text = envelope.get("result", "")
                 usage = envelope.get("usage") or {}
                 cost = envelope.get("total_cost_usd", cost)
-                try:
-                    cand = json.loads(result_text)
-                    if self._validate_schema(cand, json_schema):
-                        parsed = cand
-                except json.JSONDecodeError:
-                    parsed = None
+                so = envelope.get("structured_output")
+                if isinstance(so, dict) and self._validate_schema(
+                        so, json_schema):
+                    parsed = so
+                elif result_text:
+                    try:
+                        cand = json.loads(result_text)
+                        if self._validate_schema(cand, json_schema):
+                            parsed = cand
+                    except json.JSONDecodeError:
+                        parsed = None
                 if parsed is None:
                     raise LLMError(
                         "claude -p schema validation failed after retry; "
