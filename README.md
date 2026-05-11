@@ -8,10 +8,11 @@ The core question brainstack measures is simple:
 
 Everything else is instrumentation for that answer: durable capture, retrieval quality, token budgets, eviction policy, and replay.
 
-Three layers, one stack:
+Four layers, one stack:
 
 - **Storage.** One global memory at `~/.agent/`. Every tool call → episodic log → nightly dream cycle clusters salient patterns → graduated lessons land in `semantic/` and are auto-loaded on every future session. Mistakes get codified so the next session reuses them.
-- **Retrieval.** Hybrid recall (Qdrant + BM25) finds the right memory for any query. Tool-agnostic: works with Claude Code, Cursor, Codex CLI.
+- **Digests.** Per-session LLM-generated summaries (title, domain tags, what-was-learned, decisions, files-touched) over Claude Code and Codex transcripts. The brain remembers your work at the *session* level, not just the tool-call level — when you ask "did I deal with this before?", recall surfaces the right past session instead of a wall of `Edit:` calls. Built via the user's existing `claude -p` / `codex exec` subscription, no separate API key.
+- **Retrieval.** Hybrid recall (Qdrant + BM25) finds the right memory for any query. Tool-agnostic: works with Claude Code, Cursor, Codex CLI. Digests, lessons, and imported markdown all participate.
 - **Runtime.** Token budgets per bucket, eviction policy as a forkable Python file, full replay/audit. Answers *"why didn't the model know X?"* from artifacts instead of guesswork. The runtime core is host-agnostic; v0.4 ships with the first adapter, Claude Code. Planned Cursor / Codex CLI adapters slot into the same interface (community contributions welcome). Today the runtime *records, budgets, and replays* every injection decision a Claude Code session makes; it does not yet inject CLAUDE.md content on its own (that lands in a later minor). What it controls is the log, the manifest, and the replay — enough to debug and prove behavior.
 
 **Constant git sync.** Hourly push to your private remote (with required secret-scanner gate). Reinstall on a new machine and `git pull` brings back every lesson, every preference, every reference. Details: [`docs/git-sync.md`](docs/git-sync.md).
@@ -82,6 +83,97 @@ This adds an hourly LaunchAgent that runs two adapters under the same fcntl lock
 Excluded by policy (privacy/volume): `~/.claude/{history.jsonl,paste-cache,file-history,telemetry}` (clipboard pastes / file backups / telemetry — not memory) and `~/.cursor/ai-tracking` (opaque SQLite blob with high-entropy hits). Audit live coverage with `~/.agent/tools/discover_all_sources.py`.
 
 Tear down with `./install.sh --remove-claude-extras`.
+
+---
+
+## Session digests — recall past work, not past tool calls
+
+The tool-call episodic stream tells you *what your agent did*; it doesn't tell you *what you worked on*. A session about debugging a payment-flow timeout shows up there as 200 `Edit:` and `Bash:` lines — useless when, three months later, you ask "did I look into payment-flow timeouts before?"
+
+Session digests fix that. Per session, the brain calls a local LLM CLI (your existing `claude -p` or `codex exec`, no API key) and writes one structured digest:
+
+```yaml
+---
+session_id: 0d446e9f-...
+source: claude
+started_at: 2026-05-06T20:02:27Z
+domain_tags: [dream, noise-filtering, clustering, candidates, pattern-extraction]
+outcome: completed
+salience: 7
+---
+
+# Activity-log filter for dream candidates
+
+## What you did
+Identified that literal tool-call narrations were leaking through the
+clustering pipeline as staged candidates...
+
+## What was learned
+Tool-call narration is high-volume noise that survives content
+clustering because it's mechanically generated per-invocation...
+
+## Decisions
+- Add _is_activity_log_claim() with 11 narrator-shape detectors
+- Thread telemetry through auto_dream.py and emit activity_log_skipped=N
+
+## Files touched
+- `agent/memory/cluster.py`
+- `agent/memory/promote.py`
+```
+
+The digest is written to two surfaces:
+
+| Surface | Path | What it's for |
+|---|---|---|
+| Episodic line | `~/.agent/memory/episodic/digests/AGENT_LEARNINGS.jsonl` | Brain-internal — feeds cluster.py + theme detection |
+| Markdown file | `~/.agent/memory/semantic/digests/<date>__<slug>.md` | What recall queries surface; what you browse + git-sync |
+
+Then `recall query "<topic>"` ranks the right digest at the top:
+
+```
+$ recall query "activity log filter dream candidates"
+score=1.000  semantic/digests/2026-05-06__activity-log-filter-for-dream-candidates__*.md
+```
+
+### Setup
+
+`install.sh` creates the digest dirs automatically. To opt in to the LLM-driven summarization:
+
+```bash
+./install.sh --setup-digests
+```
+
+This checks which provider is ready (`claude -p` or `codex exec`), prints the exact fix-it command if neither is authed, and writes a `~/.agent/.digests-enabled` marker. The hourly LaunchAgent (`sync_claude_extras`) then runs `digest_cli.py incremental` after each transcript sync — gated on that marker so users who haven't opted in never incur surprise LLM calls.
+
+First-time backfill of historical sessions:
+
+```bash
+BRAIN_ROOT=$HOME/.agent python3 ~/.agent/tools/digest_cli.py backfill          # both sources
+BRAIN_ROOT=$HOME/.agent python3 ~/.agent/tools/digest_cli.py backfill --source claude
+BRAIN_ROOT=$HOME/.agent python3 ~/.agent/tools/digest_cli.py provider list    # see what's ready
+```
+
+The backfill is idempotent (SHA sidecar at `memory/episodic/digests/_imported.jsonl`); re-runs are no-ops on unchanged sessions. Per-session failures (LLM timeout, prompt-too-long on multi-MB outliers) are logged and skipped without halting the run. Map-reduce handles large sessions automatically.
+
+### What gets built on top of digests
+
+| Tool | What | Output |
+|---|---|---|
+| `profile_builder.py` | Periodic LLM rollup of all digests | `~/.agent/memory/semantic/PROFILE.md` — ranked domains, active threads, recent learnings, long-running themes |
+| `theme_cluster.py` | Cluster digests sharing `domain_tags` | Stages theme candidates in `memory/candidates/` for review via `recall pending --review`; graduating one becomes a durable lesson |
+| `proactive_context.py` | Token-overlap + tag-boost search across digests | Returns a `<brain-context>` block for SessionStart-hook injection so new sessions start *with* relevant past work pre-loaded |
+
+PROFILE.md is auto-indexed by recall, so `recall profile` (or any query overlapping with a domain tag) surfaces it.
+
+### Pluggable LLM providers
+
+The summarization layer is a one-file plugin per CLI. Shipping today: `claude-code` (via `claude -p`) and `codex` (via `codex exec`). Adding Cursor / Aider / any other LLM CLI is a 50-line subclass of `LLMProvider` in `agent/tools/llm_providers/` — register in `PROVIDERS`, done. See `agent/tools/llm_providers/__README.md`.
+
+Auto-detection picks the first available provider. Pin with `BRAIN_LLM_PROVIDER=claude-code` in the env, or `llm_provider = "codex"` in `~/.agent/config.toml`.
+
+### Framework purity
+
+No org/employer/domain references in any of the digest code or prompts. The LLM is asked to extract domain tags from the session content itself — never from a fixed taxonomy. Tests use synthetic placeholders. A pre-merge `grep -RIin -E 'veho|cart-location|...'` audit gates against accidental leakage.
 
 ---
 
