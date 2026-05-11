@@ -34,6 +34,7 @@ import json
 import os
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 from typing import Optional
 
@@ -73,27 +74,237 @@ def _list_candidates(candidates_dir: Path) -> list[Path]:
     return [p for _, p in files]
 
 
+# Canonical outcome buckets the theme digester emits. Anything else in
+# data["source"]["outcomes"] is a long-form LLM description of a single
+# session's wrap-up: treated as a successful-completion narrative for
+# the purposes of the recommend heuristic (it counts toward `completed`).
+_CATEGORICAL_OUTCOMES = ("completed", "in-progress", "abandoned", "blocked")
+
+# Imperative-rule markers in feedback claims. Their presence is a strong
+# signal the claim is a behavioral rule worth keeping, not just a
+# narrative summary.
+# Must stay a superset of theme_cluster.py:_IMPERATIVE_MARKERS so any rule
+# the synth accepts ALSO classifies as a rule in the REPL. Asymmetric lists
+# were flagged in code review 2026-05-11 when a "When X, do Y" v2 rule
+# got recommended for [r] reject because the REPL list omitted "when ".
+_IMPERATIVE_MARKERS = (
+    "don't", "do not", "never", "always", "when ", "must ", "should ",
+    "prefer", "use ", "stop ", "avoid ", "only ",
+)
+
+
+_LESSON_PREVIEW_CHARS = 240  # length of the claim shown in the preview;
+                              # chosen so a typical terminal width (80-100 cols)
+                              # shows ~3 wrapped lines, enough to recognize
+                              # whether the content is a behavioral rule.
+
+
+def _lesson_preview(data: dict, max_chars: int = _LESSON_PREVIEW_CHARS) -> tuple[str, int]:
+    """Return (truncated_claim, full_claim_length)."""
+    claim = (data.get("claim") or "").strip().replace("\n", " ")
+    if len(claim) <= max_chars:
+        return (claim, len(claim))
+    return (claim[:max_chars].rstrip() + "...", len(claim))
+
+
+def _behavioral_value(data: dict) -> tuple[str, str]:
+    """Return (kind, one_line_explanation).
+
+    Answers the user's actual question: "if I graduate this, what
+    behavior will the next LLM session do differently?" Mustafa 2026-05-11:
+    "i care about why i should save it... why its going to be helpful".
+    By his standard, a graduated lesson must change future LLM sessions'
+    actions; cluster summaries and pointers don't qualify.
+
+    kind is one of:
+      "rule"     - claim contains an imperative; graduating CAN change
+                   future behavior. Worth a [g].
+      "data"     - claim is auto-generated cluster summary or outcome
+                   list. Graduating adds noise; future LLM sessions get no
+                   instruction.
+      "marker"   - claim is the theme.digest meta-prompt template
+                   ("Recurring topic across N sessions... Review and
+                   graduate the durable insight"). Graduating just
+                   bookmarks the cluster; no behavior changes.
+      "unknown"  - can't classify; user should read the full claim.
+    """
+    claim = (data.get("claim") or "").strip()
+    origin = (data.get("origin") or "").strip()
+    head = claim.lower()[:200]
+
+    if claim.lower().startswith("recurring topic across"):
+        return (
+            "marker",
+            "auto-generated meta-prompt ('Recurring topic across N sessions...'); future LLM sessions read it as a pointer, not a rule, and nothing changes",
+        )
+
+    if any(m in head for m in _IMPERATIVE_MARKERS):
+        return (
+            "rule",
+            "imperative rule in claim; future LLM sessions will see this and apply it when the conditions match",
+        )
+
+    if origin.startswith("theme.digest") or len(claim) > 800:
+        return (
+            "data",
+            "claim is cluster/outcome data, not a rule; future LLM sessions get context noise but no instruction",
+        )
+
+    return (
+        "unknown",
+        "can't tell from the claim head; read full claim with [e] before deciding",
+    )
+
+
+def _recommend(data: dict) -> tuple[str, str]:
+    """Return (action_letter, short_reason) advisory.
+
+    Decision rule (Mustafa's standard, 2026-05-11): a graduated lesson
+    must change what future LLM sessions DO. Cluster summaries, session
+    pointers, and outcome lists don't meet that bar even when they
+    carry friction signal; only imperative behavioral rules do.
+
+    Heuristics, in order:
+      1. Already rejected before -> reject again.
+      2. Claim has rule-shape (imperative marker like don't / always /
+         must / use X) -> graduate; this is the only path to [g].
+      3. Claim is a theme.digest meta-prompt or cluster summary ->
+         reject; no rule, no behavior change.
+      4. Anything else -> skip; let the user read it manually.
+    """
+    rejs = data.get("rejection_count", 0) or 0
+    if rejs > 0:
+        return ("r", f"rejected {rejs} prior time(s); pattern unchanged")
+
+    kind, _ = _behavioral_value(data)
+    # Defensive: legacy / hand-written candidates may have `source`
+    # as a bare string instead of a dict. Tolerate both shapes.
+    _src = data.get("source")
+    outcomes = (_src.get("outcomes") if isinstance(_src, dict) else None) or {}
+
+    if kind == "rule":
+        return ("g", "claim is an imperative rule; graduating changes how future LLM sessions act when the condition matches")
+
+    if kind == "marker":
+        # Add the friction signal context if present; user may still want
+        # to use the cluster as a PROMPT for writing a real lesson via
+        # `recall remember`. Recommendation stays [r] because the claim
+        # itself doesn't change behavior.
+        friction = sum(
+            int(outcomes.get(k, 0) or 0)
+            for k in ("abandoned", "blocked", "in-progress")
+        )
+        total = sum(int(v) for v in outcomes.values() if isinstance(v, int))
+        if total > 0 and friction / total >= 0.30:
+            return (
+                "r",
+                f"meta-prompt claim, no rule; {int(friction/total*100)}% friction in cluster though, so consider `recall remember \"...\"` to write the real lesson manually",
+            )
+        return ("r", "meta-prompt claim, no rule; future LLM sessions read it as a pointer and nothing changes")
+
+    if kind == "data":
+        return ("r", "claim is cluster/outcome data, not a rule; graduating adds noise to future context")
+
+    return ("s", "claim shape unclear; read the full claim with [e] before deciding")
+
+
 def _print_candidate(data: dict, idx: int, total: int) -> None:
     cid = data.get("id", "?")
-    claim = (data.get("claim") or "").strip()
     cs = data.get("cluster_size", "?")
     sal = data.get("canonical_salience", 0)
     eids = data.get("evidence_ids") or []
     rejs = data.get("rejection_count", 0)
-    staged = data.get("staged_at", "?")[:19]
+    staged = data.get("staged_at", "?")[:10]  # date only, not full timestamp
+    origin = data.get("origin") or "?"
+    conditions = data.get("conditions") or []
+    # Defensive: legacy / hand-written candidates may have `source`
+    # as a bare string instead of a dict. Tolerate both shapes.
+    _src = data.get("source")
+    outcomes = (_src.get("outcomes") if isinstance(_src, dict) else None) or {}
+
+    prio = cs * sal if isinstance(cs, (int, float)) and isinstance(sal, (int, float)) else 0
+    tag_str = ", ".join(str(c) for c in conditions) if conditions else "(no tag)"
 
     print()
     print(f"=== Candidate {idx + 1} of {total} ===")
-    print(f"  id:            {cid}")
-    print(f"  priority:      {cs} cluster x {sal:.1f} salience = {cs * sal if isinstance(cs, (int, float)) else '?':.1f}")
-    print(f"  claim:         {claim[:200]}")
-    print(f"  staged_at:     {staged}")
+    print(f"  id:        {cid}")
+    print(f"  type:      {origin}")
+    print(f"  cluster:   {cs} sessions tagged \"{tag_str}\"  |  priority {prio:.0f}  |  staged {staged}")
+
+    # Outcome breakdown (theme.digest only).
+    if origin.startswith("theme.digest") and outcomes:
+        parts = []
+        for k in _CATEGORICAL_OUTCOMES:
+            v = outcomes.get(k)
+            if isinstance(v, int) and v > 0:
+                parts.append(f"{v} {k}")
+        narrative = sum(
+            1 for k, v in outcomes.items()
+            if isinstance(v, int) and k not in _CATEGORICAL_OUTCOMES
+        )
+        if narrative:
+            parts.append(f"{narrative} other")
+        if parts:
+            print(f"  outcomes:  {', '.join(parts)}")
+
     if rejs:
-        print(f"  rejected:      {rejs} prior time(s)")
+        print(f"  rejected:  {rejs} prior time(s)")
+
+    # Headline block: what BEHAVIOR this lesson would drive in future
+    # LLM sessions. Mustafa 2026-05-11: "i care about why i should save
+    # it... why its going to be helpful". So lead with the value
+    # question, not the storage location.
+    kind, why = _behavioral_value(data)
+    preview, full_len = _lesson_preview(data)
+
+    kind_label = {
+        "rule":    "RULE that would guide future LLM sessions:",
+        "marker":  "NO RULE; just a cluster marker. Future LLM sessions would see:",
+        "data":    "NO RULE; just cluster/outcome data. Future LLM sessions would see:",
+        "unknown": "claim shape unclear. The text is:",
+    }.get(kind, "the claim is:")
+
+    print()
+    print(f"  {kind_label}")
+    wrapped = textwrap.fill(
+        f'"{preview}"',
+        width=78,
+        initial_indent="    ",
+        subsequent_indent="    ",
+        break_long_words=False,
+        break_on_hyphens=False,
+    )
+    print(wrapped)
+    if full_len > _LESSON_PREVIEW_CHARS:
+        print(f"    (full claim is {full_len} chars; press [e] to read it all)")
+
+    print()
+    print(f"  why this {'helps' if kind == 'rule' else 'does NOT help'}:")
+    why_wrapped = textwrap.fill(
+        why,
+        width=78,
+        initial_indent="    ",
+        subsequent_indent="    ",
+        break_long_words=False,
+        break_on_hyphens=False,
+    )
+    print(why_wrapped)
+
+    rec_action, rec_reason = _recommend(data)
+    rec_label = {"g": "graduate", "r": "reject", "s": "skip"}.get(rec_action, "skip")
+    print()
+    print(f"  recommend: [{rec_action}] {rec_label}")
+    rec_wrapped = textwrap.fill(
+        rec_reason,
+        width=78,
+        initial_indent="    ",
+        subsequent_indent="    ",
+        break_long_words=False,
+        break_on_hyphens=False,
+    )
+    print(rec_wrapped)
     if eids:
-        print(f"  evidence (first 3 of {len(eids)}):")
-        for e in eids[:3]:
-            print(f"                 {str(e)[:80]}")
+        print(f"  (press [e] for all {len(eids)} evidence ids + full claim)")
 
 
 def _print_full_evidence(data: dict) -> None:
