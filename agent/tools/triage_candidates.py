@@ -401,13 +401,16 @@ def _triage_one_namespace(brain: Path, namespace: str) -> tuple[dict, bool]:
             continue
 
         cid = data.get("id", path.stem)
-        # Loop until a terminal decision (g/r/s/q) — `e` re-prompts
+        # Loop until a terminal decision (g/r/s/a/q) - `e` re-prompts
         while True:
             _print_candidate(data, idx, len(candidates))
             try:
-                choice = input("\n  [g]raduate  [r]eject  [s]kip  [e]vidence  [q]uit: ").strip().lower()
+                choice = input(
+                    "\n  [g]raduate  [r]eject  [s]kip  [a]ccept-rec  "
+                    "[e]vidence  [q]uit: "
+                ).strip().lower()
             except EOFError:
-                print("\n(eof — quitting)")
+                print("\n(eof, quitting)")
                 quit_requested = True
                 break
 
@@ -423,15 +426,21 @@ def _triage_one_namespace(brain: Path, namespace: str) -> tuple[dict, bool]:
                 _print_full_evidence(data)
                 continue  # re-prompt
 
-            # The keypress IS the user's decision (Mustafa 2026-05-11
-            # "remove rationale (required)"). The no-auto-decide
+            # `a` accept the recommendation. Lets the user blast through
+            # a long queue while still inspecting each candidate. The
+            # rec was computed by `_recommend(data)` and is displayed
+            # in the candidate block; pressing `a` applies that
+            # specific letter as if the user had typed it. Mustafa
+            # 2026-05-11 "going through all 270 is not going to happen".
+            if choice in ("a", "accept", "accept-rec"):
+                rec_action, _ = _recommend(data)
+                choice = rec_action  # fall through to the g/r/s branches
+
+            # The keypress IS the user's decision. The no-auto-decide
             # contract is still enforced by the TTY check at startup,
             # which refuses to run without an interactive terminal, so
             # an AI agent calling this loop via Bash cannot rubber-stamp
             # candidates regardless of what rationale string is passed.
-            # graduate.py / reject.py still record a rationale field;
-            # we fill it with an auto-string that captures the source
-            # of the decision rather than prompting the user.
             if choice in ("g", "graduate"):
                 if _apply_graduate(brain, namespace, cid,
                                     "graduated via interactive triage"):
@@ -444,9 +453,86 @@ def _triage_one_namespace(brain: Path, namespace: str) -> tuple[dict, bool]:
                     decisions["rejected"] += 1
                 break
 
-            print(f"  unknown choice: {choice!r}. Try g / r / s / e / q.")
+            # Re-handle skip in case `a` resolved to `s`.
+            if choice in ("s", "skip"):
+                decisions["skipped"] += 1
+                break
+
+            print(f"  unknown choice: {choice!r}. Try g / r / s / a / e / q.")
 
     return decisions, quit_requested
+
+
+def _batch_apply_recommendations(brain: Path,
+                                  namespaces: list[str]) -> dict:
+    """Walk every staged candidate across `namespaces` and apply each
+    candidate's `_recommend(data)` action without prompting per-item.
+
+    User-initiated batch mode (Mustafa 2026-05-11 "going through all
+    270 is not going to happen"). Still gated by the same TTY check
+    as the interactive REPL, so AI agents cannot trigger it via Bash.
+    [s] skip recommendations are LEFT STAGED for later manual review;
+    only [g] and [r] result in graduate.py / reject.py calls.
+
+    Returns the same totals dict the REPL returns."""
+    totals = {"graduated": 0, "rejected": 0, "skipped": 0}
+
+    # First pass: count per action so we can show the user what
+    # they're about to commit to BEFORE we touch any files.
+    plan: list[tuple[str, str, str, dict]] = []  # (ns, cid, action, data)
+    for ns in namespaces:
+        for path in _list_candidates(_candidate_dir(brain, ns)):
+            try:
+                data = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            action, _ = _recommend(data)
+            plan.append((ns, data.get("id", path.stem), action, data))
+
+    if not plan:
+        print("triage: no staged candidates to apply.")
+        return totals
+
+    by_action = {"g": 0, "r": 0, "s": 0}
+    for _, _, action, _ in plan:
+        by_action[action] = by_action.get(action, 0) + 1
+
+    print()
+    print(f"=== batch apply: {len(plan)} candidate(s) across "
+          f"{len(namespaces)} namespace(s) ===")
+    print(f"  [g] graduate: {by_action['g']}")
+    print(f"  [r] reject:   {by_action['r']}")
+    print(f"  [s] skip:     {by_action['s']} (left staged, not touched)")
+    print()
+    try:
+        confirm = input(
+            "Apply these recommendations? Type 'yes' to proceed: "
+        ).strip().lower()
+    except EOFError:
+        print("\n(eof, aborted)")
+        return totals
+    if confirm != "yes":
+        print("triage: aborted, no changes applied.")
+        return totals
+
+    print()
+    for i, (ns, cid, action, _) in enumerate(plan, start=1):
+        if action == "g":
+            if _apply_graduate(brain, ns, cid,
+                                "graduated via --apply-recommendations"):
+                totals["graduated"] += 1
+        elif action == "r":
+            if _apply_reject(brain, ns, cid,
+                              "rejected via --apply-recommendations"):
+                totals["rejected"] += 1
+        else:
+            totals["skipped"] += 1
+        # Progress every 25 to give the user a sense of motion without
+        # flooding the terminal with 270 lines.
+        if i % 25 == 0:
+            print(f"  ... {i}/{len(plan)} processed")
+
+    return totals
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -458,6 +544,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         help=("default | claude-sessions | codex. If omitted, triage walks "
               "ALL namespaces with pending candidates in turn."),
     )
+    p.add_argument(
+        "--apply-recommendations", action="store_true",
+        help=("Batch mode: apply each candidate's [g]/[r] recommendation "
+              "without per-candidate prompting. One y/N confirmation at "
+              "startup. Skip-recommended candidates are left staged for "
+              "later manual review. Still requires a TTY."),
+    )
     args = p.parse_args(argv)
 
     brain = _resolve_brain(args.brain)
@@ -466,7 +559,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     # structural enforcement of "user decides per candidate". Codex
     # 2026-05-04 bug: previously, an AI assistant calling this via Bash
     # tool without a PTY would either hang or treat the empty stdin as
-    # "skip" — both wrong. Exit 2 with explicit instructions instead.
+    # "skip" - both wrong. Exit 2 with explicit instructions instead.
     if not sys.stdin.isatty():
         sys.stderr.write(
             "triage_candidates: stdin is not a TTY. This tool requires an "
@@ -494,6 +587,14 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if not namespaces_to_walk:
         print(f"triage: no staged candidates in any namespace under {brain}")
+        return 0
+
+    # Batch mode short-circuits the per-candidate REPL.
+    if args.apply_recommendations:
+        totals = _batch_apply_recommendations(brain, namespaces_to_walk)
+        print()
+        print(f"triage: total graduated={totals['graduated']} "
+              f"rejected={totals['rejected']} skipped={totals['skipped']}")
         return 0
 
     totals = {"graduated": 0, "rejected": 0, "skipped": 0}

@@ -310,6 +310,13 @@ def pending(
         False, "--review",
         help="Open the candidate triage flow (delegates to list_candidates.py).",
     ),
+    apply_recommendations: bool = typer.Option(
+        False, "--apply-recommendations",
+        help=("With --review: batch-apply each candidate's "
+              "graduate/reject recommendation after a single y/N "
+              "confirmation. Skip-recommended candidates stay staged "
+              "for later manual review."),
+    ),
     brain: Optional[Path] = typer.Option(
         None, "--brain",
         help="Brain root (default: $BRAIN_ROOT or ~/.agent).",
@@ -362,7 +369,10 @@ def pending(
     if review:
         triage = brain_root / "tools" / "triage_candidates.py"
         if triage.is_file():
-            os.execv(sys.executable, [sys.executable, str(triage), "--brain", str(brain_root)])
+            argv = [sys.executable, str(triage), "--brain", str(brain_root)]
+            if apply_recommendations:
+                argv.append("--apply-recommendations")
+            os.execv(sys.executable, argv)
         typer.echo(
             "recall pending: triage_candidates.py missing; run `./install.sh --upgrade`",
             err=True,
