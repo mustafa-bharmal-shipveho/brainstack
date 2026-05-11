@@ -464,15 +464,22 @@ def _triage_one_namespace(brain: Path, namespace: str) -> tuple[dict, bool]:
 
 
 def _batch_apply_recommendations(brain: Path,
-                                  namespaces: list[str]) -> dict:
+                                  namespaces: list[str],
+                                  *,
+                                  include_graduates: bool = False) -> dict:
     """Walk every staged candidate across `namespaces` and apply each
     candidate's `_recommend(data)` action without prompting per-item.
 
     User-initiated batch mode (Mustafa 2026-05-11 "going through all
     270 is not going to happen"). Still gated by the same TTY check
     as the interactive REPL, so AI agents cannot trigger it via Bash.
-    [s] skip recommendations are LEFT STAGED for later manual review;
-    only [g] and [r] result in graduate.py / reject.py calls.
+
+    Defaults to REJECT-ONLY (Mustafa 2026-05-11: dropping 110 v2 rules
+    into LESSONS.md in one batch is a lot of new auto-recall surface
+    area; we want to clear the noise first and graduate deliberately).
+    [g] graduate recommendations stay staged unless the caller passes
+    `include_graduates=True`. [s] skip recommendations always stay
+    staged.
 
     Returns the same totals dict the REPL returns."""
     totals = {"graduated": 0, "rejected": 0, "skipped": 0}
@@ -497,16 +504,26 @@ def _batch_apply_recommendations(brain: Path,
     for _, _, action, _ in plan:
         by_action[action] = by_action.get(action, 0) + 1
 
+    # Decide which actions will actually run vs which stay staged.
+    will_graduate = by_action["g"] if include_graduates else 0
+    will_reject = by_action["r"]
+    staged_graduates = 0 if include_graduates else by_action["g"]
+
     print()
     print(f"=== batch apply: {len(plan)} candidate(s) across "
           f"{len(namespaces)} namespace(s) ===")
-    print(f"  [g] graduate: {by_action['g']}")
-    print(f"  [r] reject:   {by_action['r']}")
-    print(f"  [s] skip:     {by_action['s']} (left staged, not touched)")
+    print(f"  [r] reject:    {will_reject} (will apply)")
+    if include_graduates:
+        print(f"  [g] graduate:  {will_graduate} (will apply, "
+              "--include-graduates set)")
+    else:
+        print(f"  [g] graduate:  {by_action['g']} (LEFT STAGED, pass "
+              "--include-graduates to apply)")
+    print(f"  [s] skip:      {by_action['s']} (left staged, not touched)")
     print()
     try:
         confirm = input(
-            "Apply these recommendations? Type 'yes' to proceed: "
+            "Apply? Type 'yes' to proceed: "
         ).strip().lower()
     except EOFError:
         print("\n(eof, aborted)")
@@ -517,7 +534,7 @@ def _batch_apply_recommendations(brain: Path,
 
     print()
     for i, (ns, cid, action, _) in enumerate(plan, start=1):
-        if action == "g":
+        if action == "g" and include_graduates:
             if _apply_graduate(brain, ns, cid,
                                 "graduated via --apply-recommendations"):
                 totals["graduated"] += 1
@@ -526,11 +543,20 @@ def _batch_apply_recommendations(brain: Path,
                               "rejected via --apply-recommendations"):
                 totals["rejected"] += 1
         else:
+            # Skip recs always stay staged; graduate recs stay staged
+            # unless --include-graduates was passed.
             totals["skipped"] += 1
         # Progress every 25 to give the user a sense of motion without
         # flooding the terminal with 270 lines.
         if i % 25 == 0:
             print(f"  ... {i}/{len(plan)} processed")
+
+    if not include_graduates and staged_graduates > 0:
+        print()
+        print(f"note: {staged_graduates} graduate-recommended candidate(s) "
+              f"stayed staged. Run `recall pending --review` to triage "
+              f"them one at a time, or re-run with "
+              f"`--apply-recommendations --include-graduates` to bulk-apply.")
 
     return totals
 
@@ -546,10 +572,20 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     p.add_argument(
         "--apply-recommendations", action="store_true",
-        help=("Batch mode: apply each candidate's [g]/[r] recommendation "
-              "without per-candidate prompting. One y/N confirmation at "
-              "startup. Skip-recommended candidates are left staged for "
-              "later manual review. Still requires a TTY."),
+        help=("Batch mode: apply each candidate's reject recommendation "
+              "without per-candidate prompting. One 'yes' confirmation at "
+              "startup. Graduate-recommended candidates STAY STAGED by "
+              "default (use --include-graduates to bulk-apply them too). "
+              "Skip-recommended candidates always stay staged. "
+              "Still requires a TTY."),
+    )
+    p.add_argument(
+        "--include-graduates", action="store_true",
+        help=("With --apply-recommendations: also bulk-apply the "
+              "graduate-recommended candidates. Off by default because "
+              "bulk-graduation adds many new entries to LESSONS.md at "
+              "once and grows the auto-recall surface area faster than "
+              "you may want."),
     )
     args = p.parse_args(argv)
 
@@ -591,7 +627,10 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # Batch mode short-circuits the per-candidate REPL.
     if args.apply_recommendations:
-        totals = _batch_apply_recommendations(brain, namespaces_to_walk)
+        totals = _batch_apply_recommendations(
+            brain, namespaces_to_walk,
+            include_graduates=args.include_graduates,
+        )
         print()
         print(f"triage: total graduated={totals['graduated']} "
               f"rejected={totals['rejected']} skipped={totals['skipped']}")
