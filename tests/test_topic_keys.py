@@ -525,6 +525,44 @@ def test_extractor_multi_topic_multi_date_emits_first_match_per_slot():
     ]
 
 
+def test_permissive_mode_rejects_slack_channel_id_shape():
+    """Real-world fix: Slack channel IDs (D0A8DQ7BP0U) and user IDs
+    (U05LZF28SRH) have digits INTERLEAVED with letters. They must NOT
+    become project:* topic keys in permissive mode."""
+    cfg = topic_keys.ExtractorConfig()
+    body = "discussion in D0A8DQ7BP0U with U05LZF28SRH about PS2 launch"
+    keys = topic_keys._topic_keys_from_body(body, cfg)
+    assert "project:d0a8dq7bp0u" not in keys
+    assert "project:u05lzf28srh" not in keys
+    assert "project:ps2" in keys
+
+
+def test_status_predicate_rejects_bare_done_in_casual_chat():
+    """Real-world fix: the body 'Any idea how can i get it done' must
+    NOT produce a status=done claim. Tightened predicate requires
+    explicit shapes ('status:', 'the status is', 'currently blocked')."""
+    ex = topic_keys.HeuristicExtractor(topic_keys.ExtractorConfig())
+    out = ex.extract({
+        "body_redacted": "Any idea how can i get it done",
+        "source": "slack", "event_id": "x", "source_ts": "1700000000.0",
+        "counterparty": "U123ABC",
+    })
+    status_claims = [c for c in out if c.claim_subject == "status"]
+    assert status_claims == []
+
+
+def test_status_predicate_still_matches_explicit_shape():
+    """Tightened status predicate must still catch real status reports."""
+    ex = topic_keys.HeuristicExtractor(topic_keys.ExtractorConfig())
+    out = ex.extract({
+        "body_redacted": "PS2 status: blocked on the data migration",
+        "source": "research-notes", "event_id": "n:1",
+        "source_ts": "1700000000.0",
+    })
+    status_claims = [c for c in out if c.claim_subject == "status"]
+    assert any(c.value_normalized == "blocked" for c in status_claims)
+
+
 def test_load_config_overrides_predicate(tmp_path):
     cfg_dir = tmp_path / "brainstack"
     cfg_dir.mkdir()
