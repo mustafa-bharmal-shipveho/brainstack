@@ -825,6 +825,25 @@ def test_watermark_handles_non_monotonic_file_order(tmp_path):
     assert newer in state.claims_by_id
 
 
+def test_auto_dream_run_invokes_consolidate(tmp_path):
+    """Wiring check: auto_dream.run() with an observation-shaped event
+    produces a consolidate_* result key, proving the nightly /dream
+    cadence consolidates claims alongside cluster + decay."""
+    brain = _make_brain(tmp_path)
+    _append_episodic(brain, _event(
+        source="research-notes", event_id="rn:1",
+        source_ts="1700000000.0",
+        body="PS2 launches on 2026-05-20",
+    ))
+    import sys
+    sys.path.insert(0, str(REPO_ROOT / "agent" / "memory"))
+    sys.path.insert(0, str(REPO_ROOT / "agent" / "harness"))
+    import auto_dream  # noqa: E402
+    result = auto_dream.run(brain_root=str(brain), namespace="default")
+    assert "consolidate_events" in result
+    assert result.get("consolidate_claims", 0) >= 1
+
+
 def test_future_schema_version_dropped_with_warner(tmp_path):
     """Schema_version > 1 → dropped + counted + warner called."""
     brain = _make_brain(tmp_path)

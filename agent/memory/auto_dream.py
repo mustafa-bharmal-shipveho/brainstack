@@ -398,6 +398,31 @@ def run_dream_cycle():
 
         pending = write_review_queue_summary(CANDIDATES, REVIEW_QUEUE)
 
+    # Consolidate observation-shaped episodic events into the claim
+    # store (default namespace). Best-effort: any failure here logs +
+    # continues — must NOT break the nightly dream cycle. The claim
+    # consolidator acquires its own claims-log sentinel lock independently
+    # of the episodic lock.
+    consolidate_summary = ""
+    try:
+        import consolidate  # local import — avoids cycles at module init
+        import topic_keys
+        resolved_brain = _resolve_brain_root(None)
+        cresult = consolidate.run_consolidation(
+            resolved_brain,
+            namespace="default",
+            extractors=topic_keys.default_extractors(),
+        )
+        consolidate_summary = (
+            f" consolidate_events={cresult.events_conforming} "
+            f"consolidate_claims={cresult.claims_asserted} "
+            f"consolidate_supersedes={cresult.supersedes_appended} "
+            f"consolidate_retracts={cresult.retracts_appended} "
+            f"projected={cresult.projection_written}"
+        )
+    except Exception as exc:  # pragma: no cover — best-effort
+        consolidate_summary = f" consolidate_error={exc!r}"
+
     print(
         f"dream cycle: patterns={len(patterns)} staged={staged} "
         f"prefiltered_out={prefiltered} pending_review={pending} "
@@ -405,6 +430,7 @@ def run_dream_cycle():
         f"burst_skipped={len(burst_telemetry)} "
         f"activity_log_skipped={len(activity_log_telemetry)} "
         f"activity_log_swept={len(swept)}"
+        f"{consolidate_summary}"
     )
     _refresh_pending_summary()
 
@@ -494,6 +520,26 @@ def run(brain_root=None, namespace="default", dry_run=False):
         result["burst_skipped"] = len(burst_telemetry)
         result["activity_log_skipped"] = len(activity_log_telemetry)
         result["activity_log_swept"] = len(swept)
+
+    # Consolidate observation-shaped episodic events into the claim
+    # store. Best-effort: an extraction error here must NOT break the
+    # nightly dream cycle.
+    try:
+        import consolidate  # local import — avoids cycles at module init
+        import topic_keys
+        resolved_brain = _resolve_brain_root(brain_root)
+        cresult = consolidate.run_consolidation(
+            resolved_brain,
+            namespace=namespace,
+            extractors=topic_keys.default_extractors(),
+        )
+        result["consolidate_events"] = cresult.events_conforming
+        result["consolidate_claims"] = cresult.claims_asserted
+        result["consolidate_supersedes"] = cresult.supersedes_appended
+        result["consolidate_retracts"] = cresult.retracts_appended
+        result["consolidate_projection_written"] = cresult.projection_written
+    except Exception as exc:  # pragma: no cover — best-effort
+        result["consolidate_error"] = str(exc)
 
     _refresh_pending_summary(brain_root)
     return result
