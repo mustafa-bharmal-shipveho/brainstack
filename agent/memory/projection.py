@@ -39,9 +39,8 @@ from __future__ import annotations
 
 import os
 import re
-import yaml  # type: ignore[import-not-found]
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import claims
 from _atomic import atomic_write_bytes
@@ -69,9 +68,42 @@ def _stance_to_type(stance: str) -> str:
     return "claim-stale"
 
 
+def _render_yaml_value(v: Any) -> str:
+    """Tiny stdlib-only YAML value renderer.
+
+    Handles the shapes we actually write (str / int / float / None /
+    bool). Strings are quoted iff they contain YAML-special chars; we
+    err on the side of always-quoting to avoid edge cases. We do NOT
+    pull in pyyaml — projection runs from launchd under the system
+    python which doesn't have it installed.
+    """
+    if v is None:
+        return "null"
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return repr(v)
+    # String. Escape backslash + double-quote and wrap in double quotes.
+    s = str(v).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{s}"'
+
+
+def _render_frontmatter(fm: Dict[str, Any]) -> str:
+    """Render an OrderedDict-style frontmatter to YAML-compatible text.
+
+    Recall's frontmatter parser (recall/frontmatter.py) accepts simple
+    `key: value` lines plus strict YAML for nested shapes — ours is
+    flat so the line-by-line writer is sufficient.
+    """
+    out = []
+    for key in sorted(fm.keys()):
+        out.append(f"{key}: {_render_yaml_value(fm[key])}")
+    return "\n".join(out) + "\n"
+
+
 def _render_claim_markdown(rec: claims.ClaimRecord) -> bytes:
     """Render a single claim as frontmattered markdown bytes."""
-    fm: Dict[str, object] = {
+    fm: Dict[str, Any] = {
         "type": _stance_to_type(rec.stance),
         "topic_key": rec.topic_key,
         "claim_subject": rec.claim_subject,
@@ -82,14 +114,13 @@ def _render_claim_markdown(rec: claims.ClaimRecord) -> bytes:
         "stance": rec.stance,
         "claim_id": rec.claim_id,
         "value_normalized": rec.value_normalized,
+        # `name` and `description` are used by recall/sources.py to
+        # weight the indexed text — give the projection meaningful
+        # values rather than relying on the file stem.
+        "name": f"{rec.topic_key} / {rec.claim_subject}",
+        "description": rec.value_normalized,
     }
-    # `name` and `description` are used by recall/sources.py to weight the
-    # indexed text — give the projection meaningful values rather than
-    # relying on the file stem.
-    fm["name"] = f"{rec.topic_key} / {rec.claim_subject}"
-    fm["description"] = rec.value_normalized
-    front = yaml.safe_dump(fm, sort_keys=True, allow_unicode=True,
-                           default_flow_style=False)
+    front = _render_frontmatter(fm)
     body = rec.value_raw or rec.value_normalized or ""
     text = f"---\n{front}---\n\n{body.rstrip()}\n"
     return text.encode("utf-8")

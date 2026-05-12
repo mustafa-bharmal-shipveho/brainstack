@@ -619,7 +619,9 @@ Overrides survive `rm claims.jsonl` deliberately (they live in `claim_overrides.
 
 **Framework rule, enforced by tests:** no brainstack code inspects `event["source"]` or imports a producer-side module. Anything that writes valid JSONL to `memory/episodic/*.jsonl` participates automatically. The AC-6 AST scan + a runtime smoke against `source: fictitious-future-producer-9000` are the structural guarantees.
 
-**Status (this PR):** PR1–PR4 of the framework — storage primitives, extractor, consolidator+overrides, markdown projection. Currently used via the Python API (`agent/memory/consolidate.run_consolidation`). The CLI surface (`recall consolidate`, `recall claim list/retract/restore`, `recall query --only-current`/`--include-superseded`) is a follow-up PR — until then, default `recall query` returns only current claims because the projection writes nothing else by default.
+**Cadence.** Consolidate is baked into the nightly `/dream` cycle — `auto_dream.run_dream_cycle()` and `auto_dream.run()` both call `consolidate.run_consolidation()` after the existing cluster/decay work, so your launchd 3am `agent-dream` job consolidates every night automatically. The call is wrapped best-effort: a consolidation failure logs a `consolidate_error=…` summary line but does NOT break the dream run. No new launchd timer needed. `./install.sh --upgrade` copies the new framework modules into your brain on the next refresh.
+
+**Status (this PR):** PR1–PR4 of the framework — storage primitives, extractor, consolidator+overrides, markdown projection, **nightly cadence wired into `/dream`**. Currently used via the Python API (`agent/memory/consolidate.run_consolidation`). The CLI surface (`recall consolidate`, `recall claim list/retract/restore`, `recall query --only-current`/`--include-superseded`) is a follow-up PR — until then, default `recall query` returns only current claims because the projection writes nothing else by default.
 
 **Files:**
 
