@@ -116,27 +116,33 @@ DEFAULT_STOPLIST: Tuple[str, ...] = (
 # --- Predicate library (v1 defaults) ---------------------------------
 
 # Phrases per predicate. The match list is consulted case-insensitively
-# with word boundaries.
+# with word boundaries. v1 defaults err on the side of HIGH PRECISION:
+# better to miss a soft signal than to manufacture noise from casual
+# chat. Operators tighten or widen via `~/.config/brainstack/extractors.toml`.
 DEFAULT_PREDICATES: Dict[str, Dict[str, Any]] = {
     "release-date": {
-        "match": ["launches", "launching", "ships", "shipping",
-                  "releases", "releasing", "go-live", "go live",
-                  "ga on", "rolls out", "rolling out", "launch"],
+        "match": ["launches", "launching", "ships on", "shipping on",
+                  "releases on", "releasing on", "go-live", "go live",
+                  "ga on", "rolls out on", "rolling out on", "launch on"],
         "normalizer": "date",
     },
     "status": {
-        "match": ["status", "blocked", "in progress", "in-progress",
-                  "done", "shipped", "stuck"],
+        # The bare words "done", "shipped", "blocked" appear constantly
+        # in casual chat ("get it done", "the issue was shipped"). Only
+        # match explicit status-report shapes:
+        "match": ["status:", "status is", "the status is",
+                  "currently blocked", "currently in progress",
+                  "now blocked"],
         "normalizer": "enum",
         "enum_values": ["blocked", "in-progress", "done", "shipped",
                         "stuck", "unknown"],
     },
     "deadline": {
-        "match": ["deadline", "due"],
+        "match": ["deadline:", "deadline is", "due on", "due by"],
         "normalizer": "date",
     },
     "owner": {
-        "match": ["owner", "assignee", "dri"],
+        "match": ["owner:", "owner is", "assignee:", "assignee is", "dri:"],
         "normalizer": "person",
     },
     "decision": {
@@ -328,6 +334,29 @@ def load_config(config_dir: Optional[str] = None) -> ExtractorConfig:
 
 _UPPER_TOKEN_FALLBACK_RE = re.compile(r"\b[A-Z][A-Z0-9]{1,}\b")
 
+def _is_project_token_shape(tok: str) -> bool:
+    """Permissive-mode project tokens must be letters with optional
+    trailing digits — e.g. PS2, OKR, MYPROJ, MÜLLER. Slack channel/user
+    IDs like D0A8DQ7BP0U or U05LZF28SRH have digits interleaved with
+    letters and would otherwise pollute the topic-key space.
+
+    Unicode-aware via stdlib `str.isalpha` / `str.isdigit` — works on
+    MÜLLER and similar without needing the `regex` package.
+    """
+    if not tok:
+        return False
+    i = 0
+    while i < len(tok) and not tok[i].isdigit():
+        i += 1
+    letters_part, digits_part = tok[:i], tok[i:]
+    if not letters_part:
+        return False
+    if not all(c.isalpha() and c.isupper() for c in letters_part):
+        return False
+    if not all(c.isdigit() for c in digits_part):
+        return False
+    return True
+
 
 def _tokenize_upper(body: str) -> List[str]:
     """Find uppercase tokens. Unicode-aware via `regex` if available;
@@ -368,13 +397,19 @@ def _topic_keys_from_body(body: str, config: ExtractorConfig) -> List[str]:
                         keys.append(key)
                     break
     else:
-        # Permissive mode: every non-stoplisted uppercase token.
+        # Permissive mode: uppercase tokens, non-stoplisted, and shaped
+        # like a project code (letters with optional trailing digits).
+        # Slack channel IDs (D0A8DQ7BP0U) and user IDs (U05LZF28SRH)
+        # have digits interleaved, so they fail the shape check and
+        # don't pollute the topic-key space.
         stop_upper = {s.upper() for s in config.stoplist}
         for tok in tokens:
             tok_u = tok.upper()
             if len(tok_u) < 3:
                 continue
             if tok_u in stop_upper:
+                continue
+            if not _is_project_token_shape(tok_u):
                 continue
             key = f"project:{tok_u.lower()}"
             if key not in seen:
