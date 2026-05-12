@@ -570,6 +570,71 @@ External agent frameworks can read and write the brain through `agent/memory/sdk
 
 ---
 
+## Consolidate — producer-agnostic fact extraction with supersession
+
+**`/dream` clusters episodes into patterns. `/consolidate` extracts atomic facts and tracks which one is currently true.** Different layers, different jobs.
+
+The problem: producers (agentry's Slack/Gmail polling, calendar sync, manual notes, anything else writing episodic JSONL) accumulate conflicting claims about the same topic over time. Two posts about "PS2 release date" weeks apart with different dates both end up in recall — the model sees both and may pick the older one. Consolidate fixes this by turning each event into one or more **claims** keyed by `(topic_key, claim_subject)` and electing a current claim per slot using `source_ts` ordering.
+
+**Pipeline (independent of producers; never branches on `source`):**
+
+```
+producer events                                       claim store
+─────────────────                                     ──────────────────────
+~/.agent/memory/episodic/<ns>.jsonl     ──►           ~/.agent/memory/semantic/claims.jsonl  (append-only log)
+  (kind, source, event_id, source_ts,                 ~/.agent/memory/semantic/claims/<id>.md (current-only)
+   body_redacted, supersedes_event_id?)               ~/.agent/memory/semantic/claim_overrides.jsonl
+                                                      ~/.agent/memory/semantic/.consolidation_watermark.json
+```
+
+**Predicate library (configurable, v1 defaults):**
+
+| subject | matches | normalizer |
+|---|---|---|
+| `release-date` | launches, ships, releases, GA on, rolls out | ISO date (absolute only) |
+| `status` | status, blocked, in progress, done, shipped | enum |
+| `deadline` | deadline, due | ISO date |
+| `owner` | owner, assignee, DRI | person (stub in v1) |
+| `decision` | we decided, decision:, going with | freeform-2k |
+
+Negation skip (within 3 tokens): `not`, `won't`, `isn't`, `no longer`, … — so "PS2 is not launching Monday" produces 0 claims.
+
+**Supersession rules — entirely data-driven:**
+
+- Two events asserting the same normalized value → grouped under one `claim_value_fingerprint`. Each event keeps a distinct `claim_id` (so tombstoning one doesn't cascade to the other), but they share the current slot.
+- Different normalized values for the same slot → conflict. Newest `source_ts` wins; the older gets a `supersede` transition.
+- `kind: tombstone-deleted` referencing an `event_id` → retracts every claim derived from that event.
+- `kind: tombstone-edited` → asserts the new body's claim AND supersedes the original.
+
+**Eventual catch-up architecture.** Consolidation is decoupled from both producers and the reply path. Producers append JSONL (best-effort, sub-millisecond). `recall query` reads markdown at whatever state the index is in. Consolidation runs separately on `/dream` cycles, manual `recall consolidate`, or a cron. Lag is fine — a brain idle for a week processes the whole backlog in one run. Deterministic `claim_id` + `transition_id` means re-running is idempotent; the watermark is purely an optimization.
+
+**Operator overrides** (mirror `recall remember` / `recall forget`):
+
+- `retract_by_claim_id` — retract a specific claim
+- `retract_by_event_id` — retract every claim from a producer event (works even before consolidation has produced the claim)
+- `retract_by_predicate` — `topic_key + claim_subject + value-regex`
+- `restore_by_claim_id` — always wins over any retraction
+
+Overrides survive `rm claims.jsonl` deliberately (they live in `claim_overrides.jsonl`), so re-consolidating from scratch keeps prior retractions in effect.
+
+**Framework rule, enforced by tests:** no brainstack code inspects `event["source"]` or imports a producer-side module. Anything that writes valid JSONL to `memory/episodic/*.jsonl` participates automatically. The AC-6 AST scan + a runtime smoke against `source: fictitious-future-producer-9000` are the structural guarantees.
+
+**Status (this PR):** PR1–PR4 of the framework — storage primitives, extractor, consolidator+overrides, markdown projection. Currently used via the Python API (`agent/memory/consolidate.run_consolidation`). The CLI surface (`recall consolidate`, `recall claim list/retract/restore`, `recall query --only-current`/`--include-superseded`) is a follow-up PR — until then, default `recall query` returns only current claims because the projection writes nothing else by default.
+
+**Files:**
+
+- `agent/memory/claims.py` — event-sourced claim log (assert/supersede/retract with deterministic IDs)
+- `agent/memory/source_ts.py` — bounded epoch normalization across producer timestamp formats
+- `agent/memory/topic_keys.py` — `TopicKeyExtractor` Protocol + `HeuristicExtractor` (regex topic keys + predicate library)
+- `agent/memory/consolidate.py` — the orchestrator
+- `agent/memory/claim_overrides.py` — operator override log
+- `agent/memory/projection.py` — claim → markdown reconciler
+- `~/.config/brainstack/{extractors,projects,channels,stoplist}.toml` — operator-tunable config
+
+**Acceptance tests (one per criterion in [`docs/consolidation-requirements.md`](docs/consolidation-requirements.md), if present):** AC-1 single-source supersedes; AC-2 cross-source newest-wins; AC-3 stale-on-arrival recorded but suppressed; AC-4 tombstone-deleted retracts; AC-5 tombstone-edited re-elects; AC-6 no source branching (AST scan); AC-7 idempotent re-runs; AC-8 retract sticky. All 24 tests passing on Python 3.13.
+
+---
+
 ## Architecture
 
 ```
