@@ -586,13 +586,56 @@ class HeuristicExtractor:
 
 # --- Registry --------------------------------------------------------
 
-def default_extractors(config_dir: Optional[str] = None) -> List[TopicKeyExtractor]:
-    """The default v1 extractor registry.
+def default_extractors(config_dir: Optional[str] = None,
+                       brain_root: Optional[str] = None,
+                       namespace: str = "default") -> List[TopicKeyExtractor]:
+    """The default extractor registry.
 
     Reads operator config from `config_dir` (default
     `~/.config/brainstack`) via `load_config()` — disk I/O is here, NOT
-    in `HeuristicExtractor.__init__`. PR3+ may register additional
-    extractors. Stub-registered alternates raise on use so framework-
-    shape compliance is forced from day one.
+    in `HeuristicExtractor.__init__`.
+
+    Opt-in LLM extractor: set `[extractor] mode = "llm"` (or "hybrid")
+    in `~/.config/brainstack/extractors.toml`. Default mode "heuristic"
+    keeps the regex-only behavior for users who don't want LLM costs.
+
+    `hybrid` mode runs the heuristic FIRST (cheap, deterministic) and
+    only falls back to the LLM extractor on events where the heuristic
+    emitted no claims. Reduces token spend on obviously empty events
+    (one-word acks, URL-only posts).
     """
-    return [HeuristicExtractor(load_config(config_dir))]
+    cfg = load_config(config_dir)
+    extractor_cfg = {}
+    if hasattr(cfg, "predicates"):
+        # Pull the optional `[extractor]` block via direct TOML read —
+        # cfg dataclass doesn't expose it (so adding the block remains
+        # backward-compatible without dataclass changes).
+        try:
+            d = config_dir or _config_dir()
+            extractor_cfg = _load_toml(
+                os.path.join(d, "extractors.toml")
+            ).get("extractor", {}) or {}
+        except Exception:
+            extractor_cfg = {}
+    mode = str(extractor_cfg.get("mode", "heuristic")).lower()
+    provider = extractor_cfg.get("provider")
+    model = extractor_cfg.get("model")
+
+    if mode == "llm":
+        if brain_root is None:
+            # Fall back silently to heuristic — caller didn't pass a
+            # brain_root so the LLM cache has nowhere to live.
+            return [HeuristicExtractor(cfg)]
+        from llm_extractor import LLMExtractor  # noqa: WPS433
+        return [LLMExtractor(brain_root=brain_root, namespace=namespace,
+                             provider_name=provider, model=model)]
+
+    if mode == "hybrid":
+        if brain_root is None:
+            return [HeuristicExtractor(cfg)]
+        from llm_extractor import LLMExtractor  # noqa: WPS433
+        return [HeuristicExtractor(cfg),
+                LLMExtractor(brain_root=brain_root, namespace=namespace,
+                             provider_name=provider, model=model)]
+
+    return [HeuristicExtractor(cfg)]
