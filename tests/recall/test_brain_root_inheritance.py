@@ -63,6 +63,9 @@ def test_xdg_fallback_when_neither_set(monkeypatch, tmp_path):
     xdg_data = tmp_path / "xdg-data"
     _clear_env(monkeypatch, "BRAIN_HOME", "BRAIN_ROOT")
     monkeypatch.setenv("XDG_DATA_HOME", str(xdg_data))
+    # Hermetic HOME so the brainstack-detection fallback
+    # (~/.agent/memory) doesn't fire from the developer's real home.
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
 
     resolved = resolve_brain_home()
 
@@ -136,6 +139,9 @@ def test_default_config_resolves_xdg_when_neither_set(monkeypatch, tmp_path):
     xdg = tmp_path / "xdg-data"
     _clear_env(monkeypatch, "BRAIN_HOME", "BRAIN_ROOT")
     monkeypatch.setenv("XDG_DATA_HOME", str(xdg))
+    # Hermetic HOME so the brainstack-detection fallback
+    # (~/.agent/memory) doesn't fire from the developer's real home.
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
 
     cfg = default_config()
 

@@ -26,8 +26,15 @@ class TestResolveBrainHome:
         monkeypatch.setenv("BRAIN_HOME", str(target))
         assert resolve_brain_home() == target
 
-    def test_falls_back_to_xdg_data(self, isolated_xdg, monkeypatch):
+    def test_falls_back_to_xdg_data(self, isolated_xdg, monkeypatch, tmp_path):
+        # Use a clean HOME so the brainstack-detection fallback
+        # (~/.agent/memory) doesn't fire from the developer's real home.
+        # The contract pinned by this test: when no brain env vars are
+        # set AND no brainstack install exists at ~/.agent/memory, the
+        # XDG default wins.
         monkeypatch.delenv("BRAIN_HOME", raising=False)
+        monkeypatch.delenv("BRAIN_ROOT", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path))
         result = resolve_brain_home()
         assert result.name == "brain"
         assert "xdg-data" in str(result)
