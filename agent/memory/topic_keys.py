@@ -651,6 +651,13 @@ def default_extractors(config_dir: Optional[str] = None,
     mode = str(extractor_cfg.get("mode", "heuristic")).lower()
     provider = extractor_cfg.get("provider")
     model = extractor_cfg.get("model")
+    # Per-call LLM budget (USD). Default is generous enough for Claude
+    # Haiku reasoning + a 2 KB system prompt. Operators tighten via
+    # `[extractor] max_budget_usd = 0.05` in extractors.toml.
+    try:
+        max_budget_usd = float(extractor_cfg.get("max_budget_usd", 0.10))
+    except (TypeError, ValueError):
+        max_budget_usd = 0.10
 
     if mode == "llm":
         if brain_root is None:
@@ -659,7 +666,8 @@ def default_extractors(config_dir: Optional[str] = None,
             return [HeuristicExtractor(cfg)]
         from llm_extractor import LLMExtractor  # noqa: WPS433
         return [LLMExtractor(brain_root=brain_root, namespace=namespace,
-                             provider_name=provider, model=model)]
+                             provider_name=provider, model=model,
+                             max_budget_usd=max_budget_usd)]
 
     if mode == "hybrid":
         if brain_root is None:
@@ -672,7 +680,8 @@ def default_extractors(config_dir: Optional[str] = None,
         return [HybridExtractor(
             primary=HeuristicExtractor(cfg),
             fallback=LLMExtractor(brain_root=brain_root, namespace=namespace,
-                                  provider_name=provider, model=model),
+                                  provider_name=provider, model=model,
+                                  max_budget_usd=max_budget_usd),
         )]
 
     return [HeuristicExtractor(cfg)]

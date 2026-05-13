@@ -46,8 +46,14 @@ LLM_EXTRACTOR_SCHEMA_VERSION = "1"
 # the start or end of a structured message).
 _MAX_BODY_CHARS = 4000
 
-# Per-call budget. Each event is one short prompt.
-_MAX_BUDGET_USD = 0.02
+# Per-call budget default. Operator overrides via
+# `~/.config/brainstack/extractors.toml`:
+#   [extractor]
+#   max_budget_usd = 0.10
+# 0.10 is enough headroom for Claude Haiku's reasoning + a 2 KB
+# system prompt without hitting error_max_budget_usd. Lower this if
+# you want to cap spend; raise it if your prompt or events grow.
+_DEFAULT_MAX_BUDGET_USD = 0.10
 
 
 _NAMESPACE_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
@@ -283,9 +289,43 @@ class LLMExtractor:
     namespace: str = "default"
     provider_name: Optional[str] = None
     model: Optional[str] = None
+    max_budget_usd: float = _DEFAULT_MAX_BUDGET_USD
     config: Optional[topic_keys.ExtractorConfig] = None
+    # Per-instance counters surfaced via `last_error_summary()` so the
+    # consolidator can include LLM error counts in dream.log instead
+    # of silently swallowing them.
     _provider: object = None
     _system_prompt: str = ""
+    _error_counts: Optional[Dict[str, int]] = None
+    _call_count: int = 0
+
+    @staticmethod
+    def _classify_error(exc: Exception) -> str:
+        """Map an exception into a short tag for the dream.log
+        summary. Recognized: budget exhaustion, schema-validation
+        failure after retry, timeout, missing provider — everything
+        else falls under 'other'."""
+        msg = str(exc).lower()
+        if "error_max_budget_usd" in msg or "max_budget" in msg:
+            return "budget_exceeded"
+        if "schema" in msg or "validation" in msg:
+            return "schema_invalid"
+        if "timeout" in msg or "timed out" in msg:
+            return "timeout"
+        if "not available" in msg or "noprovider" in msg:
+            return "provider_unavailable"
+        return "other"
+
+    def error_summary(self) -> Optional[str]:
+        """Render a one-line summary of LLM-call failures for inclusion
+        in the consolidator's dream.log line. Returns None if no calls
+        failed or no calls were made."""
+        if not self._error_counts:
+            return None
+        parts = [f"{tag}={count}"
+                 for tag, count in sorted(self._error_counts.items())]
+        return (f"llm_calls={self._call_count} "
+                f"llm_errors=" + ",".join(parts))
 
     def _resolve(self):
         if self._provider is not None:
@@ -330,16 +370,25 @@ class LLMExtractor:
         except Exception:
             return []
 
+        self._call_count += 1
         try:
             result = provider.invoke(
                 system=system_prompt,
                 prompt=_build_user_prompt(event),
                 model=self.model,
                 json_schema=_OUTPUT_SCHEMA,
-                max_budget_usd=_MAX_BUDGET_USD,
+                max_budget_usd=self.max_budget_usd,
                 timeout_s=30,
             )
-        except Exception:
+        except Exception as exc:
+            # Count by error class so the consolidator can surface a
+            # one-line summary in dream.log instead of silently
+            # swallowing failures (this is how the 2-cent budget bug
+            # went undetected for one full pass).
+            if self._error_counts is None:
+                object.__setattr__(self, "_error_counts", {})
+            tag = self._classify_error(exc)
+            self._error_counts[tag] = self._error_counts.get(tag, 0) + 1
             return []
 
         parsed = result.parsed_json
