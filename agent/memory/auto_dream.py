@@ -411,7 +411,9 @@ def run_dream_cycle():
         cresult = consolidate.run_consolidation(
             resolved_brain,
             namespace="default",
-            extractors=topic_keys.default_extractors(),
+            extractors=topic_keys.default_extractors(
+                brain_root=resolved_brain, namespace="default",
+            ),
         )
         consolidate_summary = (
             f" consolidate_events={cresult.events_conforming} "
@@ -531,7 +533,9 @@ def run(brain_root=None, namespace="default", dry_run=False):
         cresult = consolidate.run_consolidation(
             resolved_brain,
             namespace=namespace,
-            extractors=topic_keys.default_extractors(),
+            extractors=topic_keys.default_extractors(
+                brain_root=resolved_brain, namespace=namespace,
+            ),
         )
         result["consolidate_events"] = cresult.events_conforming
         result["consolidate_claims"] = cresult.claims_asserted

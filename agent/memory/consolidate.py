@@ -233,7 +233,12 @@ def run_consolidation(brain_root: str, namespace: str = "default",
     Returns a ConsolidationResult; the consumer (CLI) can render it.
     """
     if extractors is None:
-        extractors = topic_keys.default_extractors()
+        # Pass brain_root + namespace so the LLM extractor (opt-in via
+        # extractors.toml [extractor] mode = "llm" | "hybrid") can
+        # find its per-event cache dir.
+        extractors = topic_keys.default_extractors(
+            brain_root=brain_root, namespace=namespace,
+        )
     if now_iso is None:
         import datetime
         now_iso = datetime.datetime.now(datetime.timezone.utc).strftime(
