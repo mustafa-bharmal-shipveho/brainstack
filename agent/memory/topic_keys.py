@@ -586,6 +586,37 @@ class HeuristicExtractor:
 
 # --- Registry --------------------------------------------------------
 
+class HybridExtractor:
+    """Coordinator: run heuristic first, only call LLM when heuristic
+    returned no claims for this event.
+
+    Why: in hybrid mode we want
+      - high precision from the heuristic when its strict shapes match
+        (free, deterministic, no LLM cost),
+      - LLM recall as a fallback ONLY when the heuristic skipped.
+
+    Running both extractors and merging by claim_id has the opposite
+    behavior: identical (topic_key, claim_subject, event_id) triples
+    produce the same claim_id and the second extractor's value
+    overwrites the first. This wrapper enforces the documented
+    precedence and saves a token spend per event the heuristic
+    handled.
+
+    Implements `TopicKeyExtractor` Protocol.
+    """
+
+    def __init__(self, primary: 'TopicKeyExtractor',
+                 fallback: 'TopicKeyExtractor') -> None:
+        self.primary = primary
+        self.fallback = fallback
+
+    def extract(self, event: Dict[str, Any]) -> List["Claim"]:
+        primary_claims = self.primary.extract(event)
+        if primary_claims:
+            return primary_claims
+        return self.fallback.extract(event)
+
+
 def default_extractors(config_dir: Optional[str] = None,
                        brain_root: Optional[str] = None,
                        namespace: str = "default") -> List[TopicKeyExtractor]:
@@ -634,8 +665,14 @@ def default_extractors(config_dir: Optional[str] = None,
         if brain_root is None:
             return [HeuristicExtractor(cfg)]
         from llm_extractor import LLMExtractor  # noqa: WPS433
-        return [HeuristicExtractor(cfg),
-                LLMExtractor(brain_root=brain_root, namespace=namespace,
-                             provider_name=provider, model=model)]
+        # Single HybridExtractor wrapper — runs heuristic first, falls
+        # back to LLM only when heuristic returned no claims. This is
+        # the cheap-but-recallful path: free + deterministic for
+        # events the heuristic handles, LLM only for the gap.
+        return [HybridExtractor(
+            primary=HeuristicExtractor(cfg),
+            fallback=LLMExtractor(brain_root=brain_root, namespace=namespace,
+                                  provider_name=provider, model=model),
+        )]
 
     return [HeuristicExtractor(cfg)]
