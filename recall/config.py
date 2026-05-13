@@ -63,11 +63,21 @@ class SourceConfig:
                 f"Invalid frontmatter mode: {self.frontmatter!r}. "
                 f"Must be one of {sorted(VALID_FRONTMATTER_MODES)}"
             )
-        # Resolve once for validation, store on the side. Don't overwrite `self.path`.
-        resolved = os.path.expanduser(os.path.expandvars(self.path))
-        if not os.path.isabs(resolved):
-            resolved = str(Path(resolved).resolve())
-        # frozen dataclass — bypass via object.__setattr__
+        # Light-touch validation only — strict resolution happens at
+        # the `.resolved_path` property so that:
+        #   - load_config / config migration can introspect a source
+        #     whose `path` references a future or operator-defined env
+        #     var without the env being set at config-load time;
+        #   - actual *use* of `resolved_path` (by discover_documents,
+        #     reindex, query) still fails loudly on unresolvable vars,
+        #     preventing the silent "Indexed 0 documents" mode.
+        # Stored only for back-compat with any caller that still reads
+        # `_resolved_path` directly.
+        try:
+            resolved = resolve_source_path(self.path)
+        except ValueError:
+            # Unresolved $VAR — defer to .resolved_path use-time check.
+            resolved = self.path
         object.__setattr__(self, "_resolved_path", resolved)
 
     @property
@@ -78,10 +88,7 @@ class SourceConfig:
         Re-resolves on access so a long-running process picks up env-var changes
         between calls (rare, but free correctness).
         """
-        resolved = os.path.expanduser(os.path.expandvars(self.path))
-        if not os.path.isabs(resolved):
-            resolved = str(Path(resolved).resolve())
-        return resolved
+        return resolve_source_path(self.path)
 
 
 @dataclass(frozen=True)
@@ -139,6 +146,76 @@ def _expand(p: str) -> Path:
     return Path(os.path.expanduser(os.path.expandvars(p)))
 
 
+# Re for finding "unresolved" `$VAR` placeholders after substitution.
+# Matches POSIX-shell-style `$NAME` and `${NAME}` forms.
+_UNRESOLVED_VAR_RE = __import__("re").compile(r"\$\{?([A-Z_][A-Z0-9_]*)\}?")
+
+
+def resolve_source_path(raw: str) -> str:
+    """Resolve a config `path` string to an absolute filesystem path.
+
+    Framework-shaped resolution (no hardcoded "if BRAIN_ROOT not set, use
+    ~/.agent" branching at this layer — that precedence lives in
+    `resolve_brain_home()`, which is the single canonical registry of
+    "where the brain lives"):
+
+      1. Substitute `$BRAIN_HOME` / `${BRAIN_HOME}` with the value of
+         `resolve_brain_home()`. This ALWAYS produces a real path —
+         even when `BRAIN_HOME` and `BRAIN_ROOT` are both unset (it
+         falls through to the XDG default). So every consumer of
+         SourceConfig sees a usable path regardless of shell env.
+      2. Substitute `$BRAIN_ROOT` / `${BRAIN_ROOT}` with the value the
+         env var would otherwise expand to. When unset, fall back to
+         `resolve_brain_home().parent` — i.e. the parent of the brain,
+         which is the same value `$BRAIN_ROOT` would have if the user
+         followed brainstack's install.sh convention.
+      3. Run `os.path.expanduser` + `os.path.expandvars` for any
+         remaining `$VARS` (preserves prior behavior for non-brain envs).
+      4. **If any `$VAR` survives substitution, raise ValueError with a
+         clear, user-actionable message.** This is the safety net: prior
+         code silently treated `$UNKNOWN/memory` as a literal directory
+         name and indexed 0 documents with no error indicating why.
+
+    Adding a new "where is the brain" env var is a one-line change in
+    `resolve_brain_home()` — all consumers (SourceConfig included)
+    pick it up automatically.
+    """
+    # Step 1: $BRAIN_HOME → resolve_brain_home()
+    brain_home_value = str(resolve_brain_home())
+    raw = raw.replace("${BRAIN_HOME}", brain_home_value)
+    raw = raw.replace("$BRAIN_HOME", brain_home_value)
+
+    # Step 2: $BRAIN_ROOT → env value if set, else resolve_brain_home().parent
+    brain_root_value = os.environ.get("BRAIN_ROOT")
+    if brain_root_value is None:
+        # Canonical fallback: parent of the resolved brain home. With the
+        # default config (`$BRAIN_ROOT/memory`) this gives `~/.agent`.
+        brain_root_value = str(resolve_brain_home().parent)
+    raw = raw.replace("${BRAIN_ROOT}", brain_root_value)
+    raw = raw.replace("$BRAIN_ROOT", brain_root_value)
+
+    # Step 3: normal env + ~ expansion for anything else.
+    resolved = os.path.expanduser(os.path.expandvars(raw))
+
+    # Step 4: loud failure if anything still unresolved. Without this
+    # check, an unresolved `$FOO` becomes a literal path segment and
+    # `discover_documents` silently finds zero files.
+    leftover = _UNRESOLVED_VAR_RE.search(resolved)
+    if leftover is not None:
+        raise ValueError(
+            f"recall: unresolved environment variable {leftover.group(0)!r} "
+            f"in source path {raw!r}. Set the variable in your shell, or "
+            f"replace the placeholder with an absolute path in your "
+            f"recall config."
+        )
+
+    # Make absolute (so a relative path doesn't silently anchor to CWD
+    # later).
+    if not os.path.isabs(resolved):
+        resolved = str(Path(resolved).resolve())
+    return resolved
+
+
 def _xdg(env_var: str, fallback_subdir: str) -> Path:
     raw = os.environ.get(env_var)
     if raw:
@@ -166,7 +243,8 @@ def xdg_data_home() -> Path:
 
 
 def resolve_brain_home() -> Path:
-    """Resolve where the brain lives.
+    """Resolve where the brain lives. Single source of truth for every
+    consumer (SourceConfig resolution, doctor, install.sh, dream cron).
 
     Precedence:
       1. $BRAIN_HOME if set — explicit override; works for standalone recall users
@@ -174,7 +252,13 @@ def resolve_brain_home() -> Path:
       2. $BRAIN_ROOT/memory if $BRAIN_ROOT is set — the brainstack-integrated default.
          brainstack's install.sh writes brain content to $BRAIN_ROOT/memory/, so the
          retriever inherits the same env var the user already configured.
-      3. $XDG_DATA_HOME/brain — XDG fallback for users who haven't run brainstack
+      3. ~/.agent/memory if it exists — the brainstack convention. install.sh
+         writes here; the dream cron's launchd plist sets $BRAIN_ROOT to ~/.agent.
+         This fallback lets `recall query` / `recall reindex` work from any
+         fresh shell (no need to `export BRAIN_ROOT` first) when a brainstack
+         install is already on disk. Without this step, a fresh shell hit
+         "Indexed 0 documents" silently because $BRAIN_ROOT was unset.
+      4. $XDG_DATA_HOME/brain — XDG fallback for users who haven't run brainstack
          and haven't set BRAIN_HOME explicitly.
     """
     explicit = os.environ.get("BRAIN_HOME")
@@ -183,6 +267,9 @@ def resolve_brain_home() -> Path:
     brainstack_root = os.environ.get("BRAIN_ROOT")
     if brainstack_root:
         return _expand(brainstack_root) / "memory"
+    brainstack_default = Path(os.path.expanduser("~/.agent/memory"))
+    if brainstack_default.is_dir():
+        return brainstack_default
     return xdg_data_home() / "brain"
 
 
