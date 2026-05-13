@@ -348,6 +348,87 @@ def test_implements_topic_key_extractor_protocol():
 
 # --- Provider resolution honors the user's setup ---------------------
 
+# --- HybridExtractor coordinator -------------------------------------
+
+class _ScriptedExtractor:
+    """Minimal TopicKeyExtractor stand-in. Returns whatever Claim list
+    was scripted in the constructor; records how many times it was
+    called."""
+    def __init__(self, claims):
+        self.scripted = claims
+        self.calls = 0
+    def extract(self, event):
+        self.calls += 1
+        return list(self.scripted)
+
+
+def test_hybrid_runs_primary_only_when_primary_emits_claims():
+    """Documented intent: heuristic precedence. When the primary
+    extractor emits ≥1 claim, the fallback (LLM) is NOT consulted —
+    saves a token spend per event."""
+    primary_claim = topic_keys.Claim(
+        topic_key="project:ps2", claim_subject="release-date",
+        value_normalized="2026-05-20", value_raw="",
+    )
+    fallback_claim = topic_keys.Claim(
+        topic_key="project:ps2", claim_subject="release-date",
+        value_normalized="2026-05-19", value_raw="",
+    )
+    primary = _ScriptedExtractor([primary_claim])
+    fallback = _ScriptedExtractor([fallback_claim])
+    hybrid = topic_keys.HybridExtractor(primary=primary, fallback=fallback)
+    out = hybrid.extract({"body_redacted": "PS2 launches on 2026-05-20",
+                          "event_id": "e:1"})
+    assert len(out) == 1
+    assert out[0].value_normalized == "2026-05-20"  # primary wins
+    assert primary.calls == 1
+    assert fallback.calls == 0  # fallback skipped
+
+
+def test_hybrid_falls_back_when_primary_emits_nothing():
+    """When the heuristic returns no claims, the LLM fills the gap."""
+    fallback_claim = topic_keys.Claim(
+        topic_key="project:ps2", claim_subject="status",
+        value_normalized="blocked", value_raw="",
+    )
+    primary = _ScriptedExtractor([])
+    fallback = _ScriptedExtractor([fallback_claim])
+    hybrid = topic_keys.HybridExtractor(primary=primary, fallback=fallback)
+    out = hybrid.extract({"body_redacted": "havent figured this out yet",
+                          "event_id": "e:1"})
+    assert len(out) == 1
+    assert out[0].value_normalized == "blocked"
+    assert primary.calls == 1
+    assert fallback.calls == 1
+
+
+def test_hybrid_returns_empty_when_both_emit_nothing():
+    primary = _ScriptedExtractor([])
+    fallback = _ScriptedExtractor([])
+    hybrid = topic_keys.HybridExtractor(primary=primary, fallback=fallback)
+    out = hybrid.extract({"body_redacted": "thanks", "event_id": "e:1"})
+    assert out == []
+    assert primary.calls == 1
+    assert fallback.calls == 1
+
+
+def test_default_extractors_hybrid_mode_returns_single_wrapped_extractor(tmp_path):
+    """Verify the registry returns a HybridExtractor (NOT a list of two
+    raw extractors that would both run + clobber each other)."""
+    cfg_dir = tmp_path / "brainstack"
+    cfg_dir.mkdir()
+    (cfg_dir / "extractors.toml").write_text(
+        '[extractor]\nmode = "hybrid"\n'
+    )
+    ex = topic_keys.default_extractors(
+        config_dir=str(cfg_dir),
+        brain_root=str(tmp_path / ".agent"),
+        namespace="default",
+    )
+    assert len(ex) == 1
+    assert isinstance(ex[0], topic_keys.HybridExtractor)
+
+
 def test_provider_resolution_respects_brain_llm_provider_env(monkeypatch, tmp_path):
     """Setting `BRAIN_LLM_PROVIDER=codex` makes the extractor use that
     provider — the same env var the digest pipeline already uses, so
