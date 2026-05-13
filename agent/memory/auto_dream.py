@@ -408,12 +408,13 @@ def run_dream_cycle():
         import consolidate  # local import — avoids cycles at module init
         import topic_keys
         resolved_brain = _resolve_brain_root(None)
+        extractors = topic_keys.default_extractors(
+            brain_root=resolved_brain, namespace="default",
+        )
         cresult = consolidate.run_consolidation(
             resolved_brain,
             namespace="default",
-            extractors=topic_keys.default_extractors(
-                brain_root=resolved_brain, namespace="default",
-            ),
+            extractors=extractors,
         )
         consolidate_summary = (
             f" consolidate_events={cresult.events_conforming} "
@@ -422,6 +423,20 @@ def run_dream_cycle():
             f"consolidate_retracts={cresult.retracts_appended} "
             f"projected={cresult.projection_written}"
         )
+        # Surface any LLM-call errors so they appear in dream.log
+        # instead of being silently swallowed. Walks every extractor
+        # (Hybrid → fallback is the LLMExtractor) and asks for its
+        # error_summary if it has one.
+        for ex in extractors:
+            for candidate in (ex, getattr(ex, "fallback", None),
+                              getattr(ex, "primary", None)):
+                if candidate is None:
+                    continue
+                summary_fn = getattr(candidate, "error_summary", None)
+                if callable(summary_fn):
+                    s = summary_fn()
+                    if s:
+                        consolidate_summary += " " + s
     except Exception as exc:  # pragma: no cover — best-effort
         consolidate_summary = f" consolidate_error={exc!r}"
 
