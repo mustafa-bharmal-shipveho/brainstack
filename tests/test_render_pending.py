@@ -389,14 +389,16 @@ class TestSyncStatusParser:
         assert "claude-sessions" in summary or "default" in summary
         assert "2" in summary and "1" in summary  # the counts appear
 
-    def test_compose_summary_emits_directive_for_claude_to_surface(self, tmp_path: Path):
-        """Critical UX contract: when total > 0, the summary MUST start with
-        a <system-reminder> directive instructing Claude to proactively
-        surface the count in its first response. Without this directive,
-        the @-imported content sits silently in the model's context — the
-        user never sees the pending count in chat (Mustafa 2026-05-04
-        third-round bug). Mustafa fourth-round: directive must be terse —
-        "just say to use recall pending --review"."""
+    def test_compose_summary_does_not_emit_system_reminder_directive(self, tmp_path: Path):
+        """Earlier in this branch the <system-reminder> directive was
+        intentionally REMOVED at the user's request: the markdown body now
+        stands alone (the @-import surfaces it naturally; an injected
+        directive was too noisy). Pin the new contract: compose_summary
+        MUST NOT emit a <system-reminder> block, and MUST NOT emit the
+        legacy 'BRAINSTACK: At the start of your first response' prefix.
+        The body still references the count and the triage command so the
+        user sees actionable info — just without the AI-directive wrapper.
+        """
         rps = self._import()
         _seed_candidates(tmp_path, "default", [_make_candidate("d1"), _make_candidate("d2")])
         summary = rps.compose_summary(
@@ -404,15 +406,12 @@ class TestSyncStatusParser:
             drift_report={"in_sync": True, "summary": "in sync"},
             sync_status="ok",
         )
-        assert "<system-reminder>" in summary
-        # Tagged so future changes can grep for the directive
-        assert "BRAINSTACK:" in summary
-        # Must reference the actual count
+        # Directive removed: no system-reminder block, no legacy prefix.
+        assert "<system-reminder>" not in summary
+        assert "BRAINSTACK: At the start of your first response" not in summary
+        # The body still carries the essentials (count + triage command).
         assert "2" in summary
-        # Must give Claude actionable guidance — the exact triage command
         assert "recall pending --review" in summary
-        # Must scope: once per session
-        assert "once" in summary.lower()
 
     def test_compose_summary_no_directive_in_empty_state(self, tmp_path: Path):
         """Empty state returns the all-clear one-liner, no directive."""

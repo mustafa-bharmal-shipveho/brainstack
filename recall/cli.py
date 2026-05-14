@@ -310,6 +310,20 @@ def pending(
         False, "--review",
         help="Open the candidate triage flow (delegates to list_candidates.py).",
     ),
+    apply_recommendations: bool = typer.Option(
+        False, "--apply-recommendations",
+        help=("With --review: batch-apply each candidate's reject "
+              "recommendation after a single 'yes' confirmation. "
+              "Graduate-recommended candidates STAY STAGED by default "
+              "(pass --include-graduates to bulk-apply them too)."),
+    ),
+    include_graduates: bool = typer.Option(
+        False, "--include-graduates",
+        help=("With --apply-recommendations: also bulk-apply the "
+              "graduate-recommended candidates. Off by default because "
+              "bulk-graduation grows the auto-recall surface area "
+              "faster than you may want."),
+    ),
     brain: Optional[Path] = typer.Option(
         None, "--brain",
         help="Brain root (default: $BRAIN_ROOT or ~/.agent).",
@@ -362,7 +376,12 @@ def pending(
     if review:
         triage = brain_root / "tools" / "triage_candidates.py"
         if triage.is_file():
-            os.execv(sys.executable, [sys.executable, str(triage), "--brain", str(brain_root)])
+            argv = [sys.executable, str(triage), "--brain", str(brain_root)]
+            if apply_recommendations:
+                argv.append("--apply-recommendations")
+            if include_graduates:
+                argv.append("--include-graduates")
+            os.execv(sys.executable, argv)
         typer.echo(
             "recall pending: triage_candidates.py missing; run `./install.sh --upgrade`",
             err=True,
