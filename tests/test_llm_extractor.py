@@ -453,6 +453,39 @@ def test_error_summary_counts_budget_exhaustion(tmp_path):
     assert "llm_calls=3" in summary
 
 
+def test_provider_unavailable_is_recorded_in_error_summary(tmp_path):
+    """Real-world bug discovered 2026-05-14: when the launchd job runs
+    with a restricted PATH that excludes ~/.local/bin (where `claude`
+    CLI lives), resolve_provider() raised ProviderNotAvailable, which
+    LLMExtractor.extract caught silently — returning [] without
+    recording the failure. dream.log showed 137 conforming events
+    processed, 0 claims, no llm_errors info. Pin the contract: every
+    extract() invocation that fails at provider-resolve time MUST be
+    counted in error_summary(), classified as provider_unavailable."""
+    class _ResolveFailExtractor(llm_extractor.LLMExtractor):
+        def _resolve(self):
+            # Mimic ProviderNotAvailable shape (class name match).
+            class ProviderNotAvailable(Exception):
+                pass
+            raise ProviderNotAvailable(
+                "no LLM provider available — claude-code: claude CLI not on PATH"
+            )
+    brain = str(tmp_path / ".agent")
+    ex = _ResolveFailExtractor(brain_root=brain, namespace="default")
+    for i in range(3):
+        out = ex.extract({
+            "body_redacted": f"event {i}", "event_id": f"e:{i}",
+            "source_ts": "1700000000.0",
+        })
+        assert out == []
+    summary = ex.error_summary()
+    assert summary is not None, (
+        "provider-unavailable failures MUST surface via error_summary()"
+    )
+    assert "provider_unavailable=3" in summary
+    assert "llm_calls=3" in summary
+
+
 def test_error_summary_is_none_when_no_failures(tmp_path):
     response = {
         "claims": [{

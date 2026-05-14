@@ -305,6 +305,9 @@ class LLMExtractor:
         summary. Recognized: budget exhaustion, schema-validation
         failure after retry, timeout, missing provider — everything
         else falls under 'other'."""
+        # ProviderNotAvailable surfaces as a class name in the
+        # exception, not always as a substring of str(exc); check both.
+        cls = type(exc).__name__.lower()
         msg = str(exc).lower()
         if "error_max_budget_usd" in msg or "max_budget" in msg:
             return "budget_exceeded"
@@ -312,7 +315,8 @@ class LLMExtractor:
             return "schema_invalid"
         if "timeout" in msg or "timed out" in msg:
             return "timeout"
-        if "not available" in msg or "noprovider" in msg:
+        if ("not available" in msg or "providernotavailable" in cls
+                or "cli not on path" in msg or "no llm provider" in msg):
             return "provider_unavailable"
         return "other"
 
@@ -362,12 +366,21 @@ class LLMExtractor:
         if cached is not None:
             return _parse_claims({"claims": cached.get("claims") or []})
 
-        # Resolve provider lazily. If the user has no LLM CLI configured,
-        # silently skip — the consolidator will surface this via the
-        # dream-cycle summary (events processed but no claims).
+        # Resolve provider lazily. If the LLM CLI isn't on PATH, count
+        # the failure so the dream-cycle summary surfaces it. Without
+        # the counter, a launchd job with a restricted PATH that
+        # excludes the user's CLI dirs silently produces 0 claims —
+        # confirmed in the wild on 2026-05-14: 137 events processed,
+        # 0 LLM calls, no error visible in dream.log until reproduced
+        # manually.
         try:
             provider, system_prompt = self._resolve()
-        except Exception:
+        except Exception as exc:
+            self._call_count += 1
+            if self._error_counts is None:
+                object.__setattr__(self, "_error_counts", {})
+            tag = self._classify_error(exc)
+            self._error_counts[tag] = self._error_counts.get(tag, 0) + 1
             return []
 
         self._call_count += 1
