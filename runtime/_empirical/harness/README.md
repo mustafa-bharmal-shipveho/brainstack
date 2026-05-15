@@ -24,7 +24,7 @@ Output feeds `phase0-empirical.md` and gates the rest of the runtime work.
 
 Uses `claude --bare --settings runtime/_empirical/harness/settings.json`.
 
-`--bare` disables user-level hooks (crystl, roux, agentic-stack global hooks)
+`--bare` disables user-level hooks and global hooks
 and auto-memory. `--settings` overlays *only* the harness hooks. So this run
 does not interact with your normal Claude Code configuration in any way.
 

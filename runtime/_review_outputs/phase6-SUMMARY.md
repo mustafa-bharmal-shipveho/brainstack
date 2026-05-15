@@ -1,7 +1,7 @@
 # Phase 6 review outputs
 
 Four final reviews ran in parallel against the full v0.2 PR diff
-(20+ commits, mustafa/runtime-v0 vs main).
+(20+ commits, feature/runtime-v0 vs main).
 
 ## Verdicts
 

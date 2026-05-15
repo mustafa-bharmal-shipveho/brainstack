@@ -65,6 +65,17 @@ recall doctor                       Diagnose missing deps / broken paths
 ```
 
 `query`, `reindex`, `sources`, and `doctor` (without subflags) are read-only.
+They never modify configured brain files; `query` and `reindex` may update the
+local retrieval cache under `$XDG_CACHE_HOME/recall`.
+
+Embedded Qdrant uses a local filesystem lock. Short-lived CLI calls wait up to
+2 seconds by default; override with `RECALL_QDRANT_LOCK_TIMEOUT=<seconds>` if
+your machine needs a different tradeoff.
+
+Long-lived entrypoints such as `recall-mcp` release the embedded client after
+each request, so multiple agents can share the same cache for occasional
+lookups. Heavy concurrent retrieval should use a shared recall/Qdrant service
+or separate `XDG_CACHE_HOME` values.
 
 ## MCP server
 

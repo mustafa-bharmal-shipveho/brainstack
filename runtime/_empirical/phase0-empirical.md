@@ -26,7 +26,7 @@ The harness scripts and aggregator have unit tests (`tests/runtime/test_harness_
 ### What the user runs
 
 ```bash
-cd ~/Documents/brainstack
+cd /path/to/brainstack
 bash runtime/_empirical/harness/run_synthetic_sessions.sh 50 mixed
 python3 runtime/_empirical/harness/aggregator.py --expected expected_runs.json
 ```

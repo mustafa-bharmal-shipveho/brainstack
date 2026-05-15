@@ -483,10 +483,9 @@ class TestSyncStatusParser:
         """Critical UX contract: when total > 0, the summary MUST start with
         a <system-reminder> directive instructing Claude to proactively
         surface the count in its first response. Without this directive,
-        the @-imported content sits silently in the model's context — the
-        user never sees the pending count in chat (Mustafa 2026-05-04
-        third-round bug). Mustafa fourth-round: directive must be terse —
-        "just say to use recall pending --review"."""
+        the @-imported content sits silently in the model's context and the
+        user never sees the pending count in chat. The directive must stay
+        terse and mention `recall pending --review`."""
         rps = self._import()
         _seed_candidates(tmp_path, "default", [_make_candidate("d1"), _make_candidate("d2")])
         summary = rps.compose_summary(
@@ -860,10 +859,9 @@ class TestClaudeMdImportManagement:
 
 class TestTriageCandidates:
     """The interactive REPL that walks staged candidates and prompts the
-    user per-candidate. Mustafa 2026-05-05: a Claude session ran
-    `recall pending --review` and rejected 22 candidates without asking.
-    The tool now refuses to run without a TTY so auto-decision is
-    structurally impossible — the human's keyboard is mandatory."""
+    user per-candidate. The tool refuses to run without a TTY so agent-side
+    auto-decision is structurally impossible — the human's keyboard is
+    mandatory."""
 
     SCRIPT_PATH = REPO_ROOT / "agent" / "tools" / "triage_candidates.py"
 
@@ -893,7 +891,7 @@ class TestTriageCandidates:
     def test_refuses_explains_consent_rule(self, tmp_path: Path):
         """The TTY-refusal message MUST tell AI assistants not to call
         graduate.py / reject.py on the user's behalf. This is the
-        explicit rule the Mustafa-2026-05-05 incident violated."""
+        explicit consent rule for interactive review."""
         (tmp_path / "memory" / "candidates").mkdir(parents=True)
         result = subprocess.run(
             [sys.executable, str(self.SCRIPT_PATH), "--brain", str(tmp_path)],
@@ -1006,8 +1004,8 @@ class TestTriageCandidates:
         """The structural guarantee: no graduate.py / reject.py call ever
         fires without an explicit g/r keystroke from the user. Even if
         stdin closes (EOF) mid-prompt, the candidate stays staged.
-        Mustafa 2026-05-05: pin the rule that previously got broken
-        (Claude rejected 22 candidates without prompting)."""
+        This pins the rule that previously allowed unattended candidate
+        decisions."""
         cdir = tmp_path / "memory" / "candidates"
         cdir.mkdir(parents=True)
         c = {
@@ -1049,8 +1047,7 @@ class TestShellBanner:
 
     Wrappers are generated dynamically from a config file
     (~/.agent/banner/wrapped_tools or template default), NOT hardcoded
-    in the .sh — Mustafa 2026-05-04 wanted "framework, not point
-    solution" so adding a new LLM is a config edit.
+    in the .sh, so adding a new LLM is a config edit.
 
     Critical contract (still holds): every generated wrapper uses
     `command <tool> "$@"` (not bare `<tool>`) or it self-recurses

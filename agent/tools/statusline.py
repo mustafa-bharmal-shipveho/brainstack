@@ -4,8 +4,7 @@
 Claude Code calls the configured `statusLine.command` and displays its
 stdout in the persistent footer of the chat UI — visible AS SOON AS the
 session opens, before the user types anything. That's the surface the
-user actually sees on launch (Mustafa 2026-05-04: "can this happen when
-the user doesnt write anything and as soon as claude starts").
+user actually sees on launch, before they send a prompt.
 
 Output: a single line of text. Empty output suppresses the statusline.
 

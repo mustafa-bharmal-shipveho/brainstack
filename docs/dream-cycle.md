@@ -100,8 +100,7 @@ Two reasons:
 
 ## Schema extension fields
 
-`lessons.jsonl` rows can carry three optional extension fields beyond
-upstream's schema:
+`lessons.jsonl` rows can carry three optional extension fields:
 
 | Field | What it captures | Source |
 |---|---|---|
@@ -109,6 +108,5 @@ upstream's schema:
 | `how_to_apply` | When/where the rule kicks in | `**How to apply:**` block |
 | `original_markdown_path` | Path to long-form companion | `migrate.py` writes a verbatim copy |
 
-Patched `_bullet_for` in `render_lessons.py` emits these as italic
-sub-lines when present. When absent, the output matches upstream
-exactly. See [`UPSTREAM.md`](../UPSTREAM.md) for the modification details.
+`_bullet_for` in `render_lessons.py` emits these as italic sub-lines
+when present. When absent, rows render as a normal one-line lesson.

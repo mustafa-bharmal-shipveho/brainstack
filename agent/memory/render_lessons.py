@@ -1,10 +1,7 @@
 # ----------------------------------------------------------------------------
-# Modified from codejunkie99/agentic-stack@df806ab (Apache-2.0)
-# Modifications by Mustafa Bharmal, 2026-04-26:
-#   - _bullet_for() extended to render optional `why` and `how_to_apply` fields
-#     when present. Backward compatible (output identical to upstream when
-#     these fields are absent).
-# See NOTICE file at repo root for full attribution.
+# Brainstack lesson rendering.
+#
+# Legal provenance for derived files is tracked centrally in NOTICE/UPSTREAM.
 # ----------------------------------------------------------------------------
 """Render semantic/LESSONS.md from structured semantic/lessons.jsonl.
 
@@ -180,7 +177,7 @@ def _bullet_for(lesson, superseded_by):
     ann = f"status={status} confidence={conf} evidence={len(ev)} id={lid}"
 
     # brainstack extension: render optional why/how_to_apply.
-    # When absent, bullet output matches upstream exactly.
+    # When absent, bullet output stays as the normal one-line lesson.
     #
     # IMPORTANT: do NOT use `- ` prefixed lines for these. migrate_legacy_bullets()
     # below strips leading whitespace and matches any `- ` line below the

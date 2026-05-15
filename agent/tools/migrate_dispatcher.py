@@ -714,8 +714,7 @@ def dispatch(
     if fmt == "cursor-plans":
         raise NoAdapterError(
             f"Cursor plans detected at {src}, but no Cursor adapter is "
-            "registered yet — see brainstack roadmap "
-            "https://github.com/mustafa-bharmal-shipveho/brainstack."
+            "registered yet — see the brainstack roadmap."
         )
     if fmt == "cursor-rules":
         raise NoAdapterError(

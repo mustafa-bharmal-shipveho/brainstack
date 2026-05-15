@@ -22,7 +22,14 @@ def recall_query_handler(
     source: Optional[str] = None,
     type: Optional[str] = None,
 ) -> list[dict]:
-    """The handler dispatched to by the MCP tool. Pure Python, no MCP deps."""
+    """The handler dispatched to by the MCP tool. Pure Python, no MCP deps.
+
+    Does NOT close the embedded-Qdrant client between requests. The MCP
+    server is long-lived; tearing down the QdrantClient after every query
+    defeats the whole point of `_qdrant_client_singleton` (amortized
+    RocksDB open + index scan). Cleanup happens on server shutdown via
+    `qdrant_backend.close_client_cache`'s atexit registration.
+    """
     cfg = load_config()
     fresh = needs_refresh(cfg.sources)
     cache = build_index(cfg.sources) if fresh else load_index(cfg.sources)

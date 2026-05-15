@@ -37,7 +37,7 @@ from typing import Iterable, Optional
 # ---------------------------------------------------------------------------
 
 # 8 conceptual buckets × 10 lessons = 80 lessons. Bucket names are intentionally
-# generic / open-source-friendly — no Veho or other employer-specific content.
+# generic / open-source-friendly — no real employer-specific content.
 BUCKETS: list[dict] = [
     {
         "slug": "agent-team-workflow",

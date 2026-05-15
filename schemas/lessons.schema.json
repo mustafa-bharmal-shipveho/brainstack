@@ -1,8 +1,8 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/mustafa-bharmal-shipveho/brainstack/schemas/lessons.schema.json",
+  "$id": "https://github.com/<your-org>/brainstack/schemas/lessons.schema.json",
   "title": "lessons.jsonl row",
-  "description": "Schema for one row of semantic/lessons.jsonl. Vendored fields match upstream agentic-stack v0.11.2. Extension fields (why, how_to_apply, original_markdown_path) are brainstack additions, optional and backward-compatible.",
+  "description": "Schema for one row of semantic/lessons.jsonl. Extension fields (why, how_to_apply, original_markdown_path) are brainstack additions, optional and backward-compatible.",
   "type": "object",
   "required": ["id", "claim", "status", "accepted_at", "reviewer", "rationale"],
   "properties": {

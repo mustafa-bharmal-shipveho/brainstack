@@ -23,7 +23,7 @@ not sure, open an issue first to discuss.
 ## Setting up a dev environment
 
 ```bash
-git clone https://github.com/mustafa-bharmal-shipveho/brainstack.git
+git clone https://github.com/<your-org>/brainstack.git
 cd brainstack
 python3.13 -m venv .venv
 source .venv/bin/activate
@@ -84,10 +84,9 @@ rm -rf /tmp/brain-sandbox
 - Adds a feature outside the project's scope (see above)
 - Adds a dependency without a strong reason (this project is
   intentionally low-dependency)
-- Modifies vendored upstream code (`agent/memory/auto_dream.py`,
-  `agent/memory/cluster.py`, etc.) without coordination — these
-  files have an explicit modification log in `UPSTREAM.md` and rebase
-  process. Open an issue first.
+- Modifies memory pipeline internals (`agent/memory/auto_dream.py`,
+  `agent/memory/cluster.py`, etc.) without coordination. These files
+  are high-blast-radius and need focused tests.
 - Removes existing security guardrails (redaction layers, BRAIN_ROOT
   validation, sentinel locking) without replacement
 - Has no tests

@@ -13,7 +13,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import NoReturn, Optional
 
 import typer
 
@@ -28,6 +28,11 @@ from recall.config import (
 )
 from recall.core import HybridRetriever
 from recall.index import build_index, load_index, needs_refresh
+from recall.qdrant_backend import (
+    QdrantStoreAccessError,
+    QdrantStoreBusyError,
+    close_client_cache,
+)
 from recall.serialize import serialize_results
 from recall.sources import discover_documents
 
@@ -64,6 +69,13 @@ def _load_or_build(cfg: Config) -> tuple[Optional[object], bool]:
 _serialize = serialize_results  # backwards-compat alias inside the module
 
 
+def _exit_qdrant_store_error(
+    exc: QdrantStoreAccessError | QdrantStoreBusyError,
+) -> NoReturn:
+    typer.echo(str(exc), err=True)
+    raise typer.Exit(code=1)
+
+
 @app.command()
 def query(
     text: list[str] = typer.Argument(..., help="Query terms"),
@@ -77,45 +89,55 @@ def query(
     ),
 ):
     """Search the brain for memories relevant to QUERY. Outputs JSON."""
-    cfg = load_config()
-    cache, fresh = _load_or_build(cfg)
-    if cache is None or not cache.documents:
-        typer.echo("[]")
-        raise typer.Exit(code=0)
+    try:
+        cfg = load_config()
+        cache, fresh = _load_or_build(cfg)
+        if cache is None or not cache.documents:
+            typer.echo("[]")
+            raise typer.Exit(code=0)
 
-    # If we just rebuilt, pass docs in to be upserted (idempotent thanks to
-    # uuid5(path) point ids). If the index is up to date, skip the embedding
-    # step and let HybridRetriever query the existing collection directly.
-    effective_reranker = rerank if rerank is not None else cfg.ranking.reranker
-    retriever = HybridRetriever(
-        documents=cache.documents if fresh else None,
-        collections=[s.name for s in cfg.sources],
-        embedder=cfg.ranking.embedder,
-        sparse_embedder=cfg.ranking.sparse_embedder,
-        reranker=effective_reranker,
-        reranker_model=cfg.ranking.reranker_model,
-        rerank_n=cfg.ranking.rerank_n,
-    )
+        # If we just rebuilt, pass docs in to be upserted (idempotent thanks to
+        # uuid5(path) point ids). If the index is up to date, skip the embedding
+        # step and let HybridRetriever query the existing collection directly.
+        effective_reranker = rerank if rerank is not None else cfg.ranking.reranker
+        retriever = HybridRetriever(
+            documents=cache.documents if fresh else None,
+            collections=[s.name for s in cfg.sources],
+            embedder=cfg.ranking.embedder,
+            sparse_embedder=cfg.ranking.sparse_embedder,
+            reranker=effective_reranker,
+            reranker_model=cfg.ranking.reranker_model,
+            rerank_n=cfg.ranking.rerank_n,
+        )
 
-    query_str = " ".join(text)
-    effective_k = k if k is not None else cfg.default_k
-    results = retriever.query(
-        query_str,
-        k=effective_k,
-        type_filter=type,
-        source_filter=source,
-    )
-    typer.echo(json.dumps(_serialize(results), indent=2))
+        query_str = " ".join(text)
+        effective_k = k if k is not None else cfg.default_k
+        results = retriever.query(
+            query_str,
+            k=effective_k,
+            type_filter=type,
+            source_filter=source,
+        )
+        typer.echo(json.dumps(_serialize(results), indent=2))
+    except (QdrantStoreAccessError, QdrantStoreBusyError) as exc:
+        _exit_qdrant_store_error(exc)
+    finally:
+        close_client_cache()
 
 
 @app.command()
 def reindex():
     """Rebuild the index cache from scratch."""
-    cfg = load_config()
-    cache = build_index(cfg.sources)
-    typer.echo(
-        f"Indexed {len(cache.documents)} documents across {len(cfg.sources)} source(s)."
-    )
+    try:
+        cfg = load_config()
+        cache = build_index(cfg.sources)
+        typer.echo(
+            f"Indexed {len(cache.documents)} documents across {len(cfg.sources)} source(s)."
+        )
+    except (QdrantStoreAccessError, QdrantStoreBusyError) as exc:
+        _exit_qdrant_store_error(exc)
+    finally:
+        close_client_cache()
 
 
 @app.command()
@@ -354,11 +376,8 @@ def pending(
             pass  # render failure is non-fatal — fall through to whatever's on disk
 
     # Review mode: hand off to the interactive triage REPL.
-    # The REPL refuses to run without a TTY (structural guarantee that
-    # the user, not an LLM, decides each candidate). Mustafa 2026-05-04:
-    # "i want the users to be able to accept or reject" — a Claude
-    # session previously rejected 22 candidates without prompting; the
-    # REPL makes that structurally impossible.
+    # The REPL refuses to run without a TTY, making candidate acceptance
+    # or rejection a user decision instead of an agent-side automation.
     if review:
         triage = brain_root / "tools" / "triage_candidates.py"
         if triage.is_file():

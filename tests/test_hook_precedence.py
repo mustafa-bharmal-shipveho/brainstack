@@ -7,7 +7,7 @@ hook fires for a given tool call. Three modes:
 2. BRAIN_ROOT env override: respect a custom brain location
 3. .agent-local-override file in $CLAUDE_PROJECT_DIR: skip (project's own
    hooks handle it; prevents double-logging if the project has its own
-   upstream agentic-stack `.agent/` folder)
+   project-local `.agent/` folder)
 """
 import json
 import os

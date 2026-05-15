@@ -437,8 +437,8 @@ def _parse_iso_to_ms(iso: str | None) -> int | None:
 #      identify domain-specific questions; they fire on chitchat, on
 #      compaction summaries, on assistant-quoted text — and miss real
 #      domain prompts that happen to use different phrasing.
-#   2. Any classifier that could work would be org-specific (Veho-
-#      specific keyword list, internal-tool-name lexicon, etc.) and
+#   2. Any classifier that could work would be org-specific (product keyword
+#      list, internal-tool-name lexicon, etc.) and
 #      this is an open-source tool.
 #   3. The raw MCP call counts (above, in StatsReport.mcp_calls) are
 #      already useful and org-agnostic — we leave the interpretation to

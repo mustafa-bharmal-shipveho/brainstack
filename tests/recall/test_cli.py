@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -102,6 +103,86 @@ class TestCliReindex:
         )
         result = run_cli(["reindex"], env=_xdg_env(isolated_xdg))
         assert result.returncode == 0
+
+    def test_reindex_reports_embedded_qdrant_lock_without_traceback(
+        self, isolated_xdg, write_config, empty_brain
+    ):
+        pytest.importorskip("fcntl")
+        write_config(
+            sources=[
+                {
+                    "name": "empty",
+                    "path": str(empty_brain),
+                    "glob": "**/*.md",
+                    "frontmatter": "optional",
+                    "exclude": [],
+                }
+            ]
+        )
+        cache_dir = isolated_xdg / "xdg-cache" / "recall"
+        lock_path = cache_dir / "qdrant.client.lock"
+        holder_code = (
+            "import fcntl, pathlib, time\n"
+            f"p = pathlib.Path({str(lock_path)!r})\n"
+            "p.parent.mkdir(parents=True, exist_ok=True)\n"
+            "f = p.open('w')\n"
+            "fcntl.flock(f.fileno(), fcntl.LOCK_EX)\n"
+            "print('ready', flush=True)\n"
+            "time.sleep(30)\n"
+        )
+        holder = subprocess.Popen(
+            [sys.executable, "-c", holder_code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert holder.stdout is not None
+            assert holder.stdout.readline().strip() == "ready"
+            env = _xdg_env(isolated_xdg)
+            env["RECALL_QDRANT_LOCK_TIMEOUT"] = "0"
+            result = run_cli(["reindex"], env=env)
+            combined = result.stdout + result.stderr
+            assert result.returncode == 1
+            assert "embedded Qdrant index is busy" in combined
+            assert "Traceback" not in combined
+        finally:
+            holder.terminate()
+            try:
+                holder.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                holder.kill()
+                holder.wait(timeout=5)
+
+    def test_reindex_reports_unwritable_qdrant_store_without_traceback(
+        self, isolated_xdg, write_config, empty_brain
+    ):
+        write_config(
+            sources=[
+                {
+                    "name": "empty",
+                    "path": str(empty_brain),
+                    "glob": "**/*.md",
+                    "frontmatter": "optional",
+                    "exclude": [],
+                }
+            ]
+        )
+        cache_dir = isolated_xdg / "xdg-cache" / "recall"
+        qdrant_path = cache_dir / "qdrant"
+        qdrant_path.mkdir(parents=True, exist_ok=True)
+        qdrant_path.chmod(0o500)
+        try:
+            if os.access(qdrant_path, os.W_OK):
+                pytest.skip("filesystem still reports the chmodded Qdrant dir as writable")
+            result = run_cli(["reindex"], env=_xdg_env(isolated_xdg))
+            combined = result.stdout + result.stderr
+            assert result.returncode == 1
+            assert "embedded Qdrant index is not writable" in combined
+            assert "XDG_CACHE_HOME" in combined
+            assert "Traceback" not in combined
+        finally:
+            qdrant_path.chmod(0o700)
 
 
 class TestCliQuery:

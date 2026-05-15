@@ -231,6 +231,6 @@ class TestFrameworkPurity:
         own digest tags, not a fixed taxonomy."""
         import inspect
         src = inspect.getsource(theme_mod).lower()
-        forbidden = ["veho", "shipveho", "cart-location", "facility-ops"]
+        forbidden = ["example-corp", "internal-service", "ticket-prefix", "customer-segment"]
         for f in forbidden:
             assert f not in src, f"theme_cluster contains {f!r}"

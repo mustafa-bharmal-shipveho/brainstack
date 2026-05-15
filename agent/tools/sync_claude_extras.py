@@ -33,12 +33,8 @@ LOCK_PATH = BRAIN_ROOT / ".auto-migrate.lock"
 LOG_PATH = BRAIN_ROOT / "claude-extras.log"
 LOCK_TIMEOUT = 90.0  # seconds
 
-# Locate the python interpreter and tools dir. Default to brainstack's venv
-# but honor explicit overrides.
-PYTHON = os.environ.get(
-    "PYTHON",
-    "/Users/mustafa.bharmal/Documents/brainstack/.venv/bin/python",
-)
+# Locate the python interpreter and tools dir. Honor explicit overrides.
+PYTHON = os.environ.get("PYTHON", sys.executable)
 TOOLS_DIR = BRAIN_ROOT / "tools"
 
 

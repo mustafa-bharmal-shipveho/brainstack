@@ -933,8 +933,7 @@ PYEOF
     cp "$REPO_DIR/templates/brainstack-shell-banner.sh" "$banner_target"
     chmod +x "$banner_target"
     # Wrapped-tool list — config-driven so adding a new LLM is a one-line
-    # edit, not a code change (Mustafa 2026-05-04: "framework, not point
-    # solution"). Don't overwrite an existing user-curated list.
+    # edit, not a code change. Don't overwrite an existing user-curated list.
     wrapped_tools_target="$banner_dir/wrapped_tools"
     if [ ! -f "$wrapped_tools_target" ] && [ -f "$REPO_DIR/templates/brainstack-wrapped-tools.txt" ]; then
         cp "$REPO_DIR/templates/brainstack-wrapped-tools.txt" "$wrapped_tools_target"
@@ -1271,8 +1270,8 @@ fi
 # Configures Claude Code's statusLine to run agent/tools/statusline.py
 # which prints "📥 N pending — recall pending --review" in the persistent
 # UI footer. Visible AS SOON AS the session opens, no user input required.
-# Mustafa 2026-05-04: "can this happen when the user doesnt write anything
-# and as soon as claude starts".
+# Dogfood finding: this must be visible as soon as Claude Code starts,
+# before the user types anything.
 #
 # Idempotent: re-runs replace the existing statusLine with our config
 # (since settings.json supports only one statusLine; we own that slot).

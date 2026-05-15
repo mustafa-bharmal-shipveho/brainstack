@@ -249,8 +249,8 @@ def _sweep_activity_log_residue(candidates_dir):
     re-checking. This sweep closes that gap by running the same regex
     against every still-staged *.json on each dream run.
 
-    DREAM_ACTIVITY_LOG_DISABLED=1 bypasses (matches the upstream filter's
-    kill switch so a forensic-mode run leaves both pipes untouched).
+    DREAM_ACTIVITY_LOG_DISABLED=1 bypasses the filter so a forensic-mode
+    run leaves both pipes untouched.
 
     Returns a list of {"id", "reason", "claim_prefix"} for telemetry.
     """
