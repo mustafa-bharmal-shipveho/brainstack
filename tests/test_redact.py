@@ -457,6 +457,47 @@ def test_dream_cycle_cluster_key_does_not_false_positive(tmp_path):
     )
 
 
+def test_session_digest_filename_does_not_false_positive(tmp_path):
+    """Session-digest filenames have the shape
+    `YYYY-MM-DD__<slug>__<8-hex>.md`. When captured in Bash output and
+    JSONL-serialized, the `\\n` line separator concatenates into the
+    next filename, producing tokens like
+    `n2026-04-13__github-gh-stack-stacked-prs-overview__7a02e53e` that
+    trip high-entropy detection — blocking real users' brain syncs.
+    Real fix in the wild on 2026-05-15: a brain accumulated 5 days of
+    work because this exact pattern kept tripping the scrubber's
+    pre-commit hook."""
+    f = tmp_path / "captured_bash_output.jsonl"
+    f.write_text(
+        '{"detail": "out=2026-04-13__github-gh-stack-stacked-prs-overview__7a02e53e.md'
+        '\\\\n2026-04-13__tdd-first-agent-team-v1-1-0-release__e22acf05.md'
+        '\\\\n2026-04-14__ruflo-inspired-agent-team-quality__b29f1c4d.md"}\n'
+    )
+    result = run_redact(tmp_path)
+    assert result.returncode == 0, (
+        f"digest filename shape tripped entropy detection; stdout: {result.stdout}"
+    )
+
+
+def test_digest_filename_ignore_does_not_open_aws_bypass(tmp_path):
+    """Same defense-in-depth principle as pattern_AKIA test: adding
+    digest-filename shape to ENTROPY_IGNORE must not open a bypass for
+    a real AWS key smuggled into the same shape. The ignore is bounded
+    to lowercase + dashes + digits + hex; smuggling uppercase IAM
+    characters still trips entropy."""
+    f = tmp_path / "leak.txt"
+    f.write_text(
+        "n2026-04-13__AKIAIOSFODNN7EXAMPLE-stuff__7a02e53e\n"
+    )
+    result = run_redact(tmp_path)
+    # An ENTROPY_IGNORE that's too permissive would let this through.
+    # The AKIA token should be caught by AWS-prefix regex even if the
+    # ignore matched the wrapping shape.
+    assert result.returncode != 0, (
+        f"AKIA-bearing pseudo-filename slipped through; stdout: {result.stdout}"
+    )
+
+
 def test_pattern_prefix_does_not_open_bypass_for_real_aws_key(tmp_path):
     """Adding `pattern_<...>` to ENTROPY_IGNORE must not open a bypass for
     real secrets. The ignore is constrained to lowercase-only cluster keys

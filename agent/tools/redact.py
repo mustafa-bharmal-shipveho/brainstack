@@ -315,7 +315,21 @@ ENTROPY_DEFAULT_THRESHOLD = 4.5  # bits/char; >=4.5 is empirically random-lookin
 #    patterns (AWS, GitHub, etc.) still apply, so a hostile
 #    `pattern_<aws-key>` is still caught by the prefix scanners above.
 ENTROPY_IGNORE = re.compile(
-    r"^(?:[a-f0-9]{32,}|[0-9]+|[a-zA-Z]+|pattern_[a-z0-9_\-]+)$"
+    r"^(?:[a-f0-9]{32,}|[0-9]+|[a-zA-Z]+|pattern_[a-z0-9_\-]+"
+    # Session-digest filename shape — `YYYY-MM-DD__<slug>__<8-hex>`,
+    # often captured from `ls memory/semantic/digests/` Bash output
+    # where the literal `\n` separator prefixes the next filename with
+    # the letter `n`. These are not secrets; ignoring this shape
+    # eliminates a recurring high-entropy false positive that blocked
+    # sync.sh on real users' brains.
+    #
+    # Strict lowercase-only character class — real digest filenames
+    # ARE all lowercase, and forbidding uppercase prevents an
+    # adversary from smuggling an AKIA-prefixed AWS key inside the
+    # ignored wrapping (defense-in-depth, mirrors the same gate on
+    # the `pattern_` prefix below).
+    r"|n?\d{4}-\d{2}-\d{2}__[a-z0-9\-]+__[a-f0-9]+"
+    r")$"
 )
 
 
