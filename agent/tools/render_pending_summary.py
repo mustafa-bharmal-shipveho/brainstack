@@ -128,56 +128,60 @@ def _is_noise_cluster(candidate: dict) -> bool:
 # ---------- counting --------------------------------------------------
 
 
-def _is_staged(path: Path) -> bool:
-    """True iff the candidate JSON exists, parses, and has `status == "staged"`.
-
-    The banner count MUST match what `recall pending --review` triages.
-    `triage_candidates.py:67` filters `status == "staged"`; mid-lifecycle
-    states (`provisional`, `accepted`, `rejected`, `superseded`) plus
-    unparseable files are skipped there, so we skip them here too. Without
-    this filter, an interrupted `mark_graduated` / `mark_rejected` move
-    leaves a non-staged file at the top level, inflating the banner to
-    "brainstack: N pending" while triage reports "no staged candidates".
-    """
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return False
-    return isinstance(data, dict) and data.get("status") == "staged"
+def _review_state():
+    """Lazy import — avoids circular import at module load."""
+    import review_state  # noqa: WPS433
+    return review_state
 
 
 def count_pending_per_namespace(brain_root: Path) -> dict[str, int]:
-    """Count staged candidate `*.json` files DIRECTLY under each namespace's
-    candidates dir. Excludes `graduated/` and `rejected/` archive subdirs,
-    AND non-staged files (see `_is_staged`).
+    """Count staged candidates in each namespace's candidates dir.
+
+    Delegates to `review_state.list_candidates(dir, status="staged")` —
+    the SHARED definition consumed by the triage REPL
+    (`triage_candidates.py`) and REVIEW_QUEUE.md
+    (`write_review_queue_summary`). Going through a single function means
+    these three surfaces CAN'T drift: if `list_candidates` says "1
+    staged", banner and triage and review-queue all agree.
 
     Namespaces tracked:
       - default          → <brain>/memory/candidates/*.json
       - claude-sessions  → <brain>/memory/candidates/claude-sessions/*.json
       - codex            → <brain>/memory/candidates/codex/*.json
     """
+    rs = _review_state()
     counts = {"default": 0, "claude-sessions": 0, "codex": 0}
     candidates_root = brain_root / "memory" / "candidates"
     if not candidates_root.is_dir():
         return counts
-    try:
-        counts["default"] = sum(
-            1 for p in candidates_root.glob("*.json")
-            if p.is_file() and _is_staged(p)
-        )
-    except OSError:
-        pass
+    counts["default"] = len(rs.list_candidates(str(candidates_root), status="staged"))
     for ns in ("claude-sessions", "codex"):
         ns_dir = candidates_root / ns
-        if not ns_dir.is_dir():
-            continue
-        try:
-            counts[ns] = sum(
-                1 for p in ns_dir.glob("*.json")
-                if p.is_file() and _is_staged(p)
-            )
-        except OSError:
-            pass
+        if ns_dir.is_dir():
+            counts[ns] = len(rs.list_candidates(str(ns_dir), status="staged"))
+    return counts
+
+
+def count_misplaced_per_namespace(brain_root: Path) -> dict[str, int]:
+    """Count non-staged JSON files sitting at the top of each namespace's
+    candidates dir. These are leaks — `mark_graduated`/`mark_rejected`
+    moves write to a subdir then remove the top; an interrupted move (or
+    an external tool writing to the wrong place) leaves a non-staged file
+    at top.
+
+    Surfacing the count in the banner means the next time this happens we
+    SEE it instead of silently inflating pending counts and going stale.
+    """
+    rs = _review_state()
+    counts = {"default": 0, "claude-sessions": 0, "codex": 0}
+    candidates_root = brain_root / "memory" / "candidates"
+    if not candidates_root.is_dir():
+        return counts
+    counts["default"] = len(rs.find_misplaced_candidates(str(candidates_root)))
+    for ns in ("claude-sessions", "codex"):
+        ns_dir = candidates_root / ns
+        if ns_dir.is_dir():
+            counts[ns] = len(rs.find_misplaced_candidates(str(ns_dir)))
     return counts
 
 
@@ -266,11 +270,14 @@ def compose_summary(
     (so SessionStart hook can suppress chatter on healthy days)."""
     counts = count_pending_per_namespace(brain_root)
     total = sum(counts.values())
+    misplaced = count_misplaced_per_namespace(brain_root)
+    misplaced_total = sum(misplaced.values())
     drift_in_sync = bool(drift_report and drift_report.get("in_sync", True))
     if drift_report is None:
         drift_in_sync = True
 
-    if total == 0 and drift_in_sync and sync_status == "ok":
+    if (total == 0 and drift_in_sync
+            and sync_status == "ok" and misplaced_total == 0):
         return _ALL_CLEAR_LINE
 
     now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
@@ -323,8 +330,28 @@ def compose_summary(
         parts.append("⚠️ drift detected")
     if sync_status != "ok":
         parts.append(f"⚠️ sync {sync_status}")
+    if misplaced_total > 0:
+        parts.append(f"⚠️ {misplaced_total} misplaced")
     lines.append(" | ".join(parts))
     lines.append("")
+
+    # Misplaced files section — surface the leak so the framework bug is
+    # visible. `mark_graduated`/`mark_rejected` move files via "write dst,
+    # remove src" and a crash leaves the src untouched (still staged), so
+    # a misplaced file at top means SOMETHING ELSE wrote it: external
+    # tooling, a manual edit, a buggy producer, or a backup restore. Auto-
+    # fixing would mask the producer bug; flagging it makes it actionable.
+    if misplaced_total > 0:
+        lines.append("## Misplaced (non-staged file at top)")
+        lines.append(
+            f"- {misplaced_total} candidate file(s) sit at the top of "
+            "`memory/candidates/` with status != staged. "
+            "Likely cause: interrupted lifecycle move OR external write."
+        )
+        lines.append("- Inspect: `python ~/.agent/tools/list_candidates.py`")
+        lines.append("- Move each to its proper subdir based on status field, "
+                     "or delete after verifying it's duplicated in graduated/rejected.")
+        lines.append("")
 
     # Per-namespace breakdown
     if total > 0:

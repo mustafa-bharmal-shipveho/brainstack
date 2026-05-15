@@ -231,7 +231,22 @@ def candidate_priority(candidate):
 
 
 def list_candidates(candidates_dir, status="staged", sort_by="priority"):
-    """Return candidate dicts with the given status, sorted by the key."""
+    """Return candidate dicts whose `status` field equals the given value,
+    found in the directory that lifecycle convention assigns to that status.
+
+    Single source of truth for "what's pending" — the banner
+    (`render_pending_summary.count_pending_per_namespace`), the triage REPL
+    (`triage_candidates._list_candidates`), and REVIEW_QUEUE.md
+    (`write_review_queue_summary`) all delegate here so they CAN'T disagree.
+
+    Both filters are applied:
+      - directory: lifecycle convention places staged at top, others under
+        a subdir named for the status.
+      - `data["status"]`: a file that landed in the wrong directory (e.g.
+        an interrupted `mark_*` move or external edit) is NOT counted as
+        the wrong status. The leak is reported separately via
+        `find_misplaced_candidates`.
+    """
     if status == "staged":
         search_dir = candidates_dir
     else:
@@ -248,15 +263,51 @@ def list_candidates(candidates_dir, status="staged", sort_by="priority"):
             continue
         try:
             with open(path) as f:
-                out.append(json.load(f))
+                data = json.load(f)
         except (OSError, json.JSONDecodeError):
             continue
+        if not isinstance(data, dict) or data.get("status") != status:
+            continue
+        out.append(data)
 
     if sort_by == "priority":
         out.sort(key=candidate_priority, reverse=True)
     elif sort_by == "age":
         out.sort(key=lambda c: c.get("staged_at", ""))
     return out
+
+
+def find_misplaced_candidates(candidates_dir):
+    """Return paths of files at the TOP of `candidates_dir` whose `status`
+    field is not `"staged"`. These are leaks — typically from an interrupted
+    `mark_graduated`/`mark_rejected` move or external tooling that bypassed
+    `review_state`. The banner surfaces them as a one-liner so the leak is
+    visible instead of silently inflating pending counts.
+
+    The proper home for these files is the subdir matching their status:
+    `candidates/graduated/<id>.json` for accepted/provisional, and
+    `candidates/rejected/<id>.json` for rejected. We don't auto-move
+    (silent self-heal would mask producer bugs); we surface the leak.
+    """
+    if not os.path.isdir(candidates_dir):
+        return []
+    misplaced = []
+    for fname in sorted(os.listdir(candidates_dir)):
+        if not fname.endswith(".json"):
+            continue
+        path = os.path.join(candidates_dir, fname)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        if data.get("status") not in (None, "staged"):
+            misplaced.append(path)
+    return misplaced
 
 
 def write_review_queue_summary(candidates_dir, summary_path):
