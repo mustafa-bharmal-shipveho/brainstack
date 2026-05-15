@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -152,6 +153,36 @@ class TestCliReindex:
             except subprocess.TimeoutExpired:
                 holder.kill()
                 holder.wait(timeout=5)
+
+    def test_reindex_reports_unwritable_qdrant_store_without_traceback(
+        self, isolated_xdg, write_config, empty_brain
+    ):
+        write_config(
+            sources=[
+                {
+                    "name": "empty",
+                    "path": str(empty_brain),
+                    "glob": "**/*.md",
+                    "frontmatter": "optional",
+                    "exclude": [],
+                }
+            ]
+        )
+        cache_dir = isolated_xdg / "xdg-cache" / "recall"
+        qdrant_path = cache_dir / "qdrant"
+        qdrant_path.mkdir(parents=True, exist_ok=True)
+        qdrant_path.chmod(0o500)
+        try:
+            if os.access(qdrant_path, os.W_OK):
+                pytest.skip("filesystem still reports the chmodded Qdrant dir as writable")
+            result = run_cli(["reindex"], env=_xdg_env(isolated_xdg))
+            combined = result.stdout + result.stderr
+            assert result.returncode == 1
+            assert "embedded Qdrant index is not writable" in combined
+            assert "XDG_CACHE_HOME" in combined
+            assert "Traceback" not in combined
+        finally:
+            qdrant_path.chmod(0o700)
 
 
 class TestCliQuery:

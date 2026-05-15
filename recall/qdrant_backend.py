@@ -53,6 +53,10 @@ class QdrantStoreBusyError(RuntimeError):
     """Embedded-Qdrant store is in use by another recall process."""
 
 
+class QdrantStoreAccessError(RuntimeError):
+    """Embedded-Qdrant store cannot be opened due to filesystem access."""
+
+
 def _qdrant_lock_timeout_seconds() -> float:
     raw = os.environ.get("RECALL_QDRANT_LOCK_TIMEOUT", "2")
     try:
@@ -67,6 +71,15 @@ def _qdrant_busy_message(cache_dir: Path) -> str:
         f"embedded Qdrant index is busy at {qdrant_path}; another recall process "
         "is using it. Retry shortly, use a separate XDG_CACHE_HOME, or run a "
         "shared recall/Qdrant service for heavy concurrent agents."
+    )
+
+
+def _qdrant_access_message(cache_dir: Path, exc: OSError) -> str:
+    qdrant_path = Path(cache_dir) / "qdrant"
+    return (
+        f"embedded Qdrant index is not writable at {qdrant_path}; check cache "
+        "ownership/permissions or set XDG_CACHE_HOME to a writable directory. "
+        f"Cause: {exc}"
     )
 
 
@@ -111,10 +124,21 @@ def _qdrant_client_singleton(cache_dir: Path) -> QdrantClient:
         client = _clients.get(key)
         if client is None:
             qdrant_path = Path(cache_dir) / "qdrant"
-            qdrant_path.mkdir(parents=True, exist_ok=True)
+            try:
+                qdrant_path.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise QdrantStoreAccessError(_qdrant_access_message(cache_dir, exc)) from exc
             lock_file = _acquire_qdrant_process_lock(cache_dir)
             try:
                 client = QdrantClient(path=str(qdrant_path))
+            except OSError as exc:
+                if lock_file is not None:
+                    try:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)  # type: ignore[union-attr]
+                    except OSError:
+                        pass
+                    lock_file.close()
+                raise QdrantStoreAccessError(_qdrant_access_message(cache_dir, exc)) from exc
             except Exception as exc:
                 if lock_file is not None:
                     try:

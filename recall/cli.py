@@ -28,7 +28,11 @@ from recall.config import (
 )
 from recall.core import HybridRetriever
 from recall.index import build_index, load_index, needs_refresh
-from recall.qdrant_backend import QdrantStoreBusyError, close_client_cache
+from recall.qdrant_backend import (
+    QdrantStoreAccessError,
+    QdrantStoreBusyError,
+    close_client_cache,
+)
 from recall.serialize import serialize_results
 from recall.sources import discover_documents
 
@@ -65,7 +69,7 @@ def _load_or_build(cfg: Config) -> tuple[Optional[object], bool]:
 _serialize = serialize_results  # backwards-compat alias inside the module
 
 
-def _exit_qdrant_busy(exc: QdrantStoreBusyError) -> None:
+def _exit_qdrant_store_error(exc: QdrantStoreAccessError | QdrantStoreBusyError) -> None:
     typer.echo(str(exc), err=True)
     raise typer.Exit(code=1)
 
@@ -113,8 +117,8 @@ def query(
             source_filter=source,
         )
         typer.echo(json.dumps(_serialize(results), indent=2))
-    except QdrantStoreBusyError as exc:
-        _exit_qdrant_busy(exc)
+    except (QdrantStoreAccessError, QdrantStoreBusyError) as exc:
+        _exit_qdrant_store_error(exc)
     finally:
         close_client_cache()
 
@@ -128,8 +132,8 @@ def reindex():
         typer.echo(
             f"Indexed {len(cache.documents)} documents across {len(cfg.sources)} source(s)."
         )
-    except QdrantStoreBusyError as exc:
-        _exit_qdrant_busy(exc)
+    except (QdrantStoreAccessError, QdrantStoreBusyError) as exc:
+        _exit_qdrant_store_error(exc)
     finally:
         close_client_cache()
 
