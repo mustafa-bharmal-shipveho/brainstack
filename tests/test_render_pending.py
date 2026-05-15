@@ -123,6 +123,42 @@ class TestRenderPendingSummary:
         counts = rps.count_pending_per_namespace(tmp_path)
         assert counts == {"default": 0, "claude-sessions": 0, "codex": 0}
 
+    def test_count_excludes_non_staged_candidates(self, tmp_path: Path):
+        """The banner count MUST match what `recall pending --review` triages.
+
+        `triage_candidates.py:67` skips any candidate whose `status` is not
+        `"staged"` (lifecycle states `provisional`, `accepted`, `rejected`,
+        `superseded` are transient mid-move states). If a `mark_graduated`
+        / `mark_rejected` move is interrupted, a non-staged file can linger
+        at the top level — historically it inflated the banner ("brainstack:
+        2 pending") while `recall pending --review` reported "no staged
+        candidates". The banner now mirrors triage."""
+        rps = self._import()
+        staged = _make_candidate("d1")
+        accepted = _make_candidate("d2"); accepted["status"] = "accepted"
+        rejected = _make_candidate("d3"); rejected["status"] = "rejected"
+        provisional = _make_candidate("d4"); provisional["status"] = "provisional"
+        _seed_candidates(tmp_path, "default",
+                         [staged, accepted, rejected, provisional])
+
+        counts = rps.count_pending_per_namespace(tmp_path)
+        assert counts["default"] == 1, (
+            "only status=staged should count toward the banner; "
+            "got transient states in the count"
+        )
+
+    def test_count_skips_unparseable_json(self, tmp_path: Path):
+        """A corrupt JSON file in the candidates dir must not crash the
+        renderer (it runs on every session-start; failure here suppresses
+        the whole pending-review banner). Match triage's behavior: skip."""
+        rps = self._import()
+        _seed_candidates(tmp_path, "default", [_make_candidate("d1")])
+        cand_dir = tmp_path / "memory" / "candidates"
+        (cand_dir / "broken.json").write_text("{not valid json")
+
+        counts = rps.count_pending_per_namespace(tmp_path)
+        assert counts["default"] == 1
+
     def test_noise_filter_rejects_tmp_evidence(self):
         """Cluster with all evidence_ids referencing /tmp/ is brainstack's own
         test infra noise (Codex 2026-05-04 finding). Must be filtered."""
