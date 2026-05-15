@@ -7,11 +7,19 @@ recall.core.HybridRetriever or recall.index.build_index.
 
 from __future__ import annotations
 
+import atexit
+import errno
 import os
 import threading
+import time
 import uuid
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional, Sequence, TextIO
+
+try:  # pragma: no cover - fcntl is unavailable on Windows.
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
 
 from qdrant_client import QdrantClient, models
 
@@ -33,11 +41,63 @@ _RERANK_OVERSAMPLE = 20  # candidates fed to the reranker before truncating to k
 
 _client_lock = threading.Lock()
 _clients: dict[str, QdrantClient] = {}
+_client_lock_files: dict[str, TextIO] = {}
 
 _embedder_lock = threading.Lock()
 _dense_embedders: dict[str, object] = {}
 _sparse_embedders: dict[str, object] = {}
 _cross_encoders: dict[str, object] = {}
+
+
+class QdrantStoreBusyError(RuntimeError):
+    """Embedded-Qdrant store is in use by another recall process."""
+
+
+def _qdrant_lock_timeout_seconds() -> float:
+    raw = os.environ.get("RECALL_QDRANT_LOCK_TIMEOUT", "2")
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 2.0
+
+
+def _qdrant_busy_message(cache_dir: Path) -> str:
+    qdrant_path = Path(cache_dir) / "qdrant"
+    return (
+        f"embedded Qdrant index is busy at {qdrant_path}; another recall process "
+        "is using it. Retry shortly, use a separate XDG_CACHE_HOME, or run a "
+        "shared recall/Qdrant service for heavy concurrent agents."
+    )
+
+
+def _acquire_qdrant_process_lock(cache_dir: Path) -> TextIO | None:
+    if fcntl is None:
+        return None
+
+    lock_path = Path(cache_dir) / "qdrant.client.lock"
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_file = lock_path.open("a+", encoding="utf-8")
+    except OSError:
+        return None
+
+    timeout = _qdrant_lock_timeout_seconds()
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return lock_file
+        except BlockingIOError:
+            pass
+        except OSError as exc:
+            if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                lock_file.close()
+                return None
+
+        if time.monotonic() >= deadline:
+            lock_file.close()
+            raise QdrantStoreBusyError(_qdrant_busy_message(cache_dir))
+        time.sleep(min(0.05, max(0.001, deadline - time.monotonic())))
 
 
 def _qdrant_client_singleton(cache_dir: Path) -> QdrantClient:
@@ -52,8 +112,26 @@ def _qdrant_client_singleton(cache_dir: Path) -> QdrantClient:
         if client is None:
             qdrant_path = Path(cache_dir) / "qdrant"
             qdrant_path.mkdir(parents=True, exist_ok=True)
-            client = QdrantClient(path=str(qdrant_path))
+            lock_file = _acquire_qdrant_process_lock(cache_dir)
+            try:
+                client = QdrantClient(path=str(qdrant_path))
+            except Exception as exc:
+                if lock_file is not None:
+                    try:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)  # type: ignore[union-attr]
+                    except OSError:
+                        pass
+                    lock_file.close()
+                if (
+                    isinstance(exc, RuntimeError)
+                    and "already accessed by another instance of Qdrant client"
+                    in str(exc)
+                ):
+                    raise QdrantStoreBusyError(_qdrant_busy_message(cache_dir)) from exc
+                raise
             _clients[key] = client
+            if lock_file is not None:
+                _client_lock_files[key] = lock_file
         return client
 
 
@@ -68,6 +146,25 @@ def _reset_client_cache_for_tests() -> None:
             except Exception:
                 pass
         _clients.clear()
+        for lock_file in _client_lock_files.values():
+            try:
+                if fcntl is not None:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                lock_file.close()
+            except OSError:
+                pass
+        _client_lock_files.clear()
+
+
+def close_client_cache() -> None:
+    """Close embedded-Qdrant clients and release process-level store locks."""
+    _reset_client_cache_for_tests()
+
+
+atexit.register(close_client_cache)
 
 
 def _reset_model_cache_for_tests() -> None:

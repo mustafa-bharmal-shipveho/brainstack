@@ -130,7 +130,7 @@ By design, deferred to v0.x:
    activation. Existing `project_brainstack_pr_checks` rule says manual
    bench is the gate until that's resolved; this PR doesn't change that.
 
-4. **Push when ready**. Branch is `mustafa/runtime-v0`, 19 commits,
+4. **Push when ready**. Branch is `feature/runtime-v0`, 19 commits,
    tagged at every sub-phase boundary.
 
 ## Honest scope

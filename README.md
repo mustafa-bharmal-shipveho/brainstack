@@ -28,7 +28,7 @@ The model gets smarter every release. Your agent only gets smarter if its contex
 **Prereqs:** `git`, Python 3.10+ (for the venv `install.sh` builds), an existing private git remote you control (used as your brain's mirror), and Claude Code if you want the runtime hooks. macOS or Linux.
 
 ```bash
-git clone https://github.com/mustafa-bharmal-shipveho/brainstack.git
+git clone https://github.com/<your-org>/brainstack.git
 cd brainstack
 
 # One-shot install. Creates ~/.agent/, wires it as a git repo with YOUR
@@ -163,7 +163,7 @@ The backfill is idempotent (SHA sidecar at `memory/episodic/digests/_imported.js
 | `theme_cluster.py` | Cluster digests sharing `domain_tags` | Stages theme candidates in `memory/candidates/` for review via `recall pending --review`; graduating one becomes a durable lesson |
 | `proactive_context.py` | Token-overlap + tag-boost search across digests | Returns a `<brain-context>` block for SessionStart-hook injection so new sessions start *with* relevant past work pre-loaded |
 
-PROFILE.md is auto-indexed by recall, so `recall profile` (or any query overlapping with a domain tag) surfaces it.
+PROFILE.md is auto-indexed by recall, so `recall query "profile"` (or any query overlapping with a domain tag) surfaces it.
 
 ### Pluggable LLM providers
 
@@ -173,7 +173,7 @@ Auto-detection picks the first available provider. Pin with `BRAIN_LLM_PROVIDER=
 
 ### Framework purity
 
-No org/employer/domain references in any of the digest code or prompts. The LLM is asked to extract domain tags from the session content itself — never from a fixed taxonomy. Tests use synthetic placeholders. A pre-merge `grep -RIin -E 'veho|cart-location|...'` audit gates against accidental leakage.
+No org/employer/domain references in any of the digest code or prompts. The LLM is asked to extract domain tags from the session content itself — never from a fixed taxonomy. Tests use synthetic placeholders. A pre-merge `grep -RIin -E '<company-name>|<internal-service>|<internal-domain>'` audit gates against accidental leakage.
 
 ---
 
@@ -216,7 +216,7 @@ every tick. To audit on demand:
 
 ## Knowing what to review
 
-The dream cycle clusters episodes into candidate lessons in `~/.agent/memory/candidates/`. Until you triage them (graduate or reject), they sit there silently. Without surfacing, real work piles up: on the maintainer's brain on 2026-05-04, **21 candidates had been pending for 3 days before anyone noticed**.
+The dream cycle clusters episodes into candidate lessons in `~/.agent/memory/candidates/`. Until you triage them (graduate or reject), they sit there silently. Without surfacing, real work piles up: during dogfood testing on 2026-05-04, **21 candidates had been pending for 3 days before anyone noticed**.
 
 Brainstack now generates `~/.agent/PENDING_REVIEW.md` on every dream cycle, sync, graduate, or reject — and surfaces it through three native injection points so you see the count whenever you start a session:
 
@@ -226,7 +226,7 @@ Brainstack now generates `~/.agent/PENDING_REVIEW.md` on every dream cycle, sync
 | Cursor `~/.cursor/.cursorrules` | `./install.sh --setup-cursor-rules` | Cursor injects the rules file on every chat session |
 | Shell wrappers (any AI CLI in `~/.agent/banner/wrapped_tools`) | `./install.sh --setup-shell-banner` | Cat'd to stdout when you launch any of those tools from a terminal |
 
-**Why @-import, not a SessionStart hook?** I tried both — registered a `SessionStart` hook in `~/.claude/settings.json` that emits the JSON envelope `{"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "..."}}`. The hook ran cleanly when invoked manually, but Claude Code's SessionStart contract on this build appears to be telemetry-only (stdout doesn't inject context). The user opened a fresh session twice with the hook registered and saw nothing. Switched to `@`-import — Claude Code's documented session-load mechanism — and it works because it's the same path your existing `~/.claude-org/CLAUDE.md` import takes.
+**Why @-import, not a SessionStart hook?** Dogfood testing tried both. A `SessionStart` hook in `~/.claude/settings.json` emitted the JSON envelope `{"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "..."}}` and ran cleanly when invoked manually, but Claude Code's SessionStart contract on that build appeared to be telemetry-only: stdout did not inject context into fresh sessions. `@`-import uses Claude Code's documented session-load mechanism and reliably loads through the same path as any existing `CLAUDE.md` import.
 
 All three read the same `PENDING_REVIEW.md`. The file is generated locally and gitignored — never synced to your private brain remote.
 
@@ -364,10 +364,6 @@ The concurrency gate runs **20 appenders x 5 rows** while the dream cycle rewrit
 The redaction pipeline test injects fake AWS/Bearer/Edit secrets into captured tool-call JSONL, runs the JSONL scrubber, then runs the scanner. Expected result: **0 literal secrets remain** and `[REDACTED:...]` markers replace them. A plain auto-memory folder usually has no append-concurrency gate and no scrub-then-scan sync gate.
 
 Set-and-forget multi-tool ingest: `./install.sh --setup-auto-migrate` installs a single hourly LaunchAgent that pulls Cursor + Codex CLI sessions in alongside Claude Code's real-time symlink. `--enable`, `--all`, `--dry-run` for non-interactive runs; `--remove-auto-migrate` to tear down. Details: [`docs/dream-cycle.md`](docs/dream-cycle.md), [`docs/git-sync.md`](docs/git-sync.md), [`docs/memory-model.md`](docs/memory-model.md).
-
-Built on top of [codejunkie99/agentic-stack](https://github.com/codejunkie99/agentic-stack) — vendored dream cycle, clustering, lesson rendering. See [`UPSTREAM.md`](UPSTREAM.md).
-
----
 
 ## Retrieval: how you read and edit the brain
 
@@ -527,7 +523,7 @@ Pass `--no-tools` to skip the transcript scan entirely (faster on brains with hu
 
 Every episode now carries two metadata fields:
 
-- **`origin`** (string, auto-defaulted to `"coding.tool_call"` if omitted): where the episode came from. Examples: `coding.tool_call`, `agentry.inbox.action`, `agentry.mustafa-agent.review_decision`. Used by the dream cycle to bucket episodes before clustering — events from different origins cluster separately.
+- **`origin`** (string, auto-defaulted to `"coding.tool_call"` if omitted): where the episode came from. Examples: `coding.tool_call`, `agent.inbox.action`, `agent.reviewer.review_decision`. Used by the dream cycle to bucket episodes before clustering — events from different origins cluster separately.
 - **`summary`** (string): the canonical text used for clustering. The feature extractor reads `summary` first; for legacy episodes lacking it, falls back to `action + reflection + detail` (backward compatible).
 
 ```json
@@ -551,22 +547,22 @@ New `python -m agent.tools.sdk_cli stats` subcommand provides visibility into th
 ```bash
 $ python -m agent.tools.sdk_cli stats --json
 {
-  "namespaces": ["default", "mustafa-agent"],
+  "namespaces": ["default", "reviewer-agent"],
   "episodeCount": 4,
   "lessonCount": 1,
   "candidateCount": 2,
   "perNamespace": {
     "default": {"episodes": 3, "lessons": 1, "candidates": 1},
-    "mustafa-agent": {"episodes": 1, "lessons": 0, "candidates": 1}
+    "reviewer-agent": {"episodes": 1, "lessons": 0, "candidates": 1}
   }
 }
 ```
 
-Supports `--namespace NS` to filter to a single namespace. Human-readable by default; `--json` for machine parsing. Powers the agentry-side `agentry brain stats` CLI (see [`mustafa-agents`](https://github.com/mustafa-bharmal-shipveho/agentry) README v0.3 section).
+Supports `--namespace NS` to filter to a single namespace. Human-readable by default; `--json` for machine parsing. Intended for companion agent runtimes that want a stable stats surface.
 
 ### External consumers (v0.2-rc1+)
 
-External agent frameworks can read and write the brain through `agent/memory/sdk.py` using namespaces. The SDK exposes `append_episodic`, `query_semantic`, `read_policy`, `write_policy`, and `register_clusterer` — each takes a `namespace` arg matching `^[a-z][a-z0-9_-]{0,31}$`. Pluggable per-namespace dream-cycle clusterers live in `agent/dream/registry.py` (`run_all` aggregates results across namespaces). Backward compatibility is preserved: `namespace="default"` maps to the v0.1 paths (no extra subdir under `episodic/`, `semantic/`, `candidates/`), so existing v0.1 brains do not need migration. New CLI flags `--namespace NS` are now available on `graduate.py` / `reject.py`, and two new tools (`promote.py`, `rollback.py`) manage tier policy + audit log per namespace. See [`mustafa-agents`](https://github.com/mustafa-bharmal-shipveho/agentry) (companion repo) for the reference TypeScript runtime that consumes this SDK.
+External agent frameworks can read and write the brain through `agent/memory/sdk.py` using namespaces. The SDK exposes `append_episodic`, `query_semantic`, `read_policy`, `write_policy`, and `register_clusterer` — each takes a `namespace` arg matching `^[a-z][a-z0-9_-]{0,31}$`. Pluggable per-namespace dream-cycle clusterers live in `agent/dream/registry.py` (`run_all` aggregates results across namespaces). Backward compatibility is preserved: `namespace="default"` maps to the v0.1 paths (no extra subdir under `episodic/`, `semantic/`, `candidates/`), so existing v0.1 brains do not need migration. New CLI flags `--namespace NS` are now available on `graduate.py` / `reject.py`, and two new tools (`promote.py`, `rollback.py`) manage tier policy + audit log per namespace.
 
 ---
 
@@ -687,27 +683,8 @@ Throughline: keep the security posture sharp. The framework's value is proportio
 
 ---
 
-<details>
-<summary>How this differs from upstream agentic-stack</summary>
-
-We vendor 20 files from [codejunkie99/agentic-stack](https://github.com/codejunkie99/agentic-stack) verbatim (clustering, decay, lesson rendering — see [`UPSTREAM.md`](UPSTREAM.md)). Different design point:
-
-| | upstream | brainstack |
-|---|---|---|
-| Brain location | per-project `.agent/` | one global `~/.agent/` |
-| Multi-machine | not designed for | `git pull` on session start |
-| Laptop-loss durability | local disk only | mirrored to private git remote |
-| Secret redaction | basic | 5-layer defense |
-| Atomic-write safety | basic | sentinel-locked; verified under stress |
-
-Per-project brains fragment context — you relearn the same lesson 10 times across 10 repos. Global persistence + git sync turns the same engine into a substrate that compounds.
-
-</details>
-
----
-
 ## License
 
-Apache 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE) for upstream attribution.
+Apache 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
 This is personal infrastructure shared as-is. Issues and PRs welcome but no support obligations are implied.

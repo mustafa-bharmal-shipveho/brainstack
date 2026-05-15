@@ -10,7 +10,7 @@ are not done. Resume by running ONE command then deciding.
 
 ## Status
 
-- **Branch:** `mustafa/runtime-v0` of `~/Documents/brainstack/`
+- **Branch:** `feature/runtime-v0` of the brainstack repo
 - **Commits since `main`:** 7 atomic commits, each with `subphase-*` git tag
 - **Brainstack regression:** 581 → 629 tests, all green
 - **Runtime tests added:** 121 across 7 files
@@ -98,7 +98,7 @@ file:
 Each takes 1–3 min. By the time you read this, all three should be done.
 Their outputs are at:
 ```
-/private/tmp/claude-502/-Users-mustafa-bharmal-Documents-codebase/<sess>/tasks/<id>.output
+/private/tmp/claude-502/<session>/tasks/<id>.output
 ```
 The outputs will also be copied into `runtime/_review_outputs/` and committed
 in the final Night-1 commit (sub-phase tagged `night-1-reviews`). If any

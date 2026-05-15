@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local data layer export for the portable agentic-stack brain.
+"""Local data layer export for the portable brainstack brain.
 
 Reads shared `.agent/` memory plus optional local data-layer inputs and writes
 dashboard-ready JSONL, JSON, CSV, a dependency-free HTML dashboard, and a
@@ -799,8 +799,8 @@ th{color:#657286}.scroll{overflow-x:auto}.footer{font-size:12px;color:#657286}
     path.write_text(
         f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>agentic-stack Data Layer Dashboard</title><style>{css}</style></head>
-<body><header><h1>agentic-stack Data Layer Dashboard</h1>
+<title>brainstack Data Layer Dashboard</title><style>{css}</style></head>
+<body><header><h1>brainstack Data Layer Dashboard</h1>
 <p>{html.escape(summary['project'])} - {html.escape(summary['window'])} - bucket: {html.escape(summary['bucket'])} - generated {html.escape(summary['generated_at'])}</p></header>
 <main>
 <section><h2>Resource Overview</h2><div class="grid">{cards}</div></section>
@@ -900,7 +900,7 @@ def build_dashboard_report(args: argparse.Namespace, summary: dict[str, Any]) ->
 
 def write_daily_report(path: Path, summary: dict[str, Any]) -> None:
     path.write_text(
-        f"""# Daily agentic-stack Resource Report
+        f"""# Daily brainstack Resource Report
 
 Generated: {summary['generated_at']}
 
@@ -990,7 +990,7 @@ def render_terminal_dashboard(out_dir: Path, color: bool = False) -> str:
     counts = summary["counts"]
     latest_activity = activity[-1] if activity else {}
     lines = [
-        f"{paint('◇', PURPLE, color)}  {paint('agentic-stack Data Layer', f'{BOLD}{WHITE}', color)}  {paint('Terminal Dashboard', MUTED, color)}",
+        f"{paint('◇', PURPLE, color)}  {paint('brainstack Data Layer', f'{BOLD}{WHITE}', color)}  {paint('Terminal Dashboard', MUTED, color)}",
         rail(color),
         f"{rail(color)}  project={summary['project']} window={summary['window']} bucket={summary['bucket']}",
         f"{rail(color)}  generated={summary['generated_at']}",
@@ -1114,7 +1114,7 @@ def export(args: argparse.Namespace) -> Path:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Export local agentic-stack activity into dashboard-ready data.")
+    parser = argparse.ArgumentParser(description="Export local brainstack activity into dashboard-ready data.")
     parser.add_argument("--agent-root", default=".agent")
     parser.add_argument("--episodic", default="")
     parser.add_argument("--events", default="", help="Optional extra cross-harness event JSONL.")
@@ -1130,7 +1130,7 @@ def main() -> int:
     args = parser.parse_args()
     apply_natural_language_request(args, sys.argv[1:])
     out_dir = export(args)
-    print(f"agentic-stack data layer export: {out_dir}")
+    print(f"brainstack data layer export: {out_dir}")
     print(f"dashboard_html={out_dir / 'dashboard.html'}")
     print()
     print(render_terminal_dashboard(out_dir, color=colored_stdout_enabled()), end="")

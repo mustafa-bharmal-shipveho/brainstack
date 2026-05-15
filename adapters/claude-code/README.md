@@ -54,8 +54,8 @@ at `~/.agent/`, with optional project-level overrides.
 
 ## Project-level override
 
-If you clone a repo that already has its own upstream-`agentic-stack` `.agent/`
-folder with its own hooks, you can prevent double-logging by creating an
+If you clone a repo that already has its own `.agent/` folder with its own
+hooks, you can prevent double-logging by creating an
 override marker in the project root:
 
 ```bash

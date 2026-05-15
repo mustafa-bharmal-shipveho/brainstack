@@ -20,8 +20,8 @@
 
 ### Why
 
-The classifier was Veho-leaning by accident — its patterns described how
-*one organization's* CLAUDE.md routing rules read, not how prompts
+The classifier was org-leaning by accident — its patterns described how
+one organization's CLAUDE.md routing rules read, not how prompts
 actually look in the wild. Any classifier that would work needs an
 org-specific keyword list (internal service names, ticket prefixes,
 etc.), which is wrong for an open-source tool. The right shape is a
@@ -264,7 +264,7 @@ brainstack `~/.agent/memory/` format never drops content.
 
 ## v0.3 — Episode schema unification + stats subcommand (2026-04-29)
 
-The companion [`agentry`](https://github.com/mustafa-bharmal-shipveho/agentry) integration added two writers (coding sessions + agentry's personal-agent surfaces) on the same brain. To keep their lessons distinct without splitting into separate stores, every episode now carries two new fields and the dream cycle clusters within-stream.
+The companion agent-runtime integration added two writers (coding sessions + personal-agent surfaces) on the same brain. To keep their lessons distinct without splitting into separate stores, every episode now carries two new fields and the dream cycle clusters within-stream.
 
 ### `origin` + `summary` fields
 
@@ -296,14 +296,14 @@ Sentinel-locked under `<jsonl>.lock` (matches the dream cycle's contract) so con
 ```bash
 $ python3 -m agent.tools.sdk_cli stats --brain-root ~/.agent
 {
-  "namespaces": ["default", "inbox", "mustafa-agent"],
+  "namespaces": ["default", "inbox", "reviewer-agent"],
   "episodeCount": 3712,
   "lessonCount": 20,
   "candidateCount": 4,
   "perNamespace": {
     "default":       {"episodes": 3700, "lessons": 18, "candidates": 2},
     "inbox":         {"episodes":    8, "lessons":  1, "candidates": 1},
-    "mustafa-agent": {"episodes":    4, "lessons":  1, "candidates": 1}
+    "reviewer-agent": {"episodes":    4, "lessons":  1, "candidates": 1}
   }
 }
 ```
@@ -327,7 +327,7 @@ External agent frameworks can now read and write the brain through `agent/memory
 
 ### Reference consumer
 
-[`agentry`](https://github.com/mustafa-bharmal-shipveho/agentry) (TypeScript runtime) is the end-to-end SDK consumer. Its `MemoryProvider` interface lets users swap brainstack for any other backend without forking.
+A companion TypeScript runtime is the end-to-end SDK consumer. Its `MemoryProvider` interface lets users swap brainstack for any other backend without forking.
 
 ## v0.1.1 — Security hardening (2026-04-27)
 
@@ -460,7 +460,7 @@ caught by the race-atomicity persona):
 ## v0.1.0 — Lean MVP + dashboard (2026-04-26)
 
 - `install.sh` targeting `~/.agent/` globally
-- Vendored dream cycle from upstream agentic-stack v0.11.2
+- Initial dream-cycle pipeline
 - Lessons.jsonl schema extension for `why` / `how_to_apply` fields
 - Clean-room: `redact.py`, `sync.sh`, `migrate.py`,
   `hooks/agentic_post_tool_global.py`
@@ -476,6 +476,6 @@ caught by the race-atomicity persona):
 - Initial repo skeleton: `tools/`, `hooks/`, `adapters/claude-code/`,
   `schemas/`, `templates/`, `docs/`, `tests/`, `examples/`, `memory_seed/`
 - LICENSE (Apache 2.0)
-- NOTICE (attribution to codejunkie99/agentic-stack v0.11.2)
+- NOTICE (third-party attribution)
 - UPSTREAM.md (vendored file inventory, pinned commit, rebase process)
 - README.md (pitch + quickstart placeholder)

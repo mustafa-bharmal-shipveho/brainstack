@@ -58,8 +58,8 @@ If `$CLAUDE_PROJECT_DIR/.agent-local-override` exists (any contents,
 including empty), the global wrapper exits 0 immediately without
 writing anywhere.
 
-Use case: you cloned a repo that already has its own
-upstream-`agentic-stack` `.agent/` folder with project-local hooks.
+Use case: you cloned a repo that already has its own `.agent/` folder
+with project-local hooks.
 You don't want the global hook duplicating work the project's own
 hooks do.
 
@@ -102,7 +102,7 @@ accumulated brain across every project). But:
 
 - Some users want **isolated brains per context** (work vs. personal
   vs. open-source contributions). Mode 2 supports this.
-- Some users **clone repos that already use upstream agentic-stack**.
+- Some users **clone repos that already have project-local agent hooks**.
   Forcing the global brain to also fire would either cause double-logging
   or fight the project's own hook design. Mode 3 cleanly opts out.
 

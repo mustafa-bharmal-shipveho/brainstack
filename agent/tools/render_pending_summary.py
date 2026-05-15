@@ -286,18 +286,15 @@ def compose_summary(
     # Lead with a system-reminder directive that gets the model to
     # SURFACE the pending count to the user in chat. Without this,
     # the @-imported content sits in the model's context window
-    # silently — the user never sees it because system-reminders
-    # don't render in the chat UI. Mustafa 2026-05-04: "still didnt
-    # come up" — third diagnostic round confirmed the data WAS being
+    # silently — the user never sees it because system-reminders don't
+    # render in the chat UI. Dogfood testing confirmed the data WAS being
     # injected, but the model wasn't proactively mentioning it.
     if total > 0:
-        # Terse directive. Three rules baked in based on user feedback:
+        # Terse directive. Three rules baked in based on dogfood feedback:
         #   1. Say exactly "brainstack: N pending - run `recall pending --review`"
-        #      (Mustafa 2026-05-04: "just say to use recall pending --review")
         #   2. Tell the user to run it in THEIR terminal — do NOT run it on
-        #      their behalf (Mustafa 2026-05-05: "i want the users to be
-        #      able to acccept or reject"). The tool refuses to run without
-        #      a TTY anyway, but the directive makes the rule explicit.
+        #      their behalf. The tool refuses to run without a TTY anyway,
+        #      but the directive makes the rule explicit.
         #   3. Never auto-graduate / auto-reject. Each candidate decision
         #      belongs to the user; even an "obvious noise" cluster gets
         #      shown to the user and waits for their choice.

@@ -5,7 +5,7 @@
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │ PUBLIC, SHAREABLE                                               │
-│ github.com/mustafa-bharmal-shipveho/brainstack       │
+│ github.com/<your-org>/brainstack                                │
 │   ├── install.sh, upgrade.sh                                    │
 │   ├── agent/    ←── source of truth for tools + hooks + schemas │
 │   ├── adapters/claude-code/                                     │
@@ -13,8 +13,8 @@
 │   ├── docs/                                                     │
 │   ├── tests/                                                    │
 │   ├── LICENSE  (Apache 2.0)                                     │
-│   ├── NOTICE   (attribution to upstream agentic-stack)          │
-│   └── UPSTREAM.md (vendored file inventory + pinned commit)     │
+│   ├── NOTICE                                                    │
+│   └── UPSTREAM.md                                               │
 │                                                                 │
 │ Anyone can fork, install, run. No personal data lives here.     │
 └─────────────────────────────────────────────────────────────────┘
@@ -88,11 +88,6 @@
 - **Required rationale on graduate AND reject** — preserves decision
   history. Recurring churn is visible (a candidate rejected twice and
   then accepted has all three reasons on record).
-
-- **Vendoring at a pinned commit, not Git submodule** — upstream is on
-  v0.11 and shipping fast. Vendoring lets us pin compatibility and
-  rebase on our schedule, with `tests/test_schema_compat.py` to fail-loud
-  on schema drift. See [`UPSTREAM.md`](../UPSTREAM.md) for the rebase process.
 
 - **Private brain, public framework** — strict separation by repo. The
   installer never edits user settings; manual merge of the Claude Code

@@ -103,6 +103,56 @@ class TestCliReindex:
         result = run_cli(["reindex"], env=_xdg_env(isolated_xdg))
         assert result.returncode == 0
 
+    def test_reindex_reports_embedded_qdrant_lock_without_traceback(
+        self, isolated_xdg, write_config, empty_brain
+    ):
+        pytest.importorskip("fcntl")
+        write_config(
+            sources=[
+                {
+                    "name": "empty",
+                    "path": str(empty_brain),
+                    "glob": "**/*.md",
+                    "frontmatter": "optional",
+                    "exclude": [],
+                }
+            ]
+        )
+        cache_dir = isolated_xdg / "xdg-cache" / "recall"
+        lock_path = cache_dir / "qdrant.client.lock"
+        holder_code = (
+            "import fcntl, pathlib, time\n"
+            f"p = pathlib.Path({str(lock_path)!r})\n"
+            "p.parent.mkdir(parents=True, exist_ok=True)\n"
+            "f = p.open('w')\n"
+            "fcntl.flock(f.fileno(), fcntl.LOCK_EX)\n"
+            "print('ready', flush=True)\n"
+            "time.sleep(30)\n"
+        )
+        holder = subprocess.Popen(
+            [sys.executable, "-c", holder_code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert holder.stdout is not None
+            assert holder.stdout.readline().strip() == "ready"
+            env = _xdg_env(isolated_xdg)
+            env["RECALL_QDRANT_LOCK_TIMEOUT"] = "0"
+            result = run_cli(["reindex"], env=env)
+            combined = result.stdout + result.stderr
+            assert result.returncode == 1
+            assert "embedded Qdrant index is busy" in combined
+            assert "Traceback" not in combined
+        finally:
+            holder.terminate()
+            try:
+                holder.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                holder.kill()
+                holder.wait(timeout=5)
+
 
 class TestCliQuery:
     def test_query_returns_json(self, isolated_xdg, write_config, auto_memory_brain):

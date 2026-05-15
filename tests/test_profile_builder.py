@@ -319,7 +319,7 @@ class TestFrameworkPurity:
         domain, or stack — the profile should reflect what's in the
         DIGESTS, not a pre-baked taxonomy."""
         system = profile_mod.SYSTEM_PROMPT
-        forbidden = ["veho", "shipveho", "anthropic.com", "openai.com"]
+        forbidden = ["example-corp", "internal.example", "vendor.example"]
         lower = system.lower()
         for f in forbidden:
             assert f not in lower, f"system prompt contains {f!r}"

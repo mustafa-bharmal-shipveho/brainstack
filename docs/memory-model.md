@@ -66,8 +66,8 @@ is a derived view rendered by `render_lessons.py`. Schema:
 ```
 
 The last three fields (`why`, `how_to_apply`, `original_markdown_path`)
-are brainstack extensions to upstream's schema. Backward
-compatible: when absent, rendering matches upstream exactly.
+are brainstack extensions. Backward compatible: older rows without these
+fields render normally.
 
 `semantic/lessons/<filename>.md` holds the long-form companion markdown
 preserved verbatim from the source feedback file. Use it when you need

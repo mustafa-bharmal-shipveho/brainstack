@@ -3,7 +3,7 @@
 #
 # Sourced from ~/.zshrc / ~/.bashrc. Defines wrapper functions for any
 # AI-CLI binary on $PATH so each one prints ~/.agent/PENDING_REVIEW.md
-# before exec'ing the real tool. Design goal (Mustafa 2026-05-04):
+# before exec'ing the real tool. Dogfood design goal:
 # **framework, not point-solution.** Adding a new LLM is a config-line
 # edit, not a code change.
 #

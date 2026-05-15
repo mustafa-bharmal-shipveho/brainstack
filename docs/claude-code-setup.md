@@ -5,7 +5,7 @@ Step-by-step wiring of the brain into your Claude Code config.
 ## 1. Install the brain
 
 ```bash
-git clone https://github.com/mustafa-bharmal-shipveho/brainstack.git
+git clone https://github.com/<your-org>/brainstack.git
 cd brainstack
 ./install.sh
 ```

@@ -59,3 +59,33 @@ def test_mcp_query_returns_json_compatible(
     import json
 
     json.dumps(result)
+
+
+def test_mcp_query_releases_embedded_qdrant_lock(
+    isolated_xdg, write_config, auto_memory_brain
+):
+    fcntl = pytest.importorskip("fcntl")
+    write_config(
+        sources=[
+            {
+                "name": "brain",
+                "path": str(auto_memory_brain),
+                "glob": "**/*.md",
+                "frontmatter": "auto-memory",
+                "exclude": [],
+            }
+        ]
+    )
+    from recall.config import cache_dir
+    from recall.mcp_server import recall_query_handler
+    from recall.qdrant_backend import _client_lock_files
+
+    result = recall_query_handler(query="atomic write crash safety", k=3)
+    assert isinstance(result, list)
+    assert _client_lock_files == {}
+
+    lock_path = cache_dir() / "qdrant.client.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)

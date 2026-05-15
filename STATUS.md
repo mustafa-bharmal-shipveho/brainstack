@@ -1,11 +1,11 @@
 # STATUS
 
-Long autonomous run on `mustafa/runtime-v0`. v0.2 context runtime — DONE.
+Long autonomous run on `feature/runtime-v0`. v0.2 context runtime — DONE.
 
 ## Current state
 
 - **State:** GREEN-3-FINAL
-- **Branch:** `mustafa/runtime-v0` (24 commits ahead of `main`)
+- **Branch:** `feature/runtime-v0` (24 commits ahead of `main`)
 - **Last commit:** `89f7142 runtime(reviews-phase6): SUMMARY of final Phase 6 reviews + applied fixes`
 - **Last tag:** `night-3-final`
 - **PR draft:** `runtime/_review_outputs/PR_DRAFT.md` (ready to push)
@@ -89,7 +89,7 @@ night-3-final          ← here (24 commits, 233 runtime tests, all reviews addr
 
 3. **Optional: real-session smoke test**. Install hooks via `recall runtime install-hooks`, run a normal Claude Code session, then `recall runtime ls` and `recall runtime replay`. Capture a real `--diff` showing a live "Claude forgot X" moment — that replaces the synthetic demo block in the README.
 
-4. **Push when ready**. Branch is clean, 24 atomic commits, every sub-phase tagged. `git push origin mustafa/runtime-v0`.
+4. **Push when ready**. Branch is clean, 24 atomic commits, every sub-phase tagged. `git push origin feature/runtime-v0`.
 
 ## Honest scope (final)
 

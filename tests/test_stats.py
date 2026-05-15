@@ -55,14 +55,14 @@ def test_stats_aggregates_default_namespace(tmp_path):
 def test_stats_walks_multiple_namespaces(tmp_path):
     _seed_jsonl(tmp_path / "memory" / "episodic" / "AGENT_LEARNINGS.jsonl", 3)
     _seed_jsonl(tmp_path / "memory" / "episodic" / "inbox" / "AGENT_LEARNINGS.jsonl", 7)
-    _seed_jsonl(tmp_path / "memory" / "episodic" / "mustafa-agent" / "AGENT_LEARNINGS.jsonl", 2)
+    _seed_jsonl(tmp_path / "memory" / "episodic" / "reviewer-agent" / "AGENT_LEARNINGS.jsonl", 2)
     r = _run_cli(tmp_path)
     assert r.returncode == 0
     out = json.loads(r.stdout)
-    assert set(out["namespaces"]) >= {"default", "inbox", "mustafa-agent"}
+    assert set(out["namespaces"]) >= {"default", "inbox", "reviewer-agent"}
     assert out["episodeCount"] == 12  # 3 + 7 + 2
     assert out["perNamespace"]["inbox"]["episodes"] == 7
-    assert out["perNamespace"]["mustafa-agent"]["episodes"] == 2
+    assert out["perNamespace"]["reviewer-agent"]["episodes"] == 2
 
 
 def test_stats_restricted_to_one_namespace(tmp_path):

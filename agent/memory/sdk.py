@@ -366,7 +366,7 @@ def stats(
 
     Shape:
       {
-        "namespaces": ["default", "inbox", "mustafa-agent"],
+        "namespaces": ["default", "inbox", "reviewer-agent"],
         "episodeCount": 3712,
         "lessonCount": 20,
         "candidateCount": 4,
