@@ -1,6 +1,54 @@
 # Changelog
 
-## Unreleased — routing-coverage classifier removal (2026-05-06)
+## v0.4.0 — 2026-05-15
+
+First internally-shareable cut. Bundles five previously-unreleased work
+streams (~98 commits since v0.1.0), the security/concurrency hardening
+from PRs #40–#43, and the README + operational-notes split from PR #45.
+Subsections below preserve the per-stream context in chronological
+order (newest first).
+
+### Hardening (this release, 2026-05-15)
+
+- **Identity scrub for internal sharing** (#43). Removed personal /
+  employer / internal-service strings from docs, comments, and test
+  fixtures. Generic placeholders only (`<your-org>`, `example-corp`,
+  `reviewer-agent`). `NOTICE` retains legitimate upstream attribution
+  to `codejunkie99/agentic-stack`; README's new `## Provenance` section
+  surfaces the relationship from the front door.
+- **Embedded-Qdrant concurrency hardening** (#43). New
+  `QdrantStoreBusyError` / `QdrantStoreAccessError` classes with
+  actionable messages; process-level fcntl lock with configurable
+  timeout (`RECALL_QDRANT_LOCK_TIMEOUT`, default 2s); no-traceback CLI
+  exit on busy/unwritable cache; per-cache-dir threading lock so
+  concurrent opens for different caches don't block each other;
+  Windows (no fcntl) emits a one-time `RuntimeWarning` so the silent
+  degradation becomes audible. MCP handler retains the singleton
+  across requests (regression test enforces it).
+- **Banner / triage / review-queue share a single "pending"
+  definition** (#42). `review_state.list_candidates` is now the
+  canonical reader; banner and triage delegate. New
+  `find_misplaced_candidates` surfaces non-staged files at the top of
+  `candidates/` as a `⚠️ N misplaced` warning, replacing silent
+  inflation of pending counts.
+- **README rewrite + operational-notes companion** (#45). README 713
+  → 246 lines, restructured into 11 user-facing sections plus
+  `docs/operational-notes.md` (7 sections of contributor / operator
+  context). CONTRIBUTING points contributors at the new doc instead
+  of the README.
+- **Sync hardening** (#40). `sync.sh` excludes the `Privacy` and
+  `NpmToken` Trufflehog detectors (UUID false positives that blocked
+  pushes for days). `redact.py` ignores digest-filename shapes in
+  entropy sweeps. Defense-in-depth: AKIA-style keys still caught.
+- **systemic $BRAIN_ROOT resolution in recall** (#38). `recall
+  reindex` no longer silently indexes 0 documents when `$BRAIN_ROOT`
+  isn't exported. `resolve_source_path` falls back via
+  `resolve_brain_home`.
+- **Surface LLM provider failures in consolidation** (#39).
+  `provider_unavailable` recorded in `_error_counts` so silent
+  `ProviderNotAvailable` crashes are visible.
+
+### Routing-coverage classifier removal (2026-05-06)
 
 ### Removed (breaking)
 
@@ -32,7 +80,7 @@ open-source tool to ship without.
 The raw MCP-call counts (`mcp_calls`, `tool_calls_other`) are unchanged
 and remain useful as-is.
 
-## Unreleased — v0.4.0 brain edits from the CLI (2026-05-01)
+### Brain edits from the CLI (2026-05-01)
 
 The two missing commands brainstack always needed:
 
@@ -60,7 +108,7 @@ surface — `runtime add/evict` for the session, `remember/forget` for the
 forever — uses the same natural-query phrasing. No more cryptic ids, no
 editor-required brain edits.
 
-## Unreleased — v0.2.0 context runtime (2026-05-01)
+### Context runtime (2026-05-01)
 
 The runtime layer. brainstack is now storage + retrieval + runtime — the
 only memory project shipping all three layers as one tool-agnostic stack.
@@ -151,7 +199,7 @@ README and `docs/runtime.md` first 200 words.
 
 ---
 
-## Unreleased — Multi-tool migration series (2026-04-30)
+### Multi-tool migration series (2026-04-30)
 
 Five PRs (#6 → #10) shipped together, turning brainstack from "Claude Code
 only" into a multi-tool brain that ingests Claude Code, Cursor plans, and
@@ -207,7 +255,7 @@ Codex CLI sessions automatically.
 - 23 tests for the auto-migrate path with mocked `launchctl`. Total
   test count: 269 → 292.
 
-## Unreleased — Lossless native-dir migration (2026-04-29)
+### Lossless native-dir migration (2026-04-29)
 
 Closes 4 documented losslessness gaps in `agent/tools/migrate.py` + `install.sh`
 so that migrating a Claude Code / Cursor native auto-memory directory into the
