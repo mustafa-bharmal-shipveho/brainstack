@@ -13,7 +13,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import NoReturn, Optional
 
 import typer
 
@@ -69,7 +69,9 @@ def _load_or_build(cfg: Config) -> tuple[Optional[object], bool]:
 _serialize = serialize_results  # backwards-compat alias inside the module
 
 
-def _exit_qdrant_store_error(exc: QdrantStoreAccessError | QdrantStoreBusyError) -> None:
+def _exit_qdrant_store_error(
+    exc: QdrantStoreAccessError | QdrantStoreBusyError,
+) -> NoReturn:
     typer.echo(str(exc), err=True)
     raise typer.Exit(code=1)
 

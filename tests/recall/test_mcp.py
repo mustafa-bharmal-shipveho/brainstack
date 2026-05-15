@@ -61,10 +61,19 @@ def test_mcp_query_returns_json_compatible(
     json.dumps(result)
 
 
-def test_mcp_query_releases_embedded_qdrant_lock(
+def test_mcp_handler_reuses_embedded_qdrant_client_across_requests(
     isolated_xdg, write_config, auto_memory_brain
 ):
-    fcntl = pytest.importorskip("fcntl")
+    """The MCP server is long-lived; tearing down the embedded-Qdrant
+    client between requests defeats the singleton's whole purpose
+    (amortized RocksDB open + index scan). Two back-to-back handler
+    calls MUST share the same client object.
+
+    Regression test for the staff-review finding that an earlier
+    version of `recall_query_handler` called `close_client_cache()` in
+    a `finally` block after every request.
+    """
+    pytest.importorskip("fcntl")
     write_config(
         sources=[
             {
@@ -76,16 +85,24 @@ def test_mcp_query_releases_embedded_qdrant_lock(
             }
         ]
     )
-    from recall.config import cache_dir
     from recall.mcp_server import recall_query_handler
-    from recall.qdrant_backend import _client_lock_files
+    from recall.qdrant_backend import _clients, _client_lock_files
 
-    result = recall_query_handler(query="atomic write crash safety", k=3)
-    assert isinstance(result, list)
-    assert _client_lock_files == {}
+    # First call materializes the client and holds the process lock.
+    result1 = recall_query_handler(query="atomic write crash safety", k=3)
+    assert isinstance(result1, list)
+    clients_after_first = dict(_clients)
+    locks_after_first = dict(_client_lock_files)
+    assert clients_after_first, "expected at least one cached QdrantClient after a query"
 
-    lock_path = cache_dir() / "qdrant.client.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    # Second call must REUSE — identity must match, locks must persist.
+    result2 = recall_query_handler(query="lessons", k=3)
+    assert isinstance(result2, list)
+    for key, client in _clients.items():
+        assert client is clients_after_first.get(key), (
+            "MCP handler reopened the embedded-Qdrant client between requests "
+            "— singleton optimization regressed"
+        )
+    assert dict(_client_lock_files) == locks_after_first, (
+        "MCP handler released the process-level Qdrant lock between requests"
+    )

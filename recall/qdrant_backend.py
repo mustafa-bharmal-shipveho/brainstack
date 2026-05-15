@@ -10,16 +10,38 @@ from __future__ import annotations
 import atexit
 import errno
 import os
+import sys
 import threading
 import time
 import uuid
+import warnings
 from pathlib import Path
-from typing import Optional, Sequence, TextIO
+from typing import NoReturn, Optional, Sequence, TextIO
 
 try:  # pragma: no cover - fcntl is unavailable on Windows.
     import fcntl
 except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
+
+# Embedded Qdrant + Windows is unsafe in concurrent use: without fcntl the
+# process-level lock is a no-op, and two recall processes can corrupt the
+# embedded store. Warn once on import so silent degradation is audible.
+_FCNTL_WARN_ONCE = threading.Event()
+
+
+def _warn_no_process_lock_once() -> None:
+    if _FCNTL_WARN_ONCE.is_set() or fcntl is not None:
+        return
+    _FCNTL_WARN_ONCE.set()
+    warnings.warn(
+        "recall: fcntl unavailable on this platform (sys.platform="
+        f"{sys.platform!r}); embedded-Qdrant process-level locking is "
+        "DISABLED. Concurrent recall processes can corrupt the cache. "
+        "Set XDG_CACHE_HOME to a unique directory per process, or run "
+        "Qdrant server-mode.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
 
 from qdrant_client import QdrantClient, models
 
@@ -42,6 +64,22 @@ _RERANK_OVERSAMPLE = 20  # candidates fed to the reranker before truncating to k
 _client_lock = threading.Lock()
 _clients: dict[str, QdrantClient] = {}
 _client_lock_files: dict[str, TextIO] = {}
+
+# Per-cache-dir lock: serializes opens for a single cache_dir within this
+# process WITHOUT holding the global `_client_lock` across slow filesystem
+# work (the fcntl wait can take up to RECALL_QDRANT_LOCK_TIMEOUT seconds).
+# Two threads opening DIFFERENT cache_dirs no longer block each other.
+_per_key_lock_guard = threading.Lock()
+_per_key_locks: dict[str, threading.Lock] = {}
+
+
+def _lock_for_key(key: str) -> threading.Lock:
+    with _per_key_lock_guard:
+        lk = _per_key_locks.get(key)
+        if lk is None:
+            lk = threading.Lock()
+            _per_key_locks[key] = lk
+        return lk
 
 _embedder_lock = threading.Lock()
 _dense_embedders: dict[str, object] = {}
@@ -85,6 +123,7 @@ def _qdrant_access_message(cache_dir: Path, exc: OSError) -> str:
 
 def _acquire_qdrant_process_lock(cache_dir: Path) -> TextIO | None:
     if fcntl is None:
+        _warn_no_process_lock_once()
         return None
 
     lock_path = Path(cache_dir) / "qdrant.client.lock"
@@ -113,55 +152,106 @@ def _acquire_qdrant_process_lock(cache_dir: Path) -> TextIO | None:
         time.sleep(min(0.05, max(0.001, deadline - time.monotonic())))
 
 
+def _release_lock_file(lock_file: Optional[TextIO]) -> None:
+    if lock_file is None:
+        return
+    try:
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        lock_file.close()
+    except OSError:
+        pass
+
+
 def _qdrant_client_singleton(cache_dir: Path) -> QdrantClient:
     """One QdrantClient per cache directory.
 
     Embedded Qdrant takes a directory lock — opening twice in one process raises.
     Cache by absolute path so tests with isolated_xdg get fresh clients per tmp dir.
+
+    Locking strategy:
+      - _client_lock guards only the _clients dict, never held across slow I/O.
+      - _lock_for_key(key) serializes opens for THIS cache_dir; threads opening
+        a different cache_dir don't block here.
+      - fcntl process-lock + QdrantClient construction happen under the
+        per-key lock only, so an unrelated query for a different cache is not
+        blocked behind a 2-second fcntl wait.
     """
     key = str(Path(cache_dir).resolve())
+
+    # Fast path: client already exists.
     with _client_lock:
         client = _clients.get(key)
-        if client is None:
-            qdrant_path = Path(cache_dir) / "qdrant"
-            try:
-                qdrant_path.mkdir(parents=True, exist_ok=True)
-            except OSError as exc:
-                raise QdrantStoreAccessError(_qdrant_access_message(cache_dir, exc)) from exc
-            lock_file = _acquire_qdrant_process_lock(cache_dir)
-            try:
-                client = QdrantClient(path=str(qdrant_path))
-            except OSError as exc:
-                if lock_file is not None:
-                    try:
-                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)  # type: ignore[union-attr]
-                    except OSError:
-                        pass
-                    lock_file.close()
-                raise QdrantStoreAccessError(_qdrant_access_message(cache_dir, exc)) from exc
-            except Exception as exc:
-                if lock_file is not None:
-                    try:
-                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)  # type: ignore[union-attr]
-                    except OSError:
-                        pass
-                    lock_file.close()
-                if (
-                    isinstance(exc, RuntimeError)
-                    and "already accessed by another instance of Qdrant client"
-                    in str(exc)
-                ):
-                    raise QdrantStoreBusyError(_qdrant_busy_message(cache_dir)) from exc
-                raise
-            _clients[key] = client
+    if client is not None:
+        return client
+
+    # Slow path under the per-key lock. Double-check after acquire (another
+    # thread for the SAME key may have constructed the client while we
+    # waited).
+    with _lock_for_key(key):
+        with _client_lock:
+            client = _clients.get(key)
+        if client is not None:
+            return client
+
+        qdrant_path = Path(cache_dir) / "qdrant"
+        try:
+            qdrant_path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise QdrantStoreAccessError(_qdrant_access_message(cache_dir, exc)) from exc
+
+        lock_file = _acquire_qdrant_process_lock(cache_dir)
+        try:
+            new_client = QdrantClient(path=str(qdrant_path))
+        except OSError as exc:
+            _release_lock_file(lock_file)
+            raise QdrantStoreAccessError(_qdrant_access_message(cache_dir, exc)) from exc
+        except Exception as exc:
+            _release_lock_file(lock_file)
+            # qdrant-client raises a RuntimeError with this message when the
+            # embedded store is already opened by another QdrantClient (any
+            # process or thread). Confirmed against qdrant-client>=1.13
+            # (pyproject pin). If the upstream wording shifts in a minor
+            # release, this fallback returns the original error unchanged
+            # rather than mis-classifying it.
+            if (
+                isinstance(exc, RuntimeError)
+                and "already accessed by another instance of Qdrant client"
+                in str(exc)
+            ):
+                raise QdrantStoreBusyError(_qdrant_busy_message(cache_dir)) from exc
+            raise
+
+        # Register. If two threads on different per-key locks somehow raced
+        # (shouldn't happen with the per-key lock above, but be defensive)
+        # the loser closes and returns the winner's client.
+        with _client_lock:
+            existing = _clients.get(key)
+            if existing is not None:
+                _release_lock_file(lock_file)
+                try:
+                    new_client.close()
+                except Exception:
+                    pass
+                return existing
+            _clients[key] = new_client
             if lock_file is not None:
                 _client_lock_files[key] = lock_file
-        return client
+        return new_client
 
 
 def _reset_client_cache_for_tests() -> None:
     """Test hook: drop client handles so tmp-dir embedded DBs get garbage collected
     and the file lock is released between tests.
+
+    Note: the FastEmbed model caches (_dense_embedders, _sparse_embedders,
+    _cross_encoders) are intentionally NOT cleared here. Model load is the
+    expensive part (hundreds of MB + GPU init); we keep them alive across
+    client teardowns so the next query doesn't pay reload cost. Use
+    `_reset_model_cache_for_tests` to drop those too.
     """
     with _client_lock:
         for c in _clients.values():
@@ -171,20 +261,18 @@ def _reset_client_cache_for_tests() -> None:
                 pass
         _clients.clear()
         for lock_file in _client_lock_files.values():
-            try:
-                if fcntl is not None:
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
-            try:
-                lock_file.close()
-            except OSError:
-                pass
+            _release_lock_file(lock_file)
         _client_lock_files.clear()
 
 
 def close_client_cache() -> None:
-    """Close embedded-Qdrant clients and release process-level store locks."""
+    """Close embedded-Qdrant clients and release process-level store locks.
+
+    Suitable for CLI exit (registered via atexit). NOT suitable to call
+    after every MCP request — the MCP server is long-lived and the
+    singleton exists precisely to amortize embedded-Qdrant open cost
+    across many queries. See recall/mcp_server.py.
+    """
     _reset_client_cache_for_tests()
 
 

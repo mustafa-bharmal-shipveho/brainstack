@@ -13,7 +13,6 @@ from typing import Optional
 from recall.config import load_config
 from recall.core import HybridRetriever
 from recall.index import build_index, load_index, needs_refresh
-from recall.qdrant_backend import close_client_cache
 from recall.serialize import serialize_results
 
 
@@ -23,26 +22,30 @@ def recall_query_handler(
     source: Optional[str] = None,
     type: Optional[str] = None,
 ) -> list[dict]:
-    """The handler dispatched to by the MCP tool. Pure Python, no MCP deps."""
-    try:
-        cfg = load_config()
-        fresh = needs_refresh(cfg.sources)
-        cache = build_index(cfg.sources) if fresh else load_index(cfg.sources)
-        if cache is None or not cache.documents:
-            return []
-        retriever = HybridRetriever(
-            documents=cache.documents if fresh else None,
-            collections=[s.name for s in cfg.sources],
-            embedder=cfg.ranking.embedder,
-            sparse_embedder=cfg.ranking.sparse_embedder,
-            reranker=cfg.ranking.reranker,
-            reranker_model=cfg.ranking.reranker_model,
-            rerank_n=cfg.ranking.rerank_n,
-        )
-        results = retriever.query(query, k=k, type_filter=type, source_filter=source)
-        return serialize_results(results)
-    finally:
-        close_client_cache()
+    """The handler dispatched to by the MCP tool. Pure Python, no MCP deps.
+
+    Does NOT close the embedded-Qdrant client between requests. The MCP
+    server is long-lived; tearing down the QdrantClient after every query
+    defeats the whole point of `_qdrant_client_singleton` (amortized
+    RocksDB open + index scan). Cleanup happens on server shutdown via
+    `qdrant_backend.close_client_cache`'s atexit registration.
+    """
+    cfg = load_config()
+    fresh = needs_refresh(cfg.sources)
+    cache = build_index(cfg.sources) if fresh else load_index(cfg.sources)
+    if cache is None or not cache.documents:
+        return []
+    retriever = HybridRetriever(
+        documents=cache.documents if fresh else None,
+        collections=[s.name for s in cfg.sources],
+        embedder=cfg.ranking.embedder,
+        sparse_embedder=cfg.ranking.sparse_embedder,
+        reranker=cfg.ranking.reranker,
+        reranker_model=cfg.ranking.reranker_model,
+        rerank_n=cfg.ranking.rerank_n,
+    )
+    results = retriever.query(query, k=k, type_filter=type, source_filter=source)
+    return serialize_results(results)
 
 
 def build_server():
