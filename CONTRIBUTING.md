@@ -73,7 +73,9 @@ rm -rf /tmp/brain-sandbox
   framework's history has examples (`tests/test_concurrent_appends.py`,
   `tests/test_redact_jsonl_fuzz.py`).
 - **Docs:** if you change behavior the user sees, update the relevant
-  file in `docs/`.
+  file in `docs/`. For design rationale and operator history, prefer
+  [`docs/operational-notes.md`](docs/operational-notes.md) over making
+  the README longer.
 - **No PII:** the framework must not contain real names, employer
   identifiers, internal URLs, or other PII even in test fixtures.
   Use placeholders (`Acme`, `<your-org>`, `Alice`, etc.). The test
