@@ -159,6 +159,60 @@ class TestRenderPendingSummary:
         counts = rps.count_pending_per_namespace(tmp_path)
         assert counts["default"] == 1
 
+    def test_count_delegates_to_review_state_list_candidates(self, tmp_path: Path):
+        """The banner count and `review_state.list_candidates(status="staged")`
+        MUST return the same set of candidates — that's the framework
+        invariant. If they ever disagree, banner says "N pending" while
+        triage shows a different number (or REVIEW_QUEUE.md does)."""
+        rps = self._import()
+        # Mixed states: 2 staged, 1 accepted, 1 rejected, 1 corrupt
+        staged_a = _make_candidate("a")
+        staged_b = _make_candidate("b")
+        accepted = _make_candidate("c"); accepted["status"] = "accepted"
+        rejected = _make_candidate("d"); rejected["status"] = "rejected"
+        _seed_candidates(tmp_path, "default",
+                         [staged_a, staged_b, accepted, rejected])
+        (tmp_path / "memory" / "candidates" / "corrupt.json").write_text("not json")
+
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent / "agent" / "memory"))
+        import review_state
+        canonical = review_state.list_candidates(
+            str(tmp_path / "memory" / "candidates"), status="staged"
+        )
+        banner_count = rps.count_pending_per_namespace(tmp_path)["default"]
+
+        assert banner_count == len(canonical) == 2, (
+            f"banner={banner_count}, canonical={len(canonical)} — these must agree"
+        )
+
+    def test_misplaced_count_surfaces_non_staged_at_top(self, tmp_path: Path):
+        """A non-staged file at the top is a leak (interrupted mark_* move,
+        external tool, or backup restore). The banner should surface it as
+        a warning instead of silently inflating pending counts."""
+        rps = self._import()
+        staged = _make_candidate("s1")
+        accepted = _make_candidate("a1"); accepted["status"] = "accepted"
+        rejected = _make_candidate("r1"); rejected["status"] = "rejected"
+        _seed_candidates(tmp_path, "default", [staged, accepted, rejected])
+
+        misplaced = rps.count_misplaced_per_namespace(tmp_path)
+        assert misplaced["default"] == 2
+
+    def test_misplaced_warning_appears_in_banner(self, tmp_path: Path):
+        """When misplaced files exist, the banner body MUST include the
+        `Misplaced` section so the user sees the leak — even when pending
+        count is zero, drift is fine, and sync is ok (i.e. the leak alone
+        breaks the all-clear state)."""
+        rps = self._import()
+        accepted = _make_candidate("a1"); accepted["status"] = "accepted"
+        _seed_candidates(tmp_path, "default", [accepted])
+
+        body = rps.compose_summary(tmp_path, drift_report=None, sync_status="ok")
+        assert "all clear" not in body, "leak must break the all-clear path"
+        assert "Misplaced" in body
+        assert "1 misplaced" in body
+
     def test_noise_filter_rejects_tmp_evidence(self):
         """Cluster with all evidence_ids referencing /tmp/ is brainstack's own
         test infra noise (Codex 2026-05-04 finding). Must be filtered."""
