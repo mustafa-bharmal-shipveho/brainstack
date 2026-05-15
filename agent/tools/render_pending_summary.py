@@ -128,9 +128,28 @@ def _is_noise_cluster(candidate: dict) -> bool:
 # ---------- counting --------------------------------------------------
 
 
+def _is_staged(path: Path) -> bool:
+    """True iff the candidate JSON exists, parses, and has `status == "staged"`.
+
+    The banner count MUST match what `recall pending --review` triages.
+    `triage_candidates.py:67` filters `status == "staged"`; mid-lifecycle
+    states (`provisional`, `accepted`, `rejected`, `superseded`) plus
+    unparseable files are skipped there, so we skip them here too. Without
+    this filter, an interrupted `mark_graduated` / `mark_rejected` move
+    leaves a non-staged file at the top level, inflating the banner to
+    "brainstack: N pending" while triage reports "no staged candidates".
+    """
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(data, dict) and data.get("status") == "staged"
+
+
 def count_pending_per_namespace(brain_root: Path) -> dict[str, int]:
-    """Count `*.json` files DIRECTLY under each namespace's candidates dir.
-    Excludes `graduated/` and `rejected/` archive subdirs.
+    """Count staged candidate `*.json` files DIRECTLY under each namespace's
+    candidates dir. Excludes `graduated/` and `rejected/` archive subdirs,
+    AND non-staged files (see `_is_staged`).
 
     Namespaces tracked:
       - default          → <brain>/memory/candidates/*.json
@@ -141,10 +160,10 @@ def count_pending_per_namespace(brain_root: Path) -> dict[str, int]:
     candidates_root = brain_root / "memory" / "candidates"
     if not candidates_root.is_dir():
         return counts
-    # default = top-level *.json (non-recursive; excludes graduated/, rejected/)
     try:
         counts["default"] = sum(
-            1 for p in candidates_root.glob("*.json") if p.is_file()
+            1 for p in candidates_root.glob("*.json")
+            if p.is_file() and _is_staged(p)
         )
     except OSError:
         pass
@@ -154,7 +173,8 @@ def count_pending_per_namespace(brain_root: Path) -> dict[str, int]:
             continue
         try:
             counts[ns] = sum(
-                1 for p in ns_dir.glob("*.json") if p.is_file()
+                1 for p in ns_dir.glob("*.json")
+                if p.is_file() and _is_staged(p)
             )
         except OSError:
             pass
