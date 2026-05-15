@@ -180,7 +180,14 @@ TH_EXCLUDE="$BRAIN_ROOT/.trufflehog-exclude.txt"
 
 case "$SCANNER" in
     trufflehog)
-        TH_ARGS=(filesystem . --no-update --fail)
+        # `Privacy` and `NpmToken` detectors pattern-match UUIDs
+        # (including the UUIDv7s brainstack itself emits for session and
+        # event ids), producing zero verified hits but constant
+        # unverified false positives that block sync.sh for days. Disable
+        # them. The structural detectors (AnthropicKey, SlackToken,
+        # OpenAIKey, AWS, Stripe, GitHub, …) remain active.
+        TH_ARGS=(filesystem . --no-update --fail
+                 --exclude-detectors Privacy,NpmToken)
         [ -f "$TH_EXCLUDE" ] && TH_ARGS+=(--exclude-paths "$TH_EXCLUDE")
         if ! trufflehog "${TH_ARGS[@]}" >/dev/null 2>>"$LOG_FILE"; then
             echo "$(date -u +%FT%TZ) sync: trufflehog flagged secrets; refusing to push" >> "$LOG_FILE"
