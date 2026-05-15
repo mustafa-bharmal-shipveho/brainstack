@@ -1,6 +1,13 @@
 # brainstack
 
-**A persistent, git-synced brain for your AI coding agent — with a runtime that records, budgets, and replays what enters your agent's context each turn.**
+**A model-independent, git-synced brain for AI coding agents. Keep the same
+memory when you switch between Claude Code, Codex CLI, Cursor, or any
+MCP-capable tool.**
+
+Brainstack is not another assistant and it is not tied to one model vendor. It
+is a local memory substrate: plain files under `~/.agent/`, portable recall via
+CLI/MCP, human-gated promotion, and a runtime that records, budgets, and replays
+what enters your agent's context each turn.
 
 The core question brainstack measures is simple:
 
