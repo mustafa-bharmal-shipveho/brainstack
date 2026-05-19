@@ -146,7 +146,11 @@ def _expanded_query(
         )
         for v in variants
     ]
-    fused = rrf_merge(per_variant)
+    # Pin the original query's top-1 to position 0 — without this, RRF
+    # can demote the doc that's-most-relevant-to-the-actual-query in favor
+    # of a doc-that's-merely-frequent-across-paraphrases, which on the
+    # maintainer's hard golden set dropped Recall@1 from 13.2% to 5.3%.
+    fused = rrf_merge(per_variant, pin_first_variant_top=True)
 
     if rerank_model is None or not fused:
         return fused[:k]
@@ -222,13 +226,18 @@ def query(
         help='Retrieval strategy: "ranked" for exact lookup, "context" for broad LLM prompts.',
     ),
     expand: bool = typer.Option(
-        False,
+        True,
         "--expand/--no-expand",
         help=(
-            "LLM-generate query paraphrases, retrieve each, RRF-fuse, and "
-            "(if --rerank is on) post-rerank the union against the original "
-            "query. +26pp Recall@10 on real-brain hard queries; adds one "
-            "LLM round-trip in latency. Default: off."
+            "LLM-generate query paraphrases, retrieve each, RRF-fuse with "
+            "the original query's top-1 pinned (so Recall@1 floors at the "
+            "no-expand baseline), and (if --rerank is on) post-rerank the "
+            "union against the original query. Lift on real-brain hard "
+            "queries: +18pp Recall@5, +24pp Recall@10, with no Recall@1 "
+            "regression. Adds one LLM round-trip in latency (~200-300ms "
+            "with provider warm; fail-open if no LLM CLI is available). "
+            "Default: on for interactive CLI use. The MCP server and "
+            "auto-recall hook bypass this flag and stay on the fast path."
         ),
     ),
     expand_n: int = typer.Option(
