@@ -58,9 +58,13 @@ def main():
                     help="Cap number of query variants used (1 = no expansion).")
     ap.add_argument(
         "--merge",
-        choices=["best-rank", "rrf"],
+        choices=["best-rank", "rrf", "rrf-pinned"],
         default="best-rank",
-        help="How to merge per-variant results. rrf=Reciprocal Rank Fusion (k=60).",
+        help=(
+            "How to merge per-variant results. rrf=Reciprocal Rank Fusion "
+            "(k=60). rrf-pinned=RRF but force the FIRST variant's top-1 to "
+            "position 0 (caps Recall@1 floor at the original query's value)."
+        ),
     )
     ap.add_argument(
         "--post-rerank",
@@ -146,6 +150,22 @@ def main():
                     path_to_score[p] = path_to_score.get(p, 0.0) + 1.0 / (K_RRF + rank)
             union_sorted = sorted(path_to_score.items(), key=lambda kv: kv[1], reverse=True)
             union_paths = [p for p, _ in union_sorted]
+        elif args.merge == "rrf-pinned":
+            # RRF, but force the FIRST variant's top-1 to position 0.
+            # Caps the Recall@1 floor at the original query's baseline.
+            K_RRF = 60
+            path_to_score: dict[str, float] = {}
+            for results in per_variant:
+                for rank, r in enumerate(results, start=1):
+                    p = r.document.path
+                    path_to_score[p] = path_to_score.get(p, 0.0) + 1.0 / (K_RRF + rank)
+            union_sorted = sorted(path_to_score.items(), key=lambda kv: kv[1], reverse=True)
+            union_paths = [p for p, _ in union_sorted]
+            if per_variant and per_variant[0]:
+                anchor = per_variant[0][0].document.path
+                if union_paths and union_paths[0] != anchor and anchor in union_paths:
+                    union_paths.remove(anchor)
+                    union_paths.insert(0, anchor)
         else:
             raise SystemExit(f"unknown merge: {args.merge}")
 

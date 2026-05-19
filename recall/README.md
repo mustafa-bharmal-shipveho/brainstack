@@ -77,31 +77,45 @@ prompt into focused subqueries, gives each intent a coverage slot, dedupes, and
 then fills the remaining slots. Auto-recall and MCP use context strategy by
 default because they feed LLM context, not a human search results page.
 
-### `--expand` for hard semantic queries
+### `--expand` for hard semantic queries (on by default for CLI)
 
 When the user phrases a question with vocabulary the target doc doesn't use
 (e.g. "look over what I've been touching" → doc titled "reviewed-X-changes"),
-hybrid retrieval alone misses. `--expand` asks the configured LLM provider
-(via the brainstack provider registry; see `agent/tools/llm_providers/`) for N
-paraphrases, retrieves each one separately, fuses the ranked lists with
-Reciprocal Rank Fusion (k=60), and (if `--rerank cross_encoder` is on) reranks
-the union against the original query.
+hybrid retrieval alone misses. `--expand` (the CLI default) asks the
+configured LLM provider (via the brainstack provider registry; see
+`agent/tools/llm_providers/`) for N paraphrases, retrieves each one
+separately, RRF-fuses the ranked lists with the **original query's top-1
+pinned to position 0**, and (if `--rerank cross_encoder` is on) reranks the
+union against the original query.
 
-Empirical lift on a 38-query LLM-paraphrased hard set against a 744-doc real
-brain:
+The "pinned" merge is what makes default-on safe: pure RRF can demote the
+doc that's most relevant to the actual user query in favor of a doc that
+just appears frequently across paraphrases. Pinning floors `Recall@1` at
+the no-expand baseline — you never lose top-1 quality by enabling `--expand`,
+you only gain `Recall@5/@10` lift.
+
+The MCP server (`recall-mcp`) and the Claude Code auto-recall hook bypass
+this flag — they call internals directly and stay on the fast no-expand
+path (sub-50ms per call, no LLM round-trip).
+
+Empirical lift on a 38-query LLM-paraphrased hard set against a real
+745-doc brain:
 
 | Config | Recall@1 | Recall@5 | Recall@10 | NDCG@10 | p50 |
 |---|---|---|---|---|---|
-| Baseline (no expand, no rerank) | 13.2% | 36.8% | 44.7% | 26.0% | 24 ms |
-| `--expand` only (RRF fusion) | 5.3% | 52.6% | **68.4%** | 36.8% | 130 ms |
-| `--expand` + `--rerank cross_encoder` | 15.8% | 50.0% | 68.4% | 39.2% | 951 ms |
-| `--expand` + bge-reranker-base post-rerank | 26.3% | 47.4% | 63.2% | 42.1% | 2.5 s |
-| `--expand` + jina-v2-base post-rerank | 26.3% | 63.2% | 78.9% | **50.1%** | 30 s |
+| Baseline (`--no-expand`) | 10.5% | 36.8% | 44.7% | 25.0% | 33 ms |
+| `--expand` (RRF + pinned, default) | **10.5%** | **55.3%** | **68.4%** | **36.7%** | 134 ms |
+| `--expand --rerank cross_encoder` | 15.8% | 50.0% | 68.4% | 39.2% | 951 ms |
+| `--expand --rerank-model BAAI/bge-reranker-base` | 26.3% | 47.4% | 63.2% | 42.1% | 2.5 s |
+| `--expand --rerank-model jinaai/jina-reranker-v2-base-multilingual` | 26.3% | **63.2%** | **78.9%** | **50.1%** | 30 s |
 
 The expansion is cached per (query, n, provider) within the process, so
 sessions that repeat a query don't pay the LLM round-trip twice. On any
 provider failure (timeout, missing CLI, network) `--expand` falls back to the
 original query alone — no hard error.
+
+`--no-expand` keeps the historical baseline path (24-33 ms p50, no LLM
+dependency) for callers that need it.
 
 ### `--rerank-model` for precision tiers
 

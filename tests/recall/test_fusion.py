@@ -87,3 +87,55 @@ class TestRRFMerge:
         assert [r.document.path for r in out_k0] == ["a", "b", "c"]
         # k=0 yields 1.0 for rank 1 vs 0.0164 for k=60
         assert abs(out_k0[0].score - 1.0) < 1e-9
+
+
+class TestPinFirstVariantTop:
+    """Pinning the first variant's top-1 to position 0 floors Recall@1 at
+    the original query's baseline. Without this, a doc that's rank 3 across
+    many paraphrases can outrank the doc that's rank 1 for the actual
+    user query, and Recall@1 regresses."""
+
+    def test_pin_overrides_rrf_winner(self):
+        # Doc "b" is rank 2 in both lists → pure RRF makes it #1.
+        # With pin_first_variant_top, doc "a" (first list's #1) wins.
+        out = rrf_merge(
+            [
+                [_qr("a"), _qr("b"), _qr("c")],
+                [_qr("d"), _qr("b"), _qr("e")],
+            ],
+            pin_first_variant_top=True,
+        )
+        paths = [r.document.path for r in out]
+        assert paths[0] == "a", f"first variant's top-1 must pin to position 0; got {paths}"
+        # The rest of the union is still present (just demoted)
+        assert set(paths) == {"a", "b", "c", "d", "e"}
+
+    def test_pin_no_op_when_anchor_already_first(self):
+        # If the RRF winner IS already the first variant's top-1, pin is
+        # a no-op. The output ordering shouldn't change.
+        out_default = rrf_merge([[_qr("a"), _qr("b")], [_qr("a"), _qr("c")]])
+        out_pinned = rrf_merge(
+            [[_qr("a"), _qr("b")], [_qr("a"), _qr("c")]],
+            pin_first_variant_top=True,
+        )
+        assert [r.document.path for r in out_default] == [r.document.path for r in out_pinned]
+        assert out_pinned[0].document.path == "a"
+
+    def test_pin_empty_first_variant_is_safe(self):
+        # If the first variant returned no results, there's nothing to
+        # pin — fall back to standard RRF.
+        out = rrf_merge(
+            [[], [_qr("a"), _qr("b")]],
+            pin_first_variant_top=True,
+        )
+        assert [r.document.path for r in out] == ["a", "b"]
+
+    def test_pin_anchor_missing_from_fused_does_not_crash(self):
+        # Pathological case: anchor doc is in first variant only AND gets
+        # somehow filtered out before RRF. (Won't happen in practice but
+        # defensive.) The loop should exit cleanly without crashing.
+        out = rrf_merge(
+            [[_qr("a")], [_qr("b"), _qr("c")]],
+            pin_first_variant_top=True,
+        )
+        assert "a" in [r.document.path for r in out]
