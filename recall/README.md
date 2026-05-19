@@ -103,6 +103,35 @@ sessions that repeat a query don't pay the LLM round-trip twice. On any
 provider failure (timeout, missing CLI, network) `--expand` falls back to the
 original query alone — no hard error.
 
+### `--rerank-model` for precision tiers
+
+`--rerank cross_encoder` defaults to `jinaai/jina-reranker-v1-turbo-en` (small,
+fast). Two bigger options trade latency for accuracy on hard queries; pin per
+query with `--rerank-model`:
+
+```bash
+# Default tier — fast (~1s p50 with rerank, ~130ms without)
+recall query --expand --rerank cross_encoder "..."
+
+# Precision tier — +9pp NDCG@10, ~2.5s p50, 1GB local model download
+recall query --expand --rerank cross_encoder --rerank-model BAAI/bge-reranker-base "..."
+
+# Oracle tier — +17pp NDCG@10 (50.1% on the hard set, industry-comparable),
+# ~30s p50 on CPU. Suitable for batch / dream-cycle use, not interactive.
+recall query --expand --rerank cross_encoder \
+    --rerank-model jinaai/jina-reranker-v2-base-multilingual "..."
+```
+
+Equivalent persistent setting in `~/.config/recall/config.json`:
+
+```json
+"ranking": {
+  "reranker": "cross_encoder",
+  "reranker_model": "BAAI/bge-reranker-base",
+  ...
+}
+```
+
 Use `--expand` when:
 
 - The query is semantic / question-shaped, not a keyword lookup

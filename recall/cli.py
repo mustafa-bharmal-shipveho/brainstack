@@ -195,6 +195,16 @@ def query(
         "--rerank",
         help='Override reranker: "cross_encoder" | "none". Default = config value.',
     ),
+    rerank_model: str = typer.Option(
+        None,
+        "--rerank-model",
+        help=(
+            "Override the cross-encoder model (requires --rerank cross_encoder). "
+            "Examples: jinaai/jina-reranker-v1-turbo-en (small, fast, default), "
+            "BAAI/bge-reranker-base (1GB, +9pp NDCG vs default), "
+            "jinaai/jina-reranker-v2-base-multilingual (1.1GB, +17pp NDCG, 30s on CPU)."
+        ),
+    ),
     strategy: str = typer.Option(
         "ranked",
         "--strategy",
@@ -228,13 +238,14 @@ def query(
             raise typer.Exit(code=0)
 
         effective_reranker = rerank if rerank is not None else cfg.ranking.reranker
+        effective_rerank_model = rerank_model if rerank_model is not None else cfg.ranking.reranker_model
         retriever = HybridRetriever(
             documents=cache.documents if fresh else None,
             collections=[s.name for s in cfg.sources],
             embedder=cfg.ranking.embedder,
             sparse_embedder=cfg.ranking.sparse_embedder,
             reranker=effective_reranker,
-            reranker_model=cfg.ranking.reranker_model,
+            reranker_model=effective_rerank_model,
             rerank_n=cfg.ranking.rerank_n,
         )
 
@@ -250,7 +261,7 @@ def query(
                 strategy=strategy,
                 type_filter=type,
                 source_filter=source,
-                rerank_model=cfg.ranking.reranker_model if effective_reranker == "cross_encoder" else None,
+                rerank_model=effective_rerank_model if effective_reranker == "cross_encoder" else None,
             )
         else:
             results = _query_results(
