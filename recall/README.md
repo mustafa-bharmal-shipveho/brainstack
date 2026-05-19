@@ -48,34 +48,96 @@ See `tests/recall/BENCH_RESULTS.md` for the full per-strategy table. Headline:
 
 "Lexical" = the query shares key tokens with the target's frontmatter
 `description`. "Paraphrase" = it doesn't (e.g., "what runs when I
-`kubectl apply`" vs. a memory titled `kubernetes-pods`). The remaining
-paraphrase-recall gap on small corpora and outlier queries is expected to
-close with the v0.3 cross-encoder reranker (see roadmap).
+`kubectl apply`" vs. a memory titled `kubernetes-pods`). Use `recall eval`
+against your own private cases before changing retrieval defaults; rerankers
+can help targeted semantic queries while hurting broad workflow prompts.
 
 ## CLI
 
 ```
 recall query "..."                  Top-K results as JSON
+recall query --strategy context "..."  Balanced context for broad prompts
+recall query --expand "..."         LLM-expand the query for hard semantic prompts
 recall query --source brain "..."   Filter to a specific source
 recall query --type feedback "..."  Filter by frontmatter type
 recall query --k 10 "..."           Custom result count
 recall reindex                      Rebuild ranking caches
+recall eval cases.jsonl --strategy context --k 5  Measure a retrieval strategy
 recall sources                      List configured sources
 recall doctor                       Diagnose missing deps / broken paths
 ```
 
-`query`, `reindex`, `sources`, and `doctor` (without subflags) are read-only.
-They never modify configured brain files; `query` and `reindex` may update the
-local retrieval cache under `$XDG_CACHE_HOME/recall`.
+`query`, `reindex`, `eval`, `sources`, and `doctor` (without subflags) are
+read-only. They never modify configured brain files; `query`, `reindex`, and
+`eval` may update the local retrieval cache under `$XDG_CACHE_HOME/recall`.
+
+`recall query` defaults to `--strategy ranked`: one ranked list for exact
+lookup. Use `--strategy context` for broad agent prompts; it decomposes the
+prompt into focused subqueries, gives each intent a coverage slot, dedupes, and
+then fills the remaining slots. Auto-recall and MCP use context strategy by
+default because they feed LLM context, not a human search results page.
+
+### `--expand` for hard semantic queries
+
+When the user phrases a question with vocabulary the target doc doesn't use
+(e.g. "look over what I've been touching" → doc titled "reviewed-X-changes"),
+hybrid retrieval alone misses. `--expand` asks the configured LLM provider
+(via the brainstack provider registry; see `agent/tools/llm_providers/`) for N
+paraphrases, retrieves each one separately, fuses the ranked lists with
+Reciprocal Rank Fusion (k=60), and (if `--rerank cross_encoder` is on) reranks
+the union against the original query.
+
+Empirical lift on a 38-query LLM-paraphrased hard set against a 744-doc real
+brain:
+
+| Config | Recall@1 | Recall@5 | Recall@10 | NDCG@10 | p50 |
+|---|---|---|---|---|---|
+| Baseline (no expand, no rerank) | 13.2% | 36.8% | 44.7% | 26.0% | 24 ms |
+| `--expand` only (RRF fusion) | 5.3% | 52.6% | **68.4%** | 36.8% | 130 ms |
+| `--expand` + `--rerank cross_encoder` | 15.8% | 50.0% | 68.4% | 39.2% | 951 ms |
+| `--expand` + bge-reranker-base post-rerank | 26.3% | 47.4% | 63.2% | 42.1% | 2.5 s |
+| `--expand` + jina-v2-base post-rerank | 26.3% | 63.2% | 78.9% | **50.1%** | 30 s |
+
+The expansion is cached per (query, n, provider) within the process, so
+sessions that repeat a query don't pay the LLM round-trip twice. On any
+provider failure (timeout, missing CLI, network) `--expand` falls back to the
+original query alone — no hard error.
+
+Use `--expand` when:
+
+- The query is semantic / question-shaped, not a keyword lookup
+- The brain has hand-written content where authors and querier might use
+  different vocabulary (digests, lessons, plans)
+- You can pay one LLM call worth of latency per query
+
+Skip `--expand` when:
+
+- The query already shares vocabulary with the target (project names, exact
+  symbol names, file paths)
+- You need sub-200ms p50 (the LLM call adds latency)
+- You're in a no-network / no-LLM-CLI environment
+
+`recall eval` reads JSONL cases:
+
+```json
+{"query":"crash safe file writes","expected":{"name":"atomic-writes"},"kind":"lexical"}
+{"query":"avoid surprise package upgrades","expected":{"path":"semantic/lessons/pin-dependencies.md"}}
+{"query":"incident response runbook","expected":{"any_of":["rollback-runbook","incident-runbook"]}}
+{"query":"setup safety and branch protection","expected":{"all_of":[{"any_of":["setup-backup","migration-backup"]},{"name":"branch-protection"}]},"kind":"broad"}
+```
+
+It prints a JSON summary with `recall_at_1`, `recall_at_k`, `mrr`, group
+coverage for broad prompts, misses, and latency. Use `--details results.jsonl`
+for per-case results.
 
 Embedded Qdrant uses a local filesystem lock. Short-lived CLI calls wait up to
 2 seconds by default; override with `RECALL_QDRANT_LOCK_TIMEOUT=<seconds>` if
 your machine needs a different tradeoff.
 
-Long-lived entrypoints such as `recall-mcp` release the embedded client after
-each request, so multiple agents can share the same cache for occasional
-lookups. Heavy concurrent retrieval should use a shared recall/Qdrant service
-or separate `XDG_CACHE_HOME` values.
+Long-lived entrypoints such as `recall-mcp` keep one embedded client open for
+warm queries. Separate recall processes still contend on the embedded Qdrant
+filesystem lock; heavy concurrent retrieval should use a shared recall/Qdrant
+service or separate `XDG_CACHE_HOME` values.
 
 ## MCP server
 
@@ -158,7 +220,7 @@ recall/
 ├── config.py          # XDG paths, BRAIN_ROOT/BRAIN_HOME resolution, RankingConfig
 ├── sources.py         # file discovery, glob, exclude, symlink containment
 ├── qdrant_backend.py  # Qdrant embedded client + FastEmbed dense/sparse models
-├── core.py            # HybridRetriever facade (delegates to qdrant_backend)
+├── core.py            # HybridRetriever facade + context strategy
 ├── index.py           # build_index / load_index / needs_refresh (delegates)
 ├── migrate.py         # two-layer-backup migration plan + verify + rollback
 ├── serialize.py       # JSON-safe coercion (YAML dates → ISO strings)
@@ -173,13 +235,18 @@ Retrieval pipeline at query time:
 2. Qdrant `Prefetch` runs both legs against the per-source collection (top-20 each).
 3. `Fusion.RRF` fuses the two ranked lists. Type/source filters are applied as
    Qdrant payload conditions inside the prefetch.
-4. **Cross-encoder rerank** (opt-in): pass `--rerank cross_encoder` or set
+4. **Context strategy** (LLM-facing): for broad prompts, decompose into focused
+   subqueries, retrieve each one, reserve coverage slots, dedupe, and then fill
+   by fused rank. CLI exact lookup stays on ranked strategy unless you pass
+   `--strategy context`.
+5. **Cross-encoder rerank** (opt-in): pass `--rerank cross_encoder` or set
    `"reranker": "cross_encoder"` in config.json to enable a third stage that
    scores `(query, doc)` pairs together via `jinaai/jina-reranker-v1-turbo-en`.
-   Adds ~250-470 ms per query. Real-brain testing showed mixed results — it
+   Adds hundreds of milliseconds to about a second per query, depending on
+   cache warmth and candidate count. Real-brain testing showed mixed results:
    helps when the query has clear semantic intent but can push correct answers
    out of top-3 when the bi-encoder already had a good ranking. Default off.
-5. Final top-K returned as JSON. Results are deserialized from each point's
+6. Final top-K returned as JSON. Results are deserialized from each point's
    payload back into `Document` + `QueryResult` shapes.
 
 Storage at `$XDG_CACHE_HOME/recall/qdrant/` (embedded mode, no daemon, no Docker).

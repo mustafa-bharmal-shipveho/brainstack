@@ -20,7 +20,6 @@ import typer
 from recall import __version__
 from recall.config import (
     Config,
-    SourceConfig,
     cache_dir,
     config_path,
     load_config,
@@ -76,6 +75,115 @@ def _exit_qdrant_store_error(
     raise typer.Exit(code=1)
 
 
+def _query_results(
+    retriever: HybridRetriever,
+    query: str,
+    *,
+    k: int,
+    strategy: str,
+    type_filter: Optional[str] = None,
+    source_filter: Optional[str] = None,
+):
+    if strategy == "ranked":
+        return retriever.query(
+            query,
+            k=k,
+            type_filter=type_filter,
+            source_filter=source_filter,
+        )
+    if strategy == "context":
+        return retriever.query_context(
+            query,
+            k=k,
+            type_filter=type_filter,
+            source_filter=source_filter,
+        )
+    raise ValueError('strategy must be "ranked" or "context"')
+
+
+def _expanded_query(
+    retriever: HybridRetriever,
+    query: str,
+    *,
+    k: int,
+    expand_n: int,
+    strategy: str,
+    type_filter: Optional[str] = None,
+    source_filter: Optional[str] = None,
+    rerank_model: Optional[str] = None,
+    per_variant_k: int = 10,
+):
+    """Query expansion + RRF fusion + optional post-hoc rerank on union.
+
+    Empirical sweet spot (real-brain hard queries, see
+    tests/recall/eval_expansion.py):
+
+      - per_variant_k=10: enough to surface the right doc most of the time
+        without diluting the reranker with low-quality candidates
+      - 4 variants total (original + expand_n=3)
+      - RRF (k=60) merge across variants
+      - Post-hoc rerank with cross-encoder if rerank is enabled
+
+    When `rerank_model` is None (rerank=off), the union is returned by
+    RRF score ordering. When set, the cross-encoder rescoreself the union
+    against the ORIGINAL query and we return its top-k.
+    """
+    from recall.expand import expand_query
+    from recall.fusion import rrf_merge
+
+    variants = expand_query(query, n=expand_n)
+    per_variant = [
+        _query_results(
+            retriever,
+            v,
+            k=per_variant_k,
+            strategy=strategy,
+            type_filter=type_filter,
+            source_filter=source_filter,
+        )
+        for v in variants
+    ]
+    fused = rrf_merge(per_variant)
+
+    if rerank_model is None or not fused:
+        return fused[:k]
+
+    # Post-hoc rerank the entire union against the ORIGINAL query (not the
+    # paraphrases) — the user asked the original, that's what we judge against.
+    from recall import qdrant_backend
+    encoder = qdrant_backend._get_cross_encoder(rerank_model)
+    texts = [qr.document.text for qr in fused]
+    scores = list(encoder.rerank(query, texts))
+    reranked = sorted(zip(fused, scores), key=lambda pair: pair[1], reverse=True)
+    from recall.core import QueryResult
+    return [
+        QueryResult(document=qr.document, score=float(s))
+        for qr, s in reranked[:k]
+    ]
+
+
+class _StrategyRetriever:
+    def __init__(self, retriever: HybridRetriever, strategy: str):
+        self._retriever = retriever
+        self._strategy = strategy
+
+    def query(
+        self,
+        query: str,
+        k: int,
+        type_filter: Optional[str] = None,
+        source_filter: Optional[str] = None,
+    ):
+        return _query_results(
+            self._retriever,
+            query,
+            k=k,
+            strategy=self._strategy,
+            type_filter=type_filter,
+            source_filter=source_filter,
+        )
+
+
 @app.command()
 def query(
     text: list[str] = typer.Argument(..., help="Query terms"),
@@ -87,18 +195,38 @@ def query(
         "--rerank",
         help='Override reranker: "cross_encoder" | "none". Default = config value.',
     ),
+    strategy: str = typer.Option(
+        "ranked",
+        "--strategy",
+        help='Retrieval strategy: "ranked" for exact lookup, "context" for broad LLM prompts.',
+    ),
+    expand: bool = typer.Option(
+        False,
+        "--expand/--no-expand",
+        help=(
+            "LLM-generate query paraphrases, retrieve each, RRF-fuse, and "
+            "(if --rerank is on) post-rerank the union against the original "
+            "query. +26pp Recall@10 on real-brain hard queries; adds one "
+            "LLM round-trip in latency. Default: off."
+        ),
+    ),
+    expand_n: int = typer.Option(
+        3,
+        "--expand-n",
+        help="Number of paraphrases to generate when --expand is on.",
+    ),
 ):
     """Search the brain for memories relevant to QUERY. Outputs JSON."""
     try:
+        if strategy not in {"ranked", "context"}:
+            typer.echo('recall query: --strategy must be "ranked" or "context"', err=True)
+            raise typer.Exit(code=2)
         cfg = load_config()
         cache, fresh = _load_or_build(cfg)
         if cache is None or not cache.documents:
             typer.echo("[]")
             raise typer.Exit(code=0)
 
-        # If we just rebuilt, pass docs in to be upserted (idempotent thanks to
-        # uuid5(path) point ids). If the index is up to date, skip the embedding
-        # step and let HybridRetriever query the existing collection directly.
         effective_reranker = rerank if rerank is not None else cfg.ranking.reranker
         retriever = HybridRetriever(
             documents=cache.documents if fresh else None,
@@ -112,12 +240,27 @@ def query(
 
         query_str = " ".join(text)
         effective_k = k if k is not None else cfg.default_k
-        results = retriever.query(
-            query_str,
-            k=effective_k,
-            type_filter=type,
-            source_filter=source,
-        )
+
+        if expand:
+            results = _expanded_query(
+                retriever,
+                query_str,
+                k=effective_k,
+                expand_n=expand_n,
+                strategy=strategy,
+                type_filter=type,
+                source_filter=source,
+                rerank_model=cfg.ranking.reranker_model if effective_reranker == "cross_encoder" else None,
+            )
+        else:
+            results = _query_results(
+                retriever,
+                query_str,
+                k=effective_k,
+                strategy=strategy,
+                type_filter=type,
+                source_filter=source,
+            )
         typer.echo(json.dumps(_serialize(results), indent=2))
     except (QdrantStoreAccessError, QdrantStoreBusyError) as exc:
         _exit_qdrant_store_error(exc)
@@ -134,6 +277,74 @@ def reindex():
         typer.echo(
             f"Indexed {len(cache.documents)} documents across {len(cfg.sources)} source(s)."
         )
+    except (QdrantStoreAccessError, QdrantStoreBusyError) as exc:
+        _exit_qdrant_store_error(exc)
+    finally:
+        close_client_cache()
+
+
+@app.command("eval")
+def eval_command(
+    cases_file: Path = typer.Argument(..., help="JSONL eval cases."),
+    k: int = typer.Option(5, "--k", "-k", help="Number of retrieval results per query."),
+    details: Optional[Path] = typer.Option(
+        None,
+        "--details",
+        help="Optional path to write per-case JSONL results.",
+    ),
+    human: bool = typer.Option(
+        False,
+        "--human",
+        help="Print a human-readable report instead of JSON.",
+    ),
+    rerank: str = typer.Option(
+        None,
+        "--rerank",
+        help='Override reranker: "cross_encoder" | "none". Default = config value.',
+    ),
+    strategy: str = typer.Option(
+        "ranked",
+        "--strategy",
+        help='Retrieval strategy under test: "ranked" or "context".',
+    ),
+):
+    """Evaluate retrieval against a private JSONL query set."""
+    try:
+        from recall.eval import load_eval_cases, render_human, run_eval, write_details
+
+        if k < 5:
+            typer.echo("recall eval: --k must be >= 5", err=True)
+            raise typer.Exit(code=2)
+        if strategy not in {"ranked", "context"}:
+            typer.echo('recall eval: --strategy must be "ranked" or "context"', err=True)
+            raise typer.Exit(code=2)
+        cases = load_eval_cases(cases_file)
+        cfg = load_config()
+        cache, fresh = _load_or_build(cfg)
+        if cache is None or not cache.documents:
+            typer.echo("recall eval: index has no documents; run `recall reindex`", err=True)
+            raise typer.Exit(code=1)
+
+        effective_reranker = rerank if rerank is not None else cfg.ranking.reranker
+        retriever = HybridRetriever(
+            documents=cache.documents if fresh else None,
+            collections=[s.name for s in cfg.sources],
+            embedder=cfg.ranking.embedder,
+            sparse_embedder=cfg.ranking.sparse_embedder,
+            reranker=effective_reranker,
+            reranker_model=cfg.ranking.reranker_model,
+            rerank_n=max(cfg.ranking.rerank_n, k),
+        )
+        report = run_eval(_StrategyRetriever(retriever, strategy), cases, k=k)
+        if details is not None:
+            write_details(details, report.results)
+        if human:
+            typer.echo(render_human(report))
+        else:
+            typer.echo(json.dumps(report.to_dict(), indent=2))
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from None
     except (QdrantStoreAccessError, QdrantStoreBusyError) as exc:
         _exit_qdrant_store_error(exc)
     finally:
@@ -278,8 +489,9 @@ def doctor():
 
     # Required deps for retrieval (Qdrant + FastEmbed)
     try:
-        import qdrant_client  # noqa: F401
         from importlib.metadata import version as _ver
+
+        import qdrant_client  # noqa: F401
         try:
             qver = _ver("qdrant-client")
         except Exception:
