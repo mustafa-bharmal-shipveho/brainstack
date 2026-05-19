@@ -94,6 +94,17 @@ class TestExpandQuery:
         # Only the genuinely-different paraphrase survives
         assert out == ["original", "different"]
 
+    def test_dedupes_repeated_paraphrases(self):
+        # If the LLM returns the same paraphrase twice (or with different
+        # whitespace / casing), we should only retrieve it once. Each duplicate
+        # in the variant list = one wasted retriever call.
+        stub = _StubProvider(["alt one", "Alt One", "  alt one  ", "alt two"])
+        with _patch_provider(stub):
+            out = expand_module.expand_query("original", n=4)
+        # Expect: original + "alt one" + "alt two" (3 entries), Alt One and
+        # whitespace-variants collapsed.
+        assert out == ["original", "alt one", "alt two"]
+
     def test_invalid_json_returns_original_only(self):
         """If the provider returns un-parseable JSON, expand should fail open."""
 

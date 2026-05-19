@@ -112,6 +112,7 @@ def _expanded_query(
     source_filter: Optional[str] = None,
     rerank_model: Optional[str] = None,
     per_variant_k: int = 10,
+    rerank_cap: int = 20,
 ):
     """Query expansion + RRF fusion + optional post-hoc rerank on union.
 
@@ -125,8 +126,10 @@ def _expanded_query(
       - Post-hoc rerank with cross-encoder if rerank is enabled
 
     When `rerank_model` is None (rerank=off), the union is returned by
-    RRF score ordering. When set, the cross-encoder rescoreself the union
-    against the ORIGINAL query and we return its top-k.
+    RRF score ordering. When set, the cross-encoder rescores up to
+    `rerank_cap` of the top-ranked union members against the ORIGINAL query
+    and we return its top-k. Capping matters on the jina-v2 path where
+    reranking the whole 40-doc union pushes p50 from ~1s to 30s on CPU.
     """
     from recall.expand import expand_query
     from recall.fusion import rrf_merge
@@ -148,14 +151,22 @@ def _expanded_query(
     if rerank_model is None or not fused:
         return fused[:k]
 
-    # Post-hoc rerank the entire union against the ORIGINAL query (not the
-    # paraphrases) — the user asked the original, that's what we judge against.
+    # Post-hoc rerank against the ORIGINAL query (not the paraphrases) —
+    # the user asked the original, that's what we judge against.
+    #
+    # Truncate the union to `rerank_cap` candidates first. With 4 variants
+    # x per_variant_k=10 the union is up to ~40 docs; cross-encoders scale
+    # linearly with the candidate count, and the jina-v2 path takes ~30s
+    # for the full 40 on CPU. The RRF-top 20 capture the right doc in
+    # practice (empirically Recall@10 = 71% for the un-reranked top-10).
     from recall import qdrant_backend
-    encoder = qdrant_backend._get_cross_encoder(rerank_model)
-    texts = [qr.document.text for qr in fused]
-    scores = list(encoder.rerank(query, texts))
-    reranked = sorted(zip(fused, scores), key=lambda pair: pair[1], reverse=True)
     from recall.core import QueryResult
+
+    candidates = fused[:rerank_cap]
+    encoder = qdrant_backend._get_cross_encoder(rerank_model)
+    texts = [qr.document.text for qr in candidates]
+    scores = list(encoder.rerank(query, texts))
+    reranked = sorted(zip(candidates, scores), key=lambda pair: pair[1], reverse=True)
     return [
         QueryResult(document=qr.document, score=float(s))
         for qr, s in reranked[:k]

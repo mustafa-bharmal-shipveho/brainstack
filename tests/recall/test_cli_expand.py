@@ -150,6 +150,44 @@ class TestExpandedQueryIntegration:
             f"results should be sorted by rerank score desc, got {scores}"
         )
 
+    def test_rerank_cap_truncates_union_before_cross_encoder(self):
+        """The post-hoc rerank caps the union it scores to keep the
+        jina-v2 path from going from ~1s to 30s on a 40-doc union."""
+        # 4 variants × 10 distinct docs each = 40 union docs.
+        by_query = {}
+        for i, q in enumerate([
+            "original",
+            "alt-1-of-original",
+            "alt-2-of-original",
+            "alt-3-of-original",
+        ]):
+            by_query[q] = [f"doc-{i}-{j}" for j in range(10)]
+        retriever = _FakeRetriever(by_query=by_query)
+
+        fake_encoder = MagicMock()
+        fake_encoder.rerank.side_effect = lambda q, texts: [float(i) for i in range(len(texts))]
+
+        with patch.object(cli_mod, "_query_results", side_effect=lambda r, q, **kw: r.query(q, k=kw.get("k", 10))), \
+             patch("recall.expand.expand_query", side_effect=_stub_expand), \
+             patch("recall.qdrant_backend._get_cross_encoder", return_value=fake_encoder):
+            cli_mod._expanded_query(
+                retriever,
+                "original",
+                k=3,
+                expand_n=3,
+                strategy="ranked",
+                rerank_model="any/model",
+                rerank_cap=20,
+            )
+
+        # Verify the encoder saw AT MOST `rerank_cap=20` texts, not the full
+        # 40-doc union.
+        texts_passed = fake_encoder.rerank.call_args.args[1]
+        assert len(texts_passed) <= 20, (
+            f"rerank_cap=20 should truncate to <=20 candidates, "
+            f"got {len(texts_passed)}"
+        )
+
     def test_empty_retriever_returns_empty(self):
         """No docs available → empty result, no crash."""
         retriever = _FakeRetriever(by_query={})
