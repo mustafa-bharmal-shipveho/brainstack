@@ -92,10 +92,22 @@ def _cached_expand(query: str, n: int, provider_name: Optional[str]) -> tuple[st
         return (query,)
 
     # Always include the original as variant #0 (priority preserved by RRF).
+    # Dedupe paraphrases against the original AND against each other —
+    # an LLM that returns ["foo", "foo", "bar"] would otherwise make the
+    # retriever run "foo" twice for nothing.
     out = [query]
+    seen = {query.strip().lower()}
     for p in paraphrases:
-        if isinstance(p, str) and p.strip() and p.strip() != query.strip():
-            out.append(p.strip())
+        if not isinstance(p, str):
+            continue
+        normalized = p.strip()
+        if not normalized:
+            continue
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(normalized)
     return tuple(out)
 
 
@@ -112,8 +124,8 @@ def expand_query(
 
     The expansion is cached per (query, n, provider) within the process so
     repeated queries don't pay the LLM round-trip twice. Cache size is 512
-    entries; LRU eviction beyond that. Set BRAIN_QUERY_EXPAND_CACHE=0 to
-    disable (useful for benchmarks).
+    entries; LRU eviction beyond that. Call `_cached_expand.cache_clear()`
+    to reset (useful for benchmarks or tests).
 
     On any provider failure, returns [query] only — the rest of the
     retrieval pipeline still works without expansion.
