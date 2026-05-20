@@ -257,6 +257,43 @@ without touching user memories:
 This updates `~/.agent/tools`, framework memory modules, and runtime helpers
 while preserving user data under `~/.agent/memory/`.
 
+## Uninstall
+
+Brainstack is safe to trial — uninstall removes every host-side surface it
+installed and **preserves your memory data** by default. The brain at
+`~/.agent/` (every digest, lesson, note you ever wrote) is the one thing the
+uninstaller never touches without an explicit opt-in.
+
+```bash
+./uninstall.sh --dry-run    # print the plan, change nothing
+./uninstall.sh              # interactive, with confirmation prompt
+./uninstall.sh -y           # skip the prompt (non-interactive)
+./uninstall.sh --purge-data # ALSO delete ~/.agent + ~/.config/{recall,brainstack}
+```
+
+(`./install.sh --uninstall ...` is the equivalent — `uninstall.sh` is a
+discoverable wrapper around it.)
+
+### What gets removed (default)
+
+- `~/Library/LaunchAgents/com.user.agent-{dream,sync,migrate,claude-extras}.plist`
+- The brainstack-shell-banner block in `~/.zshrc`
+- brainstack-managed blocks in `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.cursor/.cursorrules`
+- brainstack hook entries in `~/.claude/settings.json`
+- The `recall` / `recall-mcp` symlinks under `~/.local/bin/`
+- The model + index cache at `~/.cache/recall/` (regenerates on next reindex)
+
+### What is preserved
+
+- `~/.agent/` — your memory (digests, lessons, claims, notes, episodic logs)
+- `~/.config/recall/` — your recall config
+- `~/.config/brainstack/` — your extractor / project / channel configs
+- Your remote brain repo on GitHub — the durable backup
+- The brainstack repo clone (delete manually if you want to)
+
+Run `./uninstall.sh --purge-data` (explicit opt-in) to also delete `~/.agent/`
+and the config dirs.
+
 ## License
 
 Apache 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
