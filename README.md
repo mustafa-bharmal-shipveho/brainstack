@@ -291,15 +291,23 @@ More detail:
 
 ## Upgrade
 
-After pulling a newer brainstack checkout, refresh installed framework code
-without touching user memories:
-
 ```bash
-./install.sh --upgrade
+./upgrade.sh              # default: git pull + refresh brain (one command)
+./upgrade.sh --no-pull    # skip the pull (you manage git yourself)
 ```
 
-This updates `~/.agent/tools`, framework memory modules, and runtime helpers
-while preserving user data under `~/.agent/memory/`.
+`./upgrade.sh` does two things:
+
+1. `git pull --ff-only origin main` in the brainstack repo so you're on the
+   latest released code. Use `--no-pull` if you're already on the version
+   you want, or in a CI/release context that handles git separately.
+2. Refreshes `~/.agent/tools`, framework memory modules, and runtime helpers
+   while preserving user data under `~/.agent/memory/`. Equivalent to
+   `./install.sh --upgrade`.
+
+Each upgrade writes the new version to `~/.agent/.brainstack-version`, so
+the next upgrade announces what changed (e.g., `Upgraded from 0.4.0 → 0.5.0`)
+and points you at the [CHANGELOG](CHANGELOG.md) for details.
 
 ## Uninstall
 
