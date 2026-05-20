@@ -539,6 +539,130 @@ class TestIdempotentDefaultInstall:
         )
 
 
+# ---------- I: Content validation — not just status strings ----------
+
+
+class TestActualArtifactsWritten:
+    """The summary block says ✓ — but is the actual content correct?
+    Validate the artifacts each default mode produces."""
+
+    def test_auto_recall_toml_flag_actually_set_to_true(self, tmp_path: Path):
+        """After a default install (auto-recall ON), the runtime TOML must
+        have `enable_auto_recall = true`. Just checking the summary line
+        is not enough."""
+        fake_home = tmp_path / "fakehome"
+        env = _fresh_env(fake_home)
+
+        result = _run(
+            "--brain-remote", "git@example.com:test/scratch.git",
+            "--no-prompt",
+            env=env,
+        )
+        assert result.returncode == 0
+
+        toml = fake_home / ".agent" / "runtime" / "pyproject.toml"
+        assert toml.is_file(), (
+            f"runtime/pyproject.toml not written:\n{result.stdout}"
+        )
+        content = toml.read_text()
+        assert re.search(r"enable_auto_recall\s*=\s*true", content), (
+            f"enable_auto_recall flag not 'true' in:\n{content[:1500]}"
+        )
+
+    def test_no_auto_recall_keeps_toml_false(self, tmp_path: Path):
+        """With --no-auto-recall, the TOML flag must NOT flip to true."""
+        fake_home = tmp_path / "fakehome"
+        env = _fresh_env(fake_home)
+
+        result = _run(
+            "--brain-remote", "git@example.com:test/scratch.git",
+            "--no-prompt",
+            "--no-auto-recall",
+            env=env,
+        )
+        assert result.returncode == 0
+
+        toml = fake_home / ".agent" / "runtime" / "pyproject.toml"
+        if not toml.is_file():
+            return  # no TOML means no flag — fine for --no-auto-recall
+        content = toml.read_text()
+        if "enable_auto_recall" in content:
+            assert not re.search(r"enable_auto_recall\s*=\s*true", content), (
+                f"--no-auto-recall: enable_auto_recall should not be true:\n"
+                f"{content[:1500]}"
+            )
+
+    def test_recall_first_sentinel_block_written_with_directive(
+        self, tmp_path: Path
+    ):
+        """After default install, ~/.claude/CLAUDE.md must contain the
+        sentinel-delimited block AND it must mention the recall-first
+        directive (not just empty sentinels)."""
+        fake_home = tmp_path / "fakehome"
+        env = _fresh_env(fake_home)
+        (fake_home / ".claude").mkdir()  # ensure the dir exists
+
+        result = _run(
+            "--brain-remote", "git@example.com:test/scratch.git",
+            "--no-prompt",
+            env=env,
+        )
+        assert result.returncode == 0
+
+        claude_md = fake_home / ".claude" / "CLAUDE.md"
+        if not claude_md.is_file():
+            pytest.skip("CLAUDE.md not created in this test fakehome")
+
+        content = claude_md.read_text()
+        assert "brainstack-recall-first-start" in content, (
+            f"sentinel start marker missing in CLAUDE.md:\n{content[:800]}"
+        )
+        assert "brainstack-recall-first-end" in content, (
+            f"sentinel end marker missing:\n{content[:800]}"
+        )
+        # The directive content (between sentinels) must non-trivially exist
+        m = re.search(
+            r"brainstack-recall-first-start.*?brainstack-recall-first-end",
+            content, re.DOTALL,
+        )
+        assert m is not None
+        block = m.group(0)
+        assert len(block) > 100, (
+            f"recall-first sentinel block suspiciously short ({len(block)} chars):\n{block}"
+        )
+
+    def test_launchd_plists_have_no_replace_placeholders(self, tmp_path: Path):
+        """Default install writes plists. None of them should contain the
+        REPLACE_HOME / REPLACE_PYTHON template placeholders — that would
+        cause silent launchd failures."""
+        fake_home = tmp_path / "fakehome"
+        env = _fresh_env(fake_home)
+
+        result = _run(
+            "--brain-remote", "git@example.com:test/scratch.git",
+            "--no-prompt",
+            env=env,
+        )
+        assert result.returncode == 0
+
+        plist_dir = fake_home / "Library" / "LaunchAgents"
+        plists = list(plist_dir.glob("*.plist"))
+        assert plists, f"no plists written to {plist_dir}"
+
+        for plist in plists:
+            content = plist.read_text()
+            assert "REPLACE_HOME" not in content, (
+                f"{plist.name} contains unexpanded REPLACE_HOME placeholder"
+            )
+            assert "REPLACE_PYTHON" not in content, (
+                f"{plist.name} contains unexpanded REPLACE_PYTHON placeholder"
+            )
+            # Must reference the actual tmp HOME (not the host machine's HOME)
+            assert str(fake_home) in content, (
+                f"{plist.name} doesn't reference the install's HOME={fake_home}"
+            )
+
+
 # ---------- E: HOME path with a space ----------
 
 
