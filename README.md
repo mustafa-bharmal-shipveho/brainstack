@@ -35,9 +35,22 @@ should outlive a specific model, tool, laptop, or vendor account.
 
 ## Quickstart
 
-**Prereqs:** `git`, Python 3.10+, macOS or Linux, and a private git remote you
-control for your brain mirror. Claude Code is optional unless you want the
-Claude runtime hooks.
+**Requirements**
+
+- `git`, Python 3.10+, macOS or Linux
+- A private git remote you control (used as your brain's mirror)
+- **~2 GB free disk** for the first `recall reindex` (one-time download of
+  ~440 MB embedding model under `~/.cache/fastembed/`, plus Qdrant cache)
+- **Network** for the model download (first run only — subsequent queries
+  are fully offline)
+- **Recommended**: `trufflehog` or `gitleaks` on PATH — required for the
+  hourly git sync. Pass `--install-scanner` to install via brew during
+  setup, or do it later via `brew install trufflehog`.
+- **Optional**: `claude` or `codex` CLI for `recall query --expand`
+  (default on; LLM round-trip adds quality on hard semantic queries.
+  Without either CLI installed, `--expand` falls open and uses the
+  original query, no error.)
+- Claude Code is optional unless you want the Claude runtime hooks.
 
 ```bash
 git clone https://github.com/<your-org>/brainstack.git
@@ -57,6 +70,11 @@ recall query "what should I remember before changing CI?"
 recall forget ci-command
 ```
 
+**First-run note**: the first `recall query` triggers a one-time reindex that
+downloads the BGE-base embedding model (~440 MB, ~30 s on a fast link).
+Subsequent queries are sub-3 s on a typical brain. Set `RECALL_NO_EXPAND=1`
+to skip the LLM expansion step if you don't have `claude` / `codex` on PATH.
+
 Optional Claude Code runtime hooks:
 
 ```bash
@@ -65,6 +83,20 @@ recall runtime install-hooks
 
 `install.sh` itself does not edit `~/.claude/`; runtime hook installation is a
 separate explicit step. Setup details: [`docs/claude-code-setup.md`](docs/claude-code-setup.md).
+
+### Enable hourly sync + nightly dream cycle (launchd)
+
+The installer doesn't wire launchd automatically. After the main install:
+
+```bash
+./install.sh --setup-launchd
+```
+
+That expands the plist templates (handles `REPLACE_HOME` / `REPLACE_PYTHON`
+substitutions; the raw templates aren't usable as-is) and runs `launchctl
+load`. Tear down with `./install.sh --remove-launchd`. Logs land at
+`~/.agent/dream.log` and `~/.agent/sync.log`. See
+[`docs/git-sync.md`](docs/git-sync.md) for the full sync architecture.
 
 ### Don't like it? Uninstall is safe and one command
 
@@ -129,6 +161,7 @@ Useful commands:
 | `recall pending --review` | Human review for staged memory candidates. |
 | `recall reindex` | Rebuild retrieval cache after large imports/edits. |
 | `recall stats --since 7d` | Inspect auto-recall usage and latency. |
+| `recall doctor` | Diagnose missing deps / broken paths / unreachable LLM providers — run this FIRST when something looks wrong. |
 | `recall runtime replay` | Reconstruct runtime context state from logs. |
 
 Retrieval details and benchmark notes: [`recall/README.md`](recall/README.md).

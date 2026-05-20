@@ -5,7 +5,13 @@ it as a git repo, sets origin to the user-supplied URL, makes the initial
 commit, and installs the pre-commit secret-scan hook.
 
 Skip if Python < 3.10 (install.sh requires it) or no python3.10+ on PATH.
+
+`from __future__ import annotations` keeps this collectable on Python 3.9
+(test SUITE supports 3.9 per CONTRIBUTING.md even though install.sh itself
+requires 3.10+).
 """
+from __future__ import annotations
+
 import os
 import shutil
 import subprocess
