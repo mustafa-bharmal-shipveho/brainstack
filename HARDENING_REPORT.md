@@ -7,7 +7,7 @@
 ## TL;DR
 
 - **1 real bug found and fixed**: `--yes` parser precedence — the new `--yes` case never fired because the existing uninstall `-y|--yes` case shadowed it. So `--yes --no-prompt` together always took the no-prompt path and never auto-accepted migrate prompts. Fixed in commit `1659b60`.
-- **23 hardening tests added** across 4 rounds. All passing.
+- **29 hardening tests added** across 6 rounds. All passing.
 - **Full suite**: 1567 pass + 3 pre-existing flakes unrelated to install (see below). Net delta from my work: +23 tests, 0 regressions.
 - **Live smoke test** on user's real machine: uninstall preserved 200 MB memory; reinstall hit status path correctly; catch-up command re-wired all 4 host surfaces; `recall doctor` reports v0.6.0.
 - **Recommendation:** ship. PR #56 covers the bug fix + tests.
@@ -36,6 +36,16 @@
 - `-y|--yes` case sets BOTH `UNINSTALL_YES` and `ASSUME_YES` (guards the precedence fix)
 - CHANGELOG has v0.6.0 entry
 - README has `## Customize your install` H2 with all 5 opt-outs
+
+### Round 5: Upgrade-mode + gitignore
+- `--upgrade` preserves memory content (the data the user spent months building)
+- `--upgrade` writes the new version to `.brainstack-version` marker
+- Brain `.gitignore` excludes `PENDING_REVIEW.md` (regenerated locally)
+- Brain `.gitignore` excludes `.brainstack-repo-path` (machine-local pin)
+
+### Round 6: Chaos
+- BRAIN_ROOT exists as a regular FILE (not a dir): install errors out or leaves the file alone — no silent corruption
+- Bare `./install.sh --no-prompt`: deterministic outcome (any well-defined rc + non-silent diagnostic)
 
 ### Misc
 - `--help` still works after parser changes

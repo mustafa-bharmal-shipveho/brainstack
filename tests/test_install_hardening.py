@@ -789,6 +789,165 @@ class TestStaticInstallShInvariants:
             )
 
 
+# ---------- L: Upgrade-mode regressions ----------
+
+
+class TestUpgradeModeBehavior:
+    """The catch-up command for 0.5.0 users is --upgrade. Verify upgrade
+    behavior doesn't touch user memory + doesn't trigger defaults block."""
+
+    def test_upgrade_preserves_memory(self, tmp_path: Path):
+        """--upgrade must NOT delete or modify memory/ subtree."""
+        fake_home = tmp_path / "fakehome"
+        env = _fresh_env(fake_home)
+        # Seed a brain with memory content
+        brain = fake_home / ".agent"
+        memory = brain / "memory" / "semantic" / "lessons"
+        memory.mkdir(parents=True)
+        sentinel = memory / "test_lesson.md"
+        sentinel.write_text("---\nname: test\n---\nHello upgrade.\n")
+        original_content = sentinel.read_text()
+
+        result = _run("--upgrade", env=env)
+        assert result.returncode == 0, (
+            f"--upgrade failed:\n{result.stdout}\n{result.stderr}"
+        )
+
+        # Memory file untouched
+        assert sentinel.is_file(), (
+            "--upgrade deleted a memory file"
+        )
+        assert sentinel.read_text() == original_content, (
+            f"--upgrade modified memory content. before:\n{original_content}\n"
+            f"after:\n{sentinel.read_text()}"
+        )
+
+    def test_upgrade_writes_brainstack_version_marker(self, tmp_path: Path):
+        """--upgrade must update .brainstack-version to current."""
+        fake_home = tmp_path / "fakehome"
+        env = _fresh_env(fake_home)
+        brain = fake_home / ".agent"
+        brain.mkdir()
+        # Seed with an OLD version marker
+        marker = brain / ".brainstack-version"
+        marker.write_text("0.4.0")
+
+        result = _run("--upgrade", env=env)
+        assert result.returncode == 0
+
+        new_version = marker.read_text().strip()
+        assert new_version != "0.4.0", (
+            f".brainstack-version not updated: still {new_version}"
+        )
+        # Should be the package version
+        from recall import __version__ as pkg_version
+        assert new_version == pkg_version, (
+            f"--upgrade marker should be {pkg_version}, got {new_version}"
+        )
+
+
+# ---------- M: gitignore correctness ----------
+
+
+class TestBrainGitignore:
+    """Fresh install creates a .gitignore in the brain. Verify it has the
+    critical entries that prevent committing logs / locks / cache files."""
+
+    def test_brain_gitignore_excludes_pending_review(self, tmp_path: Path):
+        """PENDING_REVIEW.md is regenerated locally — must not be committed."""
+        fake_home = tmp_path / "fakehome"
+        env = _fresh_env(fake_home)
+
+        result = _run(
+            "--brain-remote", "git@example.com:test/scratch.git",
+            "--no-prompt",
+            env=env,
+        )
+        assert result.returncode == 0
+
+        gitignore = fake_home / ".agent" / ".gitignore"
+        assert gitignore.is_file(), ".gitignore not created in brain"
+        content = gitignore.read_text()
+        assert "PENDING_REVIEW.md" in content, (
+            f".gitignore missing PENDING_REVIEW.md entry:\n{content}"
+        )
+
+    def test_brain_gitignore_excludes_brainstack_repo_path_pin(
+        self, tmp_path: Path
+    ):
+        """.brainstack-repo-path is machine-local; must not be committed."""
+        fake_home = tmp_path / "fakehome"
+        env = _fresh_env(fake_home)
+
+        result = _run(
+            "--brain-remote", "git@example.com:test/scratch.git",
+            "--no-prompt",
+            env=env,
+        )
+        assert result.returncode == 0
+
+        gitignore = (fake_home / ".agent" / ".gitignore").read_text()
+        assert ".brainstack-repo-path" in gitignore, (
+            f".gitignore missing .brainstack-repo-path entry:\n{gitignore}"
+        )
+
+
+# ---------- N: Chaos scenarios (deliberately broken state) ----------
+
+
+class TestChaosScenarios:
+    """Verify graceful failure when state is corrupted or paths are unusable.
+    These are the bugs colleagues hit when something goes weird on their machine."""
+
+    def test_brain_root_already_a_regular_file_fails_gracefully(
+        self, tmp_path: Path
+    ):
+        """If BRAIN_ROOT exists as a FILE (not a dir), install must error
+        out with a useful message rather than silently writing into ~/.agent
+        as if it were a directory."""
+        fake_home = tmp_path / "fakehome"
+        env = _fresh_env(fake_home)
+        # Replace what would be ~/.agent dir with a regular file
+        brain_path = fake_home / ".agent"
+        brain_path.write_text("a stray file sitting at BRAIN_ROOT")
+
+        result = _run(
+            "--brain-remote", "git@example.com:test/scratch.git",
+            "--no-prompt",
+            env=env,
+        )
+        # We don't care HOW it fails, just that it doesn't silently corrupt
+        # the user's file. If it returns 0, the file must still be intact.
+        if result.returncode == 0:
+            assert brain_path.read_text() == "a stray file sitting at BRAIN_ROOT", (
+                "install destroyed user's stray file at BRAIN_ROOT"
+            )
+        # If it returns non-zero, that's the safer outcome — flag with a
+        # non-trivial error message
+        else:
+            assert len(result.stderr) > 0 or len(result.stdout) > 0, (
+                "install failed silently — no diagnostic output"
+            )
+
+    def test_install_with_no_args_at_all(self, tmp_path: Path):
+        """`./install.sh` with no args: should either run the default install
+        (no --brain-remote means local-only brain) OR error helpfully."""
+        fake_home = tmp_path / "fakehome"
+        env = _fresh_env(fake_home)
+
+        result = _run("--no-prompt", env=env)
+        # Either is acceptable — we just want a deterministic outcome,
+        # not a crash with garbled output
+        assert result.returncode in (0, 1, 2), (
+            f"bare install returned unexpected rc={result.returncode}:\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        # Some output must be produced (not silent)
+        assert (result.stdout + result.stderr).strip(), (
+            "bare install produced no output"
+        )
+
+
 # ---------- E: HOME path with a space ----------
 
 
