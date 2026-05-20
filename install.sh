@@ -2518,7 +2518,15 @@ else
             fi
 
             if [ "$do_migrate" = "1" ]; then
-                if PYTHON_BIN="$PYTHON_BIN" "$0" --migrate "$src" >/dev/null 2>&1; then
+                # --no-symlink: mirror the source into the brain but leave the
+                # original dir untouched. Default-on migrate discovery must NOT
+                # silently swap a user's ~/.claude/projects/*/memory for a
+                # symlink — that's destructive behavior the user explicitly
+                # said they don't want as a default. Users who want the swap
+                # can still run `./install.sh --migrate <path>` directly
+                # (where SYMLINK_NATIVE=1 remains the default for that explicit
+                # invocation).
+                if PYTHON_BIN="$PYTHON_BIN" "$0" --migrate "$src" --no-symlink >/dev/null 2>&1; then
                     migrated_count=$((migrated_count + 1))
                 fi
             fi

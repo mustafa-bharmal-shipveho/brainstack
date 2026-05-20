@@ -328,6 +328,52 @@ class TestIdempotency:
             )
 
 
+# ---------- Migrate discovery is non-destructive by default ----------
+
+
+class TestMigrateDiscoveryDoesNotSymlinkSources:
+    """The new default-on migrate discovery must NOT silently swap a user's
+    ~/.claude/projects/*/memory for a symlink into the brain. That's
+    destructive default behavior the user explicitly said they don't want.
+
+    The defaults block passes --no-symlink when calling --migrate, so the
+    source dir is mirrored (preserved as-is) instead of being backed up + replaced.
+
+    Pinned at source level by grepping install.sh for the flag near the
+    discovery loop — the install.sh logic is a recursive `$0 --migrate ...`
+    call, so the flag has to be on that line.
+    """
+
+    def test_discovery_recursive_migrate_includes_no_symlink(self):
+        """The defaults-block migrate-discovery loop must include --no-symlink
+        on the recursive `$0 --migrate ...` call. This is the safety bar:
+        users running the default install get mirror-not-replace behavior."""
+        install_sh = (REPO_ROOT / "install.sh").read_text()
+
+        # Find the defaults-block migrate discovery section (lives between
+        # the `Default 1: interactive migrate discovery` marker and the
+        # `Default 2: --setup-auto-migrate` marker).
+        m = re.search(
+            r"# --- Default 1: interactive migrate discovery ---(.*?)# --- Default 2:",
+            install_sh,
+            re.DOTALL,
+        )
+        assert m is not None, (
+            "couldn't locate the defaults-block migrate discovery section "
+            "in install.sh — the section markers may have been renamed"
+        )
+        discovery_block = m.group(1)
+
+        # The recursive `$0 --migrate` call inside this block MUST include
+        # --no-symlink. Otherwise the default-on discovery silently swaps
+        # native dirs for symlinks (the behavior the user wants to avoid).
+        assert re.search(r'"\$0"\s+--migrate\s+"\$src"\s+--no-symlink', discovery_block), (
+            "default-on migrate discovery must call `$0 --migrate $src --no-symlink` "
+            "(mirror-not-replace). Found block (first 800 chars):\n"
+            + discovery_block[:800]
+        )
+
+
 # ---------- Summary block UX ----------
 
 
