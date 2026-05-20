@@ -178,6 +178,14 @@ while [ $# -gt 0 ]; do
             MODE="uninstall"
             shift
             ;;
+        --setup-launchd)
+            MODE="setup-launchd"
+            shift
+            ;;
+        --remove-launchd)
+            MODE="remove-launchd"
+            shift
+            ;;
         --purge-data)
             UNINSTALL_PURGE_DATA=1
             shift
@@ -1604,6 +1612,98 @@ PYEOF
     exit 0
 fi
 
+# ----- Mode: setup-launchd / remove-launchd -----
+# Expands REPLACE_HOME and REPLACE_PYTHON in the launchd plist templates and
+# copies them into ~/Library/LaunchAgents/, then runs `launchctl load`.
+# Previously the README told users to `cp templates/com.user.agent-*.plist
+# ~/Library/LaunchAgents/` directly — which leaves REPLACE_* placeholders in
+# the installed plist, and launchd silently fails to fire the hourly sync +
+# nightly dream cycle.
+if [ "$MODE" = "setup-launchd" ] || [ "$MODE" = "remove-launchd" ]; then
+    if [ ! -d "$BRAIN_ROOT" ]; then
+        echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
+        exit 2
+    fi
+    LD_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    plist_dir="$HOME/Library/LaunchAgents"
+    mkdir -p "$plist_dir"
+
+    launchd_plists=(
+        "com.user.agent-dream.plist"
+        "com.user.agent-sync.plist"
+    )
+
+    if [ "$MODE" = "remove-launchd" ]; then
+        for name in "${launchd_plists[@]}"; do
+            dest="$plist_dir/$name"
+            if [ -f "$dest" ]; then
+                if [ "${BRAINSTACK_SKIP_LAUNCHCTL:-0}" != "1" ]; then
+                    launchctl unload "$dest" 2>/dev/null || true
+                fi
+                rm -f "$dest"
+                echo "  removed $dest"
+            fi
+        done
+        echo "==> launchd agents removed."
+        exit 0
+    fi
+
+    # setup: expand REPLACE_* and install. Idempotent.
+    for name in "${launchd_plists[@]}"; do
+        src="$LD_SCRIPT_DIR/templates/$name"
+        dest="$plist_dir/$name"
+        if [ ! -f "$src" ]; then
+            echo "install: template missing: $src" >&2
+            exit 2
+        fi
+
+        # Expand placeholders. Pass HOME and PYTHON_ABS via env-style
+        # argv so an exotic $HOME with quotes can't poison the sed string.
+        "$PYTHON_BIN" - "$src" "$dest" "$HOME" "$PYTHON_ABS" <<'PYEOF'
+import sys
+from pathlib import Path
+src, dest, home, python_abs = sys.argv[1:5]
+text = Path(src).read_text()
+expanded = (
+    text
+    .replace("REPLACE_HOME", home)
+    .replace("REPLACE_PYTHON", python_abs)
+)
+if "REPLACE_HOME" in expanded or "REPLACE_PYTHON" in expanded:
+    print(f"install: unexpanded placeholder in {dest}", file=sys.stderr)
+    sys.exit(2)
+Path(dest).write_text(expanded)
+print(f"  wrote {dest}")
+PYEOF
+
+        # Reload (idempotent — `unload || true` then `load`).
+        # BRAINSTACK_SKIP_LAUNCHCTL=1 lets tests + tmp-HOME smokes write the
+        # plist files without registering them with the live launchd. The
+        # write itself is the verifiable artifact; the `launchctl load` is
+        # the host-side activation that should only fire for real installs.
+        if [ "${BRAINSTACK_SKIP_LAUNCHCTL:-0}" = "1" ]; then
+            echo "  wrote $dest (skipped launchctl load: BRAINSTACK_SKIP_LAUNCHCTL=1)"
+        else
+            launchctl unload "$dest" 2>/dev/null || true
+            if launchctl load "$dest" 2>/dev/null; then
+                echo "  loaded launchd agent: $name"
+            else
+                echo "  WARN: launchctl load failed for $dest — try manually:" >&2
+                echo "    launchctl load $dest" >&2
+            fi
+        fi
+    done
+
+    echo
+    echo "==> launchd agents installed."
+    echo "    dream cycle (clusters episodic events into lessons) runs nightly"
+    echo "    sync (hourly git push to your brain remote) runs every hour"
+    echo "    inspect:  launchctl list | grep com.user.agent"
+    echo "    logs:     ~/.agent/dream.log  +  ~/.agent/sync.log"
+    echo "    tear down: ./install.sh --remove-launchd"
+    exit 0
+fi
+
 # ----- Mode: uninstall -----
 # Single safe entry point for removing brainstack from a user's machine.
 # Default behavior: removes every host-side surface brainstack installed,
@@ -2296,10 +2396,10 @@ Next steps (manual — installer never edits ~/.claude/ for safety):
                     --push-initial-commit
 
   3. Set up nightly dream + hourly sync via launchd:
-       cp $REPO_DIR/templates/com.user.agent-dream.plist ~/Library/LaunchAgents/
-       cp $REPO_DIR/templates/com.user.agent-sync.plist ~/Library/LaunchAgents/
-       launchctl load ~/Library/LaunchAgents/com.user.agent-dream.plist
-       launchctl load ~/Library/LaunchAgents/com.user.agent-sync.plist
+       $REPO_DIR/install.sh --setup-launchd
+
+     (this expands REPLACE_HOME / REPLACE_PYTHON in the plist templates
+     and runs launchctl load for you; tear down with --remove-launchd)
 
   4. (Optional) Migrate an existing flat memory directory:
        $REPO_DIR/install.sh --migrate ~/.claude/projects/<slug>/memory

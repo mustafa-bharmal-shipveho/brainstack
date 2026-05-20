@@ -3,8 +3,10 @@
 #
 # Idempotent: re-running is a no-op when already set up. Three steps:
 #   1. Create $REPO_DIR/.venv/ if missing.
-#   2. pip install -e . into the venv (gets the recall + recall-mcp scripts
-#      written into .venv/bin/).
+#   2. pip install -e '.[embeddings,mcp]' into the venv (gets the recall +
+#      recall-mcp scripts plus runtime deps qdrant-client, fastembed, mcp).
+#      Without the extras, `recall query` crashes with ModuleNotFoundError
+#      on first call.
 #   3. Symlink .venv/bin/recall into ~/.local/bin/recall.
 #
 # Then prints PATH guidance if ~/.local/bin isn't already on $PATH.
@@ -47,11 +49,15 @@ if [ ! -d "$VENV_DIR" ]; then
     "$PY" -m venv "$VENV_DIR"
 fi
 
-# 2. pip install -e .
+# 2. pip install -e '.[embeddings,mcp]'
+# Extras are required: without `embeddings` the user hits
+# ModuleNotFoundError: qdrant_client on first `recall query`; without `mcp`
+# the recall-mcp tool is missing. Both surfaces are part of the documented
+# CLI so we install them by default.
 if [ ! -x "$VENV_RECALL" ]; then
-    log "pip install -e . into $VENV_DIR"
+    log "pip install -e '.[embeddings,mcp]' into $VENV_DIR"
     "$VENV_DIR/bin/pip" install --quiet --upgrade pip >/dev/null
-    "$VENV_DIR/bin/pip" install --quiet -e "$REPO_DIR"
+    "$VENV_DIR/bin/pip" install --quiet -e "${REPO_DIR}[embeddings,mcp]"
 fi
 
 if [ ! -x "$VENV_RECALL" ]; then

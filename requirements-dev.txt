@@ -1,4 +1,14 @@
-# Dev dependencies — not required to RUN the framework, only to test/develop it.
-# Install via:  pip install -r requirements-dev.txt
+# Dev dependencies — what `pip install -r requirements-dev.txt` needs to
+# pull so `make test` works on a fresh clone.
+#
+# `-e .[embeddings,mcp]` installs the brainstack package itself in editable
+# mode + the `embeddings` and `mcp` extras. That pulls qdrant-client, typer,
+# pyyaml, platformdirs, fastembed, mcp via pyproject.toml's
+# [project.optional-dependencies], so test files don't hit
+# ModuleNotFoundError on collection.
+-e .[embeddings,mcp]
+
+# Test runners — kept explicit so a fresh clone has them without relying
+# on pyproject's optional extras.
 pytest>=7
 pytest-timeout>=2
