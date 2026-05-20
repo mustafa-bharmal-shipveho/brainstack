@@ -205,7 +205,10 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         -y|--yes)
+            # Dual-purpose: in uninstall mode, auto-confirms removal.
+            # In install mode, auto-accepts migrate-discovery prompts.
             UNINSTALL_YES=1
+            ASSUME_YES=1
             shift
             ;;
         --enable-auto-recall)
@@ -326,10 +329,6 @@ while [ $# -gt 0 ]; do
             ;;
         --skip-migrate)
             SKIP_MIGRATE=1
-            shift
-            ;;
-        --yes)
-            ASSUME_YES=1
             shift
             ;;
         --no-prompt)
