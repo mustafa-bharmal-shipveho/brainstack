@@ -663,6 +663,132 @@ class TestActualArtifactsWritten:
             )
 
 
+# ---------- J: Per-mode setup → remove → setup idempotency ----------
+
+
+class TestPerModeReentry:
+    """Each --setup-X must be safe to run after --remove-X. This is how
+    users recover from manual surgery on their host configs."""
+
+    def test_setup_recall_first_after_remove_re_creates(self, tmp_path: Path):
+        fake_home = tmp_path / "fakehome"
+        env = _fresh_env(fake_home)
+        brain = fake_home / ".agent"
+        brain.mkdir()
+        (fake_home / ".claude").mkdir()
+
+        # setup → remove → setup
+        r1 = _run("--setup-recall-first-all", env=env)
+        assert r1.returncode == 0, f"setup-1 failed:\n{r1.stdout}\n{r1.stderr}"
+
+        r2 = _run("--remove-recall-first-all", env=env)
+        assert r2.returncode == 0, f"remove failed:\n{r2.stdout}\n{r2.stderr}"
+
+        r3 = _run("--setup-recall-first-all", env=env)
+        assert r3.returncode == 0, f"setup-2 failed:\n{r3.stdout}\n{r3.stderr}"
+
+        # After re-setup, CLAUDE.md should have the sentinel block
+        claude_md = fake_home / ".claude" / "CLAUDE.md"
+        if claude_md.is_file():
+            content = claude_md.read_text()
+            assert "brainstack-recall-first-start" in content, (
+                f"after setup→remove→setup, CLAUDE.md missing sentinel block:\n{content[:500]}"
+            )
+
+    def test_enable_disable_enable_auto_recall(self, tmp_path: Path):
+        """Auto-recall TOML flag must flip cleanly."""
+        fake_home = tmp_path / "fakehome"
+        env = _fresh_env(fake_home)
+        # Seed brain with runtime dir + minimal pyproject
+        brain = fake_home / ".agent"
+        runtime = brain / "runtime"
+        runtime.mkdir(parents=True)
+        (runtime / "pyproject.toml").write_text(
+            "[tool.brainstack]\nenable_auto_recall = false\n"
+        )
+
+        r1 = _run("--enable-auto-recall", env=env)
+        assert r1.returncode == 0
+        assert "true" in (runtime / "pyproject.toml").read_text()
+
+        r2 = _run("--disable-auto-recall", env=env)
+        assert r2.returncode == 0
+        assert "false" in (runtime / "pyproject.toml").read_text()
+
+        r3 = _run("--enable-auto-recall", env=env)
+        assert r3.returncode == 0
+        assert "true" in (runtime / "pyproject.toml").read_text()
+
+
+# ---------- K: Static invariants (cheap pin via grep) ----------
+
+
+class TestStaticInstallShInvariants:
+    """Cheap static checks that pin properties of install.sh — fast guards
+    against accidental regressions in the option parser, mode dispatch, etc."""
+
+    def test_all_five_opt_outs_are_in_parser(self):
+        """All 5 opt-out flags must have explicit case-statement branches.
+        Without this, an unknown-arg error would surface."""
+        content = (REPO_ROOT / "install.sh").read_text()
+        for flag in (
+            "--no-auto-migrate",
+            "--no-launchd",
+            "--no-recall-first",
+            "--no-auto-recall",
+            "--skip-migrate",
+            "--no-prompt",
+        ):
+            assert re.search(rf"^\s*{re.escape(flag)}\)", content, re.M), (
+                f"option parser missing case for {flag}"
+            )
+
+    def test_yes_is_dual_purpose(self):
+        """`-y|--yes` must set BOTH UNINSTALL_YES (uninstall) and
+        ASSUME_YES (install migrate-discovery). This is the bug that
+        the precedence test caught."""
+        content = (REPO_ROOT / "install.sh").read_text()
+        # Find the -y|--yes case body
+        m = re.search(
+            r"-y\|--yes\)(.*?);;\s*$",
+            content, re.DOTALL | re.MULTILINE,
+        )
+        assert m is not None, "no -y|--yes case found"
+        body = m.group(1)
+        assert "UNINSTALL_YES=1" in body, (
+            f"-y|--yes case must set UNINSTALL_YES=1:\n{body}"
+        )
+        assert "ASSUME_YES=1" in body, (
+            f"-y|--yes case must set ASSUME_YES=1 (the precedence fix):\n{body}"
+        )
+
+    def test_changelog_has_v060_entry(self):
+        """v0.6.0 release entry must exist in CHANGELOG."""
+        content = (REPO_ROOT / "CHANGELOG.md").read_text()
+        assert "## v0.6.0" in content, "CHANGELOG.md missing ## v0.6.0 section"
+        # And it should mention the defaults flip
+        v060_section = content.split("## v0.6.0", 1)[1].split("## v0.5", 1)[0]
+        assert "default" in v060_section.lower(), (
+            "v0.6.0 CHANGELOG should describe the defaults flip"
+        )
+
+    def test_readme_has_customize_your_install_section(self):
+        """README must have the new H2 introduced by PR #55."""
+        content = (REPO_ROOT / "README.md").read_text()
+        assert "## Customize your install" in content, (
+            "README.md missing `## Customize your install` H2"
+        )
+        # And it should reference the 5 opt-outs in the table
+        customize_section = content.split("## Customize your install", 1)[1].split("##", 1)[0]
+        for flag in (
+            "--skip-migrate", "--no-auto-migrate", "--no-launchd",
+            "--no-recall-first", "--no-auto-recall",
+        ):
+            assert flag in customize_section, (
+                f"`## Customize your install` table missing {flag}"
+            )
+
+
 # ---------- E: HOME path with a space ----------
 
 
