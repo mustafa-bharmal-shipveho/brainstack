@@ -358,21 +358,55 @@ def upsert_documents(
     sparse_model: str = _SPARSE_DEFAULT,
     batch_size: int = 64,
 ) -> int:
-    """Embed + upsert. Returns number of points written. Idempotent across runs."""
+    """Embed + upsert ONLY docs whose source-file mtime differs from the
+    already-indexed value. Returns the number of points written.
+
+    Why: in the common case (brain syncs hourly, dream cycle writes a
+    handful of files) `build_index` is called with the full doc set but
+    99% of those docs are unchanged. Embedding all of them re-runs
+    BGE-base inference on 700+ docs per `recall query` invocation —
+    4-5 minutes on CPU. Skipping unchanged docs collapses that to
+    sub-second (1-3 changed files embedded).
+
+    Mtime semantics:
+      * mtime read from `os.stat(d.path).st_mtime` (the source file)
+      * compared against `payload.mtime` of the existing Qdrant point
+      * exact float equality (no tolerance) — filesystem mtime precision
+        is consistent across syncs; tolerance would mask real updates
+      * if the source file is missing (`OSError`), we use the 0.0
+        sentinel and re-embed defensively (matches pre-fix behavior)
+
+    Idempotency across runs: yes (mtime comparison is the new
+    short-circuit; without it the function was already idempotent
+    via uuid5(path) point ids).
+    """
     if not docs:
         return 0
+
+    # Read what's already indexed so we can skip unchanged docs.
+    existing_mtimes = collection_mtimes(client, collection)
+
+    # Partition: changed (needs embed+upsert) vs unchanged (skip).
+    changed: list[tuple[Document, float]] = []
+    for d in docs:
+        try:
+            current_mtime = os.stat(d.path).st_mtime
+        except OSError:
+            current_mtime = 0.0
+        if existing_mtimes.get(d.path) != current_mtime:
+            changed.append((d, current_mtime))
+
+    if not changed:
+        return 0
+
     dense = _get_embedder(dense_model)
     sparse = _get_sparse_embedder(sparse_model)
-    texts = [d.text for d in docs]
+    texts = [d.text for d, _ in changed]
     dense_vecs = list(dense.embed(texts))
     sparse_vecs = list(sparse.embed(texts))
 
     points: list[models.PointStruct] = []
-    for d, dv, sv in zip(docs, dense_vecs, sparse_vecs):
-        try:
-            mtime = os.stat(d.path).st_mtime
-        except OSError:
-            mtime = 0.0
+    for (d, mtime), dv, sv in zip(changed, dense_vecs, sparse_vecs):
         points.append(
             models.PointStruct(
                 id=_doc_id(d.path),
