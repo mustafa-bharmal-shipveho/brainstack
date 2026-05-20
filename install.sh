@@ -740,6 +740,19 @@ if [ "$MODE" = "upgrade" ]; then
         echo "install: $BRAIN_ROOT does not exist; nothing to upgrade. Run plain ./install.sh first." >&2
         exit 2
     fi
+
+    # Read the previously-recorded version (if any) BEFORE the upgrade
+    # rewrites the brain's recall/__init__.py. This lets us print
+    # "upgraded from X → Y" so a colleague sees what just shifted.
+    PREVIOUS_VERSION=""
+    if [ -f "$BRAIN_ROOT/.brainstack-version" ]; then
+        PREVIOUS_VERSION="$(cat "$BRAIN_ROOT/.brainstack-version" 2>/dev/null || true)"
+    fi
+
+    # Read the version we're upgrading TO from the repo's pyproject.toml.
+    # Single source of truth — recall/__init__.py just mirrors this.
+    CURRENT_VERSION="$(/usr/bin/awk -F'"' '/^version = / {print $2; exit}' "$REPO_DIR/pyproject.toml" 2>/dev/null || true)"
+
     echo "==> Upgrading code at $BRAIN_ROOT (memory user data left untouched)"
     # Convention: any file named `*.user.*` (e.g. tools/my_helper.user.sh) is
     # considered user-local and preserved across upgrades. Without this,
@@ -798,9 +811,30 @@ if [ "$MODE" = "upgrade" ]; then
     fi
     # Refresh the recall CLI symlink (idempotent; pip-installs into the venv
     # if the venv exists, otherwise creates it).
-    if [ -x "$REPO_DIR/bin/install-recall-cli.sh" ]; then
+    # BRAINSTACK_SKIP_CLI_INSTALL=1 lets fast/hermetic tests skip the
+    # network-touching pip install (which can be slow on first cold start).
+    if [ "${BRAINSTACK_SKIP_CLI_INSTALL:-0}" != "1" ] \
+       && [ -x "$REPO_DIR/bin/install-recall-cli.sh" ]; then
         bash "$REPO_DIR/bin/install-recall-cli.sh" --quiet || true
     fi
+
+    # Record what version this brain was upgraded TO so the NEXT
+    # `--upgrade` can compute and surface the transition.
+    if [ -n "$CURRENT_VERSION" ]; then
+        echo "$CURRENT_VERSION" > "$BRAIN_ROOT/.brainstack-version"
+    fi
+
+    # Announce the version transition + point at the CHANGELOG so the
+    # colleague sees what changed in this upgrade.
+    if [ -n "$PREVIOUS_VERSION" ] && [ -n "$CURRENT_VERSION" ] \
+       && [ "$PREVIOUS_VERSION" != "$CURRENT_VERSION" ]; then
+        echo "==> Upgraded from $PREVIOUS_VERSION → $CURRENT_VERSION"
+        echo "    See $REPO_DIR/CHANGELOG.md for what's new."
+    elif [ -n "$CURRENT_VERSION" ] && [ -z "$PREVIOUS_VERSION" ]; then
+        echo "==> First upgrade recorded — pinned at $CURRENT_VERSION."
+        echo "    Future ./upgrade.sh runs will announce version transitions."
+    fi
+
     echo "==> Upgrade complete."
     exit 0
 fi
