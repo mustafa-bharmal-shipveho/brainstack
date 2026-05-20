@@ -8,7 +8,7 @@
 
 - **1 real bug found and fixed**: `--yes` parser precedence — the new `--yes` case never fired because the existing uninstall `-y|--yes` case shadowed it. So `--yes --no-prompt` together always took the no-prompt path and never auto-accepted migrate prompts. Fixed in commit `1659b60`.
 - **29 hardening tests added** across 6 rounds. All passing.
-- **Full suite**: 1567 pass + 3 pre-existing flakes unrelated to install (see below). Net delta from my work: +23 tests, 0 regressions.
+- **Full suite (final)**: 1582 passed, 0 failed. (An earlier run showed 3 flakes in `test_adversarial.py` + `test_query_fixtures.py` — they passed in the final run, confirming they're genuinely flaky and unrelated to install.)
 - **Live smoke test** on user's real machine: uninstall preserved 200 MB memory; reinstall hit status path correctly; catch-up command re-wired all 4 host surfaces; `recall doctor` reports v0.6.0.
 - **Recommendation:** ship. PR #56 covers the bug fix + tests.
 
@@ -67,9 +67,9 @@
 - **Not in this PR** — pre-existing in 0.5.0.
 - **Recommended follow-up:** open issue for uninstall dry-run accuracy.
 
-## Pre-existing flakes (NOT caused by this branch)
+## Flaky tests observed (NOT caused by this branch)
 
-Run against `main` (no hardening changes) — these 3 fail identically:
+Earlier in the night I saw these 3 fail:
 
 ```
 tests/recall/test_adversarial.py::TestJsonSerialization::test_date_value_is_serialized
@@ -77,7 +77,7 @@ tests/recall/test_query_fixtures.py::test_query_top_3_bm25_only_lexical[python g
 tests/recall/test_query_fixtures.py::test_query_top_3_bm25_only_lexical[rust ownership lifetime]
 ```
 
-Out of scope for install hardening. Triage separately.
+The final full-suite run showed all 3 passing. So they're genuinely flaky (intermittent), not deterministic failures. Out of scope for install hardening — but worth a separate issue to investigate the BM25 fixture nondeterminism + date serialization race.
 
 ## What is NOT covered yet
 
