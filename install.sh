@@ -174,6 +174,18 @@ while [ $# -gt 0 ]; do
             MODE="remove-recall-first-all"
             shift
             ;;
+        --uninstall)
+            MODE="uninstall"
+            shift
+            ;;
+        --purge-data)
+            UNINSTALL_PURGE_DATA=1
+            shift
+            ;;
+        -y|--yes)
+            UNINSTALL_YES=1
+            shift
+            ;;
         --enable-auto-recall)
             MODE="enable-auto-recall"
             shift
@@ -1589,6 +1601,230 @@ if not new.endswith("\n"):
 p.write_text(new)
 print(f"wrote recall-first block to {p}")
 PYEOF
+    exit 0
+fi
+
+# ----- Mode: uninstall -----
+# Single safe entry point for removing brainstack from a user's machine.
+# Default behavior: removes every host-side surface brainstack installed,
+# PRESERVES the user's data at ~/.agent/, ~/.config/recall/, ~/.config/brainstack/.
+#
+# Flags:
+#   --dry-run      (sets the existing DRY_RUN var) print the plan, change nothing
+#   --purge-data   ALSO delete ~/.agent + configs
+#   -y / --yes     skip the confirmation prompt
+#
+# Discoverable wrapper: ./uninstall.sh exec's this same mode.
+if [ "$MODE" = "uninstall" ]; then
+    # Map the existing DRY_RUN global into the uninstall-local naming so the
+    # rest of this handler reads naturally. The arg parser sets DRY_RUN=1
+    # for `--dry-run` (shared with --migrate and other flows).
+    UNINSTALL_DRY_RUN="${DRY_RUN:-0}"
+    UNINSTALL_PURGE_DATA="${UNINSTALL_PURGE_DATA:-0}"
+    UNINSTALL_YES="${UNINSTALL_YES:-0}"
+
+    UN_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    plist_dir="$HOME/Library/LaunchAgents"
+
+    # ---- Build the inventory of what's present ----
+    inventory_present=()
+    inventory_absent=()
+
+    for plist in \
+        "$plist_dir/com.user.agent-dream.plist" \
+        "$plist_dir/com.user.agent-sync.plist" \
+        "$plist_dir/com.user.agent-migrate.plist" \
+        "$plist_dir/com.user.agent-claude-extras.plist"; do
+        [ -f "$plist" ] && inventory_present+=("launchd plist: $plist")
+    done
+
+    if [ -f "$HOME/.zshrc" ] && grep -q "brainstack-shell-banner" "$HOME/.zshrc"; then
+        inventory_present+=("shell init block in ~/.zshrc (brainstack-shell-banner)")
+    fi
+
+    for file in "$HOME/.claude/CLAUDE.md" "$HOME/.codex/AGENTS.md" "$HOME/.cursor/.cursorrules"; do
+        if [ -f "$file" ] && grep -q "brainstack-" "$file" 2>/dev/null; then
+            inventory_present+=("brainstack block(s) in $file")
+        fi
+    done
+
+    if [ -f "$HOME/.claude/settings.json" ] && grep -q "brainstack" "$HOME/.claude/settings.json" 2>/dev/null; then
+        inventory_present+=("brainstack hook entries in ~/.claude/settings.json")
+    fi
+
+    for symlink in "$HOME/.local/bin/recall" "$HOME/.local/bin/recall-mcp"; do
+        [ -L "$symlink" ] && inventory_present+=("PATH symlink: $symlink")
+    done
+
+    if [ -d "$HOME/.cache/recall" ]; then
+        cache_size="$(du -sh "$HOME/.cache/recall" 2>/dev/null | awk '{print $1}')"
+        inventory_present+=("recall cache: ~/.cache/recall (${cache_size:-unknown size}, regenerates on next reindex)")
+    fi
+
+    # Data inventory (preserved by default, removed only with --purge-data)
+    data_present=()
+    [ -d "$HOME/.agent" ] && data_present+=("$HOME/.agent")
+    [ -d "$HOME/.config/recall" ] && data_present+=("$HOME/.config/recall")
+    [ -d "$HOME/.config/brainstack" ] && data_present+=("$HOME/.config/brainstack")
+
+    # ---- Print the plan ----
+    if [ "$UNINSTALL_DRY_RUN" = "1" ]; then
+        echo "==> brainstack uninstall plan (dry-run — nothing will change)"
+    else
+        echo "==> brainstack uninstall plan"
+    fi
+    echo
+
+    if [ "${#inventory_present[@]}" -eq 0 ] && [ "$UNINSTALL_PURGE_DATA" != "1" ]; then
+        echo "Nothing to remove — no brainstack surfaces detected on this machine."
+        if [ "${#data_present[@]}" -gt 0 ]; then
+            echo
+            echo "Your data is still present at:"
+            for d in "${data_present[@]}"; do
+                echo "  ✓ $d"
+            done
+            echo
+            echo "To delete it: re-run with --purge-data."
+        fi
+        exit 0
+    fi
+
+    if [ "${#inventory_present[@]}" -gt 0 ]; then
+        echo "Will REMOVE:"
+        for item in "${inventory_present[@]}"; do
+            echo "  ✗ $item"
+        done
+        echo
+    fi
+
+    if [ "$UNINSTALL_PURGE_DATA" = "1" ]; then
+        if [ "${#data_present[@]}" -gt 0 ]; then
+            echo "Will REMOVE (--purge-data):"
+            for d in "${data_present[@]}"; do
+                echo "  ✗ $d  ← YOUR DATA"
+            done
+            echo
+        fi
+    else
+        if [ "${#data_present[@]}" -gt 0 ]; then
+            echo "PRESERVED (your data — re-run with --purge-data to delete too):"
+            for d in "${data_present[@]}"; do
+                echo "  ✓ $d"
+            done
+            echo
+        fi
+        echo "The brainstack repo clone (this directory) is also preserved — delete manually if desired."
+        echo "Your remote brain repo on GitHub is the durable backup."
+        echo
+    fi
+
+    if [ "$UNINSTALL_DRY_RUN" = "1" ]; then
+        echo "==> Dry-run complete. Nothing was changed."
+        exit 0
+    fi
+
+    # ---- Confirm (unless -y) ----
+    if [ "$UNINSTALL_YES" != "1" ]; then
+        if [ ! -t 0 ]; then
+            echo "ERROR: refusing to run without a TTY (use -y / --yes to bypass)." >&2
+            exit 2
+        fi
+        printf "Proceed? [y/N] "
+        read -r reply
+        case "$reply" in
+            y|Y|yes|YES) ;;
+            *) echo "Aborted."; exit 0 ;;
+        esac
+        echo
+    fi
+
+    # ---- Execute removal ----
+    PYTHON_BIN_FORWARD="${PYTHON_BIN:-python3}"
+
+    echo "==> Removing host-side surfaces…"
+
+    # Unload + remove launchd plists.
+    for plist in \
+        "$plist_dir/com.user.agent-dream.plist" \
+        "$plist_dir/com.user.agent-sync.plist" \
+        "$plist_dir/com.user.agent-migrate.plist" \
+        "$plist_dir/com.user.agent-claude-extras.plist"; do
+        if [ -f "$plist" ]; then
+            launchctl unload "$plist" 2>/dev/null || true
+            rm -f "$plist"
+            echo "  removed $plist"
+        fi
+    done
+
+    # Run the existing --remove-* flags for host configs. Each handles
+    # "absent" gracefully (matches our partial-install contract).
+    PYTHON_BIN="$PYTHON_BIN_FORWARD" "$UN_SCRIPT_DIR/install.sh" --remove-pending-review-all 2>&1 | sed 's/^/  /' || true
+    PYTHON_BIN="$PYTHON_BIN_FORWARD" "$UN_SCRIPT_DIR/install.sh" --remove-recall-first-all   2>&1 | sed 's/^/  /' || true
+    PYTHON_BIN="$PYTHON_BIN_FORWARD" "$UN_SCRIPT_DIR/install.sh" --disable-auto-recall       2>&1 | sed 's/^/  /' || true
+    PYTHON_BIN="$PYTHON_BIN_FORWARD" "$UN_SCRIPT_DIR/install.sh" --remove-auto-migrate       2>&1 | sed 's/^/  /' || true
+    PYTHON_BIN="$PYTHON_BIN_FORWARD" "$UN_SCRIPT_DIR/install.sh" --remove-claude-extras      2>&1 | sed 's/^/  /' || true
+
+    # Strip the shell-init block from .zshrc (sentinel-delimited).
+    zshrc="$HOME/.zshrc"
+    if [ -f "$zshrc" ]; then
+        "$PYTHON_BIN_FORWARD" - "$zshrc" <<'PYEOF'
+import sys, re
+from pathlib import Path
+p = Path(sys.argv[1])
+text = p.read_text()
+# Strip the bracketed block including the sentinel comments themselves.
+new = re.sub(
+    r"\n?#\s*>>>\s*brainstack-shell-banner\s*>>>.*?#\s*<<<\s*brainstack-shell-banner\s*<<<\n?",
+    "\n",
+    text,
+    flags=re.DOTALL,
+)
+if new != text:
+    p.write_text(new)
+    print(f"  stripped brainstack-shell-banner block from {p}")
+PYEOF
+    fi
+
+    # Remove PATH symlinks (only if they ARE symlinks — never delete a regular file).
+    for symlink in "$HOME/.local/bin/recall" "$HOME/.local/bin/recall-mcp"; do
+        if [ -L "$symlink" ]; then
+            rm -f "$symlink"
+            echo "  removed symlink $symlink"
+        fi
+    done
+
+    # Remove cache (regeneratable; no prompt).
+    if [ -d "$HOME/.cache/recall" ]; then
+        rm -rf "$HOME/.cache/recall"
+        echo "  removed ~/.cache/recall"
+    fi
+
+    # ---- Purge data (explicit opt-in) ----
+    if [ "$UNINSTALL_PURGE_DATA" = "1" ]; then
+        echo
+        echo "==> Purging user data (--purge-data)…"
+        for d in "$HOME/.agent" "$HOME/.config/recall" "$HOME/.config/brainstack"; do
+            if [ -d "$d" ]; then
+                rm -rf "$d"
+                echo "  removed $d"
+            fi
+        done
+    fi
+
+    # ---- Summary ----
+    echo
+    echo "==> Uninstall complete."
+    if [ "$UNINSTALL_PURGE_DATA" != "1" ]; then
+        if [ "${#data_present[@]}" -gt 0 ]; then
+            echo
+            echo "PRESERVED (your data):"
+            for d in "${data_present[@]}"; do
+                echo "  ✓ $d"
+            done
+            echo
+            echo "To delete your memory + configs too, re-run: ./uninstall.sh --purge-data"
+        fi
+    fi
     exit 0
 fi
 
