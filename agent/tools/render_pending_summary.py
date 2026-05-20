@@ -214,26 +214,40 @@ def _load_candidates(brain_root: Path) -> list[tuple[str, dict]]:
 # ---------- sync staleness -------------------------------------------
 
 
-_SYNC_BLOCKED_MARKERS = (
-    # sync.sh writes one of these lines when push is blocked OR fails
-    "refusing to push",
-    "push failed",
-    "commit blocked",
-    "trufflehog flagged",
+# Per-marker classification: (substring, reason). Order matters — first
+# match wins, so put the most specific marker first.
+_SYNC_BLOCKED_MARKERS: tuple[tuple[str, str], ...] = (
+    # Trufflehog hit: a verified secret in the working tree.
+    ("trufflehog flagged",       "blocked-trufflehog"),
+    ("refusing to push",         "blocked-trufflehog"),
+    # Pre-commit hook (redact.py etc.) blocked the local commit. Server-
+    # side trufflehog never ran here — this is a client-side scrubber
+    # refusing to let the commit through.
+    ("commit blocked",           "blocked-precommit"),
+    # Push failed AFTER the commit succeeded. Typically network /
+    # DNS / GitHub-reachability problem — NOT a secret-scanner hit.
+    # (Prior code lumped this into "blocked" and the banner falsely
+    # claimed trufflehog found a secret — see 2026-05-20 user report.)
+    ("push failed",              "blocked-network"),
 )
 
 
 def _check_sync_status(brain_root: Path) -> str:
-    """Return 'ok', 'stale', 'blocked', or 'missing'.
+    """Return a precise sync-status string so the banner can render an
+    accurate reason instead of a single misleading "TruffleHog blocked"
+    line for every failure mode.
 
-    - missing: sync.log doesn't exist (sync never ran)
-    - blocked: last meaningful line indicates push failed or was refused
-      (Codex 2026-05-05 P2: the parser used to match only "refusing to
-      push", so "commit succeeded but push failed..." and "commit blocked..."
-      were silently classified as ok until the log went stale. All
-      sync.sh failure markers are now matched.)
-    - stale: last sync line is > 2 hours old
-    - ok: otherwise
+    Values:
+      - 'missing'             — sync.log doesn't exist (sync never ran)
+      - 'blocked-trufflehog'  — trufflehog flagged a verified secret
+      - 'blocked-precommit'   — local pre-commit hook (redact.py etc.) blocked commit
+      - 'blocked-network'     — commit succeeded but push failed (remote unreachable)
+      - 'stale'               — last sync line is > 2 hours old
+      - 'ok'                  — last line is a successful push or no-op
+
+    Callers can treat the three 'blocked-*' variants uniformly via
+    `status.startswith("blocked")` if they don't care about the specific
+    cause; `compose_summary` uses the full string to pick the right text.
     """
     log = brain_root / "sync.log"
     if not log.is_file():
@@ -243,8 +257,11 @@ def _check_sync_status(brain_root: Path) -> str:
     except OSError:
         return "missing"
     tail_lines = [ln for ln in text.splitlines()[-100:] if "sync:" in ln]
-    if tail_lines and any(m in tail_lines[-1] for m in _SYNC_BLOCKED_MARKERS):
-        return "blocked"
+    if tail_lines:
+        last = tail_lines[-1].lower()
+        for marker, reason in _SYNC_BLOCKED_MARKERS:
+            if marker in last:
+                return reason
     try:
         mtime = log.stat().st_mtime
     except OSError:
@@ -326,7 +343,11 @@ def compose_summary(
     if not drift_in_sync:
         parts.append("⚠️ drift detected")
     if sync_status != "ok":
-        parts.append(f"⚠️ sync {sync_status}")
+        # Strip the leading "blocked-" prefix in the headline; the dedicated
+        # Sync section below explains the specific cause. Headline reads
+        # naturally as "⚠️ sync trufflehog" / "⚠️ sync network" / etc.
+        headline_status = sync_status.removeprefix("blocked-") if sync_status.startswith("blocked-") else sync_status
+        parts.append(f"⚠️ sync {headline_status}")
     if misplaced_total > 0:
         parts.append(f"⚠️ {misplaced_total} misplaced")
     lines.append(" | ".join(parts))
@@ -389,14 +410,22 @@ def compose_summary(
         lines.append("- Run `./install.sh --upgrade` from the brainstack repo")
         lines.append("")
 
-    # Sync section
+    # Sync section — message matches the actual sync.log marker so a
+    # transient network failure doesn't trigger "verified secret in tree"
+    # panic, and a real trufflehog hit isn't masked as "push failed".
     if sync_status != "ok":
         lines.append("## Sync")
         if sync_status == "stale":
             lines.append("- Last sync > 2h ago. Hourly LaunchAgent may be stuck.")
-        elif sync_status == "blocked":
-            lines.append("- TruffleHog blocked the last push (verified secret in tree).")
-            lines.append("- Run `~/.agent/tools/sync.sh` and inspect output.")
+        elif sync_status == "blocked-trufflehog":
+            lines.append("- TruffleHog blocked the last push (verified secret in the working tree).")
+            lines.append("- Run `~/.agent/tools/sync.sh` and inspect the secret hit; rewrite history if needed.")
+        elif sync_status == "blocked-precommit":
+            lines.append("- Local pre-commit hook (likely `redact.py`) refused the commit.")
+            lines.append("- Run `~/.agent/tools/sync.sh` to see the offending pattern; adjust `redact-private.txt` or scrub the input.")
+        elif sync_status == "blocked-network":
+            lines.append("- Commit succeeded locally but the push failed — usually a network/remote-reachability issue, NOT a secret.")
+            lines.append("- The brain repo is committed locally; the next hourly sync will retry. Run `~/.agent/tools/sync.sh` manually to retry now.")
         elif sync_status == "missing":
             lines.append("- No sync.log yet (sync never ran).")
         lines.append("")

@@ -339,29 +339,43 @@ class TestSyncStatusParser:
         import time
         os.utime(log, (time.time(), time.time()))
 
-    def test_classifies_push_failed_as_blocked(self, tmp_path: Path):
+    def test_classifies_push_failed_as_blocked_network(self, tmp_path: Path):
+        """Push failure usually means the network/remote was unreachable —
+        previously misreported as 'TruffleHog blocked'. Now: blocked-network."""
         rps = self._import()
         self._seed_log(tmp_path, [
             "2026-05-05T13:00:00Z sync: commit succeeded but push failed; "
             "brain is committed locally",
         ])
-        assert rps._check_sync_status(tmp_path) == "blocked"
+        assert rps._check_sync_status(tmp_path) == "blocked-network"
 
-    def test_classifies_commit_blocked_as_blocked(self, tmp_path: Path):
+    def test_classifies_commit_blocked_as_blocked_precommit(self, tmp_path: Path):
+        """Commit blocked = the local redact.py / similar pre-commit hook
+        rejected the commit. Not trufflehog (that runs server-side after the
+        commit succeeds), not network."""
         rps = self._import()
         self._seed_log(tmp_path, [
             "2026-05-05T13:00:00Z sync: commit blocked (likely by redact "
             "pre-commit hook)",
         ])
-        assert rps._check_sync_status(tmp_path) == "blocked"
+        assert rps._check_sync_status(tmp_path) == "blocked-precommit"
 
-    def test_classifies_trufflehog_flagged_as_blocked(self, tmp_path: Path):
+    def test_classifies_trufflehog_flagged_as_blocked_trufflehog(self, tmp_path: Path):
+        """Trufflehog found a verified secret in the tree."""
         rps = self._import()
         self._seed_log(tmp_path, [
             "2026-05-05T13:00:00Z sync: trufflehog flagged secrets; "
             "refusing to push",
         ])
-        assert rps._check_sync_status(tmp_path) == "blocked"
+        assert rps._check_sync_status(tmp_path) == "blocked-trufflehog"
+
+    def test_classifies_refusing_to_push_as_blocked_trufflehog(self, tmp_path: Path):
+        """Older sync.sh wording — 'refusing to push' is also trufflehog."""
+        rps = self._import()
+        self._seed_log(tmp_path, [
+            "2026-05-05T13:00:00Z sync: refusing to push (trufflehog hit)",
+        ])
+        assert rps._check_sync_status(tmp_path) == "blocked-trufflehog"
 
     def test_classifies_pushed_as_ok(self, tmp_path: Path):
         rps = self._import()
@@ -381,6 +395,49 @@ class TestSyncStatusParser:
         rps = self._import()
         # No sync.log at all
         assert rps._check_sync_status(tmp_path) == "missing"
+
+
+class TestComposeSummarySyncMessageMatchesReason:
+    """The rendered Sync section MUST say what actually happened. The bug we
+    fix: when sync was blocked by network timeout, the banner falsely said
+    'TruffleHog blocked the last push (verified secret in tree)' — leading
+    to "did I just commit a secret?!" panic. Each reason now renders its
+    own message."""
+
+    def _import(self):
+        import importlib
+        import render_pending_summary
+        importlib.reload(render_pending_summary)
+        return render_pending_summary
+
+    def test_trufflehog_block_renders_trufflehog_message(self, tmp_path: Path):
+        rps = self._import()
+        body = rps.compose_summary(tmp_path, drift_report=None, sync_status="blocked-trufflehog")
+        assert "TruffleHog" in body or "trufflehog" in body
+        assert "secret" in body.lower()
+
+    def test_network_block_renders_network_message_not_trufflehog(self, tmp_path: Path):
+        rps = self._import()
+        body = rps.compose_summary(tmp_path, drift_report=None, sync_status="blocked-network")
+        # The misleading claims we MUST NOT make.
+        assert "TruffleHog" not in body, f"network block must not name TruffleHog; got:\n{body}"
+        assert "verified secret" not in body.lower(), (
+            f"network block must not claim a verified secret was found; got:\n{body}"
+        )
+        # The actual cause we SHOULD name.
+        assert (
+            "push failed" in body.lower()
+            or "network" in body.lower()
+            or "remote" in body.lower()
+        )
+
+    def test_precommit_block_renders_precommit_message_not_trufflehog(self, tmp_path: Path):
+        rps = self._import()
+        body = rps.compose_summary(tmp_path, drift_report=None, sync_status="blocked-precommit")
+        assert "TruffleHog" not in body and "verified secret" not in body, (
+            f"pre-commit block must NOT claim trufflehog/secret; got:\n{body}"
+        )
+        assert "pre-commit" in body.lower() or "redact" in body.lower() or "hook" in body.lower()
 
     def test_full_render_against_live_shaped_fixtures(self, tmp_path: Path):
         """Mid-tier integration check: feed the renderer 5 candidates that
