@@ -1,5 +1,51 @@
 # Changelog
 
+## v0.6.0 — 2026-05-20
+
+**One-command install: defaults flip + opt-out flags.** Pre-0.6.0, a vanilla
+`./install.sh --brain-remote ...` left users with an empty brain — no
+host wiring, no nightly dream, no migration of existing Claude / Codex /
+Cursor memory. The README promise ("brain context surfaces automatically
+when you use Claude Code") only materialized after the user ran five more
+setup commands they didn't know about.
+
+Five modes are now **default-on for fresh installs**:
+
+1. **Interactive migrate discovery** — scans `~/.claude/projects/*/memory`,
+   `~/.codex/`, `~/.cursor/` and prompts y/n before importing each found dir
+2. `--setup-auto-migrate` — background scanner that rolls new agent sessions in
+3. `--setup-launchd` — hourly sync + nightly dream LaunchAgents (macOS only)
+4. `--setup-recall-first-all` — recall-first directive in 3 host config files
+5. `--enable-auto-recall` — Claude Code UserPromptSubmit hook
+
+Each has an opt-out flag (`--no-auto-migrate`, `--no-launchd`,
+`--no-recall-first`, `--no-auto-recall`, `--skip-migrate`). For CI / scripted
+installs: `--yes` accepts all migrate prompts non-interactively;
+`--no-prompt` declines them. The final install output prints a structured
+summary block showing each default's status + the opt-out flag in parens.
+
+**Backward compatibility:** `./install.sh --upgrade` and explicit
+`--setup-X` invocations do NOT trigger the defaults. Existing 0.5.0 users
+running `./upgrade.sh` see zero behavior change. If you installed 0.5.0
+and want the new defaults retroactively, one-shot catch-up:
+
+```bash
+./install.sh --setup-auto-migrate \
+             --setup-launchd \
+             --setup-recall-first-all \
+             --enable-auto-recall
+```
+
+**README:** Quickstart cut from 75 lines to ~25, recall-internals moved out
+of the first impression. New `## Customize your install` H2 documents each
+opt-out flag with a "reason you might" column. New `## Setup details` H2
+holds the requirements wall + launchd subsection + runtime hooks. New
+`## Manual brain edits via CLI` H2 explains the `recall remember / query /
+forget` surface as a power-user tool (daily use happens via the host agent).
+
+15 new tests in `tests/test_install_defaults_flip.py` pin every opt-out, the
+upgrade-mode regression invariant, idempotency, and the final summary format.
+
 ## v0.5.0 — 2026-05-20
 
 Recall quality + adoption + latency + honesty + uninstall. Five PRs land

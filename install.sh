@@ -58,6 +58,20 @@ SYMLINK_NATIVE_FLAG_COUNT=0
 # --dry-run shows the plan without executing; used by tests + cautious users.
 DRY_RUN=0
 
+# Default-on setup modes (v0.6.0+): fresh install runs all five automatically.
+# Each --no-X flag disables exactly one. Only takes effect in fresh-install
+# mode; ignored when explicit --setup-X / --upgrade is passed.
+NO_AUTO_MIGRATE=0
+NO_LAUNCHD=0
+NO_RECALL_FIRST=0
+NO_AUTO_RECALL=0
+SKIP_MIGRATE=0
+# --yes accepts all interactive migrate-discovery prompts non-interactively.
+# --no-prompt declines all of them (silent skip). Either makes the install
+# script safe to run from CI / wrappers without stdin attached.
+ASSUME_YES=0
+NO_PROMPT=0
+
 # Captures any extra args after a mode flag so they can be forwarded to
 # the relevant helper. Used for --setup-auto-migrate / --remove-auto-migrate
 # which delegate to the Python helper for everything past the mode.
@@ -293,6 +307,34 @@ while [ $# -gt 0 ]; do
                     exit 2
                     ;;
             esac
+            ;;
+        --no-auto-migrate)
+            NO_AUTO_MIGRATE=1
+            shift
+            ;;
+        --no-launchd)
+            NO_LAUNCHD=1
+            shift
+            ;;
+        --no-recall-first)
+            NO_RECALL_FIRST=1
+            shift
+            ;;
+        --no-auto-recall)
+            NO_AUTO_RECALL=1
+            shift
+            ;;
+        --skip-migrate)
+            SKIP_MIGRATE=1
+            shift
+            ;;
+        --yes)
+            ASSUME_YES=1
+            shift
+            ;;
+        --no-prompt)
+            NO_PROMPT=1
+            shift
             ;;
         --help|-h)
             sed -n '2,38p' "$0" | sed 's/^# //; s/^#//'
@@ -2395,59 +2437,180 @@ if [ -x "$REPO_DIR/bin/install-recall-cli.sh" ]; then
         echo "WARN: recall CLI symlink step failed; run \`bash $REPO_DIR/bin/install-recall-cli.sh\` manually." >&2
 fi
 
+# ----- Default-on setup modes (v0.6.0+) -----
+# A fresh install now runs five setup modes by default. Each --no-X opt-out
+# disables exactly one. Each mode's summary line names the opt-out flag so
+# users see what was done and how to skip it next install.
+#
+# Why default-on: in 0.5.0 a vanilla install left users with an empty brain
+# and no host wiring. The README promise ("brain context surfaces automatically")
+# only materialized after they ran five more commands they didn't know about.
+#
+# Track outcomes per-mode so the summary block can list them accurately.
+DEFAULT_MIGRATE_STATUS="pending"
+DEFAULT_MIGRATE_DETAIL=""
+DEFAULT_AUTO_MIGRATE_STATUS="pending"
+DEFAULT_LAUNCHD_STATUS="pending"
+DEFAULT_RECALL_FIRST_STATUS="pending"
+DEFAULT_AUTO_RECALL_STATUS="pending"
+
+echo ""
+echo "==> Applying default setup (opt out per-mode with --no-X)"
+
+# --- Default 1: interactive migrate discovery ---
+# Scan known native dirs (~/.claude/projects/*, ~/.codex/*, ~/.cursor) and
+# prompt per-source. --skip-migrate / --no-prompt skip silently; --yes
+# accepts all without prompting.
+if [ "$SKIP_MIGRATE" = "1" ]; then
+    DEFAULT_MIGRATE_STATUS="skipped"
+    DEFAULT_MIGRATE_DETAIL="--skip-migrate set"
+elif [ "$NO_PROMPT" = "1" ] && [ "$ASSUME_YES" != "1" ]; then
+    DEFAULT_MIGRATE_STATUS="skipped"
+    DEFAULT_MIGRATE_DETAIL="--no-prompt set"
+else
+    # Build candidate list
+    candidates=()
+    if [ -d "$HOME/.claude/projects" ]; then
+        for d in "$HOME/.claude/projects"/*/memory; do
+            [ -d "$d" ] || continue
+            candidates+=("$d")
+        done
+    fi
+    [ -d "$HOME/.codex" ] && candidates+=("$HOME/.codex")
+    [ -d "$HOME/.cursor" ] && candidates+=("$HOME/.cursor")
+
+    migrated_count=0
+    if [ "${#candidates[@]}" -eq 0 ]; then
+        DEFAULT_MIGRATE_STATUS="skipped"
+        DEFAULT_MIGRATE_DETAIL="no candidate dirs found"
+    else
+        echo ""
+        echo "    Discovered ${#candidates[@]} potential memory source(s):"
+        for src in "${candidates[@]}"; do
+            # Skip if already a symlink into the brain
+            if [ -L "$src" ]; then
+                tgt="$(readlink "$src")"
+                case "$tgt" in
+                    *"$BRAIN_ROOT"*) continue ;;
+                esac
+            fi
+
+            do_migrate=0
+            if [ "$ASSUME_YES" = "1" ]; then
+                do_migrate=1
+            else
+                size="$(du -sh "$src" 2>/dev/null | awk '{print $1}')"
+                printf "      • %s (%s)  import? [Y/n] " "$src" "${size:-?}"
+                # Read with a timeout-free interactive prompt; if stdin is
+                # not a tty (e.g. test subprocess), fall back to declining.
+                if [ -t 0 ]; then
+                    read ans
+                else
+                    ans=""
+                    do_migrate=0
+                fi
+                if [ -t 0 ]; then
+                    case "${ans:-Y}" in
+                        [Yy]*|"") do_migrate=1 ;;
+                        *)        do_migrate=0 ;;
+                    esac
+                fi
+            fi
+
+            if [ "$do_migrate" = "1" ]; then
+                if PYTHON_BIN="$PYTHON_BIN" "$0" --migrate "$src" >/dev/null 2>&1; then
+                    migrated_count=$((migrated_count + 1))
+                fi
+            fi
+        done
+
+        if [ "$migrated_count" -gt 0 ]; then
+            DEFAULT_MIGRATE_STATUS="done"
+            DEFAULT_MIGRATE_DETAIL="$migrated_count source(s) imported"
+        else
+            DEFAULT_MIGRATE_STATUS="skipped"
+            DEFAULT_MIGRATE_DETAIL="declined or empty"
+        fi
+    fi
+fi
+
+# --- Default 2: --setup-auto-migrate ---
+if [ "$NO_AUTO_MIGRATE" = "1" ]; then
+    DEFAULT_AUTO_MIGRATE_STATUS="skipped"
+else
+    if PYTHON_BIN="$PYTHON_BIN" "$0" --setup-auto-migrate >/dev/null 2>&1; then
+        DEFAULT_AUTO_MIGRATE_STATUS="done"
+    else
+        DEFAULT_AUTO_MIGRATE_STATUS="failed"
+    fi
+fi
+
+# --- Default 3: --setup-launchd ---
+if [ "$NO_LAUNCHD" = "1" ]; then
+    DEFAULT_LAUNCHD_STATUS="skipped"
+elif [ "$(uname -s)" != "Darwin" ]; then
+    DEFAULT_LAUNCHD_STATUS="skipped"
+    # Linux / other: no launchd. systemd timers are out of scope for this PR.
+else
+    if PYTHON_BIN="$PYTHON_BIN" "$0" --setup-launchd >/dev/null 2>&1; then
+        DEFAULT_LAUNCHD_STATUS="done"
+    else
+        DEFAULT_LAUNCHD_STATUS="failed"
+    fi
+fi
+
+# --- Default 4: --setup-recall-first-all ---
+if [ "$NO_RECALL_FIRST" = "1" ]; then
+    DEFAULT_RECALL_FIRST_STATUS="skipped"
+else
+    if PYTHON_BIN="$PYTHON_BIN" "$0" --setup-recall-first-all >/dev/null 2>&1; then
+        DEFAULT_RECALL_FIRST_STATUS="done"
+    else
+        DEFAULT_RECALL_FIRST_STATUS="failed"
+    fi
+fi
+
+# --- Default 5: --enable-auto-recall ---
+if [ "$NO_AUTO_RECALL" = "1" ]; then
+    DEFAULT_AUTO_RECALL_STATUS="skipped"
+else
+    if PYTHON_BIN="$PYTHON_BIN" "$0" --enable-auto-recall >/dev/null 2>&1; then
+        DEFAULT_AUTO_RECALL_STATUS="done"
+    else
+        DEFAULT_AUTO_RECALL_STATUS="failed"
+    fi
+fi
+
+# ----- Summary -----
+# Print a single block listing each default with its opt-out flag. The
+# (--no-X) markers are how `recall doctor` and the tests verify what fired.
+# ✓ = mode ran successfully. • = mode skipped (by opt-out or env). ✗ = failed.
+_mark_for() {
+    case "$1" in
+        done) echo "✓" ;;
+        skipped) echo "•" ;;
+        failed) echo "✗" ;;
+        *) echo "?" ;;
+    esac
+}
+
 cat <<EOF
 
 ==> Installed. Brain is at: $BRAIN_ROOT
 
-Next steps (manual — installer never edits ~/.claude/ for safety):
+Defaults applied (skip on next install with the flag in parens):
+  $(_mark_for "$DEFAULT_MIGRATE_STATUS") Migrate discovery: $DEFAULT_MIGRATE_STATUS${DEFAULT_MIGRATE_DETAIL:+ ($DEFAULT_MIGRATE_DETAIL)}    (--skip-migrate)
+  $(_mark_for "$DEFAULT_AUTO_MIGRATE_STATUS") Auto-migrate background scanner: $DEFAULT_AUTO_MIGRATE_STATUS                                  (--no-auto-migrate)
+  $(_mark_for "$DEFAULT_LAUNCHD_STATUS") Hourly sync + nightly dream: $DEFAULT_LAUNCHD_STATUS                                              (--no-launchd)
+  $(_mark_for "$DEFAULT_RECALL_FIRST_STATUS") Recall-first directive: $DEFAULT_RECALL_FIRST_STATUS                                                   (--no-recall-first)
+  $(_mark_for "$DEFAULT_AUTO_RECALL_STATUS") Claude Code auto-recall: $DEFAULT_AUTO_RECALL_STATUS                                                 (--no-auto-recall)
 
-  1. Add the global hook to ~/.claude/settings.json. The snippet template
-     uses placeholders — fill in the absolute paths shown below (do NOT use
-     \$HOME or ~ in the command; absolute paths defend against env-poisoning):
+Next: open Claude Code / Codex CLI / Cursor and ask a question.
+      Your brain context will surface in their replies automatically.
 
-       Python interpreter: $PYTHON_ABS
-       Hook wrapper:       $BRAIN_ROOT/harness/hooks/agentic_post_tool_global.py
-
-       So the hook entry is:
-         "command": "$PYTHON_ABS $BRAIN_ROOT/harness/hooks/agentic_post_tool_global.py"
-
-     Reference template:
-       cat $REPO_DIR/adapters/claude-code/settings.snippet.json
-
-     Merge into your settings.json under "hooks.PostToolUse". Validate:
-       python3 -m json.tool ~/.claude/settings.json > /dev/null
-
-  2. Initialize the brain as a git repo and add a private remote:
-
-       cd $BRAIN_ROOT
-       git init && git branch -m main
-       git remote add origin <your-private-repo-url>
-       git add . && git commit -m "Initial brain"
-       git push -u origin main
-
-     OR re-run the installer with --brain-remote to do this automatically:
-       ./install.sh --brain-remote git@github.com:<you>/<your-brain-repo>.git \\
-                    --push-initial-commit
-
-  3. Set up nightly dream + hourly sync via launchd:
-       $REPO_DIR/install.sh --setup-launchd
-
-     (this expands REPLACE_HOME / REPLACE_PYTHON in the plist templates
-     and runs launchctl load for you; tear down with --remove-launchd)
-
-  4. (Optional) Migrate an existing flat memory directory:
-       $REPO_DIR/install.sh --migrate ~/.claude/projects/<slug>/memory
-
-  5. (Recommended) Pre-commit hook for secret scanning:
-       cd $BRAIN_ROOT
-       cp $REPO_DIR/templates/pre-commit .git/hooks/pre-commit
-       chmod +x .git/hooks/pre-commit
-
-  6. (Recommended) Server-side secret scan workflow on the brain repo
-     (catches \`git commit --no-verify\` bypass attempts):
-       mkdir -p $BRAIN_ROOT/.github/workflows
-       cp $REPO_DIR/templates/brain-secret-scan.yml \\
-          $BRAIN_ROOT/.github/workflows/secret-scan.yml
-
-See docs/claude-code-setup.md and docs/git-sync.md for details.
+Verify:  recall doctor
+Remove:  ./uninstall.sh
 EOF
+
+# See docs/claude-code-setup.md and docs/git-sync.md for advanced setup
+# (manual hook wiring, server-side secret scanning workflow, etc.).

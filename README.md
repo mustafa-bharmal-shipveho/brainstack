@@ -35,110 +35,121 @@ should outlive a specific model, tool, laptop, or vendor account.
 
 ## Quickstart
 
-**Requirements**
-
-- `git`, Python 3.10+, macOS or Linux
-- A private git remote you control (used as your brain's mirror)
-- **~2 GB free disk** for the first `recall reindex` (one-time download of
-  ~440 MB embedding model under `~/.cache/fastembed/`, plus Qdrant cache)
-- **Network** for the model download (first run only — subsequent queries
-  are fully offline)
-- **Recommended**: `trufflehog` or `gitleaks` on PATH — required for the
-  hourly git sync. Pass `--install-scanner` to install via brew during
-  setup, or do it later via `brew install trufflehog`.
-- **Optional**: `claude` or `codex` CLI for `recall query --expand`
-  (default on; LLM round-trip adds quality on hard semantic queries.
-  Without either CLI installed, `--expand` falls open and uses the
-  original query, no error.)
-- Claude Code is optional unless you want the Claude runtime hooks.
+Prereqs: `git`, Python 3.10+, macOS/Linux, a private git remote for your brain.
 
 ```bash
 git clone https://github.com/<your-org>/brainstack.git
 cd brainstack
-
 ./install.sh --brain-remote git@github.com:<you>/<your-private-brain-repo>.git \
              --push-initial-commit
 ```
 
-Omit `--push-initial-commit` if your private brain remote already has history.
+That's it. The installer will:
 
-After the installer adds `recall` to your PATH:
+- Discover existing Claude Code / Codex CLI / Cursor memory and ask before importing
+- Schedule hourly sync + nightly dream consolidation (raw events → digests)
+- Wire the recall-first directive into Claude Code, Codex CLI, and Cursor
+- Enable auto-recall on Claude Code (every prompt auto-surfaces brain context)
 
-```bash
-recall remember "always run the exact CI command from the repo config"
-recall query "what should I remember before changing CI?"
-recall forget ci-command
-```
+Open Claude Code / Codex CLI / Cursor and ask a question — your brain context
+surfaces in their replies automatically.
 
-**First-run note**: the first `recall query` triggers a one-time reindex that
-downloads the BGE-base embedding model (~440 MB, ~30 s on a fast link).
-Subsequent queries are sub-3 s on a typical brain. Set `RECALL_NO_EXPAND=1`
-to skip the LLM expansion step if you don't have `claude` / `codex` on PATH.
+Verify: `recall doctor`. Skip any default: see [Customize your install](#customize-your-install). Remove everything: `./uninstall.sh`.
 
-Optional Claude Code runtime hooks:
+## Customize your install
 
-```bash
-recall runtime install-hooks
-```
+The defaults install everything. Skip any subset by passing `--no-X` to `./install.sh`:
 
-`install.sh` itself does not edit `~/.claude/`; runtime hook installation is a
-separate explicit step. Setup details: [`docs/claude-code-setup.md`](docs/claude-code-setup.md).
+| Flag | Skips | Reason you might |
+|---|---|---|
+| `--skip-migrate` | Interactive scan-and-import of existing Claude / Codex / Cursor memory | Start with an empty brain |
+| `--no-auto-migrate` | Background scanner that pulls new agent sessions into the brain | Trigger migrate manually instead |
+| `--no-launchd` | Hourly sync + nightly dream LaunchAgents | You're on Linux, or want to script the schedule |
+| `--no-recall-first` | Recall-first directive in `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.cursor/.cursorrules` | You don't use those agents, or wire elsewhere |
+| `--no-auto-recall` | Claude Code UserPromptSubmit hook firing recall on every prompt | Want only agent-driven recall, not the unconditional sweep |
+| `--yes` | (Accept all migrate-discovery prompts non-interactively) | CI / scripted installs |
+| `--no-prompt` | (Decline all migrate prompts; still runs the other 4 defaults) | CI / scripted installs |
 
-### Enable hourly sync + nightly dream cycle (launchd)
-
-The installer doesn't wire launchd automatically. After the main install:
-
-```bash
-./install.sh --setup-launchd
-```
-
-That expands the plist templates (handles `REPLACE_HOME` / `REPLACE_PYTHON`
-substitutions; the raw templates aren't usable as-is) and runs `launchctl
-load`. Tear down with `./install.sh --remove-launchd`. Logs land at
-`~/.agent/dream.log` and `~/.agent/sync.log`. See
-[`docs/git-sync.md`](docs/git-sync.md) for the full sync architecture.
-
-### Don't like it? Uninstall is safe and one command
-
-```bash
-./uninstall.sh --dry-run    # see what would be removed
-./uninstall.sh              # interactive, with confirmation
-```
-
-Removes every host-side surface brainstack installed and **preserves your
-memory data** (`~/.agent/`, configs) by default. Full breakdown in the
-[Uninstall](#uninstall) section below.
+Each opt-out is reversible later via the matching `--setup-X` / `--enable-X` flag (or `--remove-X` / `--disable-X` to undo something later). Run `recall doctor` any time to see what's enabled.
 
 ## Bring Existing Memories
 
-A fresh install creates `~/.agent/`. Existing Claude Code, Cursor, and Codex CLI
-memories are not silently imported.
-
-Recommended ongoing import:
-
-```bash
-./install.sh --setup-auto-migrate
-```
-
-One-time snapshot import:
+The default install discovers `~/.claude/projects/*/memory`, `~/.codex/`, and
+`~/.cursor/` and prompts y/n before importing each. If you skipped that
+(via `--skip-migrate` / `--no-prompt`) or want to import additional sources
+manually later:
 
 ```bash
-./install.sh --migrate
-./install.sh --migrate ~/.claude/projects/<slug>/memory
+./install.sh --migrate                                    # interactive discovery
+./install.sh --migrate ~/.claude/projects/<slug>/memory   # specific path
 ```
 
 For Claude Code memory directories, migration preserves the original at
-`<source>.bak.<timestamp>` before wiring the source into brainstack. Cursor and
-Codex imports are snapshot-only unless you enable `--setup-auto-migrate`.
+`<source>.bak.<timestamp>` before wiring the source into brainstack as a
+symlink. Cursor and Codex imports are snapshot-style.
 
-Optional deeper Claude Code mirroring:
+The default install also turns on a background scanner (`--setup-auto-migrate`)
+that continuously rolls newly-written agent sessions into the brain. If you
+opted out via `--no-auto-migrate`, enable it later with
+`./install.sh --setup-auto-migrate`.
+
+Optional deeper Claude Code mirroring (transcripts + misc dirs into
+`~/.agent/imports/`, no modifications to source):
 
 ```bash
 ./install.sh --setup-claude-extras
 ```
 
-That mirrors Claude transcripts and misc directories into `~/.agent/imports/`
-without modifying the source directories.
+## Setup details
+
+Most users won't need this section — the default install handles it. Read on
+if you want to understand what's running, opt out of pieces, or troubleshoot.
+
+### Requirements detail
+
+- `git`, Python 3.10+, macOS or Linux
+- A private git remote you control (your brain's mirror)
+- **~2 GB free disk** for the first `recall reindex` (one-time download of
+  the ~440 MB BGE-base embedding model under `~/.cache/fastembed/`, plus
+  Qdrant cache)
+- **Network** for the first model download — subsequent queries are offline
+- **Recommended**: `trufflehog` or `gitleaks` on PATH (required for hourly
+  git sync). Pass `--install-scanner` during setup, or `brew install trufflehog`.
+- **Optional**: `claude` or `codex` CLI for `recall query --expand` (default
+  on; LLM round-trip improves hard semantic queries. Without either, expand
+  falls open silently and uses the original query.)
+
+First-run note: the first `recall query` triggers a one-time reindex
+(~30 s on a fast link). Subsequent queries are sub-3 s on a typical brain.
+Per-feature retrieval details: [`recall/README.md`](recall/README.md).
+
+### Hourly sync + nightly dream cycle (launchd)
+
+The default install schedules these LaunchAgents. To wire them later (e.g.
+after `--no-launchd`) or to tear down:
+
+```bash
+./install.sh --setup-launchd       # expands plist templates + launchctl load
+./install.sh --remove-launchd      # unload + delete plists
+```
+
+The setup mode handles `REPLACE_HOME` / `REPLACE_PYTHON` substitution in the
+plist templates (raw templates aren't usable as-is). Logs land at
+`~/.agent/dream.log` and `~/.agent/sync.log`. Full sync architecture:
+[`docs/git-sync.md`](docs/git-sync.md).
+
+Linux: launchd isn't available; the default install silently skips this
+mode and prints a note. Use a systemd timer if you want equivalent scheduling.
+
+### Claude Code runtime hooks
+
+```bash
+recall runtime install-hooks
+```
+
+`install.sh` does not edit `~/.claude/settings.json` for safety; runtime hook
+installation is a separate explicit step that you (or `--enable-auto-recall`)
+opt into. Setup details: [`docs/claude-code-setup.md`](docs/claude-code-setup.md).
 
 ## What It Does
 
@@ -167,11 +178,10 @@ Useful commands:
 Retrieval details and benchmark notes: [`recall/README.md`](recall/README.md).
 Runtime design: [`docs/runtime.md`](docs/runtime.md).
 
-Optional features:
+Additional features (default install already wires `--enable-auto-recall`):
 
 ```bash
 ./install.sh --setup-digests       # summarize sessions into searchable digests
-./install.sh --enable-auto-recall  # Claude Code: retrieve memories per prompt
 recall-mcp                         # expose recall to MCP-capable clients
 ```
 
@@ -197,9 +207,12 @@ wrappers for AI CLIs listed in `~/.agent/banner/wrapped_tools`.
 
 ## Tell Your Agents to Use Recall First
 
-Recall only helps if the agent calls it. Without explicit instructions, hosts
-(Claude Code, Codex CLI, Cursor) tend to default to grep / Minerva / web
-search — even when the answer is already in your brain.
+The default install wires this for you (skip with `--no-recall-first`). What it
+does and why: recall only helps if the agent calls it. Without explicit
+instructions, hosts (Claude Code, Codex CLI, Cursor) tend to default to grep /
+Minerva / web search — even when the answer is already in your brain.
+
+To wire this later (e.g. after `--no-recall-first`) or to tear down:
 
 ```bash
 ./install.sh --setup-recall-first-all      # all three host configs
@@ -235,6 +248,24 @@ Mirror any folder into recall:
 Mirrored sources land under `~/.agent/imports/` and are included in recall by
 default. They are also synced to your private brain remote unless you add the
 destination to `~/.agent/.gitignore`.
+
+## Manual brain edits via CLI
+
+The daily way to use brainstack is through your host agent — Claude Code,
+Codex CLI, or Cursor — which calls `recall` automatically. For times when
+you want CLI access (adding a one-shot note from a terminal, debugging
+retrieval, scripting against the brain), the `recall` command is your surface:
+
+```bash
+recall remember "always run the exact CI command from the repo config"
+recall query "what should I remember before changing CI?"
+recall forget ci-command
+recall pending --review                  # review staged candidates
+recall stats --since 24h                 # see auto-recall ROI
+recall doctor                            # diagnose missing wiring
+```
+
+Full retrieval design and benchmarks: [`recall/README.md`](recall/README.md).
 
 ## Safety Model
 
