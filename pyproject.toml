@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "recall-brain"
-version = "0.4.0"
+version = "0.5.0"
 description = "Tool-agnostic memory storage + retrieval + runtime for AI coding assistants"
 readme = "README.md"
 license = "Apache-2.0"
