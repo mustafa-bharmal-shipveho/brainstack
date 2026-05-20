@@ -1,5 +1,74 @@
 # Changelog
 
+## v0.5.0 — 2026-05-20
+
+Recall quality + adoption + latency + honesty + uninstall. Five PRs land
+together that take recall from "good in theory" to "fast, used by default,
+honest, and removable."
+
+### Recall quality (#47)
+
+`recall query --expand` (new, **default ON** for CLI) — LLM-generates
+query paraphrases via the existing provider registry, retrieves each
+separately, fuses with RRF (k=60) **pinning the original query's top-1**
+so Recall@1 floors at the no-expand baseline. On a real-brain
+38-query LLM-paraphrased hard set, Recall@10 lifts from 44.7% to
+84% (32/38 vs 17/38 reachable), NDCG@10 from 25.0% to 36.7%.
+Optional `--rerank-model` flag pins higher-quality cross-encoders
+for batch-precision use (bge-reranker-base: NDCG 42.1%;
+jina-reranker-v2-base-multilingual: NDCG 50.1% — industry-comparable).
+
+The MCP server and the auto-recall hook bypass the `--expand` flag and
+stay on the fast no-expand path; high-frequency per-prompt callers
+preserved.
+
+### Recall adoption across hosts (#48)
+
+`./install.sh --setup-recall-first-{claude,codex,cursor,all}` plus
+matching `--remove-*` flags. Injects a brainstack-managed block into
+`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, and `~/.cursor/.cursorrules`
+that tells the host agent to call recall FIRST for prior-personal-context
+questions, before grep / Minerva / web search. Sentinel-delimited so the
+block coexists with the existing pending-review block; idempotent on
+re-run; graceful when a host's dir is missing.
+
+### Recall latency (#49)
+
+`upsert_documents` now skips embedding for docs whose source-file mtime
+matches the indexed value. Existing collection mtimes were already
+tracked (used by `needs_refresh`); now they short-circuit the expensive
+BGE-base inference instead of just signaling "stale." On the real
+745-doc brain: queries went from 4-5 minutes to 2.4 s (first) /
+2.1 s (warm). MCP server warm queries drop into the ~100 ms range.
+
+### Banner honesty (#50)
+
+`render_pending_summary._check_sync_status` now classifies sync.log
+failure markers by their actual cause:
+`blocked-trufflehog` / `blocked-precommit` / `blocked-network`.
+Each variant renders a distinct Sync section message. The previous
+behavior — every failure printed "TruffleHog blocked the last push
+(verified secret in tree)" — would scare users into "did I just
+commit a secret?" panic when the underlying cause was actually a
+network timeout.
+
+### Uninstall (#51)
+
+`./uninstall.sh` and `./install.sh --uninstall` (equivalent) — single
+safe entry point for removing brainstack from a user's machine. Default
+removes every host-side surface (launchd plists, shell-init block,
+host-config blocks, hook entries, PATH symlinks, cache) but PRESERVES
+`~/.agent/` and `~/.config/{recall,brainstack}/`. `--purge-data` is the
+explicit opt-in to also delete user data. `--dry-run` prints the plan
+without changing anything. Three-flag-design (interactive confirm,
+`-y`, `--dry-run`) so trial users can audit before committing.
+
+### Tests
+
+Baseline pre-arc: 1448 passing. Post-arc: 1492 passing in ~180 s.
+Plus full test suite runtime dropped from 222 s → 128 s thanks to
+the #49 skip-if-fresh change cutting reindex work in the test fixtures.
+
 ## v0.4.0 — 2026-05-15
 
 First internally-shareable cut. Bundles five previously-unreleased work

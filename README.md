@@ -66,6 +66,17 @@ recall runtime install-hooks
 `install.sh` itself does not edit `~/.claude/`; runtime hook installation is a
 separate explicit step. Setup details: [`docs/claude-code-setup.md`](docs/claude-code-setup.md).
 
+### Don't like it? Uninstall is safe and one command
+
+```bash
+./uninstall.sh --dry-run    # see what would be removed
+./uninstall.sh              # interactive, with confirmation
+```
+
+Removes every host-side surface brainstack installed and **preserves your
+memory data** (`~/.agent/`, configs) by default. Full breakdown in the
+[Uninstall](#uninstall) section below.
+
 ## Bring Existing Memories
 
 A fresh install creates `~/.agent/`. Existing Claude Code, Cursor, and Codex CLI
