@@ -151,6 +151,33 @@ Optional startup surfaces:
 These wire pending-review visibility into Claude Code, Cursor rules, and shell
 wrappers for AI CLIs listed in `~/.agent/banner/wrapped_tools`.
 
+## Tell Your Agents to Use Recall First
+
+Recall only helps if the agent calls it. Without explicit instructions, hosts
+(Claude Code, Codex CLI, Cursor) tend to default to grep / Minerva / web
+search — even when the answer is already in your brain.
+
+```bash
+./install.sh --setup-recall-first-all      # all three host configs
+./install.sh --remove-recall-first-all
+```
+
+This injects a brainstack-managed block into:
+
+- `~/.claude/CLAUDE.md` — Claude Code
+- `~/.codex/AGENTS.md`  — Codex CLI
+- `~/.cursor/.cursorrules` — Cursor
+
+with a directive telling the agent: for prior-personal-context questions
+("have I dealt with X before?", "what did I learn about Y?"), call `recall
+query "..."` (or the `recall_query` MCP tool) FIRST. The block is delimited
+by `<!-- brainstack-recall-first-start -->` sentinels and is idempotent — re-
+running replaces the bracketed section without touching anything else.
+
+Per-host variants if you only want one: `--setup-recall-first-claude`,
+`--setup-recall-first-codex`, `--setup-recall-first-cursor` (each with a
+matching `--remove-*`).
+
 ## Add More Sources
 
 Mirror any folder into recall:

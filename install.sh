@@ -142,6 +142,38 @@ while [ $# -gt 0 ]; do
             MODE="remove-pending-review-all"
             shift
             ;;
+        --setup-recall-first-claude)
+            MODE="setup-recall-first-claude"
+            shift
+            ;;
+        --remove-recall-first-claude)
+            MODE="remove-recall-first-claude"
+            shift
+            ;;
+        --setup-recall-first-codex)
+            MODE="setup-recall-first-codex"
+            shift
+            ;;
+        --remove-recall-first-codex)
+            MODE="remove-recall-first-codex"
+            shift
+            ;;
+        --setup-recall-first-cursor)
+            MODE="setup-recall-first-cursor"
+            shift
+            ;;
+        --remove-recall-first-cursor)
+            MODE="remove-recall-first-cursor"
+            shift
+            ;;
+        --setup-recall-first-all)
+            MODE="setup-recall-first-all"
+            shift
+            ;;
+        --remove-recall-first-all)
+            MODE="remove-recall-first-all"
+            shift
+            ;;
         --enable-auto-recall)
             MODE="enable-auto-recall"
             shift
@@ -1436,6 +1468,127 @@ if [ "$MODE" = "setup-pending-review-all" ] || [ "$MODE" = "remove-pending-revie
     echo "    Codex:         sentinel block in ~/.codex/AGENTS.md"
     echo "    Shell:         wrappers for any AI CLI in ~/.agent/banner/wrapped_tools"
     echo "    Tear down all: ./install.sh --remove-pending-review-all"
+    exit 0
+fi
+
+# ----- Mode: setup-recall-first-{claude,codex,cursor,all} / remove-recall-first-* -----
+# Tells the host agent (Claude Code / Codex CLI / Cursor) to call `recall query`
+# FIRST when answering questions where prior personal context might exist —
+# before grep / Minerva / web search / file reads. Each setup injects the
+# templates/recall-first.md content between sentinels in the host's instructions
+# file. Sentinels are distinct from the pending-review installer's sentinels so
+# both can coexist.
+#
+# Idempotent: re-running --setup replaces the bracketed section.
+# Graceful: if the host tool dir doesn't exist, exit 0 with a notice.
+if [[ "$MODE" == setup-recall-first-* ]] || [[ "$MODE" == remove-recall-first-* ]]; then
+    if [ ! -d "$BRAIN_ROOT" ]; then
+        echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
+        exit 2
+    fi
+
+    RF_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    RF_TEMPLATE="$RF_SCRIPT_DIR/templates/recall-first.md"
+    RF_START="<!-- brainstack-recall-first-start -->"
+    RF_END="<!-- brainstack-recall-first-end -->"
+
+    # All-in-one fans out to the three single-host modes.
+    if [ "$MODE" = "setup-recall-first-all" ]; then
+        echo "==> Wiring recall-first directive into Claude / Codex / Cursor…"
+        PYTHON_BIN="$PYTHON_BIN" "$0" --setup-recall-first-claude 2>&1 | sed 's/^/  [claude] /'
+        PYTHON_BIN="$PYTHON_BIN" "$0" --setup-recall-first-codex  2>&1 | sed 's/^/  [codex]  /'
+        PYTHON_BIN="$PYTHON_BIN" "$0" --setup-recall-first-cursor 2>&1 | sed 's/^/  [cursor] /'
+        echo "==> Done. Recall is now the first-line resource on all installed hosts."
+        exit 0
+    fi
+    if [ "$MODE" = "remove-recall-first-all" ]; then
+        echo "==> Removing recall-first directive from Claude / Codex / Cursor…"
+        "$0" --remove-recall-first-claude 2>&1 | sed 's/^/  /'
+        "$0" --remove-recall-first-codex  2>&1 | sed 's/^/  /'
+        "$0" --remove-recall-first-cursor 2>&1 | sed 's/^/  /'
+        echo "==> Removal complete."
+        exit 0
+    fi
+
+    # Resolve target file per host.
+    case "$MODE" in
+        *-claude) host_dir="$HOME/.claude"; host_file="$host_dir/CLAUDE.md"; host_label="Claude Code" ;;
+        *-codex)  host_dir="$HOME/.codex";  host_file="$host_dir/AGENTS.md"; host_label="Codex CLI" ;;
+        *-cursor) host_dir="$HOME/.cursor"; host_file="$host_dir/.cursorrules"; host_label="Cursor" ;;
+        *)
+            echo "install: unknown mode $MODE" >&2
+            exit 2
+            ;;
+    esac
+
+    if [ ! -d "$host_dir" ]; then
+        echo "==> $host_label dir ($host_dir) not found; skipping."
+        exit 0
+    fi
+
+    if [[ "$MODE" == remove-* ]]; then
+        if [ ! -f "$host_file" ]; then
+            echo "==> $host_file not present; nothing to remove."
+            exit 0
+        fi
+        "$PYTHON_BIN" - "$host_file" "$RF_START" "$RF_END" <<'PYEOF'
+import sys
+from pathlib import Path
+p, S, E = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+text = p.read_text()
+if S in text and E in text:
+    s = text.index(S)
+    e = text.index(E) + len(E)
+    new = text[:s].rstrip() + "\n" + text[e:].lstrip()
+    if new and not new.endswith("\n"):
+        new += "\n"
+    p.write_text(new)
+    print(f"removed recall-first block from {p}")
+else:
+    print(f"no recall-first block found in {p}")
+PYEOF
+        exit 0
+    fi
+
+    # setup: insert/replace the block.
+    if [ ! -f "$RF_TEMPLATE" ]; then
+        echo "install: template missing: $RF_TEMPLATE" >&2
+        exit 2
+    fi
+
+    # Ensure the host file exists (create empty if missing — fine since
+    # subsequent edits preserve everything outside the sentinels).
+    if [ ! -f "$host_file" ]; then
+        : > "$host_file"
+    fi
+
+    "$PYTHON_BIN" - "$host_file" "$RF_TEMPLATE" "$RF_START" "$RF_END" <<'PYEOF'
+import sys
+from pathlib import Path
+p, tmpl, S, E = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], sys.argv[4]
+template_body = tmpl.read_text()
+block = f"{S}\n{template_body.rstrip()}\n{E}\n"
+
+text = p.read_text() if p.is_file() else ""
+
+if S in text and E in text:
+    # Replace existing block in place — keep surrounding content untouched.
+    s = text.index(S)
+    e = text.index(E) + len(E)
+    new = text[:s] + block.rstrip() + text[e:]
+else:
+    # Append at end, separated by a blank line if the file has content.
+    if text and not text.endswith("\n"):
+        text += "\n"
+    if text and not text.endswith("\n\n"):
+        text += "\n"
+    new = text + block
+
+if not new.endswith("\n"):
+    new += "\n"
+p.write_text(new)
+print(f"wrote recall-first block to {p}")
+PYEOF
     exit 0
 fi
 
