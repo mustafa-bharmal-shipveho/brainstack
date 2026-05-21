@@ -1805,11 +1805,17 @@ if [ "$MODE" = "uninstall" ]; then
     inventory_present=()
     inventory_absent=()
 
+    # Inventory the launchd plists brainstack actually installs. The names
+    # split across two prefixes because they were added at different times:
+    #   com.user.agent-{dream,sync}.plist        — original launchd setup
+    #   com.brainstack.{auto-migrate,claude-extras}.plist — newer setup helpers
+    # If a name here drifts from what `--setup-X` actually writes, the
+    # dry-run preview under-reports. Pinned by tests/test_uninstall_inventory.py.
     for plist in \
         "$plist_dir/com.user.agent-dream.plist" \
         "$plist_dir/com.user.agent-sync.plist" \
-        "$plist_dir/com.user.agent-migrate.plist" \
-        "$plist_dir/com.user.agent-claude-extras.plist"; do
+        "$plist_dir/com.brainstack.auto-migrate.plist" \
+        "$plist_dir/com.brainstack.claude-extras.plist"; do
         [ -f "$plist" ] && inventory_present+=("launchd plist: $plist")
     done
 
@@ -1918,12 +1924,13 @@ if [ "$MODE" = "uninstall" ]; then
 
     echo "==> Removing host-side surfaces…"
 
-    # Unload + remove launchd plists.
+    # Unload + remove launchd plists. Same name list as the inventory loop
+    # above so the dry-run preview matches the real removal.
     for plist in \
         "$plist_dir/com.user.agent-dream.plist" \
         "$plist_dir/com.user.agent-sync.plist" \
-        "$plist_dir/com.user.agent-migrate.plist" \
-        "$plist_dir/com.user.agent-claude-extras.plist"; do
+        "$plist_dir/com.brainstack.auto-migrate.plist" \
+        "$plist_dir/com.brainstack.claude-extras.plist"; do
         if [ -f "$plist" ]; then
             launchctl unload "$plist" 2>/dev/null || true
             rm -f "$plist"
