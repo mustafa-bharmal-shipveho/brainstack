@@ -546,6 +546,83 @@ class TestActualArtifactsWritten:
     """The summary block says ✓ — but is the actual content correct?
     Validate the artifacts each default mode produces."""
 
+    def test_enable_auto_recall_actually_registers_userpromptsubmit_hook(
+        self, tmp_path: Path
+    ):
+        """Real shipping gap caught in v0.6.0 audit: --enable-auto-recall
+        used to only flip the TOML flag — it did NOT register the hook
+        in ~/.claude/settings.json. So a default install would leave
+        the user with `enable_auto_recall=true` but no actual hook, and
+        auto-recall would silently never fire.
+
+        Fix: --enable-auto-recall now also runs install_claude_code_hooks
+        (idempotent) when ~/.claude exists. This test pins that behavior."""
+        import json
+
+        fake_home = tmp_path / "fakehome"
+        env = _fresh_env(fake_home)
+        # Seed ~/.claude/ so the hook installer has somewhere to write
+        (fake_home / ".claude").mkdir()
+
+        result = _run(
+            "--brain-remote", "git@example.com:test/scratch.git",
+            "--no-prompt",
+            env=env,
+        )
+        assert result.returncode == 0, (
+            f"default install failed:\n{result.stdout}\n{result.stderr}"
+        )
+
+        settings = fake_home / ".claude" / "settings.json"
+        assert settings.is_file(), (
+            f"~/.claude/settings.json not created. install output:\n"
+            f"{result.stdout}\n{result.stderr}"
+        )
+
+        s = json.loads(settings.read_text())
+        ups_hooks = s.get("hooks", {}).get("UserPromptSubmit", [])
+        # The brainstack hook is identifiable by the runtime adapter path
+        brainstack_hooks = [
+            h for h in ups_hooks
+            if any(
+                "runtime/adapters/claude_code/hooks.py" in inner.get("command", "")
+                or "brainstack" in inner.get("command", "").lower()
+                for inner in h.get("hooks", [])
+            )
+        ]
+        assert brainstack_hooks, (
+            f"--enable-auto-recall did NOT register a UserPromptSubmit hook "
+            f"in {settings}. Without this hook, auto-recall never fires "
+            f"on Claude Code prompts even with the TOML flag enabled.\n"
+            f"Found UserPromptSubmit hooks:\n{json.dumps(ups_hooks, indent=2)}"
+        )
+
+    def test_no_claude_dir_skips_hook_registration_gracefully(
+        self, tmp_path: Path
+    ):
+        """If the user doesn't have ~/.claude (doesn't use Claude Code),
+        the hook registration must skip silently, NOT crash the install."""
+        fake_home = tmp_path / "fakehome"
+        env = _fresh_env(fake_home)
+        # NO ~/.claude dir
+
+        result = _run(
+            "--brain-remote", "git@example.com:test/scratch.git",
+            "--no-prompt",
+            env=env,
+        )
+        assert result.returncode == 0, (
+            f"default install must complete cleanly when ~/.claude missing:\n"
+            f"{result.stdout}\n{result.stderr}"
+        )
+
+        # ~/.claude/settings.json was NOT created (we didn't synthesize ~/.claude)
+        assert not (fake_home / ".claude").exists() or \
+               not (fake_home / ".claude" / "settings.json").is_file(), (
+            "hook installer should skip when ~/.claude is missing — it "
+            "must NOT create the dir + settings.json on the user's behalf"
+        )
+
     def test_auto_recall_toml_flag_actually_set_to_true(self, tmp_path: Path):
         """After a default install (auto-recall ON), the runtime TOML must
         have `enable_auto_recall = true`. Just checking the summary line

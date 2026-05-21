@@ -2185,12 +2185,22 @@ fi
 # ----- Mode: enable-auto-recall / disable-auto-recall -----
 # Toggle the per-prompt auto-recall feature. When enabled, every Claude
 # Code user-prompt fires recall and injects top-K results as additional
-# context via the existing UserPromptSubmit hook.
+# context via the UserPromptSubmit hook.
 #
-# This mode only flips the TOML flag. The UserPromptSubmit hook itself is
-# already registered as part of the brainstack runtime install (verify by
-# inspecting ~/.claude/settings.json — look for `runtime/adapters/claude_code/hooks.py`).
-# If somehow it isn't, run --setup-claude-extras first.
+# v0.6.0+: --enable-auto-recall is responsible for BOTH parts of "make
+# auto-recall actually work":
+#   1. Register the UserPromptSubmit hook in ~/.claude/settings.json
+#      (idempotent — `install_claude_code_hooks` preserves other hooks)
+#   2. Flip the [tool.recall.runtime] enable_auto_recall TOML flag
+#
+# Prior to v0.6.0 this mode only did step 2, on the assumption that the
+# hook was already registered via `recall runtime install-hooks`. That
+# assumption broke for default-on installs: colleagues running the
+# defaults block got the flag flipped but no hook registered, and
+# auto-recall never fired. See HARDENING_REPORT.md (gap audit).
+#
+# The hook registration is skipped silently if ~/.claude doesn't exist
+# (user doesn't use Claude Code) — graceful no-op.
 if [ "$MODE" = "enable-auto-recall" ] || [ "$MODE" = "disable-auto-recall" ]; then
     if [ ! -d "$BRAIN_ROOT" ]; then
         echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
@@ -2243,6 +2253,28 @@ text = text[:m.start(1)] + new_body + text[m.end(1):]
 target.write_text(text)
 print(f"  enable_auto_recall = {value} written to {target}")
 PYEOF
+
+    # Step 2: register the UserPromptSubmit hook in ~/.claude/settings.json.
+    # Only fires when enabling AND when ~/.claude exists. Idempotent.
+    if [ "$MODE" = "enable-auto-recall" ] && [ -d "$HOME/.claude" ]; then
+        # Use the Python helper directly so we don't depend on the recall
+        # CLI symlink being on PATH yet (the install flow runs this mode
+        # AFTER bin/install-recall-cli.sh, but we still don't want a hard
+        # dependency on PATH lookup).
+        PYTHONPATH="$REPO_DIR" "$PYTHON_BIN" - <<'PYEOF' || \
+            echo "  WARN: hook registration in ~/.claude/settings.json failed; run 'recall runtime install-hooks' manually." >&2
+import os
+from pathlib import Path
+from runtime.adapters.claude_code.installer import install_claude_code_hooks
+
+settings = Path(os.path.expanduser("~/.claude/settings.json"))
+report = install_claude_code_hooks(settings_path=settings, dry_run=False)
+print(f"  {report.summary()}")
+PYEOF
+    elif [ "$MODE" = "enable-auto-recall" ] && [ ! -d "$HOME/.claude" ]; then
+        echo "  Note: ~/.claude/ does not exist; skipping hook registration."
+        echo "        (You only need this if you use Claude Code.)"
+    fi
 
     if [ "$MODE" = "enable-auto-recall" ]; then
         echo "==> Auto-recall ENABLED."
