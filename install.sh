@@ -2504,23 +2504,20 @@ else
             do_migrate=0
             if [ "$ASSUME_YES" = "1" ]; then
                 do_migrate=1
-            else
+            elif [ -t 0 ]; then
+                # Interactive TTY: prompt + read user's choice.
                 size="$(du -sh "$src" 2>/dev/null | awk '{print $1}')"
                 printf "      • %s (%s)  import? [Y/n] " "$src" "${size:-?}"
-                # Read with a timeout-free interactive prompt; if stdin is
-                # not a tty (e.g. test subprocess), fall back to declining.
-                if [ -t 0 ]; then
-                    read ans
-                else
-                    ans=""
-                    do_migrate=0
-                fi
-                if [ -t 0 ]; then
-                    case "${ans:-Y}" in
-                        [Yy]*|"") do_migrate=1 ;;
-                        *)        do_migrate=0 ;;
-                    esac
-                fi
+                read ans
+                case "${ans:-Y}" in
+                    [Yy]*|"") do_migrate=1 ;;
+                    *)        do_migrate=0 ;;
+                esac
+            else
+                # Non-TTY (test subprocess, CI, piped install): decline
+                # silently. Use --yes for non-interactive auto-accept or
+                # --no-prompt to skip the discovery entirely.
+                do_migrate=0
             fi
 
             if [ "$do_migrate" = "1" ]; then
