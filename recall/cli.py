@@ -267,6 +267,8 @@ def query(
             reranker=effective_reranker,
             reranker_model=effective_rerank_model,
             rerank_n=cfg.ranking.rerank_n,
+            needs_review_policy=cfg.ranking.needs_review_policy,
+            needs_review_penalty=cfg.ranking.needs_review_penalty,
         )
 
         query_str = " ".join(text)
@@ -365,6 +367,8 @@ def eval_command(
             reranker=effective_reranker,
             reranker_model=cfg.ranking.reranker_model,
             rerank_n=max(cfg.ranking.rerank_n, k),
+            needs_review_policy=cfg.ranking.needs_review_policy,
+            needs_review_penalty=cfg.ranking.needs_review_penalty,
         )
         report = run_eval(_StrategyRetriever(retriever, strategy), cases, k=k)
         if details is not None:
@@ -380,6 +384,169 @@ def eval_command(
         _exit_qdrant_store_error(exc)
     finally:
         close_client_cache()
+
+
+@app.command()
+def lint(
+    stale: bool = typer.Option(
+        False, "--stale",
+        help="Only run staleness checks (dead paths, broken links). "
+             "Default: all checks including frontmatter integrity.",
+    ),
+    mark: bool = typer.Option(
+        False, "--mark",
+        help="Reconcile `needs_review` flags with reality: ADD the flag to "
+             "memories that have findings, and AUTO-CLEAR it from memories "
+             "that carry the flag but now have none (e.g. a dead path was "
+             "recreated). Off by default — plain lint is report-only.",
+    ),
+    no_clear: bool = typer.Option(
+        False, "--no-clear",
+        help="With --mark, only ADD flags; do not auto-clear flags from "
+             "now-fresh memories (use if you hand-set needs_review yourself).",
+    ),
+    repair: bool = typer.Option(
+        False, "--repair",
+        help="Find memories whose frontmatter YAML doesn't parse (usually an "
+             "unquoted value with a colon) and PREVIEW the fix (re-quote the "
+             "offending value). Preview-only by default; add --apply to write. "
+             "Body preserved exactly; only writes if the result parses.",
+    ),
+    apply: bool = typer.Option(
+        False, "--apply",
+        help="With --repair, actually write the repairs (default is a dry-run "
+             "preview, since repair mutates your memory files in place).",
+    ),
+    json_out: bool = typer.Option(
+        False, "--json",
+        help="Emit findings as JSON instead of the human-readable report.",
+    ),
+    brain: Optional[Path] = typer.Option(
+        None, "--brain",
+        help="Memory root to lint (default: resolved brain memory dir).",
+    ),
+):
+    """Find stale or broken memories (deterministic, offline, high-precision).
+
+    Scans every markdown memory and reports checkable problems:
+
+      - dead_path: a backticked/linked absolute or ~/ path that no longer
+        exists on disk (the headline staleness signal)
+      - broken_wikilink: a [[target]] pointing at no memory
+      - broken_local_link: a [text](path) to a missing local file
+      - missing_frontmatter: a lesson missing name/description/type
+
+    A bad injected memory is worse than a missing one, so checks are
+    conservative — repo-relative paths, bare prose paths, and URL liveness
+    are intentionally NOT checked to keep false positives near zero.
+
+    Exit code is 0 when clean, 1 when any finding is reported.
+    """
+    import json as _json
+
+    from recall.lint import (
+        ALL_KINDS,
+        STALE_KINDS,
+        find_flagged_files,
+        lint_brain,
+        mark_needs_review,
+        repair_frontmatter,
+        unmark_needs_review,
+    )
+
+    brain_root = brain.expanduser() if brain else resolve_brain_home()
+    if not brain_root.is_dir():
+        typer.echo(f"recall lint: brain not found: {brain_root}", err=True)
+        raise typer.Exit(code=2)
+
+    kinds = STALE_KINDS if stale else ALL_KINDS
+    findings = lint_brain(brain_root, kinds=kinds)
+
+    if json_out:
+        typer.echo(_json.dumps([f.to_dict() for f in findings], indent=2))
+    else:
+        from collections import Counter
+
+        n_files = sum(1 for _ in brain_root.rglob("*.md"))
+        typer.echo(f"== recall lint ==  ({n_files} memories scanned under {brain_root})")
+        if not findings:
+            typer.echo("No issues detected.")
+        else:
+            by_kind: Counter[str] = Counter(f.kind for f in findings)
+            affected = len({f.file for f in findings})
+            for f in findings:
+                rel = f.file
+                try:
+                    rel = f.file.relative_to(brain_root)
+                except ValueError:
+                    pass
+                typer.echo(f"  {f.severity:9s} {f.kind:18s} {rel}:{f.line}")
+                typer.echo(f"            {f.detail}")
+            typer.echo("")
+            typer.echo(
+                f"{len(findings)} finding(s) across {affected} file(s): "
+                + ", ".join(f"{k}={v}" for k, v in by_kind.most_common())
+            )
+
+    if repair:
+        detect = findings if kinds == ALL_KINDS else lint_brain(brain_root, kinds=ALL_KINDS)
+        targets = {f.file for f in detect if f.kind == "unparseable_frontmatter"}
+        if not apply:
+            # Dry-run preview: repair mutates the user's only copy of their
+            # notes, so never write without an explicit --apply.
+            fixable = repair_frontmatter(targets, dry_run=True)
+            for p in sorted(fixable):
+                try:
+                    rel = p.relative_to(brain_root)
+                except ValueError:
+                    rel = p
+                typer.echo(f"  would repair  {rel}", err=True)
+            typer.echo(
+                f"\n{len(fixable)} file(s) repairable, "
+                f"{len(targets) - len(fixable)} need manual review. "
+                f"Re-run with --repair --apply to write.", err=True,
+            )
+        else:
+            fixed = repair_frontmatter(targets)
+            if fixed:
+                typer.echo(f"\nRepaired frontmatter on {len(fixed)} file(s).", err=True)
+            unfixable = len(targets) - len(fixed)
+            if unfixable:
+                typer.echo(
+                    f"{unfixable} file(s) have unparseable frontmatter the repair "
+                    f"couldn't fix automatically — review by hand.", err=True,
+                )
+
+    if mark:
+        # Reconcile flags against the FULL check suite, independent of the
+        # --stale display filter: needs_review is a single per-file boolean
+        # about overall freshness, so a file with any finding stays flagged.
+        # Recompute after a repair so the reconcile reflects the fixed state.
+        full_findings = (
+            lint_brain(brain_root, kinds=ALL_KINDS)
+            if (repair or kinds != ALL_KINDS)
+            else findings
+        )
+        files_with_issues = {f.file for f in full_findings}
+
+        marked = mark_needs_review(files_with_issues)
+        if marked:
+            typer.echo(f"\nMarked needs_review on {len(marked)} file(s).", err=True)
+
+        if not no_clear:
+            # Auto-clear: any memory that carries the flag but no longer has a
+            # finding (e.g. its dead path was recreated) gets un-flagged.
+            stale_flagged = set(find_flagged_files(brain_root)) - files_with_issues
+            cleared = unmark_needs_review(stale_flagged)
+            if cleared:
+                typer.echo(f"Auto-cleared needs_review on {len(cleared)} now-fresh file(s).", err=True)
+
+    # Exit code reflects RESIDUAL findings. After --repair the brain may be
+    # clean, so re-scan rather than trust the pre-repair snapshot (otherwise a
+    # CI `recall lint --repair` that fixes everything would still fail).
+    residual = lint_brain(brain_root, kinds=kinds) if repair else findings
+    if residual:
+        raise typer.Exit(code=1)
 
 
 @app.command()

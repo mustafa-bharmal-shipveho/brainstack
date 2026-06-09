@@ -123,6 +123,18 @@ class RankingConfig:
     reranker_model: str = "jinaai/jina-reranker-v1-turbo-en"
     rerank_n: int = 20
 
+    # How to treat memories flagged `needs_review: true` (e.g. by `recall lint
+    # --mark` when they reference dead paths). A flagged memory is potentially
+    # stale, so injecting it costs trust.
+    #   - "demote":  keep, but multiply its score by `needs_review_penalty` so
+    #                fresh memories outrank it (default — never silently lose info)
+    #   - "exclude": drop flagged memories from results entirely
+    #   - "ignore":  no special handling (pre-lint behavior)
+    needs_review_policy: str = "demote"
+    # Score multiplier applied to flagged memories under the "demote" policy.
+    # 0.0 = effectively exclude, 1.0 = no penalty. 0.5 halves the score.
+    needs_review_penalty: float = 0.5
+
 
 @dataclass(frozen=True)
 class Config:
@@ -553,6 +565,8 @@ def _config_from_dict(data: dict) -> Config:
                 ranking_raw.get("reranker_model", "jinaai/jina-reranker-v1-turbo-en")
             ),
             rerank_n=int(ranking_raw.get("rerank_n", 20)),
+            needs_review_policy=str(ranking_raw.get("needs_review_policy", "demote")),
+            needs_review_penalty=float(ranking_raw.get("needs_review_penalty", 0.5)),
         )
     else:
         ranking = RankingConfig(
@@ -564,6 +578,8 @@ def _config_from_dict(data: dict) -> Config:
                 ranking_raw.get("reranker_model", "jinaai/jina-reranker-v1-turbo-en")
             ),
             rerank_n=int(ranking_raw.get("rerank_n", 20)),
+            needs_review_policy=str(ranking_raw.get("needs_review_policy", "demote")),
+            needs_review_penalty=float(ranking_raw.get("needs_review_penalty", 0.5)),
         )
     return Config(
         sources=sources,
