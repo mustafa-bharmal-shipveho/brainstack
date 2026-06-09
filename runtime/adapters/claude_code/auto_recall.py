@@ -230,4 +230,6 @@ def _load_retriever() -> _Retriever:
         reranker=cfg.ranking.reranker,
         reranker_model=cfg.ranking.reranker_model,
         rerank_n=cfg.ranking.rerank_n,
+        needs_review_policy=cfg.ranking.needs_review_policy,
+        needs_review_penalty=cfg.ranking.needs_review_penalty,
     )

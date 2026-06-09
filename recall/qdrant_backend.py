@@ -542,8 +542,11 @@ def query_hybrid_rerank(
     )
     if not candidates:
         return []
-    if len(candidates) <= k:
-        # No rerank value when we already have <=k candidates; return as is
+    if len(candidates) <= 1:
+        # Nothing to reorder. (We deliberately do NOT short-circuit at <=k:
+        # callers oversample `k` for a downstream policy/truncation step, so
+        # reranking still determines which candidates survive — skipping it
+        # there silently bypassed the cross-encoder.)
         return candidates
 
     encoder = _get_cross_encoder(reranker_model)

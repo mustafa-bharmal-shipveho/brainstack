@@ -176,11 +176,44 @@ class TestCrossEncoderReranker:
         assert len(results) == 2  # both surface, no rerank crash
 
     def test_reranker_short_corpus_short_circuits(self):
-        # When candidates <= k, rerank is wasted and should pass through.
+        # Small corpus still returns (<= corpus size); never crashes.
         docs = [_make_doc(f"d{i}", f"desc {i}") for i in range(3)]
         retriever = HybridRetriever(docs, reranker="cross_encoder", rerank_n=20)
         results = retriever.query("desc 1", k=5)
         assert 1 <= len(results) <= 3
+
+    def test_rerank_not_bypassed_under_needs_review_policy(self, monkeypatch):
+        # Regression for the bug where the deeper needs_review fetch (fetch_n)
+        # was passed as the rerank's k, tripping the <=k short-circuit so the
+        # cross-encoder NEVER ran. Inject a deterministic fake reranker that
+        # forces a poor-bi-encoder-match doc to the top; if rerank is bypassed,
+        # that doc won't be first and this fails.
+        from recall import qdrant_backend as qb
+
+        called = {"n": 0}
+
+        class _FakeEncoder:
+            def rerank(self, query, texts):
+                called["n"] += 1
+                return [1.0 if "RERANKWINNER" in t else 0.0 for t in texts]
+
+        monkeypatch.setattr(qb, "_get_cross_encoder", lambda model: _FakeEncoder())
+
+        docs = [
+            _make_doc("match-a", "alpha bravo charlie delta echo"),
+            _make_doc("match-b", "alpha bravo charlie delta echo"),
+            _make_doc("match-c", "alpha bravo charlie delta echo"),
+            # Poor bi-encoder match for the query, but the fake reranker scores
+            # it highest via the sentinel in its body.
+            _make_doc("winner", "totally unrelated zzz", body="RERANKWINNER"),
+        ]
+        retriever = HybridRetriever(
+            docs, reranker="cross_encoder", rerank_n=20,
+            needs_review_policy="demote",  # the default that triggered the bug
+        )
+        results = retriever.query("alpha bravo charlie delta echo", k=3)
+        assert called["n"] >= 1, "cross-encoder was never invoked (rerank bypassed)"
+        assert results[0].document.frontmatter["name"] == "winner"
 
     def test_reranker_default_is_none(self):
         # Sanity: HybridRetriever() default value matches RankingConfig default.
