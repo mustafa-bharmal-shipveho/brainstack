@@ -1,9 +1,11 @@
 """Cursor adapter for the migrate dispatcher.
 
 Ingests `~/.cursor/plans/*.plan.md` files into the brain at
-`<brain>/memory/personal/notes/cursor/`. Plans are copied verbatim
-(byte-for-byte) — Cursor plans are markdown with YAML frontmatter,
-which the brain stores as-is. No reformat, no schema mangling.
+`<brain>/memory/personal/notes/cursor/`. Plans are markdown with YAML
+frontmatter, which the brain stores as-is: no reformat, no schema
+mangling. The only transformation is write-path redaction
+(`_redact_common.redact_for_write`): secret-shaped tokens are scrubbed,
+everything else round-trips byte-for-byte.
 
 Future extensions (not in this PR):
   - `.cursorrules` files at repo roots — needs discovery extension
@@ -24,6 +26,7 @@ sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_BASE / "memory"))
 
 from _atomic import atomic_write_bytes  # noqa: E402
+from _redact_common import redact_for_write  # noqa: E402
 from migrate_dispatcher import (  # noqa: E402
     AdapterRegistrationError,
     MigrationResult,
@@ -33,6 +36,19 @@ from migrate_dispatcher import (  # noqa: E402
 
 
 _TARGET_REL = Path("personal") / "notes" / "cursor"
+
+
+def _redacted_plan_bytes(raw: bytes, brain_root: Path) -> bytes:
+    """Redact a plan's text before it lands in the brain.
+
+    Plans are UTF-8 markdown; non-token text round-trips byte-for-byte
+    because redaction is surgical (only matched tokens are replaced).
+    Undecodable content is written unmodified rather than dropped."""
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw
+    return redact_for_write(text, brain_root).encode("utf-8")
 
 
 class CursorPlansAdapter:
@@ -95,7 +111,7 @@ class CursorPlansAdapter:
         files_written = 0
         for path in plan_files:
             target = target_dir / path.name
-            atomic_write_bytes(target, path.read_bytes())
+            atomic_write_bytes(target, _redacted_plan_bytes(path.read_bytes(), dst))
             files_written += 1
 
         return MigrationResult(

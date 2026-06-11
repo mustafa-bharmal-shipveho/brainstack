@@ -17,6 +17,10 @@ embarrass us if a colleague hit them:
 
 These are subprocess-level integration tests against the real install.sh,
 isolated via tmp HOME + BRAINSTACK_SKIP_LAUNCHCTL=1 + BRAINSTACK_SKIP_CLI_INSTALL=1.
+
+Consent gate (adoption-audit fix): non-TTY default installs without --yes
+fall back to --minimal, so every test that expects the five defaults passes
+--yes. test_install_with_no_args_at_all is THE minimal-fallback assertion.
 """
 from __future__ import annotations
 
@@ -137,14 +141,14 @@ class TestPrepopulatedHostSourcesMigrate:
 
         result = _run(
             "--brain-remote", "git@example.com:test/scratch.git",
-            "--no-prompt",
+            "--yes",
             env=env,
         )
         assert result.returncode == 0
         combined = result.stdout + result.stderr
-        # Migrate line shows skipped (because --no-prompt)
+        # Migrate line shows skipped (no candidate dirs found)
         assert re.search(r"^\s*•\s.+\(--skip-migrate\)\s*$", combined, re.M), (
-            f"empty ~/.claude with --no-prompt: migrate summary missing • line:\n"
+            f"empty ~/.claude: migrate summary missing • line:\n"
             f"{combined}"
         )
 
@@ -157,6 +161,7 @@ class TestPrepopulatedHostSourcesMigrate:
 
         result = _run(
             "--brain-remote", "git@example.com:test/scratch.git",
+            "--yes",
             env=env,
         )
         assert result.returncode == 0, (
@@ -325,6 +330,7 @@ class TestMultipleOptOutsCompose:
 
         result = _run(
             "--brain-remote", "git@example.com:test/scratch.git",
+            "--yes",
             "--skip-migrate",
             "--no-auto-migrate",
             "--no-launchd",
@@ -362,6 +368,7 @@ class TestMultipleOptOutsCompose:
 
         result = _run(
             "--brain-remote", "git@example.com:test/scratch.git",
+            "--yes",
             "--skip-migrate",
             "--no-launchd",
             "--no-recall-first",
@@ -495,7 +502,7 @@ class TestIdempotentDefaultInstall:
 
         r1 = _run(
             "--brain-remote", "git@example.com:test/scratch.git",
-            "--no-prompt",
+            "--yes",
             env=env,
         )
         assert r1.returncode == 0
@@ -506,7 +513,7 @@ class TestIdempotentDefaultInstall:
 
         r2 = _run(
             "--brain-remote", "git@example.com:test/scratch.git",
-            "--no-prompt",
+            "--yes",
             env=env,
         )
         assert r2.returncode == 0, (
@@ -566,7 +573,7 @@ class TestActualArtifactsWritten:
 
         result = _run(
             "--brain-remote", "git@example.com:test/scratch.git",
-            "--no-prompt",
+            "--yes",
             env=env,
         )
         assert result.returncode == 0, (
@@ -608,7 +615,7 @@ class TestActualArtifactsWritten:
 
         result = _run(
             "--brain-remote", "git@example.com:test/scratch.git",
-            "--no-prompt",
+            "--yes",
             env=env,
         )
         assert result.returncode == 0, (
@@ -632,7 +639,7 @@ class TestActualArtifactsWritten:
 
         result = _run(
             "--brain-remote", "git@example.com:test/scratch.git",
-            "--no-prompt",
+            "--yes",
             env=env,
         )
         assert result.returncode == 0
@@ -653,7 +660,7 @@ class TestActualArtifactsWritten:
 
         result = _run(
             "--brain-remote", "git@example.com:test/scratch.git",
-            "--no-prompt",
+            "--yes",
             "--no-auto-recall",
             env=env,
         )
@@ -681,7 +688,7 @@ class TestActualArtifactsWritten:
 
         result = _run(
             "--brain-remote", "git@example.com:test/scratch.git",
-            "--no-prompt",
+            "--yes",
             env=env,
         )
         assert result.returncode == 0
@@ -717,7 +724,7 @@ class TestActualArtifactsWritten:
 
         result = _run(
             "--brain-remote", "git@example.com:test/scratch.git",
-            "--no-prompt",
+            "--yes",
             env=env,
         )
         assert result.returncode == 0
@@ -937,7 +944,7 @@ class TestBrainGitignore:
 
         result = _run(
             "--brain-remote", "git@example.com:test/scratch.git",
-            "--no-prompt",
+            "--yes",
             env=env,
         )
         assert result.returncode == 0
@@ -958,7 +965,7 @@ class TestBrainGitignore:
 
         result = _run(
             "--brain-remote", "git@example.com:test/scratch.git",
-            "--no-prompt",
+            "--yes",
             env=env,
         )
         assert result.returncode == 0
@@ -990,7 +997,7 @@ class TestChaosScenarios:
 
         result = _run(
             "--brain-remote", "git@example.com:test/scratch.git",
-            "--no-prompt",
+            "--yes",
             env=env,
         )
         # We don't care HOW it fails, just that it doesn't silently corrupt
@@ -1007,21 +1014,56 @@ class TestChaosScenarios:
             )
 
     def test_install_with_no_args_at_all(self, tmp_path: Path):
-        """`./install.sh` with no args: should either run the default install
-        (no --brain-remote means local-only brain) OR error helpfully."""
+        """THE minimal-fallback assertion: a bare non-TTY `./install.sh`
+        (no --yes) must fall back to the minimal install: brain + recall
+        CLI and NOTHING else. No settings.json, no plists, no sentinel
+        blocks, and a notice naming --yes for the full install."""
         fake_home = tmp_path / "fakehome"
         env = _fresh_env(fake_home)
+        # Seed empty host files so we can assert they stay untouched
+        (fake_home / ".claude").mkdir()
+        (fake_home / ".claude" / "CLAUDE.md").write_text("")
+        (fake_home / ".codex").mkdir()
+        (fake_home / ".codex" / "AGENTS.md").write_text("")
+        (fake_home / ".cursor").mkdir()
+        (fake_home / ".cursor" / ".cursorrules").write_text("")
 
-        result = _run("--no-prompt", env=env)
-        # Either is acceptable — we just want a deterministic outcome,
-        # not a crash with garbled output
-        assert result.returncode in (0, 1, 2), (
-            f"bare install returned unexpected rc={result.returncode}:\n"
+        # input_str="" pipes an empty stdin so the run is non-TTY even when
+        # pytest itself is attached to a terminal.
+        result = _run(env=env, input_str="")
+        assert result.returncode == 0, (
+            f"bare non-TTY install must succeed as minimal:\n"
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
-        # Some output must be produced (not silent)
-        assert (result.stdout + result.stderr).strip(), (
-            "bare install produced no output"
+
+        # Brain + base layout exist
+        brain = fake_home / ".agent"
+        assert brain.is_dir(), "minimal fallback did not create the brain"
+        assert (brain / "memory").is_dir()
+        assert (brain / "tools").is_dir()
+
+        # NOTHING else: no host-config side effects
+        assert not (fake_home / ".claude" / "settings.json").exists(), (
+            "bare install without --yes wrote ~/.claude/settings.json"
+        )
+        plists = list((fake_home / "Library" / "LaunchAgents").glob("*.plist"))
+        assert plists == [], f"bare install wrote LaunchAgents: {plists}"
+        for host_file in (
+            fake_home / ".claude" / "CLAUDE.md",
+            fake_home / ".codex" / "AGENTS.md",
+            fake_home / ".cursor" / ".cursorrules",
+        ):
+            assert host_file.read_text() == "", (
+                f"bare install without --yes modified {host_file}"
+            )
+
+        # The fallback notice teaches --yes
+        out = result.stdout
+        assert "minimal" in out.lower(), (
+            f"fallback notice missing 'minimal':\n{out}"
+        )
+        assert "--yes" in out, (
+            f"fallback notice must name --yes for the full install:\n{out}"
         )
 
 
@@ -1037,7 +1079,7 @@ class TestHomePathWithSpace:
 
         result = _run(
             "--brain-remote", "git@example.com:test/scratch.git",
-            "--no-prompt",
+            "--yes",
             env=env,
         )
         assert result.returncode == 0, (

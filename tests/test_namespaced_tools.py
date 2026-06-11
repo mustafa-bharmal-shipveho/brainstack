@@ -67,6 +67,9 @@ def test_graduate_namespace_inbox_routes_to_inbox_paths(brain):
         str(TOOLS / "graduate.py"), "cand_inbox_1",
         "--rationale", "verified by reviewer in CI run",
         "--namespace", "inbox",
+        # No TTY under pytest; graduate.py's human-decision gate needs
+        # the explicit acknowledgment flag for non-interactive runs.
+        "--non-interactive-ack",
     ], brain)
     assert res.returncode == 0, f"stderr: {res.stderr}\nstdout: {res.stdout}"
 
@@ -95,6 +98,7 @@ def test_graduate_without_flag_still_works_on_default(brain):
     res = _run([
         str(TOOLS / "graduate.py"), "cand_default_1",
         "--rationale", "compat test",
+        "--non-interactive-ack",
     ], brain)
     assert res.returncode == 0, f"stderr: {res.stderr}\nstdout: {res.stdout}"
 

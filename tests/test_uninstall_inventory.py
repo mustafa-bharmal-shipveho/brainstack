@@ -102,6 +102,99 @@ def test_dry_run_only_lists_plists_that_exist(tmp_path: Path):
     )
 
 
+def test_dry_run_lists_systemd_units_when_present(tmp_path: Path):
+    """Linux parity: seed the six systemd user units --setup-systemd writes.
+    The --dry-run preview must list every one of them, same contract as the
+    launchd plists."""
+    fake_home = tmp_path / "fakehome"
+    env = _fresh_env(fake_home)
+    env["BRAINSTACK_SKIP_SYSTEMCTL"] = "1"
+    unit_dir = fake_home / ".config" / "systemd" / "user"
+    unit_dir.mkdir(parents=True)
+
+    expected = [
+        "brainstack-sync.service",
+        "brainstack-sync.timer",
+        "brainstack-dream.service",
+        "brainstack-dream.timer",
+        "brainstack-auto-migrate.service",
+        "brainstack-auto-migrate.timer",
+    ]
+    for name in expected:
+        (unit_dir / name).write_text("[Unit]\nDescription=test seed\n")
+
+    result = _run_uninstall("--dry-run", env=env)
+    assert result.returncode == 0, (
+        f"--dry-run failed:\n{result.stdout}\n{result.stderr}"
+    )
+
+    combined = result.stdout + result.stderr
+    for name in expected:
+        assert name in combined, (
+            f"--dry-run preview missing systemd unit {name!r}:\n{combined}"
+        )
+
+
+def test_uninstall_removes_seeded_systemd_units(tmp_path: Path):
+    """Live uninstall must delete the seeded systemd units (with
+    BRAINSTACK_SKIP_SYSTEMCTL=1 so no real systemctl is needed)."""
+    fake_home = tmp_path / "fakehome"
+    env = _fresh_env(fake_home)
+    env["BRAINSTACK_SKIP_SYSTEMCTL"] = "1"
+    unit_dir = fake_home / ".config" / "systemd" / "user"
+    unit_dir.mkdir(parents=True)
+    names = [
+        "brainstack-sync.service",
+        "brainstack-sync.timer",
+        "brainstack-dream.service",
+        "brainstack-dream.timer",
+        "brainstack-auto-migrate.service",
+        "brainstack-auto-migrate.timer",
+    ]
+    for name in names:
+        (unit_dir / name).write_text("[Unit]\nDescription=test seed\n")
+
+    result = _run_uninstall("-y", env=env)
+    assert result.returncode == 0, (
+        f"uninstall failed:\n{result.stdout}\n{result.stderr}"
+    )
+    leftovers = [n for n in names if (unit_dir / n).exists()]
+    assert leftovers == [], f"uninstall left systemd units behind: {leftovers}"
+
+
+def test_inventory_and_removal_use_same_systemd_unit_names():
+    """Static guard, mirroring the plist-name check below: the uninstall
+    inventory loop and the removal loop must list the SAME systemd unit
+    names, and there must be all six of them."""
+    content = (REPO_ROOT / "install.sh").read_text()
+
+    inventory_match = re.search(
+        r"# Inventory the systemd user units.*?(?=\n\s*for unit in)(.*?)(?=\s*done)",
+        content, re.DOTALL,
+    )
+    removal_match = re.search(
+        r"# Remove systemd user units\.(.*?)(?=\s*done)",
+        content, re.DOTALL,
+    )
+    assert inventory_match, "couldn't locate systemd inventory loop in install.sh"
+    assert removal_match, "couldn't locate systemd removal loop in install.sh"
+
+    def extract_names(block: str) -> set[str]:
+        return set(re.findall(r"\$systemd_unit_dir/([^\"]+\.(?:service|timer))", block))
+
+    inv_names = extract_names(inventory_match.group(1))
+    rm_names = extract_names(removal_match.group(1))
+
+    assert inv_names == rm_names, (
+        f"systemd inventory + removal unit lists differ.\n"
+        f"  inventory only: {inv_names - rm_names}\n"
+        f"  removal only:   {rm_names - inv_names}"
+    )
+    assert len(inv_names) == 6, (
+        f"expected the six brainstack systemd units, got: {inv_names}"
+    )
+
+
 def test_inventory_and_removal_use_same_plist_names(tmp_path: Path):
     """Static guard: the dry-run inventory loop and the actual removal loop
     in install.sh must use the SAME plist names. Otherwise the preview

@@ -44,9 +44,14 @@ customer-specific strings in framework code, docs, schemas, or tests. Use
 generic examples such as `<your-org>`, `example-corp`, `internal-service`, and
 `reviewer-agent`.
 
+Exception: the canonical repository URL
+(`github.com/mustafa-bharmal-shipveho/brainstack`) appears in install
+instructions and the doc-truth test by deliberate decision. All examples,
+fixtures, and schemas still use placeholders.
+
 Before release, run a targeted string audit for known local/company terms and
-confirm any remaining hits are legal provenance in `NOTICE` / `UPSTREAM.md` or
-explicitly intentional documentation.
+confirm any remaining hits are legal provenance in `NOTICE` / `UPSTREAM.md`,
+the canonical-URL carve-out above, or explicitly intentional documentation.
 
 ## Session digests
 
@@ -69,8 +74,9 @@ extracted from session content, not from a fixed company taxonomy.
 
 ## Auto-recall
 
-Auto-recall is opt-in and currently implemented for Claude Code's
-`UserPromptSubmit` hook. It runs recall per user prompt, injects bounded results
+Auto-recall is on by default in the full install since v0.6.0 (opt out with
+`--no-auto-recall`; the `--minimal` install does not enable it) and is
+currently implemented for Claude Code's `UserPromptSubmit` hook. It runs recall per user prompt, injects bounded results
 for that turn, and records telemetry consumable by `recall stats`.
 
 The operational tradeoff is latency versus context quality:

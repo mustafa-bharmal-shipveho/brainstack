@@ -29,6 +29,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
+from recall.sanitize import UNTRUSTED_PREAMBLE, sanitize_untrusted
 from runtime.core.events import EventRecord
 from runtime.core.manifest import InjectionItemSnapshot, Manifest
 
@@ -54,11 +55,17 @@ def build_reinjection_block(ctx: ReinjectionContext) -> str:
     sections: list[str] = []
     char_budget = ctx.budget_tokens * ctx.chars_per_token
 
+    # Item content comes from files on disk (memories, notes) and is
+    # UNTRUSTED: sanitize each body so a literal wrapper-escape tag or a
+    # forged reinjection marker inside a file cannot break out of (or
+    # forge) the runtime-reinject block.
     pinned = [it for it in ctx.manifest.items if it.pinned]
     if pinned:
         block = ["User has marked these as always-relevant:"]
         for it in sorted(pinned, key=lambda x: x.id):
-            content = ctx.item_content_by_id.get(it.id, "").strip()
+            content = sanitize_untrusted(
+                ctx.item_content_by_id.get(it.id, "")
+            ).strip()
             block.append(f"- {it.source_path} (id={it.id})")
             if content:
                 block.append(_indent(content))
@@ -67,7 +74,9 @@ def build_reinjection_block(ctx: ReinjectionContext) -> str:
     if ctx.user_added_items:
         block = ["User just added these for this turn:"]
         for it in ctx.user_added_items:
-            content = ctx.item_content_by_id.get(it.id, "").strip()
+            content = sanitize_untrusted(
+                ctx.item_content_by_id.get(it.id, "")
+            ).strip()
             block.append(f"- {it.source_path} (id={it.id})")
             if content:
                 block.append(_indent(content))
@@ -85,7 +94,7 @@ def build_reinjection_block(ctx: ReinjectionContext) -> str:
 
     body = "\n\n".join(sections)
     body = _truncate_to_chars(body, char_budget)
-    return f"{REINJECT_OPEN}\n{body}\n{REINJECT_CLOSE}"
+    return f"{REINJECT_OPEN}\n{UNTRUSTED_PREAMBLE}\n{body}\n{REINJECT_CLOSE}"
 
 
 def _indent(s: str, prefix: str = "    ") -> str:

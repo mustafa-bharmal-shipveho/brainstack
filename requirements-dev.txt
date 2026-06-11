@@ -12,3 +12,6 @@
 # on pyproject's optional extras.
 pytest>=7
 pytest-timeout>=2
+
+# Linter, pinned exactly so local `make lint-ci` and the CI lint job agree.
+ruff==0.15.12

@@ -10,7 +10,7 @@ import importlib.util
 import json
 from typing import Optional
 
-from recall.config import load_config
+from recall.config import effective_mode, load_config
 from recall.core import HybridRetriever
 from recall.index import build_index, load_index, needs_refresh
 from recall.serialize import serialize_results
@@ -31,8 +31,13 @@ def recall_query_handler(
     `qdrant_backend.close_client_cache`'s atexit registration.
     """
     cfg = load_config()
+    # Honor the same retrieval mode the CLI/auto-recall use (RECALL_MODE env >
+    # ranking.mode). Without this, a user who set sparse to avoid the dense
+    # model would still trigger a dense download/load over MCP, on both the
+    # index build and the query.
+    mode = effective_mode(cfg)
     fresh = needs_refresh(cfg.sources)
-    cache = build_index(cfg.sources) if fresh else load_index(cfg.sources)
+    cache = build_index(cfg.sources, mode=mode) if fresh else load_index(cfg.sources)
     if cache is None or not cache.documents:
         return []
     retriever = HybridRetriever(
@@ -43,6 +48,13 @@ def recall_query_handler(
         reranker=cfg.ranking.reranker,
         reranker_model=cfg.ranking.reranker_model,
         rerank_n=cfg.ranking.rerank_n,
+        mode=mode,
+        # Seam fix (Codex review): the MCP path must honor the same
+        # needs_review ranking policy as the CLI. Without these, a doc
+        # flagged for review ranked at full strength over MCP even when
+        # the user configured "exclude"/"demote".
+        needs_review_policy=cfg.ranking.needs_review_policy,
+        needs_review_penalty=cfg.ranking.needs_review_penalty,
     )
     results = retriever.query(query, k=k, type_filter=type, source_filter=source)
     return serialize_results(results)

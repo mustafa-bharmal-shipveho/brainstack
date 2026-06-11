@@ -1,0 +1,31 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json",
+  "name": "io.github.mustafa-bharmal-shipveho/brainstack",
+  "description": "Auditable, local-first memory recall for AI coding agents: hybrid (Qdrant + BM25) search over your own markdown brain, with provenance and a human review gate.",
+  "repository": {
+    "url": "https://github.com/mustafa-bharmal-shipveho/brainstack",
+    "source": "github"
+  },
+  "version": "0.6.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "recall-brain",
+      "version": "0.6.0",
+      "transport": { "type": "stdio" },
+      "runtimeHint": "uvx",
+      "environmentVariables": [
+        {
+          "name": "BRAIN_HOME",
+          "description": "Path to your brain's memory directory (default: ~/.agent/memory).",
+          "isRequired": false
+        },
+        {
+          "name": "RECALL_MODE",
+          "description": "Force a retrieval mode: hybrid, dense, or sparse (BM25-only, no embedding model).",
+          "isRequired": false
+        }
+      ]
+    }
+  ]
+}

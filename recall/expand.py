@@ -19,8 +19,12 @@ brain (744 docs):
     +4-var expansion (RRF merge)            68.4%      36.8%    130ms
     +4-var expansion + bge post-rerank      63.2%      42.1%    2476ms
 
-The expansion call itself is the latency bottleneck (one LLM round-trip).
-Cache by (query, n) so a stable session paying that cost once amortizes.
+The expansion call itself is the latency bottleneck: one LLM CLI
+round-trip per uncached query, measured ~5-20 s with a cold claude/codex
+CLI process (the 130ms figure above is the retrieval-side cost once the
+paraphrases exist, not the end-to-end wall time). That is why expansion
+is opt-in on the CLI (`--expand` / ranking.expand_default). Cache by
+(query, n) so a stable session paying that cost once amortizes.
 """
 from __future__ import annotations
 

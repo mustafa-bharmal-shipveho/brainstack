@@ -5,13 +5,17 @@ Step-by-step wiring of the brain into your Claude Code config.
 ## 1. Install the brain
 
 ```bash
-git clone https://github.com/<your-org>/brainstack.git
+git clone https://github.com/mustafa-bharmal-shipveho/brainstack.git
 cd brainstack
-./install.sh
+./install.sh --minimal     # brain + recall CLI only, no host edits
 ```
 
-This creates `~/.agent/` with the 4-layer memory scaffolding, all tools,
-and the hook wrapper. It does **not** edit `~/.claude/settings.json`.
+`--minimal` creates `~/.agent/` with the 4-layer memory scaffolding, all
+tools, and the recall CLI, and edits nothing under `~/.claude/`. The full
+install (`./install.sh`, which prints its plan and asks once) does register
+auto-recall hooks in `~/.claude/settings.json`; opt out with
+`--no-auto-recall`. The rest of this page is the manual wiring path for
+people who want to place each piece themselves.
 
 ## 2. (Optional) Migrate an existing native auto-memory directory
 
@@ -111,7 +115,7 @@ If you have an existing `~/.claude/commands/dream.md`, replace it with
 the review-staged-candidates flow:
 
 ```bash
-cp ~/Documents/codebase/brainstack/templates/dream-command.md.template \
+cp <your-brainstack-clone>/templates/dream-command.md.template \
     ~/.claude/commands/dream.md
 ```
 

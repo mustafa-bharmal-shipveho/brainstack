@@ -1,0 +1,23 @@
+{
+  "name": "brainstack",
+  "owner": {
+    "name": "mustafa-bharmal-shipveho",
+    "url": "https://github.com/mustafa-bharmal-shipveho"
+  },
+  "plugins": [
+    {
+      "name": "brainstack-recall",
+      "description": "Auditable memory for Claude Code: every-prompt recall from your own markdown brain, with a human review gate, provenance, and replay. Exposes the recall_query MCP tool.",
+      "version": "0.6.0",
+      "source": "https://github.com/mustafa-bharmal-shipveho/brainstack",
+      "homepage": "https://github.com/mustafa-bharmal-shipveho/brainstack",
+      "license": "Apache-2.0",
+      "keywords": ["memory", "recall", "rag", "mcp", "local-first"],
+      "mcpServers": {
+        "brainstack": {
+          "command": "recall-mcp"
+        }
+      }
+    }
+  ]
+}

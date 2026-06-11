@@ -14,8 +14,8 @@ future sessions.
 - A replacement for project documentation
 - A way to bypass model context limits via RAG (it's *learned context*,
   not retrieved context)
-- A team-shared knowledge base (the brain is per-user; lesson sharing
-  is roadmapped for v0.4)
+- A team-shared knowledge base (the brain is per-user by design;
+  opt-in lesson sharing is on the roadmap, see [ROADMAP.md](ROADMAP.md))
 
 PRs that drift outside this scope will be closed politely. If you're
 not sure, open an issue first to discuss.
@@ -23,12 +23,12 @@ not sure, open an issue first to discuss.
 ## Setting up a dev environment
 
 ```bash
-git clone https://github.com/<your-org>/brainstack.git
+git clone https://github.com/mustafa-bharmal-shipveho/brainstack.git
 cd brainstack
 python3.13 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements-dev.txt
-make test         # 152+ tests should pass
+make test         # 1,650+ tests should pass
 ```
 
 Python ≥ 3.10 is required for the install path; the test suite passes
@@ -44,7 +44,7 @@ make test-both-pythons     # 3.9 + 3.13 in series
 ```
 
 Stress tests for atomic writes and concurrent appends use multiprocess
-spawn — they're slow on macOS (~5s) but should always pass.
+spawn; they're slow on macOS (~5s) but should always pass.
 
 ## Smoke-testing changes against a sandbox brain
 
@@ -77,9 +77,13 @@ rm -rf /tmp/brain-sandbox
   [`docs/operational-notes.md`](docs/operational-notes.md) over making
   the README longer.
 - **No PII:** the framework must not contain real names, employer
-  identifiers, internal URLs, or other PII even in test fixtures.
-  Use placeholders (`Acme`, `<your-org>`, `Alice`, etc.). The test
-  suite will reject some shapes via `redact.py`.
+  identifiers, internal URLs, or other PII in code, examples, fixtures,
+  schemas, or tests. Use placeholders (`Acme`, `<your-org>`, `Alice`,
+  etc.). The test suite will reject some shapes via `redact.py`.
+  One deliberate exception: the canonical repository URL
+  (`github.com/mustafa-bharmal-shipveho/brainstack`) appears in install
+  instructions and the doc-truth test. Do not add that identifier
+  anywhere else.
 
 ## What makes a PR get closed quickly
 
@@ -114,7 +118,7 @@ Open an issue. Include:
 - Steps to reproduce
 - Expected vs actual behavior
 
-For security issues, see [`SECURITY.md`](SECURITY.md) — do NOT open a
+For security issues, see [`SECURITY.md`](SECURITY.md): do NOT open a
 public issue with reproduction details for security bugs.
 
 ## Code of Conduct

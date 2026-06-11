@@ -70,7 +70,7 @@ Then aggregate as above.
 `SessionStart`, `UserPromptSubmit`, `PostToolUse`, and `Stop` each at >=90%
 deliverability across the synthetic sessions. If any fall short, the runtime
 design needs to find a different mechanism (e.g., re-injection on next
-`UserPromptSubmit` if `SessionStart` is unreliable). Halt to `HALT.md` rather
+`UserPromptSubmit` if `SessionStart` is unreliable). Halt to `docs/history/HALT-night-1.md` rather
 than designing on assumptions.
 
 ## Output

@@ -71,7 +71,33 @@ def main():
                    help="ID of an existing lesson this replaces.")
     p.add_argument("--namespace", default="default",
                    help="Brain namespace (default: 'default' = v0.1 layout).")
+    p.add_argument("--non-interactive-ack", action="store_true",
+                   help="Acknowledge a non-interactive graduation: stdin is "
+                        "not a TTY but a human explicitly approved this "
+                        "promotion (e.g. an agent relaying the user's "
+                        "decision from the dream-cycle review).")
     args = p.parse_args()
+
+    # TTY gate (brainstack modification): graduation makes memory durable,
+    # so it must trace back to a human decision. With the default reviewer
+    # and no TTY on stdin, require the explicit acknowledgment flag so an
+    # injected prompt cannot silently promote a candidate through an agent.
+    if args.reviewer == "host-agent" and not sys.stdin.isatty():
+        if not args.non_interactive_ack:
+            print(
+                "ERROR: stdin is not a TTY and --reviewer is the default "
+                "'host-agent'. Graduation must be a human decision: run "
+                "this from an interactive terminal (e.g. `recall pending "
+                "--review`), or, if a human already approved this exact "
+                "promotion, re-run with --non-interactive-ack.",
+                file=sys.stderr,
+            )
+            sys.exit(4)
+        print(
+            "WARNING: non-interactive graduation proceeding under "
+            "--non-interactive-ack (caller asserts a human approved it).",
+            file=sys.stderr,
+        )
 
     # Shadow the module-level constants with namespace-resolved paths so
     # the rest of main() reads from the right place under v0.2 layouts.

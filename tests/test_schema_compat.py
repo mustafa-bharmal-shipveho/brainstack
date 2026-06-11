@@ -120,6 +120,9 @@ def test_lessons_jsonl_required_fields_match_upstream():
         # Migration-extension fields added when migrating native auto-memory
         # dirs into the brain. See CHANGELOG / lessons.schema.json.
         "name", "type", "source_session_id",
+        # Trust-extension fields (self-reported provenance attribution).
+        # See lessons.schema.json / SECURITY.md.
+        "created_by", "session_id",
     }
     upstream_in_schema = declared_fields - extension_fields
     assert upstream_in_schema == expected_fields, (

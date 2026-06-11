@@ -44,6 +44,11 @@ Modifications summary:
   - tools/render_lessons.py: extended _bullet_for() to render optional
     'why' and 'how_to_apply' fields when present in lesson rows. Backward
     compatible — when absent, output matches upstream.
+  - tools/graduate.py: added a human-decision gate. With the default
+    reviewer ('host-agent') and no TTY on stdin, graduation now requires
+    an explicit --non-interactive-ack flag (asserting a human approved
+    the promotion) or exits non-zero with an actionable message.
+    Interactive runs are unchanged.
 
 Files originally written by Mustafa Bharmal (clean-room, not derived from
 upstream):

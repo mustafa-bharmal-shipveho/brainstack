@@ -156,8 +156,18 @@ def _yaml_safe(s: str) -> str:
     if (
         s
         and _YAML_SAFE_BARE_RE.match(s)
+        # ": " (colon+space) and a trailing ":" are YAML mapping indicators;
+        # " #" starts a comment. A bare scalar containing any of these is
+        # invalid YAML even though the chars are individually "safe" (e.g.
+        # "19:33:48" is fine bare, but "Scope negotiated: 502" is not).
+        and ": " not in s
+        and not s.endswith(":")
+        and " #" not in s
         and s.strip().lower() not in _YAML_RESERVED
         and not s.startswith("-")
+        # A leading YAML indicator char (e.g. "@mention", "`code`") is reserved
+        # and breaks a bare scalar even though the rest of the value is safe.
+        and s[0] not in "@`!&*?|>%#"
         and not s[0].isdigit()  # don't risk timestamp/number coercion
     ):
         return s
@@ -185,6 +195,9 @@ def render_markdown(digest: dict, meta: dict) -> str:
         "---",
         f"session_id: {_yaml_safe(str(meta.get('session_id') or ''))}",
         f"source: {meta.get('source', 'claude')}",
+        # Provenance attribution (self-reported, feeds recall's per-doc
+        # provenance labels): every digest is written by this adapter.
+        "created_by: digest-adapter",
         f"started_at: {meta.get('started_at') or ''}",
         f"ended_at: {meta.get('ended_at') or ''}",
         f"cwd: {_yaml_safe(str(meta.get('cwd') or ''))}",
@@ -192,7 +205,10 @@ def render_markdown(digest: dict, meta: dict) -> str:
         f"project_slug: {_yaml_safe(str(meta.get('project_slug') or ''))}",
         f"model: {_yaml_safe(str(meta.get('model') or ''))}",
         f"domain_tags: {_yaml_list(domain_tags)}",
-        f"outcome: {digest.get('outcome', 'unknown')}",
+        # _yaml_safe: outcome is free LLM text and often contains a colon
+        # (e.g. "Scope negotiated: ..."), which breaks unquoted YAML and made
+        # the whole frontmatter unparseable. Quote it.
+        f"outcome: {_yaml_safe(str(digest.get('outcome', 'unknown')))}",
         f"salience: {_importance_from_salience(digest.get('salience'))}",
         "---",
         "",
@@ -228,6 +244,50 @@ def render_markdown(digest: dict, meta: dict) -> str:
 # Dual write
 # ---------------------------------------------------------------------------
 
+# Match an optional surrounding quote on the truthy value, so a flag written
+# as `needs_review: 'true'` / `"yes"` is preserved across re-render too — must
+# stay consistent with recall.core / recall.lint, which both accept the quoted
+# form (otherwise _carry_needs_review would silently drop a quoted flag).
+_NEEDS_REVIEW_RE = re.compile(r"""needs_review\s*:\s*['"]?(true|yes|1)\b""", re.IGNORECASE)
+
+
+def _existing_needs_review(path: Path) -> bool:
+    """True if `path` already carries a top-level `needs_review` flag.
+
+    Markdown digests are overwritten by deterministic path, so a re-render
+    would silently drop a flag added later (e.g. by `recall lint --mark`).
+    We detect it here so write_dual can carry it across the rewrite.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, ValueError, UnicodeDecodeError):
+        return False
+    if not text.startswith("---"):
+        return False
+    for line in text.replace("\r\n", "\n").split("\n")[1:]:
+        if line.strip() == "---":
+            break
+        if _NEEDS_REVIEW_RE.match(line):
+            return True
+    return False
+
+
+def _carry_needs_review(md_body: str) -> str:
+    """Splice `needs_review: true` into a freshly-rendered digest's
+    frontmatter (idempotent). md_body is LF-newlined with a leading
+    `---`-delimited block."""
+    lines = md_body.split("\n")
+    if not lines or lines[0] != "---":
+        return md_body
+    for i in range(1, len(lines)):
+        if lines[i] == "---":
+            if any(_NEEDS_REVIEW_RE.match(ln) for ln in lines[1:i]):
+                return md_body  # already present
+            lines.insert(i, "needs_review: true")
+            return "\n".join(lines)
+    return md_body
+
+
 def write_dual(digest: dict, meta: dict, *,
                episodic_path: Path | str,
                markdown_dir: Path | str) -> dict:
@@ -241,6 +301,10 @@ def write_dual(digest: dict, meta: dict, *,
     # Markdown — atomic via temp file + replace
     md_path = markdown_path_for(digest, meta, base_dir=markdown_dir)
     md_body = render_markdown(digest, meta)
+    # Preserve a review flag a human/lint added to a prior render of this
+    # exact digest, so re-rendering never silently un-flags a stale memory.
+    if _existing_needs_review(md_path):
+        md_body = _carry_needs_review(md_body)
     atomic_write_text(md_path, md_body)
 
     # Episodic — append-only newline-delimited JSON

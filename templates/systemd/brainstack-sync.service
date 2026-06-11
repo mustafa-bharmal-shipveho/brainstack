@@ -1,0 +1,26 @@
+# Hourly brain-sync systemd user service (Linux parity for
+# com.user.agent-sync.plist).
+#
+# Install:
+#   ./install.sh --setup-systemd
+# (expands the placeholders below and runs
+#  systemctl --user daemon-reload && systemctl --user enable --now
+#  brainstack-sync.timer)
+#
+# Edit before installing manually:
+#   1. Replace REPLACE_HOME with your actual home dir (e.g. /home/yourname)
+#   2. Replace REPLACE_PYTHON with the absolute path to a Python >= 3.10
+#      interpreter. systemd user units run with a minimal environment, so
+#      sync.sh needs PYTHON_BIN set explicitly.
+#
+# The sync.sh script handles JSONL scrub + commit + push + scanner check.
+
+[Unit]
+Description=brainstack hourly brain sync (scrub + commit + push)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env bash REPLACE_BRAIN_ROOT/tools/sync.sh
+Environment=PYTHON_BIN=REPLACE_PYTHON
+Environment=BRAIN_ROOT=REPLACE_BRAIN_ROOT
+Environment=HOME=REPLACE_HOME

@@ -2,12 +2,25 @@
 # brainstack installer for the global brain at ~/.agent/.
 #
 # Modes:
-#   ./install.sh              -- install fresh ~/.agent/ if missing, else show status
+#   ./install.sh              -- install fresh ~/.agent/ if missing, else show status.
+#                                Prints the full plan first and asks for
+#                                confirmation. Non-interactive runs without
+#                                --yes fall back to --minimal.
+#   ./install.sh --yes        -- explicit consent for the full default install
+#                                (no prompt, works without a TTY)
+#   ./install.sh --minimal    -- brain + recall CLI only; touch NO host
+#                                configs, install NO scheduler. Prints the
+#                                commands to enable everything else later.
+#   ./install.sh --dry-run    -- global plan mode: combine with ANY mode to
+#                                print what would change and touch nothing
 #   ./install.sh --upgrade    -- refresh tools + hooks; leave memory/ untouched
 #   ./install.sh --verify     -- self-check: confirm brain is healthy
 #   ./install.sh --setup-digests
 #                             -- check LLM providers, wire digest sync into
 #                                LaunchAgent, optionally run initial backfill
+#   ./install.sh --setup-systemd / --remove-systemd
+#                             -- Linux scheduler parity: install/remove the
+#                                systemd user units (sync/dream/auto-migrate)
 #   ./install.sh --migrate <flat-memory-dir>
 #                             -- run tools/migrate.py against the given dir
 #
@@ -35,10 +48,24 @@
 #                                NOT reach the brain; you must set up your
 #                                own forwarding to capture them.
 #
-# Always prints manual-merge instructions for ~/.claude/settings.json. The
-# installer never auto-edits user settings — you copy the snippet by hand,
-# preserving any other hooks/permissions you already have.
+# Honesty note: the FULL default install (consented via the prompt or --yes)
+# DOES edit user settings: it registers Claude Code hooks in
+# ~/.claude/settings.json and writes sentinel-bracketed blocks into
+# ~/.claude/CLAUDE.md, ~/.codex/AGENTS.md, and ~/.cursor/.cursorrules.
+# The full plan is printed BEFORE anything executes, confirmation is asked
+# first (non-interactive runs without --yes fall back to --minimal), and
+# every edit is reversible via ./uninstall.sh.
+# Absolute path to this script, so recursive sub-invocations work no matter
+# how the user launched it (./install.sh, bash install.sh, absolute path).
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 set -euo pipefail
+
+# Keep helper-Python invocations from writing bytecode caches into $HOME.
+# The macOS CommandLineTools Python (the typical `python3` probed before
+# walking to a newer interpreter) writes ~/Library/Caches/com.apple.python
+# on every -c invocation, which would break --dry-run's nothing-changed
+# guarantee.
+export PYTHONDONTWRITEBYTECODE=1
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BRAIN_ROOT="${BRAIN_ROOT:-$HOME/.agent}"
@@ -55,8 +82,12 @@ MIGRATE_SOURCE=""
 SYMLINK_NATIVE=1
 # Track explicit user intent so we can refuse mutually exclusive flag pairs.
 SYMLINK_NATIVE_FLAG_COUNT=0
-# --dry-run shows the plan without executing; used by tests + cautious users.
+# --dry-run is a GLOBAL plan mode: combined with any invocation it prints
+# what would change and touches nothing on disk.
 DRY_RUN=0
+# --minimal: brain + recall CLI only (no host configs, no scheduler). Also
+# the automatic fallback for non-interactive default installs without --yes.
+MINIMAL=0
 
 # Default-on setup modes (v0.6.0+): fresh install runs all five automatically.
 # Each --no-X flag disables exactly one. Only takes effect in fresh-install
@@ -200,6 +231,14 @@ while [ $# -gt 0 ]; do
             MODE="remove-launchd"
             shift
             ;;
+        --setup-systemd)
+            MODE="setup-systemd"
+            shift
+            ;;
+        --remove-systemd)
+            MODE="remove-systemd"
+            shift
+            ;;
         --purge-data)
             UNINSTALL_PURGE_DATA=1
             shift
@@ -331,12 +370,24 @@ while [ $# -gt 0 ]; do
             SKIP_MIGRATE=1
             shift
             ;;
+        --minimal)
+            # Trust-building entry point: brain + recall CLI only. Skips all
+            # five defaults, the scanner offer, and migrate discovery; never
+            # touches host configs. The summary teaches the opt-in commands.
+            MINIMAL=1
+            shift
+            ;;
         --no-prompt)
             NO_PROMPT=1
             shift
             ;;
         --help|-h)
-            sed -n '2,38p' "$0" | sed 's/^# //; s/^#//'
+            # Print the full header comment block (everything between the
+            # shebang and the first non-comment line) so the help text can't
+            # drift out of sync with a hard-coded line range. Single awk
+            # process: a tail|sed pipeline here dies of SIGPIPE under
+            # `set -o pipefail` when sed quits early.
+            /usr/bin/awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$SELF"
             exit 0
             ;;
         *)
@@ -403,6 +454,107 @@ maybe_install_scanner() {
     fi
 }
 
+# ----- Helper: print the install plan -----
+# Shared by --dry-run (print + exit) and the consent gate (print + confirm).
+# Enumerates every path the install would create or modify, based on the
+# parsed flags, the platform, and the current disk state. READ-ONLY: this
+# function must never touch the filesystem.
+print_install_plan() {
+    local kind="$1"  # "full" or "minimal"
+    local plan_platform="${BRAINSTACK_PLATFORM_OVERRIDE:-$(uname -s)}"
+
+    echo ""
+    echo "==> Install plan ($kind install); nothing has been changed yet:"
+    echo ""
+    echo "    Brain (created if missing):"
+    echo "      $BRAIN_ROOT/                    memory tree + tools/ + harness/"
+    echo "      $BRAIN_ROOT/.gitignore          default ignore rules"
+    echo "      $BRAIN_ROOT/redact-private.txt  private redaction patterns stub"
+    if [ -n "$BRAIN_REMOTE" ]; then
+        echo "      git init + remote origin = $BRAIN_REMOTE"
+        if [ "$PUSH_INITIAL_COMMIT" -eq 1 ]; then
+            echo "      initial commit pushed to origin (--push-initial-commit)"
+        else
+            echo "      initial commit created locally (not pushed)"
+        fi
+    fi
+    echo ""
+    echo "    Recall CLI:"
+    echo "      $REPO_DIR/.venv                 package venv (created if missing)"
+    echo "      $HOME/.local/bin/recall         symlink onto your PATH"
+
+    if [ "$kind" = "minimal" ]; then
+        echo ""
+        echo "    Nothing else: no host configs are touched, no scheduler is"
+        echo "    installed. The summary lists the opt-in commands."
+        return 0
+    fi
+
+    echo ""
+    echo "    Scheduler (hourly sync + nightly dream + hourly auto-migrate):"
+    if [ "$NO_LAUNCHD" = "1" ]; then
+        echo "      skipped (--no-launchd)"
+    elif [ "$plan_platform" = "Darwin" ]; then
+        echo "      $HOME/Library/LaunchAgents/com.user.agent-sync.plist"
+        echo "      $HOME/Library/LaunchAgents/com.user.agent-dream.plist"
+        echo "      $HOME/Library/LaunchAgents/com.brainstack.auto-migrate.plist"
+    elif [ "$plan_platform" = "Linux" ] && command -v systemctl >/dev/null 2>&1; then
+        echo "      ${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/brainstack-{sync,dream,auto-migrate}.{service,timer}"
+    else
+        echo "      NONE: no launchd or systemd on this platform ($plan_platform);"
+        echo "      set up cron manually or run ./install.sh --setup-systemd where available"
+    fi
+
+    echo ""
+    echo "    Host configs (sentinel-bracketed edits, reversible via ./uninstall.sh):"
+    echo "      $HOME/.claude/settings.json     Claude Code UserPromptSubmit hook (auto-recall)"
+    echo "      $HOME/.claude/CLAUDE.md         recall-first directive block"
+    echo "      $HOME/.codex/AGENTS.md          recall-first directive block"
+    echo "      $HOME/.cursor/.cursorrules      recall-first directive block"
+    echo "      $BRAIN_ROOT/runtime/pyproject.toml  enable_auto_recall flag"
+
+    # Migrate discovery: list the candidate dirs that WOULD be offered.
+    local plan_candidates=()
+    if [ "$SKIP_MIGRATE" != "1" ]; then
+        if [ -d "$HOME/.claude/projects" ]; then
+            local d
+            for d in "$HOME/.claude/projects"/*/memory; do
+                [ -d "$d" ] || continue
+                plan_candidates+=("$d")
+            done
+        fi
+        [ -d "$HOME/.codex" ] && plan_candidates+=("$HOME/.codex")
+        [ -d "$HOME/.cursor" ] && plan_candidates+=("$HOME/.cursor")
+    fi
+    echo ""
+    echo "    Migrate discovery (mirror-only; sources are never replaced):"
+    if [ "$SKIP_MIGRATE" = "1" ]; then
+        echo "      skipped (--skip-migrate)"
+    elif [ "${#plan_candidates[@]}" -eq 0 ]; then
+        echo "      no candidate memory dirs found"
+    else
+        local c
+        for c in "${plan_candidates[@]}"; do
+            echo "      candidate: $c"
+        done
+    fi
+
+    # Scanner offer
+    if [ -z "$INSTALL_SCANNER" ] \
+       && ! command -v trufflehog >/dev/null 2>&1 \
+       && ! command -v gitleaks >/dev/null 2>&1; then
+        echo ""
+        echo "    Secret scanner: none found on PATH; the install will offer to"
+        echo "    install trufflehog (sync refuses to push without a scanner)."
+    elif [ -n "$INSTALL_SCANNER" ]; then
+        echo ""
+        echo "    Secret scanner: $INSTALL_SCANNER will be installed if missing (--install-scanner)"
+    fi
+
+    echo ""
+    echo "    Everything above is reversible with ./uninstall.sh"
+}
+
 # ----- Python version check -----
 # Auto-detect: if the default `python3` isn't >= 3.10, walk preferred
 # versions (matches sync.sh's behavior). Codex QA caught that
@@ -441,7 +593,11 @@ PYTHON_ABS="$("$PYTHON_BIN" -c 'import sys; print(sys.executable)')"
 # sync.sh fails closed without trufflehog or gitleaks. If --install-scanner
 # was passed, attempt installation now; otherwise warn so the user can
 # install before first sync.
-if [ -n "$INSTALL_SCANNER" ]; then
+if [ -n "$INSTALL_SCANNER" ] && [ "$DRY_RUN" = "1" ]; then
+    # Global plan mode: never invoke the package manager. Without this gate,
+    # `--dry-run --install-scanner` REALLY installed the scanner.
+    echo "==> DRY RUN: would install $INSTALL_SCANNER via the local package manager (skipped)"
+elif [ -n "$INSTALL_SCANNER" ]; then
     maybe_install_scanner "$INSTALL_SCANNER" || {
         echo "install: scanner install failed; sync.sh will refuse to push" >&2
         echo "         Set SYNC_ALLOW_NO_SCANNER=1 to bypass (NOT RECOMMENDED)." >&2
@@ -777,6 +933,10 @@ fi
 
 # ----- Mode: upgrade -----
 if [ "$MODE" = "upgrade" ]; then
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "==> DRY RUN (--upgrade): would refresh $BRAIN_ROOT/{tools,harness,memory/*.py} from $REPO_DIR and refresh the recall CLI. Nothing was changed."
+        exit 0
+    fi
     if [ ! -d "$BRAIN_ROOT" ]; then
         echo "install: $BRAIN_ROOT does not exist; nothing to upgrade. Run plain ./install.sh first." >&2
         exit 2
@@ -895,6 +1055,10 @@ fi
 # them from a sibling agent under the same fcntl lock keeps them from
 # racing the dispatcher.
 if [ "$MODE" = "setup-claude-extras" ] || [ "$MODE" = "remove-claude-extras" ]; then
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "==> DRY RUN ($MODE): would install/remove $HOME/Library/LaunchAgents/com.brainstack.claude-extras.plist. Nothing was changed."
+        exit 0
+    fi
     if [ ! -d "$BRAIN_ROOT" ]; then
         echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
         exit 2
@@ -958,6 +1122,10 @@ fi
 # pending-review summary on every chat session. Idempotent — re-running
 # replaces the bracketed section without disturbing other content.
 if [ "$MODE" = "setup-cursor-rules" ] || [ "$MODE" = "remove-cursor-rules" ]; then
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "==> DRY RUN ($MODE): would edit the brainstack-pending block in $HOME/.cursor/.cursorrules. Nothing was changed."
+        exit 0
+    fi
     if [ ! -d "$BRAIN_ROOT" ]; then
         echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
         exit 2
@@ -1009,6 +1177,10 @@ fi
 # <brain>/PENDING_REVIEW.md before exec'ing the real binary. Idempotent
 # (sentinel-marked block in the rc file).
 if [ "$MODE" = "setup-shell-banner" ] || [ "$MODE" = "remove-shell-banner" ]; then
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "==> DRY RUN ($MODE): would edit the brainstack-shell-banner block in your shell rc and $BRAIN_ROOT/banner/. Nothing was changed."
+        exit 0
+    fi
     if [ ! -d "$BRAIN_ROOT" ]; then
         echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
         exit 2
@@ -1100,6 +1272,10 @@ fi
 # SessionStart entry tagged with our sentinel (cleans up post-upgrade
 # from the prior iteration).
 if [ "$MODE" = "setup-pending-hook" ] || [ "$MODE" = "remove-pending-hook" ]; then
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "==> DRY RUN ($MODE): would edit the brainstack-pending-review block in $HOME/.claude/CLAUDE.md. Nothing was changed."
+        exit 0
+    fi
     if [ ! -d "$BRAIN_ROOT" ]; then
         echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
         exit 2
@@ -1227,6 +1403,10 @@ fi
 # so subsequent --upgrade runs know the user opted into digests.
 # Auth uses the user's existing subscription/login — never an API key.
 if [ "$MODE" = "setup-digests" ]; then
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "==> DRY RUN ($MODE): would check LLM providers and write $BRAIN_ROOT/.digests-enabled. Nothing was changed."
+        exit 0
+    fi
     if [ ! -d "$BRAIN_ROOT" ]; then
         echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
         exit 2
@@ -1404,6 +1584,10 @@ fi
 # (since settings.json supports only one statusLine; we own that slot).
 # --remove-statusline restores no statusLine (Claude Code's default).
 if [ "$MODE" = "setup-statusline" ] || [ "$MODE" = "remove-statusline" ]; then
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "==> DRY RUN ($MODE): would edit the statusLine entry in $HOME/.claude/settings.json. Nothing was changed."
+        exit 0
+    fi
     if [ ! -d "$BRAIN_ROOT" ]; then
         echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
         exit 2
@@ -1476,6 +1660,10 @@ fi
 #
 # Idempotent. Preserves user-authored AGENTS.md content above and below.
 if [ "$MODE" = "setup-codex-agents-md" ] || [ "$MODE" = "remove-codex-agents-md" ]; then
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "==> DRY RUN ($MODE): would edit the brainstack-pending block in $HOME/.codex/AGENTS.md. Nothing was changed."
+        exit 0
+    fi
     if [ ! -d "$BRAIN_ROOT" ]; then
         echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
         exit 2
@@ -1530,17 +1718,21 @@ fi
 # Each sub-mode is idempotent and silently skips its surface if the
 # host tool isn't installed (e.g., no ~/.cursor → cursor step is no-op).
 if [ "$MODE" = "setup-pending-review-all" ] || [ "$MODE" = "remove-pending-review-all" ]; then
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "==> DRY RUN ($MODE): would wire/unwire all five pending-review surfaces (statusline / Claude / Cursor / Codex / shell). Nothing was changed."
+        exit 0
+    fi
     if [ ! -d "$BRAIN_ROOT" ]; then
         echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
         exit 2
     fi
     if [ "$MODE" = "remove-pending-review-all" ]; then
         echo "==> Removing pending-review surfaces (statusline / Claude / Cursor / Codex / shell)…"
-        "$0" --remove-statusline        2>&1 | sed 's/^/  /'
-        "$0" --remove-pending-hook      2>&1 | sed 's/^/  /'
-        "$0" --remove-cursor-rules      2>&1 | sed 's/^/  /'
-        "$0" --remove-codex-agents-md   2>&1 | sed 's/^/  /'
-        "$0" --remove-shell-banner      2>&1 | sed 's/^/  /'
+        "$SELF" --remove-statusline        2>&1 | sed 's/^/  /'
+        "$SELF" --remove-pending-hook      2>&1 | sed 's/^/  /'
+        "$SELF" --remove-cursor-rules      2>&1 | sed 's/^/  /'
+        "$SELF" --remove-codex-agents-md   2>&1 | sed 's/^/  /'
+        "$SELF" --remove-shell-banner      2>&1 | sed 's/^/  /'
         echo "==> Removal complete."
         exit 0
     fi
@@ -1550,11 +1742,11 @@ if [ "$MODE" = "setup-pending-review-all" ] || [ "$MODE" = "remove-pending-revie
     # Order: statusline first (most user-visible: appears as soon as
     # session opens), then directives that fire on first response.
     echo "==> Setting up pending-review surfaces (statusline / Claude / Cursor / Codex / shell)…"
-    PYTHON_BIN="$PYTHON_BIN" "$0" --setup-statusline        2>&1 | sed 's/^/  [statusln] /'
-    PYTHON_BIN="$PYTHON_BIN" "$0" --setup-pending-hook      2>&1 | sed 's/^/  [claude]   /'
-    PYTHON_BIN="$PYTHON_BIN" "$0" --setup-cursor-rules      2>&1 | sed 's/^/  [cursor]   /'
-    PYTHON_BIN="$PYTHON_BIN" "$0" --setup-codex-agents-md   2>&1 | sed 's/^/  [codex]    /'
-    PYTHON_BIN="$PYTHON_BIN" "$0" --setup-shell-banner      2>&1 | sed 's/^/  [shell]    /'
+    PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-statusline        2>&1 | sed 's/^/  [statusln] /'
+    PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-pending-hook      2>&1 | sed 's/^/  [claude]   /'
+    PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-cursor-rules      2>&1 | sed 's/^/  [cursor]   /'
+    PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-codex-agents-md   2>&1 | sed 's/^/  [codex]    /'
+    PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-shell-banner      2>&1 | sed 's/^/  [shell]    /'
     echo
     echo "==> All five surfaces configured."
     echo "    Statusline:    Claude Code UI footer, visible immediately on session open"
@@ -1577,6 +1769,10 @@ fi
 # Idempotent: re-running --setup replaces the bracketed section.
 # Graceful: if the host tool dir doesn't exist, exit 0 with a notice.
 if [[ "$MODE" == setup-recall-first-* ]] || [[ "$MODE" == remove-recall-first-* ]]; then
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "==> DRY RUN ($MODE): would edit the brainstack-recall-first block in the host instruction file(s) (CLAUDE.md / AGENTS.md / .cursorrules). Nothing was changed."
+        exit 0
+    fi
     if [ ! -d "$BRAIN_ROOT" ]; then
         echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
         exit 2
@@ -1590,17 +1786,17 @@ if [[ "$MODE" == setup-recall-first-* ]] || [[ "$MODE" == remove-recall-first-* 
     # All-in-one fans out to the three single-host modes.
     if [ "$MODE" = "setup-recall-first-all" ]; then
         echo "==> Wiring recall-first directive into Claude / Codex / Cursor…"
-        PYTHON_BIN="$PYTHON_BIN" "$0" --setup-recall-first-claude 2>&1 | sed 's/^/  [claude] /'
-        PYTHON_BIN="$PYTHON_BIN" "$0" --setup-recall-first-codex  2>&1 | sed 's/^/  [codex]  /'
-        PYTHON_BIN="$PYTHON_BIN" "$0" --setup-recall-first-cursor 2>&1 | sed 's/^/  [cursor] /'
+        PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-recall-first-claude 2>&1 | sed 's/^/  [claude] /'
+        PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-recall-first-codex  2>&1 | sed 's/^/  [codex]  /'
+        PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-recall-first-cursor 2>&1 | sed 's/^/  [cursor] /'
         echo "==> Done. Recall is now the first-line resource on all installed hosts."
         exit 0
     fi
     if [ "$MODE" = "remove-recall-first-all" ]; then
         echo "==> Removing recall-first directive from Claude / Codex / Cursor…"
-        "$0" --remove-recall-first-claude 2>&1 | sed 's/^/  /'
-        "$0" --remove-recall-first-codex  2>&1 | sed 's/^/  /'
-        "$0" --remove-recall-first-cursor 2>&1 | sed 's/^/  /'
+        "$SELF" --remove-recall-first-claude 2>&1 | sed 's/^/  /'
+        "$SELF" --remove-recall-first-codex  2>&1 | sed 's/^/  /'
+        "$SELF" --remove-recall-first-cursor 2>&1 | sed 's/^/  /'
         echo "==> Removal complete."
         exit 0
     fi
@@ -1695,6 +1891,10 @@ fi
 # the installed plist, and launchd silently fails to fire the hourly sync +
 # nightly dream cycle.
 if [ "$MODE" = "setup-launchd" ] || [ "$MODE" = "remove-launchd" ]; then
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "==> DRY RUN ($MODE): would install/remove com.user.agent-{dream,sync}.plist in $HOME/Library/LaunchAgents/. Nothing was changed."
+        exit 0
+    fi
     if [ ! -d "$BRAIN_ROOT" ]; then
         echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
         exit 2
@@ -1779,6 +1979,117 @@ PYEOF
     exit 0
 fi
 
+# ----- Mode: setup-systemd / remove-systemd -----
+# Linux parity for --setup-launchd. Expands REPLACE_HOME and REPLACE_PYTHON
+# in templates/systemd/* and copies them into the user unit dir, then runs
+# `systemctl --user daemon-reload` + `enable --now` on each timer.
+# BRAINSTACK_SKIP_SYSTEMCTL=1 writes the units without registering them;
+# mirrors BRAINSTACK_SKIP_LAUNCHCTL for hermetic tests and for machines
+# where the user systemd session isn't reachable.
+if [ "$MODE" = "setup-systemd" ] || [ "$MODE" = "remove-systemd" ]; then
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "==> DRY RUN ($MODE): would install/remove the brainstack-{sync,dream,auto-migrate} systemd user units in ${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/. Nothing was changed."
+        exit 0
+    fi
+    SD_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+
+    systemd_units=(
+        "brainstack-sync.service"
+        "brainstack-sync.timer"
+        "brainstack-dream.service"
+        "brainstack-dream.timer"
+        "brainstack-auto-migrate.service"
+        "brainstack-auto-migrate.timer"
+    )
+
+    if [ "$MODE" = "remove-systemd" ]; then
+        for name in "${systemd_units[@]}"; do
+            dest="$unit_dir/$name"
+            if [ -f "$dest" ]; then
+                if [ "${BRAINSTACK_SKIP_SYSTEMCTL:-0}" != "1" ] \
+                   && command -v systemctl >/dev/null 2>&1; then
+                    case "$name" in
+                        *.timer) systemctl --user disable --now "$name" 2>/dev/null || true ;;
+                    esac
+                fi
+                rm -f "$dest"
+                echo "  removed $dest"
+            fi
+        done
+        if [ "${BRAINSTACK_SKIP_SYSTEMCTL:-0}" != "1" ] \
+           && command -v systemctl >/dev/null 2>&1; then
+            systemctl --user daemon-reload 2>/dev/null || true
+        fi
+        echo "==> systemd user units removed."
+        exit 0
+    fi
+
+    # setup: expand REPLACE_* and install. Idempotent.
+    mkdir -p "$unit_dir"
+    for name in "${systemd_units[@]}"; do
+        src="$SD_SCRIPT_DIR/templates/systemd/$name"
+        dest="$unit_dir/$name"
+        if [ ! -f "$src" ]; then
+            echo "install: template missing: $src" >&2
+            exit 2
+        fi
+        # Same placeholder expansion mechanism as the launchd handler:
+        # values passed via argv so exotic $HOME values can't poison sed.
+        "$PYTHON_BIN" - "$src" "$dest" "$HOME" "$PYTHON_ABS" "$BRAIN_ROOT" <<'PYEOF'
+import sys
+from pathlib import Path
+src, dest, home, python_abs, brain_root = sys.argv[1:6]
+text = Path(src).read_text()
+# Expand REPLACE_BRAIN_ROOT before REPLACE_HOME so the units run sync/dream
+# against the brain the user actually installed (honors a custom
+# --brain-root), not a hardcoded ~/.agent.
+expanded = (
+    text
+    .replace("REPLACE_BRAIN_ROOT", brain_root)
+    .replace("REPLACE_HOME", home)
+    .replace("REPLACE_PYTHON", python_abs)
+)
+if (
+    "REPLACE_BRAIN_ROOT" in expanded
+    or "REPLACE_PYTHON" in expanded
+    or "REPLACE_HOME" in expanded
+):
+    print(f"install: unexpanded placeholder in {dest}", file=sys.stderr)
+    sys.exit(2)
+Path(dest).write_text(expanded)
+print(f"  wrote {dest}")
+PYEOF
+    done
+
+    if [ "${BRAINSTACK_SKIP_SYSTEMCTL:-0}" = "1" ]; then
+        echo "  (skipped systemctl registration: BRAINSTACK_SKIP_SYSTEMCTL=1)"
+    elif ! command -v systemctl >/dev/null 2>&1; then
+        echo "  WARN: systemctl not found; units written but not enabled." >&2
+        echo "        Enable later with: systemctl --user daemon-reload && systemctl --user enable --now brainstack-sync.timer brainstack-dream.timer brainstack-auto-migrate.timer" >&2
+    else
+        systemctl --user daemon-reload
+        for timer in brainstack-sync.timer brainstack-dream.timer brainstack-auto-migrate.timer; do
+            if systemctl --user enable --now "$timer" 2>/dev/null; then
+                echo "  enabled $timer"
+            else
+                echo "  WARN: systemctl --user enable --now $timer failed; try manually:" >&2
+                echo "    systemctl --user enable --now $timer" >&2
+            fi
+        done
+    fi
+
+    echo
+    echo "==> systemd user units installed."
+    echo "    dream cycle (clusters episodic events into lessons) runs nightly at 03:00"
+    echo "    sync (hourly git push to your brain remote) runs every hour"
+    echo "    auto-migrate (imports native tool memory) runs every hour"
+    echo "    inspect:  systemctl --user list-timers 'brainstack-*'"
+    echo "    logs:     journalctl --user -u brainstack-sync.service"
+    echo "    tear down: ./install.sh --remove-systemd"
+    exit 0
+fi
+
 # ----- Mode: uninstall -----
 # Single safe entry point for removing brainstack from a user's machine.
 # Default behavior: removes every host-side surface brainstack installed,
@@ -1817,6 +2128,20 @@ if [ "$MODE" = "uninstall" ]; then
         "$plist_dir/com.brainstack.auto-migrate.plist" \
         "$plist_dir/com.brainstack.claude-extras.plist"; do
         [ -f "$plist" ] && inventory_present+=("launchd plist: $plist")
+    done
+
+    # Inventory the systemd user units (Linux scheduler parity). Same
+    # names as the --setup-systemd handler writes; the removal loop below
+    # uses the identical list.
+    systemd_unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    for unit in \
+        "$systemd_unit_dir/brainstack-sync.service" \
+        "$systemd_unit_dir/brainstack-sync.timer" \
+        "$systemd_unit_dir/brainstack-dream.service" \
+        "$systemd_unit_dir/brainstack-dream.timer" \
+        "$systemd_unit_dir/brainstack-auto-migrate.service" \
+        "$systemd_unit_dir/brainstack-auto-migrate.timer"; do
+        [ -f "$unit" ] && inventory_present+=("systemd unit: $unit")
     done
 
     if [ -f "$HOME/.zshrc" ] && grep -q "brainstack-shell-banner" "$HOME/.zshrc"; then
@@ -1938,6 +2263,26 @@ if [ "$MODE" = "uninstall" ]; then
         fi
     done
 
+    # Remove systemd user units. Same name list as the inventory loop above.
+    for unit in \
+        "$systemd_unit_dir/brainstack-sync.service" \
+        "$systemd_unit_dir/brainstack-sync.timer" \
+        "$systemd_unit_dir/brainstack-dream.service" \
+        "$systemd_unit_dir/brainstack-dream.timer" \
+        "$systemd_unit_dir/brainstack-auto-migrate.service" \
+        "$systemd_unit_dir/brainstack-auto-migrate.timer"; do
+        if [ -f "$unit" ]; then
+            if [ "${BRAINSTACK_SKIP_SYSTEMCTL:-0}" != "1" ] \
+               && command -v systemctl >/dev/null 2>&1; then
+                case "$unit" in
+                    *.timer) systemctl --user disable --now "$(basename "$unit")" 2>/dev/null || true ;;
+                esac
+            fi
+            rm -f "$unit"
+            echo "  removed $unit"
+        fi
+    done
+
     # Run the existing --remove-* flags for host configs. Each handles
     # "absent" gracefully (matches our partial-install contract).
     PYTHON_BIN="$PYTHON_BIN_FORWARD" "$UN_SCRIPT_DIR/install.sh" --remove-pending-review-all 2>&1 | sed 's/^/  /' || true
@@ -2020,6 +2365,10 @@ fi
 # Storage: <brain>/imports/extra_sources.txt — one "SRC=DST_SUB" line per
 # source. Edit by hand if you prefer; these flags are just convenience.
 if [ "$MODE" = "add-source" ] || [ "$MODE" = "remove-source" ] || [ "$MODE" = "list-sources" ]; then
+    if [ "$DRY_RUN" = "1" ] && [ "$MODE" != "list-sources" ]; then
+        echo "==> DRY RUN ($MODE): would edit $BRAIN_ROOT/imports/extra_sources.txt. Nothing was changed."
+        exit 0
+    fi
     if [ ! -d "$BRAIN_ROOT" ]; then
         echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
         exit 2
@@ -2202,6 +2551,10 @@ fi
 # The hook registration is skipped silently if ~/.claude doesn't exist
 # (user doesn't use Claude Code) — graceful no-op.
 if [ "$MODE" = "enable-auto-recall" ] || [ "$MODE" = "disable-auto-recall" ]; then
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "==> DRY RUN ($MODE): would flip enable_auto_recall in $BRAIN_ROOT/runtime/pyproject.toml and register/keep the UserPromptSubmit hook in $HOME/.claude/settings.json. Nothing was changed."
+        exit 0
+    fi
     if [ ! -d "$BRAIN_ROOT" ]; then
         echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
         exit 2
@@ -2352,6 +2705,50 @@ if [ -d "$BRAIN_ROOT" ]; then
     exit 0
 fi
 
+# ----- Fresh install: plan + consent gate -----
+# The full default install edits ~/.claude/settings.json and writes sentinel
+# blocks into three host config files. That requires explicit consent: the
+# plan is printed UPFRONT, a TTY gets one prompt, --yes is the
+# non-interactive consent, and non-interactive runs WITHOUT --yes fall back
+# to the minimal install (safe default for `curl | bash` and CI).
+INSTALL_KIND="full"
+[ "$MINIMAL" = "1" ] && INSTALL_KIND="minimal"
+
+if [ "$DRY_RUN" = "1" ]; then
+    print_install_plan "$INSTALL_KIND"
+    echo ""
+    echo "==> Dry-run complete. Nothing was changed."
+    exit 0
+fi
+
+if [ "$INSTALL_KIND" = "full" ]; then
+    print_install_plan full
+    echo ""
+    if [ "$ASSUME_YES" = "1" ]; then
+        echo "==> --yes given: proceeding with the full install."
+    elif [ -t 0 ]; then
+        printf "Proceed with full install? [Y/n] (m for minimal) "
+        read -r consent_reply
+        case "$consent_reply" in
+            m|M)
+                INSTALL_KIND="minimal"
+                echo "==> Minimal install selected."
+                ;;
+            n|N|no|NO)
+                echo "Aborted. Nothing was changed."
+                exit 0
+                ;;
+            *) : ;;  # default Y → full
+        esac
+    else
+        echo "==> Non-interactive without --yes: falling back to minimal install"
+        echo "    (brain + recall CLI only; NO host configs are touched)."
+        echo "    Re-run with --yes for the full default install."
+        INSTALL_KIND="minimal"
+    fi
+fi
+
+echo ""
 echo "==> Installing brain at $BRAIN_ROOT"
 mkdir -p "$BRAIN_ROOT"
 
@@ -2468,11 +2865,43 @@ fi
 
 # Make `recall` available as a bare command (creates venv if missing,
 # pip installs the package, symlinks into ~/.local/bin/). Idempotent.
-if [ -x "$REPO_DIR/bin/install-recall-cli.sh" ]; then
+# BRAINSTACK_SKIP_CLI_INSTALL=1 lets fast/hermetic tests skip the
+# network-touching pip install (mirrors the gate on the upgrade path).
+if [ "${BRAINSTACK_SKIP_CLI_INSTALL:-0}" != "1" ] \
+   && [ -x "$REPO_DIR/bin/install-recall-cli.sh" ]; then
     echo ""
     echo "==> Setting up the recall CLI on your PATH"
     bash "$REPO_DIR/bin/install-recall-cli.sh" || \
         echo "WARN: recall CLI symlink step failed; run \`bash $REPO_DIR/bin/install-recall-cli.sh\` manually." >&2
+fi
+
+# ----- Minimal install: stop here, teach the opt-ins -----
+if [ "$INSTALL_KIND" = "minimal" ]; then
+    cat <<EOF
+
+==> Minimal install complete. Brain is at: $BRAIN_ROOT
+
+Install root: $REPO_DIR
+    This clone is permanent infrastructure: the recall venv, hooks, and the
+    ~/.local/bin/recall symlink point into it; do not move or delete it. To
+    relocate, re-run ./install.sh from the new location and ./uninstall.sh
+    from the old one.
+
+No host configs were touched and no scheduler was installed.
+Enable each surface when you're ready:
+
+  Hourly sync + nightly dream (macOS):    ./install.sh --setup-launchd
+  Hourly sync + nightly dream (Linux):    ./install.sh --setup-systemd
+  Background auto-migrate scanner:        ./install.sh --setup-auto-migrate
+  Recall-first directive (3 host files):  ./install.sh --setup-recall-first-all
+  Per-prompt auto-recall (Claude Code):   ./install.sh --enable-auto-recall
+  Import an existing memory dir:          ./install.sh --migrate <dir>
+  Everything at once (the full default):  ./install.sh --yes
+
+Verify:  recall doctor
+Remove:  ./uninstall.sh
+EOF
+    exit 0
 fi
 
 # ----- Default-on setup modes (v0.6.0+) -----
@@ -2494,6 +2923,36 @@ DEFAULT_AUTO_RECALL_STATUS="pending"
 
 echo ""
 echo "==> Applying default setup (opt out per-mode with --no-X)"
+
+# --- Scanner offer (full install only) ---
+# sync.sh fails closed without trufflehog or gitleaks. Offer the fix now
+# instead of leaving a warning the user only rediscovers when the first
+# sync refuses to push. --yes consents; a TTY gets one prompt; otherwise
+# the earlier warning stands.
+if [ -z "$INSTALL_SCANNER" ] \
+   && ! command -v trufflehog >/dev/null 2>&1 \
+   && ! command -v gitleaks >/dev/null 2>&1; then
+    if [ "$ASSUME_YES" = "1" ]; then
+        maybe_install_scanner trufflehog || {
+            echo "install: scanner install failed; sync.sh will refuse to push" >&2
+            echo "         Retry with: ./install.sh --install-scanner" >&2
+        }
+    elif [ -t 0 ]; then
+        printf "    No secret scanner found. Install trufflehog now? [Y/n] "
+        read -r scanner_reply
+        case "${scanner_reply:-Y}" in
+            [Yy]*|"")
+                maybe_install_scanner trufflehog || {
+                    echo "install: scanner install failed; sync.sh will refuse to push" >&2
+                    echo "         Retry with: ./install.sh --install-scanner" >&2
+                }
+                ;;
+            *)
+                echo "    Skipped. Install later with: ./install.sh --install-scanner" >&2
+                ;;
+        esac
+    fi
+fi
 
 # --- Default 1: interactive migrate discovery ---
 # Scan known native dirs (~/.claude/projects/*, ~/.codex/*, ~/.cursor) and
@@ -2561,7 +3020,7 @@ else
                 # can still run `./install.sh --migrate <path>` directly
                 # (where SYMLINK_NATIVE=1 remains the default for that explicit
                 # invocation).
-                if PYTHON_BIN="$PYTHON_BIN" "$0" --migrate "$src" --no-symlink >/dev/null 2>&1; then
+                if PYTHON_BIN="$PYTHON_BIN" "$SELF" --migrate "$src" --no-symlink >/dev/null 2>&1; then
                     migrated_count=$((migrated_count + 1))
                 fi
             fi
@@ -2581,32 +3040,54 @@ fi
 if [ "$NO_AUTO_MIGRATE" = "1" ]; then
     DEFAULT_AUTO_MIGRATE_STATUS="skipped"
 else
-    if PYTHON_BIN="$PYTHON_BIN" "$0" --setup-auto-migrate >/dev/null 2>&1; then
+    if PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-auto-migrate >/dev/null 2>&1; then
         DEFAULT_AUTO_MIGRATE_STATUS="done"
     else
         DEFAULT_AUTO_MIGRATE_STATUS="failed"
     fi
 fi
 
-# --- Default 3: --setup-launchd ---
+# --- Default 3: platform scheduler (--setup-launchd / --setup-systemd) ---
+# Darwin gets launchd plists, Linux with systemctl gets systemd user units,
+# anything else gets a LOUD no-scheduler warning. --no-launchd opts out of
+# BOTH schedulers. BRAINSTACK_PLATFORM_OVERRIDE forces the selection for
+# tests.
+PLATFORM="${BRAINSTACK_PLATFORM_OVERRIDE:-$(uname -s)}"
+DEFAULT_SCHEDULER_KIND="none"
 if [ "$NO_LAUNCHD" = "1" ]; then
     DEFAULT_LAUNCHD_STATUS="skipped"
-elif [ "$(uname -s)" != "Darwin" ]; then
-    DEFAULT_LAUNCHD_STATUS="skipped"
-    # Linux / other: no launchd. systemd timers are out of scope for this PR.
-else
-    if PYTHON_BIN="$PYTHON_BIN" "$0" --setup-launchd >/dev/null 2>&1; then
+elif [ "$PLATFORM" = "Darwin" ]; then
+    DEFAULT_SCHEDULER_KIND="launchd"
+    if PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-launchd >/dev/null 2>&1; then
         DEFAULT_LAUNCHD_STATUS="done"
     else
         DEFAULT_LAUNCHD_STATUS="failed"
     fi
+elif [ "$PLATFORM" = "Linux" ] && command -v systemctl >/dev/null 2>&1; then
+    DEFAULT_SCHEDULER_KIND="systemd"
+    if PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-systemd >/dev/null 2>&1; then
+        DEFAULT_LAUNCHD_STATUS="done"
+    else
+        DEFAULT_LAUNCHD_STATUS="failed"
+    fi
+else
+    DEFAULT_LAUNCHD_STATUS="skipped"
+    echo ""
+    echo "    ⚠️  WARNING: NO SCHEDULER INSTALLED on this platform ($PLATFORM)."
+    echo "       Neither launchd (macOS) nor systemd (Linux) is available, so the"
+    echo "       hourly sync, nightly dream cycle, and hourly auto-migrate will"
+    echo "       NOT run automatically. Alternatives:"
+    echo "         - cron: schedule  bash ~/.agent/tools/sync.sh  hourly and"
+    echo "                 $PYTHON_BIN ~/.agent/tools/dream_runner.py  nightly"
+    echo "         - systemd (if available later): ./install.sh --setup-systemd"
+    echo ""
 fi
 
 # --- Default 4: --setup-recall-first-all ---
 if [ "$NO_RECALL_FIRST" = "1" ]; then
     DEFAULT_RECALL_FIRST_STATUS="skipped"
 else
-    if PYTHON_BIN="$PYTHON_BIN" "$0" --setup-recall-first-all >/dev/null 2>&1; then
+    if PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-recall-first-all >/dev/null 2>&1; then
         DEFAULT_RECALL_FIRST_STATUS="done"
     else
         DEFAULT_RECALL_FIRST_STATUS="failed"
@@ -2617,7 +3098,7 @@ fi
 if [ "$NO_AUTO_RECALL" = "1" ]; then
     DEFAULT_AUTO_RECALL_STATUS="skipped"
 else
-    if PYTHON_BIN="$PYTHON_BIN" "$0" --enable-auto-recall >/dev/null 2>&1; then
+    if PYTHON_BIN="$PYTHON_BIN" "$SELF" --enable-auto-recall >/dev/null 2>&1; then
         DEFAULT_AUTO_RECALL_STATUS="done"
     else
         DEFAULT_AUTO_RECALL_STATUS="failed"
@@ -2637,14 +3118,30 @@ _mark_for() {
     esac
 }
 
+# The scheduler line names the scheduler that actually ran. On systemd the
+# opt-out flag moves to its own unmarked line so the summary never prints a
+# ✓ line claiming "launchd" on a Linux box.
+if [ "$DEFAULT_SCHEDULER_KIND" = "systemd" ]; then
+    SCHEDULER_SUMMARY="  $(_mark_for "$DEFAULT_LAUNCHD_STATUS") Hourly sync + nightly dream: $DEFAULT_LAUNCHD_STATUS via systemd user timers
+      (opt out of the scheduler next install with: --no-launchd)"
+else
+    SCHEDULER_SUMMARY="  $(_mark_for "$DEFAULT_LAUNCHD_STATUS") Hourly sync + nightly dream: $DEFAULT_LAUNCHD_STATUS                                              (--no-launchd)"
+fi
+
 cat <<EOF
 
 ==> Installed. Brain is at: $BRAIN_ROOT
 
+Install root: $REPO_DIR
+    This clone is permanent infrastructure: the recall venv, hooks, and the
+    ~/.local/bin/recall symlink point into it; do not move or delete it. To
+    relocate, re-run ./install.sh from the new location and ./uninstall.sh
+    from the old one.
+
 Defaults applied (skip on next install with the flag in parens):
   $(_mark_for "$DEFAULT_MIGRATE_STATUS") Migrate discovery: $DEFAULT_MIGRATE_STATUS${DEFAULT_MIGRATE_DETAIL:+ ($DEFAULT_MIGRATE_DETAIL)}    (--skip-migrate)
   $(_mark_for "$DEFAULT_AUTO_MIGRATE_STATUS") Auto-migrate background scanner: $DEFAULT_AUTO_MIGRATE_STATUS                                  (--no-auto-migrate)
-  $(_mark_for "$DEFAULT_LAUNCHD_STATUS") Hourly sync + nightly dream: $DEFAULT_LAUNCHD_STATUS                                              (--no-launchd)
+$SCHEDULER_SUMMARY
   $(_mark_for "$DEFAULT_RECALL_FIRST_STATUS") Recall-first directive: $DEFAULT_RECALL_FIRST_STATUS                                                   (--no-recall-first)
   $(_mark_for "$DEFAULT_AUTO_RECALL_STATUS") Claude Code auto-recall: $DEFAULT_AUTO_RECALL_STATUS                                                 (--no-auto-recall)
 

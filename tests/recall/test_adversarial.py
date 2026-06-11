@@ -23,6 +23,8 @@ from recall.frontmatter import parse_file_text, parse_path
 from recall.migrate import MigrationAbort, plan_migration
 from recall.sources import _matches_any, discover_documents
 
+pytestmark = pytest.mark.embeddings
+
 
 # ---------------------------------------------------------------------------
 # Migration safety

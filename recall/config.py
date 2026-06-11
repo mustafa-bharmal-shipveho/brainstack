@@ -123,11 +123,50 @@ class RankingConfig:
     reranker_model: str = "jinaai/jina-reranker-v1-turbo-en"
     rerank_n: int = 20
 
+    # How to treat memories flagged `needs_review: true` (e.g. by `recall lint
+    # --mark` when they reference dead paths). A flagged memory is potentially
+    # stale, so injecting it costs trust.
+    #   - "demote":  keep, but multiply its score by `needs_review_penalty` so
+    #                fresh memories outrank it (default — never silently lose info)
+    #   - "exclude": drop flagged memories from results entirely
+    #   - "ignore":  no special handling (pre-lint behavior)
+    needs_review_policy: str = "demote"
+    # Score multiplier applied to flagged memories under the "demote" policy.
+    # 0.0 = effectively exclude, 1.0 = no penalty. 0.5 halves the score.
+    needs_review_penalty: float = 0.5
+
+    # Whether `recall query` runs LLM query expansion when neither --expand
+    # nor --no-expand is passed. Expansion costs one LLM CLI round-trip per
+    # query (measured ~5-20 s with a cold claude/codex CLI), so it is
+    # opt-in: flip this to true, or pass --expand per query.
+    expand_default: bool = False
+
+
+@dataclass(frozen=True)
+class AutoRecallConfig:
+    """Scoping for the every-prompt auto-recall injection (Claude Code hook).
+
+    `exclude_sources` names sources that must NOT feed auto-recall. They stay
+    fully available to explicit `recall query` and the MCP surface; they just
+    never get injected into a session automatically. This is the lever for a
+    sensitive mirrored source (e.g. an `--add-source` folder of employer or
+    incident notes) that you want searchable on demand but not surfaced into
+    unrelated repositories on every prompt.
+
+    Default empty = exclude nothing (auto-recall queries every source), which
+    preserves pre-0.6 behavior. Per-memory / per-project (cwd) scoping is a
+    separate, finer-grained mechanism tracked on the roadmap; this source-level
+    exclusion is the coarse but immediately useful first cut.
+    """
+
+    exclude_sources: list[str] = field(default_factory=list)
+
 
 @dataclass(frozen=True)
 class Config:
     sources: list[SourceConfig]
     ranking: RankingConfig = field(default_factory=RankingConfig)
+    auto_recall: AutoRecallConfig = field(default_factory=AutoRecallConfig)
     default_k: int = 5
 
     def __post_init__(self):
@@ -499,6 +538,7 @@ def _config_to_dict(cfg: Config) -> dict:
             for s in cfg.sources
         ],
         "ranking": asdict(cfg.ranking),
+        "auto_recall": asdict(cfg.auto_recall),
         "default_k": cfg.default_k,
         # Always stamp the marker on save: fresh defaults + every migrated
         # config write through here, so a downgrade-and-re-upgrade cycle
@@ -553,6 +593,9 @@ def _config_from_dict(data: dict) -> Config:
                 ranking_raw.get("reranker_model", "jinaai/jina-reranker-v1-turbo-en")
             ),
             rerank_n=int(ranking_raw.get("rerank_n", 20)),
+            needs_review_policy=str(ranking_raw.get("needs_review_policy", "demote")),
+            needs_review_penalty=float(ranking_raw.get("needs_review_penalty", 0.5)),
+            expand_default=bool(ranking_raw.get("expand_default", False)),
         )
     else:
         ranking = RankingConfig(
@@ -564,12 +607,33 @@ def _config_from_dict(data: dict) -> Config:
                 ranking_raw.get("reranker_model", "jinaai/jina-reranker-v1-turbo-en")
             ),
             rerank_n=int(ranking_raw.get("rerank_n", 20)),
+            needs_review_policy=str(ranking_raw.get("needs_review_policy", "demote")),
+            needs_review_penalty=float(ranking_raw.get("needs_review_penalty", 0.5)),
+            expand_default=bool(ranking_raw.get("expand_default", False)),
         )
+    auto_recall_raw = data.get("auto_recall") or {}
+    auto_recall = AutoRecallConfig(
+        exclude_sources=list(auto_recall_raw.get("exclude_sources", [])),
+    )
     return Config(
         sources=sources,
         ranking=ranking,
+        auto_recall=auto_recall,
         default_k=int(data.get("default_k", 5)),
     )
+
+
+def effective_mode(cfg: "Config", override: str | None = None) -> str:
+    """Resolve the retrieval mode that every surface must agree on.
+
+    Precedence: explicit override (a CLI flag) > `RECALL_MODE` env > the
+    config's `ranking.mode`. Centralized so the CLI, MCP server, auto-recall
+    hook, and the index-build path all pick the SAME mode. That matters
+    because a `sparse` mode must skip the dense embedder on BOTH query and
+    indexing; if indexing silently used hybrid it would download the dense
+    model the user set sparse to avoid.
+    """
+    return override or os.environ.get("RECALL_MODE") or cfg.ranking.mode
 
 
 def load_config() -> Config:

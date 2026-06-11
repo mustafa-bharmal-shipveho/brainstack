@@ -1,0 +1,15 @@
+# Hourly trigger for brainstack-sync.service.
+#
+# Install: ./install.sh --setup-systemd
+# Inspect: systemctl --user list-timers brainstack-sync.timer
+
+[Unit]
+Description=Run brainstack brain sync hourly
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

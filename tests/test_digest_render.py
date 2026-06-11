@@ -238,3 +238,63 @@ class TestDualWrite:
         # Only one markdown
         mds = list(md_dir.glob("*.md"))
         assert len(mds) == 1
+
+    def test_carry_needs_review_preserves_quoted_flag(self, render_mod, tmp_path):
+        # _existing_needs_review must recognize a QUOTED truthy flag (consistent
+        # with recall.core / recall.lint), else re-render silently drops it.
+        episodic_path = tmp_path / "ep" / "AGENT_LEARNINGS.jsonl"
+        md_dir = tmp_path / "md"
+        result = render_mod.write_dual(SAMPLE_DIGEST, SAMPLE_META,
+                                       episodic_path=episodic_path, markdown_dir=md_dir)
+        md_path = Path(result["markdown_path"])
+        text = md_path.read_text()
+        text = text.replace("---\n", "---\nneeds_review: 'yes'\n", 1)  # QUOTED form
+        md_path.write_text(text)
+        render_mod.write_dual(SAMPLE_DIGEST, SAMPLE_META,
+                              episodic_path=episodic_path, markdown_dir=md_dir)
+        assert "needs_review" in md_path.read_text(), "re-render dropped a quoted review flag"
+
+    def test_yaml_safe_quotes_leading_at(self, render_mod):
+        import yaml
+        digest = dict(SAMPLE_DIGEST, outcome="@oncall paged; resolved in 20m")
+        md = render_mod.render_markdown(digest, SAMPLE_META)
+        parsed = yaml.safe_load(md.split("---", 2)[1])  # must not raise
+        assert parsed["outcome"] == "@oncall paged; resolved in 20m"
+
+    def test_outcome_with_colon_yields_parseable_frontmatter(self, render_mod):
+        """Regression: an `outcome` containing a colon must not break YAML
+        (it used to make the whole frontmatter unparseable → empty fm →
+        type filter, needs_review, etc. all invisible)."""
+        import yaml
+        digest = dict(SAMPLE_DIGEST,
+                      outcome="Scope negotiated: 502 backend error deferred to triage")
+        md = render_mod.render_markdown(digest, SAMPLE_META)
+        block = md.split("---", 2)[1]
+        parsed = yaml.safe_load(block)
+        assert isinstance(parsed, dict)
+        assert parsed["outcome"] == "Scope negotiated: 502 backend error deferred to triage"
+
+    def test_write_dual_preserves_needs_review_across_rerender(self, render_mod, tmp_path):
+        """If a human / `recall lint --mark` flagged a digest with
+        needs_review, re-rendering the SAME digest must NOT silently drop
+        the flag (it overwrites by deterministic path)."""
+        episodic_path = tmp_path / "ep" / "AGENT_LEARNINGS.jsonl"
+        md_dir = tmp_path / "md"
+        result = render_mod.write_dual(SAMPLE_DIGEST, SAMPLE_META,
+                                       episodic_path=episodic_path,
+                                       markdown_dir=md_dir)
+        md_path = Path(result["markdown_path"])
+        # Simulate lint --mark adding the flag into the frontmatter.
+        text = md_path.read_text()
+        text = text.replace("---\n", "---\nneeds_review: true\n", 1)
+        md_path.write_text(text)
+        assert "needs_review: true" in md_path.read_text()
+
+        # Re-render the same digest (same path → overwrite).
+        render_mod.write_dual(SAMPLE_DIGEST, SAMPLE_META,
+                              episodic_path=episodic_path,
+                              markdown_dir=md_dir)
+        after = md_path.read_text()
+        assert "needs_review: true" in after, "re-render dropped the review flag"
+        # Idempotent: exactly one occurrence, not duplicated.
+        assert after.count("needs_review:") == 1

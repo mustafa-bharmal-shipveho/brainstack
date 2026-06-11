@@ -233,6 +233,11 @@ def test_install_sh_migrate_routes_cursor_through_dispatcher(tmp_path):
     shutil.copy(REPO_ROOT / "agent" / "tools" / "migrate.py", brain / "tools")
     shutil.copy(REPO_ROOT / "agent" / "tools" / "migrate_dispatcher.py", brain / "tools")
     shutil.copy(REPO_ROOT / "agent" / "tools" / "cursor_adapter.py", brain / "tools")
+    # Write-path redaction dependencies (the real installer ships the whole
+    # tools/ dir; this synthetic brain only gets what the adapter imports).
+    shutil.copy(REPO_ROOT / "agent" / "tools" / "_redact_common.py", brain / "tools")
+    shutil.copy(REPO_ROOT / "agent" / "tools" / "redact.py", brain / "tools")
+    shutil.copy(REPO_ROOT / "agent" / "tools" / "redact_jsonl.py", brain / "tools")
     shutil.copy(REPO_ROOT / "agent" / "memory" / "_atomic.py", brain / "memory")
 
     install_script = REPO_ROOT / "install.sh"
