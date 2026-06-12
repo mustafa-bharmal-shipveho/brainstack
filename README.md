@@ -37,7 +37,17 @@ recall query "what did I learn about flaky integration tests"
 
 ## The full experience
 
-`./install.sh` (no flags) prints everything it will touch, including an `Install root:` line showing where the clone and its Python venv will live, and asks once before doing anything. `--yes` accepts the plan; non-interactive runs without `--yes` fall back to the minimal install. `--dry-run` prints the plan and exits without changing anything. If neither `trufflehog` nor `gitleaks` is on PATH, the full install offers to install one.
+Want everything turned on (auto-recall on every prompt, recall-first directives, hourly sync + nightly dream, the background session scanner) in one command, no prompts:
+
+```bash
+git clone https://github.com/mustafa-bharmal-shipveho/brainstack.git
+cd brainstack
+./install.sh --yes
+```
+
+`--yes` is the "install all options, don't ask me" path. Prefer to see what it does first? Run `./install.sh` with no flags: it prints everything it will touch, including an `Install root:` line showing where the clone and its Python venv will live, and asks once before doing anything (a non-interactive run without `--yes` falls back to the minimal install). `./install.sh --dry-run` prints that same plan and exits without changing anything. If neither `trufflehog` nor `gitleaks` is on PATH, the full install offers to install one.
+
+Turn individual pieces off by adding the opt-out flags from the table below (they compose, e.g. `./install.sh --yes --no-launchd --no-auto-migrate`).
 
 What the full install touches:
 
