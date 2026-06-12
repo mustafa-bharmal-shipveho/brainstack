@@ -1,6 +1,38 @@
 # Changelog
 
-## v0.6.0 — 2026-05-20
+## v0.5.1 (2026-06-12)
+
+Next release after v0.5.0 (the last tagged release). Supersedes the unreleased
+0.6.0 below: that version was set in `pyproject.toml` and documented here but
+never tagged or published, so its changes ship as part of this release.
+
+**Adoption-gap audit: trust, install UX, retrieval, packaging, and proof.**
+
+- Install UX: true `--dry-run` (previously performed a real install), a
+  `--minimal` mode (brain + recall CLI only, no host edits), a consent gate
+  that prints what the full install touches and falls back to minimal when run
+  non-interactively without `--yes`, and systemd parity for Linux.
+- Retrieval: the auto-recall hook now uses the repo venv Python (was silently
+  no-op on fresh installs), the embedding-model cache is pinned to
+  `~/.cache/fastembed`, BM25-only auto-fallback with `--mode`/`RECALL_MODE`
+  threaded through indexing, `--expand` off by default, and a deeper
+  `recall doctor`.
+- Trust: recalled memory is sanitized before injection (wrapper-escape
+  neutralization, fences, untrusted preamble), `recall remember` stages for
+  review by default, write-path PII redaction across all adapters, per-document
+  provenance plus a new `recall trace` command, and `auto_recall.exclude_sources`
+  scoping. Read-only MCP.
+- Proof + positioning: a reproducible auto-recall A/B benchmark
+  (`make bench`; recall@1 = 0.905), a README rewritten around the
+  trust-and-verifiability wedge, a refreshed privacy audit, ROADMAP, and
+  CODE_OF_CONDUCT.
+- Distribution: MCP `server.json`, Claude Code `marketplace.json`, an
+  Add-to-Cursor deeplink, WSL2 docs, and a verified PyPI build.
+- Fixes (found by a clean-room end-to-end day): a first-query crash on an empty
+  `imports` collection, and YAML-corrupting frontmatter from `recall remember`
+  when the text contained a colon.
+
+## v0.6.0 — 2026-05-20 (unreleased; superseded by v0.5.1)
 
 **One-command install: defaults flip + opt-out flags.** Pre-0.6.0, a vanilla
 `./install.sh --brain-remote ...` left users with an empty brain — no
