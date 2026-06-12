@@ -120,9 +120,11 @@ if [ -x "$JSONL_SCRUBBER" ] || [ -f "$JSONL_SCRUBBER" ]; then
 
     if [ "${#SCRUB_TARGETS[@]}" -gt 0 ]; then
         # Scrubber returns 1 if it changed files; we still want to proceed.
-        # rc=2 is the only fatal case.
+        # rc=2 is the only fatal case. --brain-root points the scrubber at
+        # THIS brain's redact-private.txt (its default is ~/.agent, which
+        # silently drops private patterns on non-default BRAIN_ROOT installs).
         set +e
-        "$PYTHON_BIN" "$JSONL_SCRUBBER" "${SCRUB_TARGETS[@]}" 2>>"$LOG_FILE"
+        "$PYTHON_BIN" "$JSONL_SCRUBBER" --brain-root "$BRAIN_ROOT" "${SCRUB_TARGETS[@]}" 2>>"$LOG_FILE"
         rc=$?
         set -e
         if [ "$rc" -eq 2 ]; then
@@ -163,11 +165,17 @@ if [ -z "$SCANNER" ]; then
     if [ "${SYNC_ALLOW_NO_SCANNER:-}" = "1" ]; then
         echo "$(date -u +%FT%TZ) sync: WARNING no scanner installed but SYNC_ALLOW_NO_SCANNER=1; continuing" >> "$LOG_FILE"
     else
+        # Log marker BEFORE exiting so render_pending_summary's
+        # _check_sync_status can classify the sync as blocked (the literal
+        # phrase "no secret scanner installed" is the detection contract).
+        echo "$(date -u +%FT%TZ) sync: no secret scanner installed; skipping push" >> "$LOG_FILE"
         echo "$(date -u +%FT%TZ) sync: ERROR no secret scanner installed (trufflehog or gitleaks)" >&2
         echo "    Install one:" >&2
         echo "      brew install trufflehog" >&2
         echo "      brew install gitleaks" >&2
+        echo "    Or: ./install.sh --install-scanner" >&2
         echo "    Or set SYNC_ALLOW_NO_SCANNER=1 to skip (NOT RECOMMENDED)." >&2
+        echo "    recall doctor will show this failure." >&2
         exit 2
     fi
 fi

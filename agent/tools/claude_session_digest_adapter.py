@@ -13,8 +13,8 @@ Architecture (matches the approved plan):
        when nothing changed.
     3. Normalize (via _session_normalize) so the LLM doesn't see
        upstream-format quirks.
-    4. Redact each turn's text via redact_jsonl.redact_string before
-       it leaves the local process.
+    4. Redact each turn's text via _redact_common.redact_for_write
+       before it leaves the local process.
     5. Summarize via the resolved LLM provider, JSON-schema enforced.
        Small sessions: single call. Big sessions (>SINGLE_PASS_TOKEN_LIMIT):
        map-reduce — one chunk-summary per chunk, then a final merge.
@@ -56,13 +56,9 @@ import _digest_render as digest_render  # type: ignore
 from llm_providers import LLMProvider, resolve_provider  # type: ignore
 from llm_providers.base import LLMError, ProviderNotAvailable  # type: ignore
 
-# Redaction
-from redact import (  # type: ignore
-    BUILTIN_PATTERNS,
-    MULTILINE_PATTERNS,
-    load_private_patterns,
-)
-from redact_jsonl import redact_string  # type: ignore
+# Redaction: shared write-path helper (builtin + multiline + private
+# patterns + entropy sweep, fail-open on private-pattern load errors).
+from _redact_common import redact_for_write  # type: ignore
 
 
 # Sessions up to this many tokens go single-pass; bigger sessions trigger
@@ -300,33 +296,19 @@ def _session_source_path(ns: NormalizedSession,
 # Redaction
 # ---------------------------------------------------------------------------
 
-_PATTERN_CACHE: dict[str, list] = {}
-
 
 def _redact_text(text: str, brain_root: Path) -> str:
-    """Single-call redaction wrapper. Uses the same patterns as the
-    JSONL adapter PLUS an entropy sweep so opaque 32+ char tokens that
-    don't match a named vendor pattern are still scrubbed.
+    """Single-call redaction wrapper. Delegates to the shared write-path
+    helper (`_redact_common.redact_for_write`): builtin + multiline +
+    private patterns from `<brain_root>/redact-private.txt` plus the
+    entropy sweep so opaque 32+ char tokens that don't match a named
+    vendor pattern are still scrubbed.
 
-    Patterns are cached per brain_root so a long backfill doesn't re-read
-    `redact-private.txt` once per session. A load failure for the private
-    patterns file is logged once to stderr — we keep going with builtin
-    coverage rather than failing closed (which would skip every digest
-    forever on a single typo in a user-provided regex)."""
-    key = str(brain_root)
-    patterns = _PATTERN_CACHE.get(key)
-    if patterns is None:
-        patterns = list(BUILTIN_PATTERNS) + list(MULTILINE_PATTERNS)
-        try:
-            patterns += list(load_private_patterns(brain_root))
-        except Exception as e:
-            sys.stderr.write(
-                f"WARN: digest adapter: load_private_patterns failed "
-                f"({type(e).__name__}: {e}); using builtin patterns only\n"
-            )
-        _PATTERN_CACHE[key] = patterns
-    redacted, _hits = redact_string(text, patterns, entropy_threshold=4.5)
-    return redacted
+    Behavior is identical to the previous in-module implementation
+    (patterns cached per brain_root; private-pattern load failures WARN
+    to stderr and fail open to builtin coverage); the logic just lives
+    in one place now so every adapter applies the same coverage."""
+    return redact_for_write(text, brain_root)
 
 
 # ---------------------------------------------------------------------------

@@ -139,6 +139,7 @@ class HybridRetriever:
         rerank_n: int = 20,
         needs_review_policy: str = "demote",
         needs_review_penalty: float = 0.5,
+        mode: str = "hybrid",
         # Legacy kwargs accepted for back-compat; ignored.
         bm25_weight: Optional[float] = None,
         embedding_weight: Optional[float] = None,
@@ -154,6 +155,10 @@ class HybridRetriever:
         self._rerank_n = int(rerank_n)
         self._needs_review_policy = needs_review_policy
         self._needs_review_penalty = float(needs_review_penalty)
+        # Retrieval mode: "hybrid" (dense + sparse), "dense", or "sparse".
+        # Passed through to every backend upsert/query so sparse mode never
+        # touches the dense embedder (works before the bge download).
+        self._mode = mode
         self._client = qb._qdrant_client_singleton(cache_dir())
         self.documents: list[Document] = list(documents) if documents else []
 
@@ -178,6 +183,7 @@ class HybridRetriever:
                     docs,
                     dense_model=self._dense_model,
                     sparse_model=self._sparse_model,
+                    mode=self._mode,
                 )
 
     def query(
@@ -230,6 +236,7 @@ class HybridRetriever:
                         sparse_model=self._sparse_model,
                         reranker_model=self._reranker_model,
                         rerank_n=self._rerank_n,
+                        mode=self._mode,
                     )
                 )
             else:
@@ -243,6 +250,7 @@ class HybridRetriever:
                         source_filter=None,  # already constrained by collection
                         dense_model=self._dense_model,
                         sparse_model=self._sparse_model,
+                        mode=self._mode,
                     )
                 )
         # Stable sort by score desc, then path for determinism

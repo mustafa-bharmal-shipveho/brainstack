@@ -195,6 +195,9 @@ def render_markdown(digest: dict, meta: dict) -> str:
         "---",
         f"session_id: {_yaml_safe(str(meta.get('session_id') or ''))}",
         f"source: {meta.get('source', 'claude')}",
+        # Provenance attribution (self-reported, feeds recall's per-doc
+        # provenance labels): every digest is written by this adapter.
+        "created_by: digest-adapter",
         f"started_at: {meta.get('started_at') or ''}",
         f"ended_at: {meta.get('ended_at') or ''}",
         f"cwd: {_yaml_safe(str(meta.get('cwd') or ''))}",

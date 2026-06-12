@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "recall-brain"
-version = "0.6.0"
+version = "0.5.1"
 description = "Tool-agnostic memory storage + retrieval + runtime for AI coding assistants"
 readme = "README.md"
 license = "Apache-2.0"
@@ -60,6 +60,7 @@ markers = [
     "embeddings: tests requiring sentence-transformers (heavy)",
     "mcp: tests requiring mcp library",
     "timeout(seconds): per-test wall-clock bound (no-op without pytest-timeout)",
+    "machine: needs the developer's real HOME / machine state (network pip, real git config); excluded in CI",
 ]
 
 [tool.coverage.run]
@@ -80,7 +81,34 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]
-ignore = ["E501"]
+ignore = [
+    "E501",
+    # Ratchet list (2026-06): pre-existing debt, burn down and remove.
+    "E402",
+    "E741",
+    "E731",
+    "E702",
+    "B007",
+    "B008",
+    "B904",
+    "B905",
+    "F401",
+    "F841",
+    "UP007",
+    "UP035",
+    # Ratchet additions measured against ruff==0.15.12 (same debt, newer
+    # rule codes: UP006/UP045 split out of UP007; I001 import sorting).
+    "I001",
+    "E401",
+    "F541",
+    "F811",
+    "B033",
+    "UP006",
+    "UP012",
+    "UP024",
+    "UP037",
+    "UP045",
+]
 
 # v0.2 context runtime config. See docs/runtime.md.
 [tool.recall.runtime]

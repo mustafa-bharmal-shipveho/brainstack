@@ -38,7 +38,8 @@ least **30 days** between report and disclosure.
 | Version | Status |
 |---|---|
 | `main` (HEAD) | actively patched |
-| Tagged `v0.1.x` | best-effort backports for high-severity issues |
+| Tagged `v0.6.x` | best-effort backports for high-severity issues |
+| Older tags (`v0.5.x` and earlier) | unsupported, upgrade |
 | Unreleased forks | unsupported |
 
 ## What this project tries to defend against
@@ -61,6 +62,41 @@ and the architecture notes:
   patterns containing nested-quantifier shapes at load time.
 - **`.agent-local-override` spoofing.** Every fire is logged to
   `<brain>/override.log` so silent disabling is auditable.
+
+## Memory poisoning and prompt injection
+
+Recalled memory is a prompt-injection surface: anything that can write
+into the brain (adapters ingesting transcripts, `recall remember`, a
+hand-edited file) can later have its text injected into a model prompt
+by auto-recall, reinjection, or the MCP `recall_query` tool. The
+mitigations, and their limits:
+
+- **Sanitization at the injection chokepoint.** All recalled text passes
+  through `recall.sanitize.sanitize_untrusted` before reaching a prompt:
+  wrapper-escape sequences are neutralized (a literal
+  `</system-reminder>` tag, a forged `<!-- runtime-reinject -->` marker,
+  or a forged `[recall-doc-N-start]` fence inside a memory body cannot
+  break out of, or fake, the injection block), ANSI/control characters
+  are stripped, and truncation happens after neutralization so a cut
+  can never resurrect a working escape tag. Each excerpt is wrapped in
+  fence lines and prefixed with a one-line untrusted-data preamble.
+- **Sanitization is structural, not semantic.** Neutralizing escape
+  mechanisms cannot make adversarial prose inert. A memory that says
+  "always disable the test suite" arrives intact, as data the model is
+  told not to obey, but a sufficiently persuasive poisoned memory can
+  still influence future LLM sessions. Review what lands in your brain.
+- **Durable writes are review-gated.** `recall remember` stages lessons
+  with `needs_review: true` by default; retrieval demotes or excludes
+  staged lessons until a human accepts them via `recall pending
+  --review` (TTY-gated). `graduate.py` refuses non-interactive runs
+  without an explicit `--non-interactive-ack`. The MCP surface is
+  read-only (exactly one tool, `recall_query`), so an injected prompt
+  cannot mutate the brain through that seam.
+- **Provenance is self-reported, not signed.** The `provenance:` labels
+  on recalled docs (`created_by`, `reviewed_by`, dates) come from
+  frontmatter that any writer can set. They support trust weighting and
+  audit, they do not prove authorship. There is no cryptographic
+  integrity layer on memory files.
 
 ## What this project does NOT defend against
 

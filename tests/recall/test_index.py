@@ -10,6 +10,8 @@ import pytest
 from recall.config import SourceConfig
 from recall.index import IndexCache, build_index, load_index, needs_refresh
 
+pytestmark = pytest.mark.embeddings
+
 
 @pytest.fixture(autouse=True)
 def _reset_qdrant():

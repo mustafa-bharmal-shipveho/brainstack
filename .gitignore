@@ -46,3 +46,10 @@ episodic/AGENT_LEARNINGS.jsonl
 SECURITY_REVIEW.md
 RESUME.md
 tmp/
+
+# Demo artifacts: the synthetic brain + isolated config/cache that
+# demo/make_demo_brain.py and demo/demo.tape generate. Regenerable;
+# only demo/demo.tape, demo/make_demo_brain.py and demo/demo.gif belong in git.
+demo/brain/
+demo/.cache/
+demo/.config/

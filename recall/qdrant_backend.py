@@ -47,6 +47,31 @@ from qdrant_client import QdrantClient, models
 
 from recall.core import Document, QueryResult
 
+# Dense-embedder failures in hybrid mode degrade to BM25-only retrieval.
+# Warn once per process (mirrors _FCNTL_WARN_ONCE) so a brain whose bge
+# download never completed stays queryable instead of failing every call.
+_SPARSE_FALLBACK_WARN_ONCE = threading.Event()
+
+
+def _warn_sparse_fallback_once(exc: Exception) -> None:
+    if _SPARSE_FALLBACK_WARN_ONCE.is_set():
+        return
+    _SPARSE_FALLBACK_WARN_ONCE.set()
+    print(
+        f"recall: dense embedding model unavailable ({exc}); falling back "
+        "to BM25-only (sparse) retrieval for this process. Run "
+        "'recall reindex' once the model can be downloaded to restore "
+        "hybrid quality, or set RECALL_MODE=sparse to make sparse-only "
+        "explicit.",
+        file=sys.stderr,
+    )
+
+
+def _reset_sparse_fallback_warning_for_tests() -> None:
+    """Test hook: re-arm the once-per-process sparse-fallback warning."""
+    _SPARSE_FALLBACK_WARN_ONCE.clear()
+
+
 # FastEmbed types are imported lazily so unit tests that monkeypatch the
 # embedder factories don't pay the import cost.
 _DENSE_DEFAULT = "BAAI/bge-base-en-v1.5"
@@ -289,13 +314,38 @@ def _reset_model_cache_for_tests() -> None:
         _cross_encoders.clear()
 
 
+def _fastembed_cache_dir() -> str:
+    """Resolve (and create) the directory FastEmbed model weights live in.
+
+    Without an explicit cache_dir, fastembed defaults to
+    $TMPDIR/fastembed_cache, which macOS purges periodically. That turns a
+    "one-time 440 MB download" into a recurring multi-minute stall. Pin the
+    weights somewhere durable instead:
+
+      1. FASTEMBED_CACHE_PATH env var, when set (fastembed's own override)
+      2. $XDG_CACHE_HOME/fastembed (default ~/.cache/fastembed)
+
+    Importable on purpose: `recall doctor` reports this exact path, and
+    tests assert the factories pass it through.
+    """
+    override = os.environ.get("FASTEMBED_CACHE_PATH")
+    if override:
+        path = Path(override).expanduser()
+    else:
+        xdg = os.environ.get("XDG_CACHE_HOME")
+        base = Path(xdg).expanduser() if xdg else Path(os.path.expanduser("~/.cache"))
+        path = base / "fastembed"
+    path.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
 def _get_embedder(name: str = _DENSE_DEFAULT):
     from fastembed import TextEmbedding
 
     with _embedder_lock:
         emb = _dense_embedders.get(name)
         if emb is None:
-            emb = TextEmbedding(model_name=name)
+            emb = TextEmbedding(model_name=name, cache_dir=_fastembed_cache_dir())
             _dense_embedders[name] = emb
         return emb
 
@@ -306,7 +356,7 @@ def _get_sparse_embedder(name: str = _SPARSE_DEFAULT):
     with _embedder_lock:
         emb = _sparse_embedders.get(name)
         if emb is None:
-            emb = SparseTextEmbedding(model_name=name)
+            emb = SparseTextEmbedding(model_name=name, cache_dir=_fastembed_cache_dir())
             _sparse_embedders[name] = emb
         return emb
 
@@ -318,7 +368,7 @@ def _get_cross_encoder(name: str = _RERANKER_DEFAULT):
     with _embedder_lock:
         ce = _cross_encoders.get(name)
         if ce is None:
-            ce = TextCrossEncoder(model_name=name)
+            ce = TextCrossEncoder(model_name=name, cache_dir=_fastembed_cache_dir())
             _cross_encoders[name] = ce
         return ce
 
@@ -357,6 +407,7 @@ def upsert_documents(
     dense_model: str = _DENSE_DEFAULT,
     sparse_model: str = _SPARSE_DEFAULT,
     batch_size: int = 64,
+    mode: str = "hybrid",
 ) -> int:
     """Embed + upsert ONLY docs whose source-file mtime differs from the
     already-indexed value. Returns the number of points written.
@@ -376,6 +427,18 @@ def upsert_documents(
       * if the source file is missing (`OSError`), we use the 0.0
         sentinel and re-embed defensively (matches pre-fix behavior)
 
+    Mode semantics:
+      * "hybrid" embeds + stores both legs (default; prior behavior)
+      * "sparse" never runs the dense embedder (no model download needed);
+        a zero-vector placeholder fills the dense slot
+      * "dense" skips the sparse leg
+      * the effective mode is recorded in each point's payload; a point
+        whose recorded mode differs from the requested one is treated as
+        changed even when the mtime matches, so a sparse-indexed brain
+        re-embeds (gains its dense leg) on the first hybrid run
+      * in hybrid mode a dense-embedder failure warns once and degrades
+        to the sparse leg instead of failing the whole upsert
+
     Idempotency across runs: yes (mtime comparison is the new
     short-circuit; without it the function was already idempotent
     via uuid5(path) point ids).
@@ -384,39 +447,66 @@ def upsert_documents(
         return 0
 
     # Read what's already indexed so we can skip unchanged docs.
-    existing_mtimes = collection_mtimes(client, collection)
+    existing_meta = _collection_index_meta(client, collection)
 
-    # Partition: changed (needs embed+upsert) vs unchanged (skip).
+    # Partition: changed (needs embed+upsert) vs unchanged (skip). A mode
+    # mismatch counts as changed; an unchanged same-mode point keeps the
+    # mtime short-circuit.
     changed: list[tuple[Document, float]] = []
     for d in docs:
         try:
             current_mtime = os.stat(d.path).st_mtime
         except OSError:
             current_mtime = 0.0
-        if existing_mtimes.get(d.path) != current_mtime:
+        prev = existing_meta.get(d.path)
+        if prev is None or prev[0] != current_mtime or prev[1] != mode:
             changed.append((d, current_mtime))
 
     if not changed:
         return 0
 
-    dense = _get_embedder(dense_model)
-    sparse = _get_sparse_embedder(sparse_model)
     texts = [d.text for d, _ in changed]
-    dense_vecs = list(dense.embed(texts))
-    sparse_vecs = list(sparse.embed(texts))
+    effective_mode = mode
+    dense_vecs: Optional[list] = None
+    if mode in ("hybrid", "dense"):
+        try:
+            dense = _get_embedder(dense_model)
+            dense_vecs = list(dense.embed(texts))
+        except Exception as exc:
+            if mode == "dense":
+                raise
+            _warn_sparse_fallback_once(exc)
+            effective_mode = "sparse"
+            dense_vecs = None
+    sparse_vecs: Optional[list] = None
+    if effective_mode in ("hybrid", "sparse"):
+        sparse = _get_sparse_embedder(sparse_model)
+        sparse_vecs = list(sparse.embed(texts))
 
     points: list[models.PointStruct] = []
-    for (d, mtime), dv, sv in zip(changed, dense_vecs, sparse_vecs):
+    for idx, (d, mtime) in enumerate(changed):
+        vector: dict = {}
+        if dense_vecs is not None:
+            vector["dense"] = list(map(float, dense_vecs[idx]))
+        else:
+            # Sparse mode stores a zero-vector dense placeholder (no
+            # embedder needed; scores ~0 against any query). Embedded
+            # Qdrant's local _add_point never grows the named dense array
+            # for points added without that leg, so a later in-place
+            # sparse-to-hybrid upgrade would IndexError; the placeholder
+            # keeps the array consistent and the upgrade is a plain
+            # re-embed triggered by the recorded-mode mismatch above.
+            vector["dense"] = [0.0] * _DENSE_DIM
+        if sparse_vecs is not None:
+            sv = sparse_vecs[idx]
+            vector["sparse"] = models.SparseVector(
+                indices=list(map(int, sv.indices)),
+                values=list(map(float, sv.values)),
+            )
         points.append(
             models.PointStruct(
                 id=_doc_id(d.path),
-                vector={
-                    "dense": list(map(float, dv)),
-                    "sparse": models.SparseVector(
-                        indices=list(map(int, sv.indices)),
-                        values=list(map(float, sv.values)),
-                    ),
-                },
+                vector=vector,
                 payload={
                     "path": d.path,
                     "source": d.source,
@@ -425,6 +515,7 @@ def upsert_documents(
                     "body": d.body,
                     "text": d.text,
                     "mtime": mtime,
+                    "mode": effective_mode,
                 },
             )
         )
@@ -464,32 +555,72 @@ def query_hybrid(
     source_filter: Optional[str] = None,
     dense_model: str = _DENSE_DEFAULT,
     sparse_model: str = _SPARSE_DEFAULT,
+    mode: str = "hybrid",
 ) -> list[QueryResult]:
-    """Prefetch dense + sparse, fuse with RRF, return top-k as QueryResult."""
+    """Prefetch dense + sparse, fuse with RRF, return top-k as QueryResult.
+
+    `mode` selects the legs: "hybrid" (both, RRF-fused), "dense" or
+    "sparse" (single leg, direct query, no prefetch/fusion). Sparse mode
+    never constructs the dense embedder, so it works before the bge model
+    is downloaded. In hybrid mode a dense-embedder failure warns once per
+    process and degrades to the sparse leg instead of raising.
+    """
     if k <= 0:
         return []
     if not client.collection_exists(collection):
         return []
-
-    dense_vec = list(map(float, next(iter(_get_embedder(dense_model).query_embed([query])))))
-    sv = next(iter(_get_sparse_embedder(sparse_model).query_embed([query])))
-    sparse_vec = models.SparseVector(
-        indices=list(map(int, sv.indices)), values=list(map(float, sv.values))
-    )
+    # An existing-but-empty collection (the fresh-install `imports` tier before
+    # any source is added) cannot be queried: Qdrant's sparse IDF rescoring
+    # raises KeyError 'sparse' over an empty corpus. Skip it so a new user's
+    # very first query does not crash.
+    if count(client, collection) == 0:
+        return []
 
     flt = _build_filter(type_filter, source_filter)
-    prefetch = [
-        models.Prefetch(query=dense_vec, using="dense", limit=_HYBRID_PREFETCH, filter=flt),
-        models.Prefetch(query=sparse_vec, using="sparse", limit=_HYBRID_PREFETCH, filter=flt),
-    ]
-    resp = client.query_points(
-        collection_name=collection,
-        prefetch=prefetch,
-        query=models.FusionQuery(fusion=models.Fusion.RRF),
-        limit=k,
-        with_payload=True,
-        query_filter=flt,
-    )
+
+    dense_vec: Optional[list[float]] = None
+    if mode in ("hybrid", "dense"):
+        try:
+            dense_vec = list(
+                map(float, next(iter(_get_embedder(dense_model).query_embed([query]))))
+            )
+        except Exception as exc:
+            if mode == "dense":
+                raise
+            _warn_sparse_fallback_once(exc)
+            dense_vec = None
+
+    sparse_vec: Optional[models.SparseVector] = None
+    if mode in ("hybrid", "sparse") or dense_vec is None:
+        sv = next(iter(_get_sparse_embedder(sparse_model).query_embed([query])))
+        sparse_vec = models.SparseVector(
+            indices=list(map(int, sv.indices)), values=list(map(float, sv.values))
+        )
+
+    if dense_vec is not None and sparse_vec is not None:
+        prefetch = [
+            models.Prefetch(query=dense_vec, using="dense", limit=_HYBRID_PREFETCH, filter=flt),
+            models.Prefetch(query=sparse_vec, using="sparse", limit=_HYBRID_PREFETCH, filter=flt),
+        ]
+        resp = client.query_points(
+            collection_name=collection,
+            prefetch=prefetch,
+            query=models.FusionQuery(fusion=models.Fusion.RRF),
+            limit=k,
+            with_payload=True,
+            query_filter=flt,
+        )
+    else:
+        # Single-leg query: no prefetch, no fusion. Used by explicit
+        # dense/sparse modes and by the hybrid dense-failure fallback.
+        resp = client.query_points(
+            collection_name=collection,
+            query=dense_vec if dense_vec is not None else sparse_vec,
+            using="dense" if dense_vec is not None else "sparse",
+            limit=k,
+            with_payload=True,
+            query_filter=flt,
+        )
 
     out: list[QueryResult] = []
     for sp in resp.points:
@@ -517,6 +648,7 @@ def query_hybrid_rerank(
     sparse_model: str = _SPARSE_DEFAULT,
     reranker_model: str = _RERANKER_DEFAULT,
     rerank_n: int = _RERANK_OVERSAMPLE,
+    mode: str = "hybrid",
 ) -> list[QueryResult]:
     """Hybrid query + cross-encoder rerank.
 
@@ -539,6 +671,7 @@ def query_hybrid_rerank(
         source_filter=source_filter,
         dense_model=dense_model,
         sparse_model=sparse_model,
+        mode=mode,
     )
     if not candidates:
         return []
@@ -585,6 +718,40 @@ def collection_mtimes(client: QdrantClient, collection: str) -> dict[str, float]
             path = payload.get("path")
             if isinstance(path, str):
                 out[path] = float(payload.get("mtime") or 0.0)
+        if next_offset is None:
+            break
+    return out
+
+
+def _collection_index_meta(
+    client: QdrantClient, collection: str
+) -> dict[str, tuple[float, str]]:
+    """Return {path: (mtime, mode)} for every point. Used by upsert_documents.
+
+    Points written before mode tracking lack the payload key; they were
+    indexed with both legs, so they read back as "hybrid" (which preserves
+    the mtime short-circuit for unchanged pre-upgrade points).
+    """
+    if not client.collection_exists(collection):
+        return {}
+    out: dict[str, tuple[float, str]] = {}
+    next_offset = None
+    while True:
+        points, next_offset = client.scroll(
+            collection_name=collection,
+            limit=1024,
+            with_payload=["path", "mtime", "mode"],
+            with_vectors=False,
+            offset=next_offset,
+        )
+        for p in points:
+            payload = p.payload or {}
+            path = payload.get("path")
+            if isinstance(path, str):
+                out[path] = (
+                    float(payload.get("mtime") or 0.0),
+                    str(payload.get("mode") or "hybrid"),
+                )
         if next_offset is None:
             break
     return out

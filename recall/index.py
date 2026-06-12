@@ -45,8 +45,14 @@ def _legacy_cache_cleanup(base: Path) -> None:
                 pass
 
 
-def build_index(sources: Iterable[SourceConfig]) -> IndexCache:
-    """Discover docs per source, upsert current docs, then prune stale points."""
+def build_index(sources: Iterable[SourceConfig], mode: str = "hybrid") -> IndexCache:
+    """Discover docs per source, upsert current docs, then prune stale points.
+
+    `mode` is threaded into the upsert so a `sparse` build skips the dense
+    embedding leg (storing a zero-vector placeholder) and never constructs or
+    downloads the dense model. Defaults to hybrid to preserve prior behavior
+    for callers that do not care.
+    """
     sources_list = list(sources)
     base = cache_dir()
     base.mkdir(parents=True, exist_ok=True)
@@ -57,7 +63,7 @@ def build_index(sources: Iterable[SourceConfig]) -> IndexCache:
     for source in sources_list:
         docs = list(discover_documents(source))
         qb.ensure_collection(client, source.name)
-        qb.upsert_documents(client, source.name, docs)
+        qb.upsert_documents(client, source.name, docs, mode=mode)
         qb.delete_points_not_in_paths(client, source.name, {d.path for d in docs})
         all_docs.extend(docs)
     return IndexCache(cache_dir=base, documents=all_docs)

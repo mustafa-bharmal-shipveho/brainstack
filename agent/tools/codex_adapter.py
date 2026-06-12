@@ -43,6 +43,7 @@ sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_BASE / "memory"))
 
 from _atomic import atomic_write_text  # noqa: E402
+from _redact_common import redact_for_write  # noqa: E402
 from migrate_dispatcher import (  # noqa: E402
     AdapterRegistrationError,
     MigrationResult,
@@ -54,6 +55,20 @@ from migrate_dispatcher import (  # noqa: E402
 _TARGET_NAMESPACE = "codex"
 _EPISODIC_REL = Path("episodic") / _TARGET_NAMESPACE / "AGENT_LEARNINGS.jsonl"
 _SIDECAR_REL = Path("episodic") / _TARGET_NAMESPACE / "_imported.jsonl"
+
+# Episode fields carrying source-derived free text. Each passes through
+# redact_for_write before the JSONL append so secrets (builtin patterns
+# AND the user's redact-private.txt shapes) never land in the brain.
+_REDACT_EPISODE_FIELDS = ("action", "detail", "reflection", "summary")
+
+
+def _redact_episode(ep: dict, brain_root: Path) -> dict:
+    """Redact every free-text field of one episode in place."""
+    for field in _REDACT_EPISODE_FIELDS:
+        v = ep.get(field)
+        if isinstance(v, str) and v:
+            ep[field] = redact_for_write(v, brain_root)
+    return ep
 
 
 def _file_hash(path: Path) -> str:
@@ -440,8 +455,11 @@ class CodexCliAdapter:
                     "kind": "history",
                 })
 
-        # Append episodes to the codex episodic JSONL.
+        # Append episodes to the codex episodic JSONL. Every free-text
+        # field is redacted at this seam (the last point before bytes hit
+        # the brain), so no parse path can leak an unredacted token.
         if all_episodes:
+            all_episodes = [_redact_episode(e, dst) for e in all_episodes]
             episodic_path.parent.mkdir(parents=True, exist_ok=True)
             existing_text = ""
             if episodic_path.is_file():

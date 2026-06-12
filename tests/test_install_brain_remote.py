@@ -9,6 +9,13 @@ Skip if Python < 3.10 (install.sh requires it) or no python3.10+ on PATH.
 `from __future__ import annotations` keeps this collectable on Python 3.9
 (test SUITE supports 3.9 per CONTRIBUTING.md even though install.sh itself
 requires 3.10+).
+
+Consent-gate note: these run non-TTY WITHOUT --yes, so since the adoption
+audit they exercise the minimal-fallback path. That is deliberate: the
+--brain-remote git init is part of the minimal install, and (because these
+tests use the real HOME) the fallback guarantees no host configs are
+touched. BRAINSTACK_SKIP_CLI_INSTALL=1 keeps the runs hermetic now that the
+fresh-install CLI step honors it.
 """
 from __future__ import annotations
 
@@ -19,6 +26,8 @@ import sys
 from pathlib import Path
 
 import pytest
+
+pytestmark = pytest.mark.machine
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INSTALL_SH = REPO_ROOT / "install.sh"
@@ -40,6 +49,7 @@ def test_install_with_brain_remote_inits_git_and_commits(tmp_path):
 
     env = os.environ.copy()
     env["PYTHON_BIN"] = py
+    env["BRAINSTACK_SKIP_CLI_INSTALL"] = "1"
     # Use real HOME so the user's git config (user.name/email) is available;
     # only the brain dir is sandboxed via --brain-root.
 
@@ -48,6 +58,7 @@ def test_install_with_brain_remote_inits_git_and_commits(tmp_path):
         capture_output=True,
         text=True,
         env=env,
+        stdin=subprocess.DEVNULL,
         timeout=60,
     )
     assert r.returncode == 0, f"install failed: rc={r.returncode}, stderr={r.stderr}"
@@ -91,11 +102,13 @@ def test_brain_remote_via_env_var(tmp_path):
 
     env = os.environ.copy()
     env["PYTHON_BIN"] = py
+    env["BRAINSTACK_SKIP_CLI_INSTALL"] = "1"
     env["BRAIN_REMOTE_URL"] = fake_url
 
     r = subprocess.run(
         [str(INSTALL_SH), "--brain-root", str(sandbox)],
-        capture_output=True, text=True, env=env, timeout=60,
+        capture_output=True, text=True, env=env,
+        stdin=subprocess.DEVNULL, timeout=60,
     )
     assert r.returncode == 0, f"install failed: stderr={r.stderr}"
     assert (sandbox / ".git").is_dir(), "BRAIN_REMOTE_URL should have triggered git init"
@@ -110,12 +123,14 @@ def test_install_without_brain_remote_skips_git(tmp_path):
 
     env = os.environ.copy()
     env["PYTHON_BIN"] = py
+    env["BRAINSTACK_SKIP_CLI_INSTALL"] = "1"
     # Make sure BRAIN_REMOTE_URL isn't bleeding in from the parent shell
     env.pop("BRAIN_REMOTE_URL", None)
 
     r = subprocess.run(
         [str(INSTALL_SH), "--brain-root", str(sandbox)],
-        capture_output=True, text=True, env=env, timeout=60,
+        capture_output=True, text=True, env=env,
+        stdin=subprocess.DEVNULL, timeout=60,
     )
     assert r.returncode == 0
     assert (sandbox / "memory").is_dir()

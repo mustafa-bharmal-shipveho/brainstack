@@ -69,16 +69,16 @@ sys.path.insert(0, str(_HERE.parent / "memory"))
 
 from _atomic import atomic_write_text  # noqa: E402
 
-# Redaction: re-use redact_jsonl.py's `redact_string()` which itself wraps the
-# pattern set from redact.py (BUILTIN_PATTERNS + MULTILINE_PATTERNS). Keeps a
-# single source of truth for what counts as a secret.
+# Redaction: re-use redact_jsonl.py's `redact_string()` with the shared
+# per-brain pattern set from _redact_common (builtin + multiline + private
+# patterns from <brain>/redact-private.txt). Keeps a single source of
+# truth for what counts as a secret.
 try:
-    from redact import BUILTIN_PATTERNS, MULTILINE_PATTERNS  # noqa: E402
+    from _redact_common import patterns_for  # noqa: E402
     from redact_jsonl import redact_string  # noqa: E402
-    _REDACT_PATTERNS = BUILTIN_PATTERNS  # MULTILINE used internally by redact_string
     _REDACT_AVAILABLE = True
 except ImportError:
-    _REDACT_PATTERNS = []
+    patterns_for = None  # type: ignore
     redact_string = None  # type: ignore
     _REDACT_AVAILABLE = False
 
@@ -164,16 +164,18 @@ def _append_sidecar(sidecar_path: Path, entries: list[dict]) -> None:
     atomic_write_text(sidecar_path, new)
 
 
-def _redact(s: str) -> tuple[str, int]:
+def _redact(s: str, brain_root: Path) -> tuple[str, int]:
     """Apply redaction. Returns (redacted_text, n_hits).
 
-    Wraps `redact_jsonl.redact_string` — single source of truth for the
-    pattern set. Falls back to identity if redact_jsonl is unavailable.
+    Wraps `redact_jsonl.redact_string` with `_redact_common.patterns_for`,
+    the single source of truth for the pattern set, now including the
+    user's private patterns from `<brain_root>/redact-private.txt`.
+    Falls back to identity if the redaction modules are unavailable.
     """
     if not s or not _REDACT_AVAILABLE:
         return s, 0
     try:
-        new_s, hits = redact_string(s, _REDACT_PATTERNS)  # type: ignore
+        new_s, hits = redact_string(s, patterns_for(brain_root))  # type: ignore
         return new_s, len(hits)
     except Exception:
         return s, 0
@@ -232,6 +234,7 @@ def _extract_episodes(
     project_slug: str,
     session_id: str,
     seen_ids: Optional[set[str]] = None,
+    brain_root: Path = Path.home() / ".agent",
 ) -> Iterator[dict]:
     """Walk a session JSONL and yield one episode per (tool_use, tool_result)
     pair. Pairs matched by tool_use_id.
@@ -314,11 +317,11 @@ def _extract_episodes(
 
                 input_blob = json.dumps(tool_input, ensure_ascii=False) if tool_input else ""
                 detail_raw = f"INPUT:\n{input_blob}\n\nOUTPUT:\n{result_text}"
-                detail_red, hits_d = _redact(detail_raw)
+                detail_red, hits_d = _redact(detail_raw, brain_root)
                 detail = _truncate(detail_red)
 
                 action = _summarize_tool_input(tool_name, tool_input if isinstance(tool_input, dict) else {})
-                action_red, hits_a = _redact(action)
+                action_red, hits_a = _redact(action, brain_root)
                 reflection = f"{tool_name} {'failed' if is_error else 'ok'} in {project_slug}"
                 _hits_total = hits_d + hits_a
 
@@ -443,7 +446,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     for i, path in enumerate(sessions):
         slug, sid = _slug_and_session_id(path, source_root)
         added_in_file = 0
-        for ep in _extract_episodes(path, slug, sid, seen_ids=seen_ids):
+        for ep in _extract_episodes(path, slug, sid, seen_ids=seen_ids,
+                                    brain_root=brain_root):
             n_redacted += ep.pop("_redaction_hits", 0)
             tuid = ep["source"]["tool_use_id"]
             seen_ids.add(tuid)  # in-memory set update for this run

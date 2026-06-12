@@ -56,7 +56,7 @@ A starter set of org-PII shapes ships at
 Copy it over to seed common patterns:
 
 ```bash
-cp ~/Documents/codebase/brainstack/templates/redact-private.example.txt \
+cp <your-brainstack-clone>/templates/redact-private.example.txt \
     ~/.agent/redact-private.txt
 # then edit ~/.agent/redact-private.txt
 ```
@@ -130,7 +130,7 @@ hatch. Install by copying it into `<brain>/.github/workflows/secret-scan.yml`.
   incident details, customer data, colleague names) — these aren't
   "secrets" in the credential sense but are still personal. Don't put
   them in the brain at all if you don't trust your private remote.
-  See finding C1 in SECURITY_REVIEW.md.
+  Redaction targets credentials; it is not a general PII filter.
 
 ## What to do on a hit
 
@@ -161,7 +161,7 @@ The PUBLIC framework repo (`brainstack`) must never contain
 personal data. Before any push to that repo, run the audit checklist:
 
 ```bash
-REPO=~/Documents/codebase/brainstack
+REPO=<your-brainstack-clone>
 gitleaks detect --source "$REPO" --redact
 trufflehog filesystem "$REPO"
 trufflehog git file://"$REPO"
@@ -169,8 +169,19 @@ trufflehog git file://"$REPO"
 git -C "$REPO" grep -nIi -E "<your-org>|<your-name>|<colleague-1>|<colleague-2>"
 ```
 
-The greps should find only the repo's own self-references (README install
-URLs, NOTICE attribution). Any other hit is a leak — investigate before
-push.
+Expected hits for the org/name grep (anything else is a leak; investigate
+before push):
 
-See `PRIVACY_AUDIT_v0.1.0.md` for the per-release checklist.
+- `README.md` — badge URLs and the canonical clone URL
+- `CONTRIBUTING.md` — canonical clone URL
+- `CODE_OF_CONDUCT.md` — repository-owner contact
+- `docs/claude-code-setup.md` — canonical clone URL
+- `docs/architecture.md` — canonical repo URL in the diagram
+- `tests/test_docs_truth.py` — the test that pins the canonical URL
+- `tests/test_distribution_readiness_golden_fixtures.py` — the scanner's own patterns
+- `.github/workflows/ci.yml` — badge/repo references, if any
+- `NOTICE` / `UPSTREAM.md` — legal provenance
+
+See [privacy-audit.md](privacy-audit.md) for the current per-release
+checklist (historical audits are archived under
+[history/](history/README.md)).

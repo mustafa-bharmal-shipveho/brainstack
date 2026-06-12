@@ -217,6 +217,10 @@ def _load_candidates(brain_root: Path) -> list[tuple[str, dict]]:
 # Per-marker classification: (substring, reason). Order matters — first
 # match wins, so put the most specific marker first.
 _SYNC_BLOCKED_MARKERS: tuple[tuple[str, str], ...] = (
+    # No secret scanner on PATH: sync.sh fails closed and the brain
+    # silently never pushes. Most specific marker first so it isn't
+    # shadowed by the generic ones below.
+    ("no secret scanner installed", "blocked-noscanner"),
     # Trufflehog hit: a verified secret in the working tree.
     ("trufflehog flagged",       "blocked-trufflehog"),
     ("refusing to push",         "blocked-trufflehog"),
@@ -239,6 +243,7 @@ def _check_sync_status(brain_root: Path) -> str:
 
     Values:
       - 'missing'             — sync.log doesn't exist (sync never ran)
+      - 'blocked-noscanner'   - no secret scanner installed; sync fails closed
       - 'blocked-trufflehog'  — trufflehog flagged a verified secret
       - 'blocked-precommit'   — local pre-commit hook (redact.py etc.) blocked commit
       - 'blocked-network'     — commit succeeded but push failed (remote unreachable)
@@ -417,6 +422,9 @@ def compose_summary(
         lines.append("## Sync")
         if sync_status == "stale":
             lines.append("- Last sync > 2h ago. Hourly LaunchAgent may be stuck.")
+        elif sync_status == "blocked-noscanner":
+            lines.append("- No secret scanner (trufflehog or gitleaks) is installed, so sync.sh refuses to push. The brain is NOT syncing.")
+            lines.append("- Install one: `./install.sh --install-scanner` (or `brew install trufflehog`), then re-run `~/.agent/tools/sync.sh`.")
         elif sync_status == "blocked-trufflehog":
             lines.append("- TruffleHog blocked the last push (verified secret in the working tree).")
             lines.append("- Run `~/.agent/tools/sync.sh` and inspect the secret hit; rewrite history if needed.")

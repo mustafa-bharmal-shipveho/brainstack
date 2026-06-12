@@ -5,7 +5,7 @@
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │ PUBLIC, SHAREABLE                                               │
-│ github.com/<your-org>/brainstack                                │
+│ github.com/mustafa-bharmal-shipveho/brainstack                  │
 │   ├── install.sh, upgrade.sh                                    │
 │   ├── agent/    ←── source of truth for tools + hooks + schemas │
 │   ├── adapters/claude-code/                                     │
@@ -89,16 +89,20 @@
   history. Recurring churn is visible (a candidate rejected twice and
   then accepted has all three reasons on record).
 
-- **Private brain, public framework** — strict separation by repo. The
-  installer never edits user settings; manual merge of the Claude Code
-  hook snippet preserves any other hooks the user already has.
+- **Private brain, public framework** — strict separation by repo. The full
+  install registers Claude Code hooks in `~/.claude/settings.json` after
+  printing its plan and asking for consent (opt out with `--no-auto-recall`);
+  the `--minimal` install edits no host settings at all. Existing hooks are
+  always preserved, never replaced.
 
-## What's missing at v0.1
+## What's missing
 
-- Multi-harness adapters (Cursor, Codex, Windsurf, etc.) — Claude Code only
-- Data flywheel exporter (approved-runs export pipeline)
-- Onboarding wizard (manual install only)
-- Brew formula
-- Windows installer (`install.ps1` is a placeholder)
+- Per-prompt injection adapters for Codex CLI and Cursor (today those hosts
+  get recall-first directives plus `recall-mcp`; Claude Code gets
+  every-prompt injection)
+- Published benchmarks (LongMemEval, auto-recall on/off A/B)
+- PyPI / MCP-registry distribution so `uvx` works without a clone
+- Native Windows installer (`install.ps1` is a placeholder; WSL2 works)
 
-See [`CHANGELOG.md`](../CHANGELOG.md) for the path forward.
+See [`ROADMAP.md`](../ROADMAP.md) for direction and
+[`CHANGELOG.md`](../CHANGELOG.md) for history.

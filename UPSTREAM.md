@@ -26,7 +26,7 @@ Source path on left, our path on right. Modifications listed where they exist.
 | `.agent/memory/render_lessons.py` | `agent/memory/render_lessons.py` | **modified**: `_bullet_for` extended for optional `why`/`how_to_apply` fields |
 | `.agent/memory/decay.py` | `agent/memory/decay.py` | none |
 | `.agent/memory/archive.py` | `agent/memory/archive.py` | none |
-| `.agent/tools/graduate.py` | `agent/tools/graduate.py` | none |
+| `.agent/tools/graduate.py` | `agent/tools/graduate.py` | **trust workstream**: human-decision gate. Default reviewer (`host-agent`) + no TTY on stdin now requires `--non-interactive-ack` (caller asserts a human approved the promotion); otherwise exits 4 with an actionable message. Interactive runs unchanged. |
 | `.agent/tools/reject.py` | `agent/tools/reject.py` | none |
 | `.agent/tools/reopen.py` | `agent/tools/reopen.py` | none |
 | `.agent/tools/list_candidates.py` | `agent/tools/list_candidates.py` | none |

@@ -117,3 +117,116 @@ class TestApplyReviewPolicy:
         results = [_qr("a", 0.9), _qr("b", 0.5)]
         out = apply_review_policy(results, "demote", 0.5)
         assert [r.document.path for r in out] == ["a", "b"]
+
+
+# ---------- staged remember lessons (trust/security workstream) ----------
+
+
+def _staged_remember_qr(path: str, score: float) -> QueryResult:
+    """A lesson exactly as `recall remember` (default, unreviewed) writes
+    it: needs_review + review_reason=unreviewed-remember + source
+    recall-remember in frontmatter."""
+    doc = Document(
+        path=path,
+        source="brain",
+        title=path,
+        frontmatter={
+            "needs_review": True,
+            "review_reason": "unreviewed-remember",
+            "source": "recall-remember",
+        },
+        body="",
+        text="",
+    )
+    return QueryResult(document=doc, score=score)
+
+
+class TestStagedRememberLessons:
+    def test_staged_remember_lesson_demoted_or_excluded(self):
+        """An unreviewed `recall remember` write must rank below an
+        otherwise-identical unflagged doc under the demote policy, and
+        disappear entirely under exclude. This is the retrieval half of
+        the review gate: agent-written lessons cannot outrank reviewed
+        memory until a human accepts them via `recall pending --review`."""
+        staged = _staged_remember_qr("staged-remember", 0.9)
+        durable = _qr("durable", 0.6)
+
+        # demote: staged sinks below the unflagged doc despite the
+        # higher raw score (0.9 * 0.5 = 0.45 < 0.6).
+        out = apply_review_policy([staged, durable], "demote", 0.5)
+        assert [r.document.path for r in out] == ["durable", "staged-remember"]
+
+        # exclude: staged is dropped entirely.
+        out = apply_review_policy([staged, durable], "exclude", 0.5)
+        assert [r.document.path for r in out] == ["durable"]
+
+
+# ---------- expanded + reranked queries keep the policy (Codex seam fix) ----------
+
+
+class _PolicyStubRetriever:
+    """Minimal HybridRetriever stand-in: scripted results plus the
+    needs_review knobs `cli._expanded_query` reads back off the retriever."""
+
+    def __init__(self, results, policy: str, penalty: float = 0.5):
+        self._results = list(results)
+        self._needs_review_policy = policy
+        self._needs_review_penalty = penalty
+
+    def query(self, query, k=5, type_filter=None, source_filter=None):
+        return list(self._results)[:k]
+
+
+class TestExpandedRerankReviewPolicy:
+    """`--expand` with a cross-encoder rerank must re-apply the
+    needs_review policy AFTER the fused-union rerank. The cross-encoder
+    replaces the per-variant scores (where the demotion lived) with raw
+    relevance, so without the re-application a flagged memory the encoder
+    likes floats back above fresh ones in the final ordering."""
+
+    def _run_expanded_rerank(self, policy: str):
+        from unittest.mock import MagicMock, patch
+
+        from recall import cli as cli_mod
+
+        # Flagged doc ranked ABOVE the unflagged one in every variant, and
+        # the cross-encoder scores them as EQUAL: any final ordering change
+        # can only come from the review policy.
+        flagged = _qr("flagged", 0.9, True)
+        fresh = _qr("fresh", 0.9)
+        retriever = _PolicyStubRetriever([flagged, fresh], policy)
+
+        fake_encoder = MagicMock()
+        fake_encoder.rerank.side_effect = lambda q, texts: [1.0 for _ in texts]
+
+        with patch(
+            "recall.expand.expand_query",
+            side_effect=lambda q, n=3, provider=None: [q, f"alt-of-{q}"],
+        ), patch(
+            "recall.qdrant_backend._get_cross_encoder", return_value=fake_encoder
+        ):
+            return cli_mod._expanded_query(
+                retriever,
+                "the question",
+                k=5,
+                expand_n=1,
+                strategy="ranked",
+                rerank_model="any/model",
+            )
+
+    def test_demote_keeps_flagged_below_unflagged_equal(self):
+        results = self._run_expanded_rerank("demote")
+        paths = [r.document.path for r in results]
+        assert paths == ["fresh", "flagged"], (
+            f"flagged doc must sink below the unflagged equal after the "
+            f"fused rerank, got {paths}"
+        )
+        # The demotion is visible in the score too (1.0 * 0.5 penalty).
+        assert results[1].score < results[0].score
+
+    def test_exclude_drops_flagged_from_reranked_union(self):
+        results = self._run_expanded_rerank("exclude")
+        paths = [r.document.path for r in results]
+        assert paths == ["fresh"], (
+            f"flagged doc must be excluded from the reranked union, got {paths}"
+        )

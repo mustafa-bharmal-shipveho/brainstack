@@ -6,6 +6,8 @@ import pytest
 
 from recall.core import Document, HybridRetriever, QueryResult
 
+pytestmark = pytest.mark.embeddings
+
 
 def _make_doc(
     name: str,

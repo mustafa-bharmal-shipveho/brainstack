@@ -1,0 +1,14 @@
+# Nightly (03:00) trigger for brainstack-dream.service.
+#
+# Install: ./install.sh --setup-systemd
+# Inspect: systemctl --user list-timers brainstack-dream.timer
+
+[Unit]
+Description=Run brainstack dream cycle nightly at 03:00
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

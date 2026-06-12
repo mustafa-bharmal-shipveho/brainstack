@@ -32,6 +32,8 @@ from recall.qdrant_backend import (
     _qdrant_client_singleton,
 )
 
+pytestmark = pytest.mark.embeddings
+
 
 _DENSE_DIM = qdrant_backend._DENSE_DIM
 

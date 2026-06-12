@@ -5,7 +5,7 @@ payload sampler) require running real Claude Code sessions, which exceeded
 the autonomous-run authorization. Sub-phase 0c (concurrent flock) ran
 unattended and is complete.
 
-The user's morning action: run `bash runtime/_empirical/harness/run_synthetic_sessions.sh 50 mixed` then re-aggregate. See `HALT.md` for the full handoff.
+The user's morning action: run `bash runtime/_empirical/harness/run_synthetic_sessions.sh 50 mixed` then re-aggregate. See `docs/history/HALT-night-1.md` for the full handoff.
 
 ---
 

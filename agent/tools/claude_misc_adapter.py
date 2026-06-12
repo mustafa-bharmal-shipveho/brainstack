@@ -69,11 +69,11 @@ sys.path.insert(0, str(_HERE.parent / "memory"))
 from _atomic import atomic_write_text, atomic_write_bytes  # noqa: E402
 
 try:
-    from redact import BUILTIN_PATTERNS  # noqa: E402
+    from _redact_common import patterns_for  # noqa: E402
     from redact_jsonl import redact_string  # noqa: E402
     _REDACT_AVAILABLE = True
 except ImportError:
-    BUILTIN_PATTERNS = []  # type: ignore
+    patterns_for = None  # type: ignore
     redact_string = None  # type: ignore
     _REDACT_AVAILABLE = False
 
@@ -279,8 +279,12 @@ def _file_hash(path: Path) -> str:
     return h.hexdigest()
 
 
-def _redact_if_text(path: Path, raw: bytes) -> tuple[bytes, int]:
-    """Decode + redact text-like content. Binary returns (raw, 0)."""
+def _redact_if_text(path: Path, raw: bytes, brain_root: Path) -> tuple[bytes, int]:
+    """Decode + redact text-like content. Binary returns (raw, 0).
+
+    Pattern set comes from `_redact_common.patterns_for(brain_root)`:
+    builtin + multiline + the user's private patterns from
+    `<brain_root>/redact-private.txt`."""
     if not _REDACT_AVAILABLE:
         return raw, 0
     if path.suffix.lower() not in _REDACTABLE_SUFFIXES:
@@ -289,17 +293,17 @@ def _redact_if_text(path: Path, raw: bytes) -> tuple[bytes, int]:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
         return raw, 0
-    new_text, hits = redact_string(text, BUILTIN_PATTERNS)  # type: ignore
+    new_text, hits = redact_string(text, patterns_for(brain_root))  # type: ignore
     return new_text.encode("utf-8"), len(hits)
 
 
-def _copy_one(src_file: Path, dst_file: Path) -> tuple[bool, int]:
+def _copy_one(src_file: Path, dst_file: Path, brain_root: Path) -> tuple[bool, int]:
     """Copy one file with redaction. Returns (changed, redaction_hits)."""
     try:
         raw = src_file.read_bytes()
     except OSError:
         return False, 0
-    new_raw, hits = _redact_if_text(src_file, raw)
+    new_raw, hits = _redact_if_text(src_file, raw, brain_root)
     dst_file.parent.mkdir(parents=True, exist_ok=True)
     if dst_file.is_file():
         try:
@@ -318,8 +322,15 @@ def _process_source(
     brain_imports: Path,
     sidecar: dict[str, dict],
     dry_run: bool,
+    brain_root: Optional[Path] = None,
 ) -> tuple[int, int, int, list[dict]]:
-    """Sync one source path. Returns (n_files, n_changed, n_redactions, sidecar_updates)."""
+    """Sync one source path. Returns (n_files, n_changed, n_redactions, sidecar_updates).
+
+    `brain_root` locates `<brain>/redact-private.txt` for the private
+    redaction patterns; defaults to the parent of `brain_imports` (the
+    imports dir always lives directly under the brain root)."""
+    if brain_root is None:
+        brain_root = brain_imports.parent
     n_files = 0
     n_changed = 0
     n_red = 0
@@ -357,13 +368,13 @@ def _process_source(
             # Best-effort redact estimate
             try:
                 raw = src_file.read_bytes()
-                _, hits = _redact_if_text(src_file, raw)
+                _, hits = _redact_if_text(src_file, raw, brain_root)
                 n_red += hits
             except OSError:
                 pass
             continue
 
-        changed, hits = _copy_one(src_file, dst_file)
+        changed, hits = _copy_one(src_file, dst_file, brain_root)
         if changed:
             n_changed += 1
         n_red += hits
@@ -418,7 +429,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             if args.verbose:
                 print(f"    (missing — skipped)")
             continue
-        nf, nc, nr, upd = _process_source(src, dst_sub, brain_imports, sidecar, args.dry_run)
+        nf, nc, nr, upd = _process_source(
+            src, dst_sub, brain_imports, sidecar, args.dry_run, brain_root
+        )
         if args.verbose:
             print(f"    {nf} files, {nc} changed, {nr} redactions")
         total_files += nf

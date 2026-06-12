@@ -59,10 +59,13 @@ consistent within a session). For each candidate:
    - **Graduate** - the lesson is worth keeping. Append to `lessons.jsonl`.
      Rationale is **required**:
      ```bash
-     python3 ~/.agent/tools/graduate.py <id> --rationale "..."
+     python3 ~/.agent/tools/graduate.py <id> --rationale "..." --non-interactive-ack
      ```
      Use the user's rationale verbatim if they gave one; otherwise propose a
      short rationale, show it to them, and only commit after they ack.
+     `--non-interactive-ack` asserts that the user explicitly approved this
+     promotion in this conversation (graduate.py refuses non-TTY runs
+     without it). NEVER pass it for a graduation the user did not approve.
 
    - **Reject** - the cluster is noise (cosmetic, too narrow, etc.). Reason
      is **required**:

@@ -111,4 +111,4 @@ The structural BLOCKs are addressed in code (Skeptic #3, #4; Security
 work.
 
 Night 2 may proceed once the user runs the harness and the empirical
-half of Phase 0 lands. See HALT.md.
+half of Phase 0 lands. See docs/history/HALT-night-1.md.

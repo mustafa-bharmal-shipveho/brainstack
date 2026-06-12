@@ -64,8 +64,11 @@ def _graduate_then(brain: Path, namespace: str, cid: str,
     realistic graduated artifact to walk back. Failures bubble up with
     full subprocess output."""
     _seed_candidate(brain, namespace, cid, claim)
+    # --non-interactive-ack: pytest subprocesses have no TTY on stdin;
+    # graduate.py's human-decision gate requires the explicit ack flag.
     args = [str(TOOLS / "graduate.py"), cid,
-            "--rationale", "seeded for demote test"]
+            "--rationale", "seeded for demote test",
+            "--non-interactive-ack"]
     if namespace != "default":
         args += ["--namespace", namespace]
     res = _run(args, brain)

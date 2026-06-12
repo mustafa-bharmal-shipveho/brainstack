@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.embeddings
+
 
 def run_cli(args: list[str], env: dict | None = None, cwd: Path | None = None) -> subprocess.CompletedProcess:
     """Invoke the CLI as a subprocess and return the completed process."""

@@ -21,6 +21,7 @@ Design constraints:
 from __future__ import annotations
 
 import json
+import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -46,6 +47,27 @@ _HOOKS_SCRIPT = _resolve_hooks_script()
 _PKG_ROOT = _resolve_pkg_root()
 
 
+def _resolve_hook_python() -> str:
+    """Pick the interpreter the hook command pins.
+
+    `sys.executable` at install time is whatever python ran the installer,
+    frequently a bare system python without qdrant_client; hooks pinned to
+    it fail silently on every prompt. Resolution order:
+
+      1. BRAINSTACK_HOOK_PYTHON env var, when set (explicit override)
+      2. <pkg_root>/.venv/bin/python, when it exists and is executable
+         (the repo venv install.sh creates, which has the runtime deps)
+      3. sys.executable (prior behavior)
+    """
+    override = os.environ.get("BRAINSTACK_HOOK_PYTHON")
+    if override:
+        return override
+    venv_python = Path(_resolve_pkg_root()) / ".venv" / "bin" / "python"
+    if venv_python.is_file() and os.access(venv_python, os.X_OK):
+        return str(venv_python)
+    return sys.executable
+
+
 def _hook_cmd(event: str) -> str:
     """Build a robust hook command that survives module shadowing.
 
@@ -55,16 +77,20 @@ def _hook_cmd(event: str) -> str:
     script via absolute path bypasses `-m runtime` resolution entirely.
     """
     return (
-        f"PYTHONPATH={_PKG_ROOT} {sys.executable} {_HOOKS_SCRIPT} {event}  {_INSTALL_MARKER}"
+        f"PYTHONPATH={_PKG_ROOT} {_resolve_hook_python()} {_HOOKS_SCRIPT} {event}  {_INSTALL_MARKER}"
     )
 
 
-_HOOK_TEMPLATES: dict[str, str] = {
-    "SessionStart":     _hook_cmd("SessionStart"),
-    "UserPromptSubmit": _hook_cmd("UserPromptSubmit"),
-    "PostToolUse":      _hook_cmd("PostToolUse"),
-    "Stop":             _hook_cmd("Stop"),
-}
+def _hook_templates() -> dict[str, str]:
+    """Event -> hook command. Lazily evaluated (not a module constant) so
+    interpreter resolution happens at install time, not import time, and
+    tests can monkeypatch the pkg-root/env knobs."""
+    return {
+        "SessionStart":     _hook_cmd("SessionStart"),
+        "UserPromptSubmit": _hook_cmd("UserPromptSubmit"),
+        "PostToolUse":      _hook_cmd("PostToolUse"),
+        "Stop":             _hook_cmd("Stop"),
+    }
 
 # PostToolUse uses a matcher to fire only on tools that produce useful items
 _HOOK_MATCHERS: dict[str, str] = {
@@ -117,7 +143,7 @@ def install_claude_code_hooks(
         report.error = "settings.json 'hooks' is not an object"
         return report
 
-    for event, command in _HOOK_TEMPLATES.items():
+    for event, command in _hook_templates().items():
         entries = hooks.get(event)
         if not isinstance(entries, list):
             entries = []

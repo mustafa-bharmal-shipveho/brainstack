@@ -1,0 +1,15 @@
+# Hourly trigger for brainstack-auto-migrate.service.
+#
+# Install: ./install.sh --setup-systemd
+# Inspect: systemctl --user list-timers brainstack-auto-migrate.timer
+
+[Unit]
+Description=Run brainstack auto-migrate hourly
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

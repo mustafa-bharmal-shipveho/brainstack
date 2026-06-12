@@ -28,6 +28,9 @@ CLI usage:
         --brain-root PATH                  : override (default $BRAIN_ROOT or ~/.agent)
         --plist-dir PATH                   : override (default ~/Library/LaunchAgents)
         --interval N                       : seconds between runs (default 3600)
+        --scheduler NAME                   : auto|launchd|systemd|none (default auto:
+                                             Darwin=launchd, Linux+systemctl=systemd,
+                                             else none with an actionable message)
 
     python3 auto_migrate_install.py remove [flags]
         Tear down the LaunchAgent. Config file kept by default.
@@ -38,7 +41,9 @@ import argparse
 import datetime
 import json
 import os
+import platform
 import plistlib
+import shutil
 import subprocess
 import sys
 import time
@@ -75,6 +80,10 @@ _SKIP_FORMATS = {
 # lets tests inject a FakeLaunchctl without touching real launchd.
 LaunchctlInvoker = Union[str, Callable[[list[str]], subprocess.CompletedProcess]]
 
+# Same pattern for systemctl: a string binary name, or an injectable
+# callable so tests exercise the systemd path without a running systemd.
+SystemctlInvoker = Union[str, Callable[[list[str]], subprocess.CompletedProcess]]
+
 
 def _run_launchctl(launchctl_bin: LaunchctlInvoker, argv: list[str]) -> subprocess.CompletedProcess:
     if callable(launchctl_bin):
@@ -83,6 +92,30 @@ def _run_launchctl(launchctl_bin: LaunchctlInvoker, argv: list[str]) -> subproce
         [launchctl_bin, *argv],
         capture_output=True, text=True,
     )
+
+
+def _run_systemctl(systemctl_bin: SystemctlInvoker, argv: list[str]) -> subprocess.CompletedProcess:
+    if callable(systemctl_bin):
+        return systemctl_bin(["systemctl", *argv])
+    return subprocess.run(
+        [systemctl_bin, *argv],
+        capture_output=True, text=True,
+    )
+
+
+def detect_scheduler(env: Optional[dict] = None) -> str:
+    """Pick the scheduler for this platform: 'launchd' | 'systemd' | 'none'.
+
+    BRAINSTACK_PLATFORM_OVERRIDE forces the platform (used by tests, same
+    contract as install.sh's default-install scheduler selection).
+    """
+    e = env if env is not None else os.environ
+    plat = e.get("BRAINSTACK_PLATFORM_OVERRIDE") or platform.system()
+    if plat == "Darwin":
+        return "launchd"
+    if plat == "Linux" and shutil.which("systemctl"):
+        return "systemd"
+    return "none"
 
 
 # ---- Discovery filtering ----
@@ -157,6 +190,142 @@ def generate_plist(
         "StandardErrorPath": log_path,
     }
     return plistlib.dumps(plist)
+
+
+# ---- systemd unit generation (Linux parity for generate_plist) ----
+
+_SYSTEMD_UNIT_BASENAME = "brainstack-auto-migrate"
+
+
+def _default_systemd_unit_dir() -> Path:
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".config"
+    return base / "systemd" / "user"
+
+
+def generate_systemd_units(
+    brain_root: Path,
+    python_abs: Path,
+    interval_seconds: int = DEFAULT_INTERVAL,
+) -> dict[str, str]:
+    """Generate the systemd user .service + .timer pair as text.
+
+    Returns {filename: content}. Paths are resolved to absolute, same
+    rationale as generate_plist: the timer does not run from the
+    installer's cwd.
+    """
+    brain_root = brain_root.resolve()
+    dispatcher_path = brain_root / "tools" / "migrate_dispatcher.py"
+    service = "\n".join([
+        "[Unit]",
+        "Description=brainstack hourly auto-migrate (import native tool memory into the brain)",
+        "",
+        "[Service]",
+        "Type=oneshot",
+        f"ExecStart={python_abs} {dispatcher_path} auto-migrate-all --brain-root {brain_root}",
+        f"Environment=BRAIN_ROOT={brain_root}",
+        f"Environment=HOME={os.environ.get('HOME', str(Path.home()))}",
+        "",
+    ])
+    timer = "\n".join([
+        "[Unit]",
+        "Description=Run brainstack auto-migrate on an interval",
+        "",
+        "[Timer]",
+        "OnBootSec=10min",
+        f"OnUnitActiveSec={int(interval_seconds)}s",
+        "Persistent=true",
+        "",
+        "[Install]",
+        "WantedBy=timers.target",
+        "",
+    ])
+    return {
+        f"{_SYSTEMD_UNIT_BASENAME}.service": service,
+        f"{_SYSTEMD_UNIT_BASENAME}.timer": timer,
+    }
+
+
+def _systemctl_available(systemctl_bin: SystemctlInvoker) -> bool:
+    """An injected callable is always 'available'; a string needs PATH."""
+    return callable(systemctl_bin) or shutil.which(str(systemctl_bin)) is not None
+
+
+def install_systemd_unit(
+    units: dict[str, str],
+    unit_dir: Path,
+    systemctl_bin: SystemctlInvoker = "systemctl",
+    dry_run: bool = False,
+    skip_systemctl: bool = False,
+) -> dict:
+    """Write the .service/.timer pair into `unit_dir`, then
+    `systemctl --user daemon-reload` + `enable --now` the timer.
+
+    Mirrors install_plist's contract: `dry_run=True` makes NO filesystem
+    changes and invokes nothing. `skip_systemctl=True` writes the unit
+    files but skips the systemctl calls (BRAINSTACK_SKIP_SYSTEMCTL=1).
+    """
+    paths = {name: unit_dir / name for name in units}
+    if dry_run:
+        return {
+            "unit_paths": [str(p) for p in paths.values()],
+            "dry_run": True,
+        }
+
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    for name, content in units.items():
+        atomic_write_text(paths[name], content)
+
+    reload_rc = enable_rc = None
+    if not skip_systemctl and not _systemctl_available(systemctl_bin):
+        print(
+            "auto-migrate setup: systemctl not found; units written but not "
+            f"enabled. Enable manually:\n"
+            f"  systemctl --user enable --now {_SYSTEMD_UNIT_BASENAME}.timer",
+            file=sys.stderr,
+        )
+        skip_systemctl = True
+    if not skip_systemctl:
+        reload_rc = _run_systemctl(systemctl_bin, ["--user", "daemon-reload"]).returncode
+        enable = _run_systemctl(systemctl_bin, [
+            "--user", "enable", "--now", f"{_SYSTEMD_UNIT_BASENAME}.timer",
+        ])
+        enable_rc = enable.returncode
+        if enable.returncode != 0:
+            print(
+                f"auto-migrate setup: systemctl --user enable --now failed "
+                f"(rc={enable.returncode}); enable it manually:\n"
+                f"  systemctl --user enable --now {_SYSTEMD_UNIT_BASENAME}.timer",
+                file=sys.stderr,
+            )
+    return {
+        "unit_paths": [str(p) for p in paths.values()],
+        "daemon_reload_returncode": reload_rc,
+        "enable_returncode": enable_rc,
+        "dry_run": False,
+    }
+
+
+def remove_systemd_unit(
+    unit_dir: Path,
+    systemctl_bin: SystemctlInvoker = "systemctl",
+    skip_systemctl: bool = False,
+) -> dict:
+    """Disable the timer (tolerated if not enabled) + delete the unit files."""
+    can_invoke = not skip_systemctl and _systemctl_available(systemctl_bin)
+    if can_invoke:
+        _run_systemctl(systemctl_bin, [
+            "--user", "disable", "--now", f"{_SYSTEMD_UNIT_BASENAME}.timer",
+        ])
+    removed = []
+    for suffix in (".service", ".timer"):
+        p = unit_dir / f"{_SYSTEMD_UNIT_BASENAME}{suffix}"
+        if p.exists():
+            p.unlink()
+            removed.append(str(p))
+    if can_invoke:
+        _run_systemctl(systemctl_bin, ["--user", "daemon-reload"])
+    return {"unit_dir": str(unit_dir), "removed": removed}
 
 
 # ---- launchctl helpers ----
@@ -351,6 +520,7 @@ def _build_config(
 def main(
     argv: Optional[list[str]] = None,
     launchctl_bin: LaunchctlInvoker = "launchctl",
+    systemctl_bin: SystemctlInvoker = "systemctl",
 ) -> int:
     p = argparse.ArgumentParser(prog="auto_migrate_install")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -367,11 +537,17 @@ def main(
     sp_setup.add_argument("--brain-root", default=os.environ.get("BRAIN_ROOT") or os.path.expanduser("~/.agent"))
     sp_setup.add_argument("--plist-dir", default=os.path.expanduser("~/Library/LaunchAgents"))
     sp_setup.add_argument("--interval", type=int, default=DEFAULT_INTERVAL)
+    sp_setup.add_argument("--scheduler", choices=["auto", "launchd", "systemd", "none"],
+                          default="auto",
+                          help="scheduler backend (default: auto-detect by platform; "
+                               "Darwin=launchd, Linux with systemctl=systemd)")
 
     # --- remove ---
     sp_remove = sub.add_parser("remove", help="tear down the auto-migrate timer")
     sp_remove.add_argument("--brain-root", default=os.environ.get("BRAIN_ROOT") or os.path.expanduser("~/.agent"))
     sp_remove.add_argument("--plist-dir", default=os.path.expanduser("~/Library/LaunchAgents"))
+    sp_remove.add_argument("--scheduler", choices=["auto", "launchd", "systemd", "none"],
+                           default="auto")
     sp_remove.add_argument("--keep-config", action="store_true", default=True,
                            help="keep auto-migrate.json (default; pass --wipe-config to remove it)")
     sp_remove.add_argument("--wipe-config", dest="keep_config", action="store_false")
@@ -382,11 +558,36 @@ def main(
         print(refusal, file=sys.stderr)
         return 2
 
+    # Resolve the scheduler seam once. "auto" picks by platform
+    # (BRAINSTACK_PLATFORM_OVERRIDE forces it for tests).
+    scheduler = getattr(args, "scheduler", "auto")
+    if scheduler == "auto":
+        scheduler = detect_scheduler()
+    skip_systemctl = os.environ.get("BRAINSTACK_SKIP_SYSTEMCTL") == "1"
+
     if args.cmd == "remove":
-        result = remove_plist(
-            plist_dir=Path(args.plist_dir),
-            launchctl_bin=launchctl_bin,
-        )
+        if scheduler == "systemd":
+            result = remove_systemd_unit(
+                unit_dir=_default_systemd_unit_dir(),
+                systemctl_bin=systemctl_bin,
+                skip_systemctl=skip_systemctl,
+            )
+        elif scheduler == "launchd":
+            result = remove_plist(
+                plist_dir=Path(args.plist_dir),
+                launchctl_bin=launchctl_bin,
+            )
+        else:
+            # No scheduler on this platform: best-effort file cleanup only.
+            result = {"scheduler": "none", "removed": []}
+            for leftover in (
+                Path(args.plist_dir) / f"{LABEL}.plist",
+                _default_systemd_unit_dir() / f"{_SYSTEMD_UNIT_BASENAME}.service",
+                _default_systemd_unit_dir() / f"{_SYSTEMD_UNIT_BASENAME}.timer",
+            ):
+                if leftover.exists():
+                    leftover.unlink()
+                    result["removed"].append(str(leftover))
         if not args.keep_config:
             cfg = Path(args.brain_root) / _CONFIG_FILENAME
             if cfg.is_file():
@@ -463,12 +664,61 @@ def main(
         print("DRY RUN — would write the following:")
         print(f"\nConfig at {brain_root / _CONFIG_FILENAME}:")
         print(json.dumps(new_config, indent=2))
-        print(f"\nPlist at {plist_dir / f'{LABEL}.plist'}:")
-        print(plist_bytes.decode("utf-8"))
+        if scheduler == "systemd":
+            units = generate_systemd_units(
+                brain_root=brain_root,
+                python_abs=_resolve_python_abs(),
+                interval_seconds=args.interval,
+            )
+            for name, content in units.items():
+                print(f"\nUnit at {_default_systemd_unit_dir() / name}:")
+                print(content)
+        else:
+            print(f"\nPlist at {plist_dir / f'{LABEL}.plist'}:")
+            print(plist_bytes.decode("utf-8"))
         return 0
 
     # Write the config first.
     write_config(brain_root, new_config)
+
+    if scheduler == "systemd":
+        # Linux: systemd user timer instead of a launchd plist.
+        units = generate_systemd_units(
+            brain_root=brain_root,
+            python_abs=_resolve_python_abs(),
+            interval_seconds=args.interval,
+        )
+        sd_result = install_systemd_unit(
+            units=units,
+            unit_dir=_default_systemd_unit_dir(),
+            systemctl_bin=systemctl_bin,
+            skip_systemctl=skip_systemctl,
+        )
+        print(json.dumps({
+            "config_path": str(brain_root / _CONFIG_FILENAME),
+            "scheduler": "systemd",
+            "unit_paths": sd_result["unit_paths"],
+            "tools_enabled": [t["format"] for t in new_config["tools"]],
+        }, indent=2))
+        return 0
+
+    if scheduler == "none":
+        # Unsupported platform: config written, no timer. Actionable, exit 0.
+        print(json.dumps({
+            "config_path": str(brain_root / _CONFIG_FILENAME),
+            "scheduler": "none",
+            "tools_enabled": [t["format"] for t in new_config["tools"]],
+        }, indent=2))
+        print(
+            "auto-migrate setup: no supported scheduler on this platform "
+            "(neither launchd nor systemd). Config was written; schedule the "
+            "import yourself, e.g. via cron:\n"
+            f"  @hourly {_resolve_python_abs()} {brain_root / 'tools' / 'migrate_dispatcher.py'} "
+            f"auto-migrate-all --brain-root {brain_root}",
+            file=sys.stderr,
+        )
+        return 0
+
     # Install (or update) the plist + register with launchd.
     result = install_plist(
         plist_bytes=plist_bytes,

@@ -1215,3 +1215,48 @@ class TestShellBanner:
             assert f"command {tool}" in out, (
                 f"generated wrapper for {tool} doesn't use `command {tool}`"
             )
+
+
+# ---------- TestSyncStatusMissingScanner --------------------------------
+
+
+class TestSyncStatusMissingScanner:
+    """sync.sh fails closed when NO secret scanner (trufflehog/gitleaks) is
+    installed: it logs 'no secret scanner installed' and skips the push.
+    Adoption-audit finding: _check_sync_status doesn't know this marker, so
+    the banner reports 'ok' while the brain silently never syncs. The
+    status must classify as blocked and the rendered summary must mention
+    the scanner so the user knows what to install."""
+
+    def _import(self):
+        import importlib
+        import render_pending_summary
+        importlib.reload(render_pending_summary)
+        return render_pending_summary
+
+    def _seed_log(self, brain: Path, last_lines: list[str]) -> None:
+        """Write a sync.log whose tail is the given lines, fresh mtime."""
+        log = brain / "sync.log"
+        log.write_text("\n".join(last_lines) + "\n")
+        import time
+        os.utime(log, (time.time(), time.time()))
+
+    def test_sync_status_blocked_on_missing_scanner(self, tmp_path: Path):
+        rps = self._import()
+        self._seed_log(tmp_path, [
+            "2026-06-09T13:00:00Z sync: no secret scanner installed; "
+            "skipping push",
+        ])
+
+        status = rps._check_sync_status(tmp_path)
+        assert status.startswith("blocked"), (
+            f"'no secret scanner installed' must classify as a blocked "
+            f"status, got {status!r} - the banner would falsely report ok "
+            f"while sync never pushes"
+        )
+
+        body = rps.compose_summary(tmp_path, drift_report=None, sync_status=status)
+        assert "scanner" in body.lower(), (
+            f"sync section must mention the missing scanner so the user "
+            f"knows to install trufflehog/gitleaks; got:\n{body}"
+        )

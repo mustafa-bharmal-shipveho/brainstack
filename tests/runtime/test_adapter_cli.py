@@ -657,3 +657,79 @@ def test_installer_refuses_invalid_json(tmp_path: Path) -> None:
     report = install_claude_code_hooks(settings_path=settings)
     assert report.error
     assert settings.read_text() == "{not valid json"  # untouched
+
+
+# ---------- hook interpreter resolution (red phase) ----------
+
+
+class TestHookPythonResolution:
+    """Planned contract: installer gains `_resolve_hook_python()`.
+
+    The generated hook command must pin an interpreter that actually has
+    the brainstack runtime deps (qdrant_client etc). `sys.executable` at
+    install time is whatever python ran the installer, which is frequently
+    a bare system python without the venv deps; hooks then fail silently
+    on every prompt. Resolution order:
+
+      1. BRAINSTACK_HOOK_PYTHON env var, when set (explicit override)
+      2. <pkg_root>/.venv/bin/python, when it exists and is executable
+      3. sys.executable (current fallback behavior)
+
+    `_hook_cmd` must use the resolved interpreter.
+    """
+
+    def _patched_installer(self, monkeypatch, pkg_root: Path):
+        """Point the installer's pkg-root resolution at a tmp dir."""
+        import runtime.adapters.claude_code.installer as installer_mod
+
+        monkeypatch.setattr(
+            installer_mod, "_PKG_ROOT", str(pkg_root), raising=False
+        )
+        monkeypatch.setattr(
+            installer_mod, "_resolve_pkg_root", lambda: str(pkg_root), raising=False
+        )
+        return installer_mod
+
+    def _make_venv_python(self, pkg_root: Path) -> Path:
+        venv_python = pkg_root / ".venv" / "bin" / "python"
+        venv_python.parent.mkdir(parents=True, exist_ok=True)
+        venv_python.write_text("#!/bin/sh\nexit 0\n")
+        venv_python.chmod(0o755)
+        return venv_python
+
+    def test_hook_cmd_prefers_repo_venv_python(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.delenv("BRAINSTACK_HOOK_PYTHON", raising=False)
+        venv_python = self._make_venv_python(tmp_path)
+        installer_mod = self._patched_installer(monkeypatch, tmp_path)
+
+        cmd = installer_mod._hook_cmd("Stop")
+        assert str(venv_python) in cmd, (
+            f"hook command should pin the repo venv python {venv_python}, "
+            f"got: {cmd}"
+        )
+
+    def test_hook_cmd_falls_back_to_sys_executable(self, tmp_path: Path, monkeypatch) -> None:
+        import sys
+
+        monkeypatch.delenv("BRAINSTACK_HOOK_PYTHON", raising=False)
+        # No .venv under this pkg root.
+        installer_mod = self._patched_installer(monkeypatch, tmp_path)
+
+        cmd = installer_mod._hook_cmd("Stop")
+        assert sys.executable in cmd, (
+            f"without a repo venv, the hook command should fall back to "
+            f"sys.executable; got: {cmd}"
+        )
+
+    def test_hook_python_env_override_wins(self, tmp_path: Path, monkeypatch) -> None:
+        venv_python = self._make_venv_python(tmp_path)
+        monkeypatch.setenv("BRAINSTACK_HOOK_PYTHON", "/custom/override/python")
+        installer_mod = self._patched_installer(monkeypatch, tmp_path)
+
+        cmd = installer_mod._hook_cmd("Stop")
+        assert "/custom/override/python" in cmd, (
+            f"BRAINSTACK_HOOK_PYTHON must override every other source; got: {cmd}"
+        )
+        assert str(venv_python) not in cmd, (
+            "env override must beat the repo venv python"
+        )

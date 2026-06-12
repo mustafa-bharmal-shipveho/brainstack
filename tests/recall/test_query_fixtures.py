@@ -17,6 +17,8 @@ from recall.config import SourceConfig
 from recall.core import HybridRetriever
 from recall.sources import discover_documents
 
+pytestmark = pytest.mark.embeddings
+
 
 def _build_retriever(corpus_path, embedding_weight: float = 0.0) -> HybridRetriever:
     """Build a HybridRetriever over the synthetic corpus.
@@ -99,7 +101,6 @@ def test_negative_queries_dont_crash(hundred_corpus_module, case):
         assert r.document.path
 
 
-@pytest.mark.embeddings
 @pytest.mark.parametrize(
     "case",
     [c for c in _query_cases() if c.get("kind") in ("lexical", "mixed")],
@@ -122,7 +123,6 @@ def test_query_top_3_hybrid_lexical(hundred_corpus_module, case):
     )
 
 
-@pytest.mark.embeddings
 def test_recall_at_5_hybrid_paraphrase_aggregate(hundred_corpus_module):
     """Aggregate hybrid recall@5 on paraphrase cases. Per-case is too brittle for
     a 90 MB general-purpose model — paraphrases like kubectl→kubernetes need
@@ -192,7 +192,6 @@ def test_recall_at_5_threshold_overall_bm25(hundred_corpus_module):
     assert rate >= 0.60, f"BM25 overall recall@5 = {rate:.2%} ({hits}/{len(positive)})"
 
 
-@pytest.mark.embeddings
 def test_recall_at_5_hybrid_overall(hundred_corpus_module):
     """Hybrid retrieval must hit recall@5 ≥ 85% across all positive cases."""
     if importlib.util.find_spec("sentence_transformers") is None:

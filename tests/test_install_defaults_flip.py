@@ -20,6 +20,10 @@ The final stdout summary lists each fired/skipped default with its opt-out flag
 in parens, so users see what was done and how to skip it next time.
 
 Tests use tmp HOME + BRAINSTACK_SKIP_LAUNCHCTL=1 + BRAINSTACK_SKIP_CLI_INSTALL=1.
+
+Consent gate (adoption-audit fix): the full default install now requires
+explicit consent. Non-TTY runs without --yes fall back to --minimal, so
+every fresh-install test below that expects the five defaults passes --yes.
 """
 from __future__ import annotations
 
@@ -91,11 +95,12 @@ class TestFreshInstallRunsAllFiveDefaults:
         fake_home = tmp_path / "fakehome"
         env = _fresh_env(fake_home)
 
-        # --no-prompt for non-interactive: discovery still runs but declines
-        # everything (no migration). The OTHER 4 defaults still fire.
+        # --yes consents to the full install (non-TTY without it falls back
+        # to --minimal). With no discoverable sources in the clean tmp HOME,
+        # migrate discovery reports skipped; the OTHER 4 defaults fire.
         result = _run(
             "--brain-remote", "git@example.com:test/scratch.git",
-            "--no-prompt",
+            "--yes",
             env=env,
         )
         assert result.returncode == 0, (
@@ -137,7 +142,7 @@ class TestOptOutFlagsIsolated:
 
         result = _run(
             "--brain-remote", "git@example.com:test/scratch.git",
-            "--no-prompt",
+            "--yes",
             opt_out,
             env=env,
         )
@@ -177,6 +182,7 @@ class TestOptOutFlagsIsolated:
 
         result = _run(
             "--brain-remote", "git@example.com:test/scratch.git",
+            "--yes",
             "--skip-migrate",
             env=env,
         )
@@ -206,6 +212,7 @@ class TestNonInteractiveMigratePrompts:
 
         result = _run(
             "--brain-remote", "git@example.com:test/scratch.git",
+            "--yes",
             "--no-prompt",
             env=env,
         )
@@ -303,10 +310,10 @@ class TestIdempotency:
         fake_home = tmp_path / "fakehome"
         env = _fresh_env(fake_home)
 
-        # First run: fresh install fires defaults
+        # First run: fresh install fires defaults (--yes consents)
         r1 = _run(
             "--brain-remote", "git@example.com:test/scratch.git",
-            "--no-prompt",
+            "--yes",
             env=env,
         )
         assert r1.returncode == 0
@@ -364,11 +371,14 @@ class TestMigrateDiscoveryDoesNotSymlinkSources:
         )
         discovery_block = m.group(1)
 
-        # The recursive `$0 --migrate` call inside this block MUST include
+        # The recursive `$SELF --migrate` call inside this block MUST include
         # --no-symlink. Otherwise the default-on discovery silently swaps
         # native dirs for symlinks (the behavior the user wants to avoid).
-        assert re.search(r'"\$0"\s+--migrate\s+"\$src"\s+--no-symlink', discovery_block), (
-            "default-on migrate discovery must call `$0 --migrate $src --no-symlink` "
+        # ("$SELF" is the absolute-path handle the installer resolves once so
+        # recursive sub-invocations work under `bash install.sh`; it replaced
+        # the bare "$0".)
+        assert re.search(r'"\$(?:0|SELF)"\s+--migrate\s+"\$src"\s+--no-symlink', discovery_block), (
+            "default-on migrate discovery must call `$SELF --migrate $src --no-symlink` "
             "(mirror-not-replace). Found block (first 800 chars):\n"
             + discovery_block[:800]
         )
@@ -388,7 +398,7 @@ class TestFinalSummaryStructure:
 
         result = _run(
             "--brain-remote", "git@example.com:test/scratch.git",
-            "--no-prompt",
+            "--yes",
             env=env,
         )
         assert result.returncode == 0
@@ -411,7 +421,7 @@ class TestFinalSummaryStructure:
 
         result = _run(
             "--brain-remote", "git@example.com:test/scratch.git",
-            "--no-prompt",
+            "--yes",
             env=env,
         )
         assert result.returncode == 0

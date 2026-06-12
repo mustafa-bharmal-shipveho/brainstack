@@ -55,6 +55,10 @@ verify: ## Self-check the brain layout
 dream: ## Run the dream cycle once
 	$(PY) ~/.agent/tools/dream_runner.py
 
+.PHONY: bench
+bench: ## Run the auto-recall A/B retrieval benchmark (see eval/RESULTS.md)
+	$(PY) eval/bench_recall_ab.py
+
 .PHONY: clean
 clean: ## Remove pyc / __pycache__ / pytest cache
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
@@ -73,3 +77,16 @@ report-status: ## Print quick health: tests + brain scan
 	@echo ""
 	@echo "=== Brain scan ==="
 	@$(PY) ~/.agent/tools/redact.py ~/.agent && echo "BRAIN CLEAN" || echo "BRAIN HAS HITS"
+
+.PHONY: test-ci
+test-ci: ## Run exactly what CI runs (hermetic subset, no model downloads)
+	BRAINSTACK_SKIP_LAUNCHCTL=1 BRAINSTACK_SKIP_CLI_INSTALL=1 $(PYTEST_BIN) tests/ -q -m "not embeddings and not machine"
+
+.PHONY: lint-ci
+lint-ci: ## Run exactly the lint CI runs
+	ruff check .
+
+.PHONY: demo
+demo: ## Regenerate demo/demo.gif from demo/demo.tape (requires vhs)
+	@command -v vhs >/dev/null || { echo "vhs not installed: brew install vhs"; exit 1; }
+	vhs demo/demo.tape

@@ -1,0 +1,22 @@
+# Hourly auto-migrate systemd user service (Linux parity for
+# com.brainstack.auto-migrate.plist).
+#
+# Install:
+#   ./install.sh --setup-systemd
+#
+# Edit before installing manually:
+#   1. Replace REPLACE_HOME with your actual home dir (e.g. /home/yourname)
+#   2. Replace REPLACE_PYTHON with the absolute path to a Python >= 3.10
+#      interpreter.
+#
+# The dispatcher iterates all enabled tools sequentially under a global
+# fcntl lock; see <brain>/auto-migrate.json for the enabled-tool config.
+
+[Unit]
+Description=brainstack hourly auto-migrate (import native tool memory into the brain)
+
+[Service]
+Type=oneshot
+ExecStart=REPLACE_PYTHON REPLACE_BRAIN_ROOT/tools/migrate_dispatcher.py auto-migrate-all --brain-root REPLACE_BRAIN_ROOT
+Environment=BRAIN_ROOT=REPLACE_BRAIN_ROOT
+Environment=HOME=REPLACE_HOME

@@ -1,0 +1,234 @@
+{
+  "_note": "Synthetic, reproducible labeled set for the recall A/B benchmark. Placeholder content only.",
+  "corpus": [
+    {
+      "slug": "flaky-integration-tests",
+      "title": "Quarantine flaky integration tests",
+      "body": "When an integration test fails intermittently, quarantine it with a skip marker and an open ticket rather than retrying in CI. Retries hide the flake and waste minutes. The quarantine list is reviewed every sprint."
+    },
+    {
+      "slug": "ci-dependency-caching",
+      "title": "Cache dependencies in CI by lockfile hash",
+      "body": "Key the CI dependency cache on a hash of the lockfile, not the branch name. Branch-keyed caches go stale and cause 'works on my machine' drift. A lockfile-hash key makes cache hits correct and reproducible."
+    },
+    {
+      "slug": "git-bisect-regressions",
+      "title": "Use git bisect to find regressions",
+      "body": "To find the commit that introduced a regression, use git bisect with a scripted test (git bisect run). Bisect is logarithmic, so even a thousand-commit range resolves in about ten steps."
+    },
+    {
+      "slug": "docker-healthchecks",
+      "title": "Add healthchecks to compose services",
+      "body": "Give every docker compose service a HEALTHCHECK and make dependents wait on service_healthy, not service_started. Without it, an app container races its database and fails on the first connection."
+    },
+    {
+      "slug": "postgres-skip-locked",
+      "title": "Claim queue rows with SKIP LOCKED",
+      "body": "For a Postgres-backed work queue, claim rows with SELECT ... FOR UPDATE SKIP LOCKED. It lets concurrent workers grab disjoint rows without blocking each other or double-processing."
+    },
+    {
+      "slug": "structured-logging",
+      "title": "Log structured key-value events",
+      "body": "Emit logs as structured key-value events, not interpolated prose. Structured fields are queryable; a sentence like 'processed 18 items' is not. Reserve free text for the human-readable message field only."
+    },
+    {
+      "slug": "feature-flag-cleanup",
+      "title": "Delete feature flags after rollout",
+      "body": "A feature flag is debt the moment it reaches 100 percent rollout. Schedule the cleanup ticket when you create the flag, with a removal date, or the codebase accretes dead branches."
+    },
+    {
+      "slug": "idempotent-webhooks",
+      "title": "Make webhook handlers idempotent",
+      "body": "Webhook deliveries can arrive more than once, so handlers must be idempotent: dedupe on the provider's event id and treat a repeat as a no-op. Assume at-least-once delivery, never exactly-once."
+    },
+    {
+      "slug": "timezone-utc-storage",
+      "title": "Store timestamps in UTC",
+      "body": "Store and compute on timestamps in UTC; convert to local time only at the display edge. A field named created_at must hold UTC. Mixing local and UTC at a service boundary is a classic source of off-by-hours bugs."
+    },
+    {
+      "slug": "retry-exponential-backoff",
+      "title": "Retry with exponential backoff and jitter",
+      "body": "Retries against a flaky dependency need exponential backoff plus jitter. Fixed-interval retries from many clients synchronize into a thundering herd that keeps the dependency down."
+    },
+    {
+      "slug": "code-review-small-prs",
+      "title": "Keep pull requests small",
+      "body": "Small pull requests get faster, deeper reviews. Past roughly four hundred changed lines, reviewer defect-detection drops sharply and approvals become rubber stamps. Split large changes by seam."
+    },
+    {
+      "slug": "secrets-not-in-env-dumps",
+      "title": "Never log full environment dumps",
+      "body": "Never log the full process environment for debugging: it leaks secrets into log aggregators that have a wider audience than the host. Log the specific variable you need, redacted if sensitive."
+    },
+    {
+      "slug": "network-call-retries",
+      "title": "Retry transient network calls, not assertions",
+      "body": "Retry transient NETWORK failures (timeouts, 503s) at the client. Do NOT retry a failed test assertion to make it pass: that masks a real defect. Retrying is for infrastructure flakiness, not logic flakiness."
+    },
+    {
+      "slug": "db-connection-pooling",
+      "title": "Size the database connection pool",
+      "body": "Size the database connection pool to the workload, not the max. Too many connections starve the database; too few serialize requests. Pool exhaustion looks like a hang, not an error, so add a checkout timeout."
+    },
+    {
+      "slug": "test-data-factories",
+      "title": "Use factories for test data",
+      "body": "Build test fixtures with factories that take overrides, not giant shared fixtures. Shared fixtures couple unrelated tests and make a single edit cascade into dozens of failures."
+    },
+    {
+      "slug": "log-sampling-high-volume",
+      "title": "Sample high-volume logs",
+      "body": "For a hot path that logs thousands of times a second, sample (for example one in a hundred) rather than logging every event. Full-fidelity logging on a hot path can cost more than the work it describes."
+    }
+  ],
+  "questions": [
+    {
+      "q": "How should I handle a test that fails only sometimes in CI?",
+      "supports": [
+        "flaky-integration-tests"
+      ],
+      "answer_substring": "quarantine"
+    },
+    {
+      "q": "What should the CI dependency cache key be based on?",
+      "supports": [
+        "ci-dependency-caching"
+      ],
+      "answer_substring": "lockfile"
+    },
+    {
+      "q": "How do I find which commit introduced a regression?",
+      "supports": [
+        "git-bisect-regressions"
+      ],
+      "answer_substring": "bisect"
+    },
+    {
+      "q": "Why does my app container fail to reach the database on startup in compose?",
+      "supports": [
+        "docker-healthchecks"
+      ],
+      "answer_substring": "healthcheck"
+    },
+    {
+      "q": "How do multiple workers pull from a Postgres queue without double-processing?",
+      "supports": [
+        "postgres-skip-locked"
+      ],
+      "answer_substring": "SKIP LOCKED"
+    },
+    {
+      "q": "Should logs be sentences or fields?",
+      "supports": [
+        "structured-logging"
+      ],
+      "answer_substring": "structured"
+    },
+    {
+      "q": "When should I remove a feature flag?",
+      "supports": [
+        "feature-flag-cleanup"
+      ],
+      "answer_substring": "rollout"
+    },
+    {
+      "q": "My webhook handler runs twice for one event, what do I do?",
+      "supports": [
+        "idempotent-webhooks"
+      ],
+      "answer_substring": "idempotent"
+    },
+    {
+      "q": "What timezone should created_at be stored in?",
+      "supports": [
+        "timezone-utc-storage"
+      ],
+      "answer_substring": "UTC"
+    },
+    {
+      "q": "How should clients retry a flaky dependency without overwhelming it?",
+      "supports": [
+        "retry-exponential-backoff"
+      ],
+      "answer_substring": "backoff"
+    },
+    {
+      "q": "How big should a pull request be for a good review?",
+      "supports": [
+        "code-review-small-prs"
+      ],
+      "answer_substring": "small"
+    },
+    {
+      "q": "Is it ok to log the whole environment to debug a prod issue?",
+      "supports": [
+        "secrets-not-in-env-dumps"
+      ],
+      "answer_substring": "secret"
+    },
+    {
+      "q": "How do I stop CI cache from going stale across branches?",
+      "supports": [
+        "ci-dependency-caching"
+      ],
+      "answer_substring": "lockfile"
+    },
+    {
+      "q": "What prevents a thundering herd when many clients retry at once?",
+      "supports": [
+        "retry-exponential-backoff"
+      ],
+      "answer_substring": "jitter"
+    },
+    {
+      "q": "How do I keep intermittent tests from wasting CI minutes on retries?",
+      "supports": [
+        "flaky-integration-tests"
+      ],
+      "answer_substring": "quarantine"
+    },
+    {
+      "q": "My test passes on the second run but fails on the first. Should I just add a retry?",
+      "supports": [
+        "flaky-integration-tests"
+      ],
+      "answer_substring": "quarantine"
+    },
+    {
+      "q": "Requests to a downstream service intermittently time out under load. How should clients behave?",
+      "supports": [
+        "retry-exponential-backoff"
+      ],
+      "answer_substring": "backoff"
+    },
+    {
+      "q": "Our service hangs instead of erroring when traffic spikes; connections seem stuck. What knob is wrong?",
+      "supports": [
+        "db-connection-pooling"
+      ],
+      "answer_substring": "pool"
+    },
+    {
+      "q": "A single change to shared setup broke twenty unrelated tests. What pattern avoids that?",
+      "supports": [
+        "test-data-factories"
+      ],
+      "answer_substring": "factor"
+    },
+    {
+      "q": "Logging every request on our busiest endpoint is expensive. What's the standard fix?",
+      "supports": [
+        "log-sampling-high-volume"
+      ],
+      "answer_substring": "sampl"
+    },
+    {
+      "q": "Is it fine to retry a failing unit-test assertion until it goes green?",
+      "supports": [
+        "network-call-retries"
+      ],
+      "answer_substring": "assertion"
+    }
+  ]
+}
