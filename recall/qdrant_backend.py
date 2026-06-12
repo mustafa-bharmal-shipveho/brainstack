@@ -569,6 +569,12 @@ def query_hybrid(
         return []
     if not client.collection_exists(collection):
         return []
+    # An existing-but-empty collection (the fresh-install `imports` tier before
+    # any source is added) cannot be queried: Qdrant's sparse IDF rescoring
+    # raises KeyError 'sparse' over an empty corpus. Skip it so a new user's
+    # very first query does not crash.
+    if count(client, collection) == 0:
+        return []
 
     flt = _build_filter(type_filter, source_filter)
 

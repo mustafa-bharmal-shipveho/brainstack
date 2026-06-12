@@ -36,10 +36,21 @@ notices.
 from __future__ import annotations
 
 import datetime
+import json
 import os
 import re
 import sys
 from pathlib import Path
+
+
+def _yaml_str(value: str) -> str:
+    """Render a string as a YAML-safe scalar for a frontmatter value.
+
+    A JSON-encoded string is a valid YAML double-quoted scalar, so this
+    handles embedded colons, quotes, and backslashes that would otherwise
+    produce invalid YAML (which parsers then read as empty frontmatter).
+    """
+    return json.dumps(value, ensure_ascii=False)
 
 DEFAULT_BRAIN_ROOT = Path("~/.agent").expanduser()
 LESSONS_SUBDIR = "memory/semantic/lessons"
@@ -131,9 +142,13 @@ def write_lesson(
     except (AttributeError, ValueError):
         is_tty = False
 
+    # Quote free-text values with json.dumps: a JSON string is a valid YAML
+    # double-quoted scalar, so an embedded ": " (e.g. a description like
+    # "fix: do X") cannot corrupt the frontmatter into invalid YAML that every
+    # parser then reads as empty (silently dropping needs_review/provenance).
     fm_lines = [
-        f"name: {slug}",
-        f"description: {desc}",
+        f"name: {_yaml_str(slug)}",
+        f"description: {_yaml_str(desc)}",
         "type: lesson",
         "source: recall-remember",
         f"created_by: {created_by or 'recall-remember'}",
