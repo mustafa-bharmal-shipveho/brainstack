@@ -4,6 +4,7 @@
 
 <b>Agent memory you can audit.</b>
 
+[![CI](https://github.com/mustafa-bharmal-shipveho/brainstack/actions/workflows/ci.yml/badge.svg)](https://github.com/mustafa-bharmal-shipveho/brainstack/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Python 3.10 | 3.11 | 3.12 | 3.13](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue.svg)](pyproject.toml)
 
@@ -13,7 +14,9 @@ Your coding agents already learn things every session, then forget them by the n
 
 ## Demo
 
-A scripted terminal walkthrough lives at [`demo/demo.tape`](https://github.com/mustafa-bharmal-shipveho/brainstack/blob/main/demo/demo.tape); the rendered GIF lands here once recorded.
+![brainstack recall surfacing a past lesson inside a session](demo/demo.gif)
+
+The walkthrough above is generated from [`demo/demo.tape`](demo/demo.tape) against a fully synthetic brain built by [`demo/make_demo_brain.py`](demo/make_demo_brain.py) (placeholder names only, safe to publish). Regenerate it with `make demo` (requires [vhs](https://github.com/charmbracelet/vhs)).
 
 ## Why you can trust it
 

@@ -273,6 +273,15 @@ class TestPyprojectDiscovery:
             "enable_auto_recall = true\n"
         )
         monkeypatch.chdir(cwd)
+        # _discover_config resolves the global file via
+        # Path("~/.agent/runtime/pyproject.toml").expanduser(), which reads
+        # $HOME (and USERPROFILE on Windows), NOT Path.home(). Pinning only
+        # Path.home() left this test silently dependent on the dev machine's
+        # real ~/.agent/runtime (which happens to enable auto-recall), so it
+        # passed locally but failed on a clean CI runner with no ~/.agent.
+        # Pin the env vars so the fallback is the fake home, deterministically.
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setenv("USERPROFILE", str(fake_home))
         monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
         monkeypatch.delenv("RECALL_RUNTIME_CONFIG", raising=False)
 

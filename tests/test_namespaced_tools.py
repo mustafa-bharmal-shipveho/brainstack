@@ -44,12 +44,13 @@ def _seed_candidate(brain, namespace, candidate_id, claim):
     return path
 
 
-def _run(args, brain):
+def _run(args, brain, stdin=None):
     env = os.environ.copy()
     env["BRAIN_ROOT"] = str(brain)
     return subprocess.run(
         [sys.executable] + args,
         capture_output=True, text=True, env=env, cwd=str(REPO_ROOT),
+        stdin=stdin,
     )
 
 
@@ -106,6 +107,27 @@ def test_graduate_without_flag_still_works_on_default(brain):
     assert lessons_jsonl.exists()
     # And the namespaced path should NOT exist under "default".
     assert not (brain / "memory" / "semantic" / "default" / "lessons.jsonl").exists()
+
+
+def test_graduate_custom_reviewer_refused_off_tty_without_ack(brain):
+    """The human-decision gate keys on the TTY, not the (self-reported)
+    --reviewer label. A non-human reviewer string like 'automation' must NOT
+    bypass it: an injected prompt could otherwise pass --reviewer=automation
+    to promote a candidate without acknowledgment. Refused, nothing graduates.
+    """
+    _seed_candidate(brain, "default", "cand_inject_1", "claim an attacker wants durable")
+    res = _run([
+        str(TOOLS / "graduate.py"), "cand_inject_1",
+        "--rationale", "looks legit",
+        "--reviewer", "automation",   # non-default, non-human label
+        # deliberately NO --non-interactive-ack
+    ], brain, stdin=subprocess.DEVNULL)  # force non-TTY: deterministic under `pytest -s`
+    assert res.returncode == 4, f"stdout: {res.stdout}\nstderr: {res.stderr}"
+    assert "not a TTY" in res.stderr
+    # Nothing was made durable.
+    assert not (brain / "memory" / "semantic" / "lessons.jsonl").exists()
+    grad = brain / "memory" / "candidates" / "graduated" / "cand_inject_1.json"
+    assert not grad.exists()
 
 
 def test_reject_namespace_inbox(brain):
