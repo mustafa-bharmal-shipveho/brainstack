@@ -6,13 +6,18 @@ Usage:
 
 Creates:
     TARGET_DIR/
-      memory/semantic/lessons/*.md     5 synthetic lessons (real frontmatter shape)
+      memory/semantic/lessons/*.md     6 synthetic lessons (real frontmatter shape;
+                                       the hero lesson carries full remember-style
+                                       provenance so `recall trace` shows a chain)
+      memory/semantic/digests/*.md     1 synthetic session digest the hero lesson's
+                                       session_id resolves to in `recall trace`
       memory/candidates/*.json         2 staged dream candidates (real triage schema)
       imports/*.md                     1 synthetic imported note (the default config
                                        indexes an imports tier; an empty collection
                                        crashes embedded-qdrant hybrid queries)
       PENDING_REVIEW.md                summary consumed by `recall pending`
-      runtime.toml                     runtime config pointing stats at the demo log
+      runtime.toml                     runtime config: auto-recall enabled (for the
+                                       hook beat) + stats pointed at the demo log
       runtime/logs/events.log.jsonl    synthetic AutoRecall telemetry for `recall stats`
 
 Every byte of content is synthetic. Placeholder org/person names only
@@ -43,10 +48,19 @@ except Exception:
     pass
 
 
+# The synthetic session the hero lesson traces back to. Appears in the
+# lesson's frontmatter (session_id) and in the digest below, so
+# `recall trace postgres-skip-locked-queue-claims` resolves the full chain:
+# lesson -> provenance -> originating digest.
+DEMO_SESSION_ID = "demo-2026-06-04-queue-double-claim"
+
+
 # ---------------------------------------------------------------------------
 # Synthetic lessons - frontmatter shape matches the auto-memory convention
 # used by recall indexing and recall/remember.py (name / description / type /
-# created + a short body with Why and How to apply).
+# created + a short body with Why and How to apply). A lesson may carry
+# `extra_fm` for provenance fields (the hero lesson uses the exact shape
+# `recall remember --reviewed` writes).
 # ---------------------------------------------------------------------------
 
 LESSONS = [
@@ -165,6 +179,42 @@ LESSONS = [
             "- Paste the checklist into the review description and tick items explicitly.\n"
             "- Anything you cannot tick becomes a comment, not a silent pass.\n"
             "- Re-read all user-facing strings out loud; wrong copy is a bug too.\n"
+        ),
+    },
+    {
+        # The demo's hero lesson: beat 1 auto-injects it, beat 2 traces it.
+        # Its frontmatter is exactly what `recall remember --reviewed` writes
+        # (source/created_by/provenance/reviewed_by) plus the session id, so
+        # `recall trace` can walk it back to the digest below.
+        "file": "postgres-skip-locked-queue-claims.md",
+        "name": "postgres-skip-locked-queue-claims",
+        "description": (
+            "Claim queue jobs with SELECT FOR UPDATE SKIP LOCKED; plain row "
+            "locks make workers double-claim or convoy behind each other"
+        ),
+        "type": "feedback",
+        "created": "2026-06-04T15:12:00+00:00",
+        "extra_fm": {
+            "source": "recall-remember",
+            "created_by": "recall-remember",
+            "provenance": "human-cli",
+            "session_id": DEMO_SESSION_ID,
+            "reviewed_by": "human-cli",
+        },
+        "body": (
+            "Workers claiming jobs from a Postgres-backed queue must select with\n"
+            "`FOR UPDATE SKIP LOCKED`, not a bare `FOR UPDATE`.\n"
+            "\n"
+            "Why: with plain row locks, every idle worker queues behind the same hot row,\n"
+            "and a retried transaction can hand the same job to two workers. Alice spent a\n"
+            "day at Acme on 'duplicate welcome emails' that was exactly this.\n"
+            "\n"
+            "How to apply:\n"
+            "- `SELECT ... FROM jobs WHERE status = 'ready' ORDER BY id\n"
+            "  FOR UPDATE SKIP LOCKED LIMIT 1` inside the claiming transaction.\n"
+            "- Mark the row taken in the same transaction; commit before starting the work.\n"
+            "- A worker that dies mid-job releases the lock on rollback, so the job is\n"
+            "  re-claimable with no janitor process.\n"
         ),
     },
 ]
@@ -300,17 +350,49 @@ def main() -> int:
         d.mkdir(parents=True, exist_ok=True)
 
     for lesson in LESSONS:
-        frontmatter = (
-            "---\n"
-            f"name: {lesson['name']}\n"
-            f"description: {lesson['description']}\n"
-            f"type: {lesson['type']}\n"
-            f"created: {lesson['created']}\n"
-            "---\n\n"
-        )
+        fm_lines = [
+            f"name: {lesson['name']}",
+            f"description: {lesson['description']}",
+            f"type: {lesson['type']}",
+            f"created: {lesson['created']}",
+        ]
+        for key, value in lesson.get("extra_fm", {}).items():
+            fm_lines.append(f"{key}: {value}")
+        frontmatter = "---\n" + "\n".join(fm_lines) + "\n---\n\n"
         (lessons_dir / lesson["file"]).write_text(
             frontmatter + lesson["body"], encoding="utf-8"
         )
+
+    # The digest the hero lesson's session_id resolves to. `recall trace`
+    # scans memory/semantic/digests/ for the session id (filename or head)
+    # and prints the match as "originating digest".
+    digests_dir = target / "memory" / "semantic" / "digests"
+    digests_dir.mkdir(parents=True, exist_ok=True)
+    (digests_dir / f"2026-06-04__queue-double-claim-hunt__{DEMO_SESSION_ID}.md").write_text(
+        "---\n"
+        f'session_id: "{DEMO_SESSION_ID}"\n'
+        "source: claude\n"
+        "started_at: 2026-06-04T13:05:00+00:00\n"
+        "ended_at: 2026-06-04T15:20:00+00:00\n"
+        "domain_tags: [postgres, queues, debugging]\n"
+        "outcome: completed\n"
+        "---\n"
+        "\n"
+        "# Queue double-claim hunt\n"
+        "\n"
+        "## What you did\n"
+        "\n"
+        "Alice traced duplicate welcome emails at Acme to two workers claiming the\n"
+        "same queue row. Reproduced with two psql sessions, fixed the claiming query\n"
+        "with FOR UPDATE SKIP LOCKED, and remembered the lesson at the CLI.\n"
+        "\n"
+        "## What was learned\n"
+        "\n"
+        "Bare FOR UPDATE makes idle workers convoy behind the same hot row, and a\n"
+        "retried transaction can hand one job to two workers. SKIP LOCKED gives each\n"
+        "worker its own row and dead workers release claims on rollback.\n",
+        encoding="utf-8",
+    )
 
     cands = _candidates(now)
     for c in cands:
@@ -340,14 +422,20 @@ def main() -> int:
         _pending_review_md(now, cands), encoding="utf-8"
     )
 
-    # Runtime config for `recall stats`: point the events log inside the
+    # Runtime config for the hook beat and `recall stats`: auto-recall is
+    # enabled with a generous timeout (the recording invokes the hook in a
+    # fresh process, so the dense model loads from disk inside the budget;
+    # the production default stays 3000ms). The events log lives inside the
     # demo brain so a recording never reads the recording machine's real
     # telemetry. Absolute path because RuntimeConfig only expanduser()s.
     (target / "runtime.toml").write_text(
         "# Synthetic runtime config for the demo. Use via:\n"
         '#   export RECALL_RUNTIME_CONFIG="$PWD/demo/brain/runtime.toml"\n'
         "[tool.recall.runtime]\n"
-        f'log_dir = "{logs_dir}"\n',
+        f'log_dir = "{logs_dir}"\n'
+        "enable_auto_recall = true\n"
+        "auto_recall_timeout_ms = 20000\n"
+        "auto_recall_k = 3\n",
         encoding="utf-8",
     )
 
@@ -357,6 +445,7 @@ def main() -> int:
 
     print(f"demo brain written to {target}")
     print(f"  lessons:    {len(LESSONS)} in {lessons_dir}")
+    print(f"  digests:    1 in {digests_dir}")
     print(f"  candidates: {len(cands)} staged in {candidates_dir}")
     print(f"  telemetry:  {logs_dir / 'events.log.jsonl'}")
     print('next: export BRAIN_ROOT="' + str(target) + '"')

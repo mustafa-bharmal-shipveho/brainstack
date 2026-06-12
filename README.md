@@ -14,9 +14,9 @@ Your coding agents already learn things every session, then forget them by the n
 
 ## Demo
 
-![brainstack recall surfacing a past lesson inside a session](demo/demo.gif)
+![brainstack: a prompt is auto-enriched with a past lesson, the lesson is traced to its source, and an agent's durable write is refused](demo/demo.gif)
 
-The walkthrough above is generated from [`demo/demo.tape`](demo/demo.tape) against a fully synthetic brain built by [`demo/make_demo_brain.py`](demo/make_demo_brain.py) (placeholder names only, safe to publish). Regenerate it with `make demo` (requires [vhs](https://github.com/charmbracelet/vhs)).
+Four beats: the per-prompt hook injects a past lesson before you ask; `recall trace` walks that lesson back to its provenance and originating session; a piped (non-human) `recall remember --reviewed` is refused while the default write lands staged for your review; `recall stats` shows the week's auto-recall ROI. Generated from [`demo/demo.tape`](demo/demo.tape) against a fully synthetic brain built by [`demo/make_demo_brain.py`](demo/make_demo_brain.py) (placeholder names only, safe to publish). Regenerate with `make demo` (requires [vhs](https://github.com/charmbracelet/vhs)).
 
 ## Why you can trust it
 
