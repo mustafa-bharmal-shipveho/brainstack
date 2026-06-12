@@ -15,9 +15,13 @@ of gravity every item below is weighed against.
 
 ## Next
 
-- **CI.** A GitHub Actions workflow (lint + the hermetic test subset on Linux
-  and macOS) is prepared as `make test-ci` / `make lint-ci`; wiring it as a
-  `.github/workflows/ci.yml` that runs on push is the immediate next step.
+- **CI.** Wired as `.github/workflows/ci.yml`: ruff (`make lint-ci`) on Linux
+  plus the hermetic test subset (`make test-ci`) on macOS (py3.11 and 3.13).
+  Making the suite Linux-portable is the remaining piece: ~13 tests are coupled
+  to the macOS environment (launchd plists, the install-summary launchd
+  wording, a systemd user session the CI container lacks, and pty-dependent
+  triage) and have never run on Linux. They need platform markers or fixes
+  before a Linux test job can be green and added to the matrix.
 - **Benchmarks.** A LongMemEval run, plus an auto-recall on/off A/B on real
   agent tasks measuring re-explanation turns saved. Publish the numbers
   whatever they say.

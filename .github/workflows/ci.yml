@@ -31,13 +31,20 @@ jobs:
       - name: Ruff (matches `make lint-ci`)
         run: make lint-ci
 
+  # Tests run on macOS only for now. Wiring CI surfaced 13 pre-existing tests
+  # that are coupled to the macOS environment (launchd plists, the install
+  # summary's launchd wording, a systemd user session the Linux runner lacks,
+  # and pty/TTY-dependent triage) and have never run on Linux. Making them
+  # Linux-portable is tracked as a follow-up (see ROADMAP); until then a
+  # Linux job would be red on issues unrelated to a given change. macOS is the
+  # project's primary platform (launchd is the default scheduler).
   test:
     name: test (${{ matrix.os }} / py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [macos-latest]
         python-version: ['3.11', '3.13']
     steps:
       - uses: actions/checkout@v4
