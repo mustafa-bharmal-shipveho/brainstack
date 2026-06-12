@@ -1,0 +1,50 @@
+name: CI
+
+# Wires the make targets the ROADMAP referenced: `make lint-ci` (ruff) and
+# `make test-ci` (the hermetic test subset, no model downloads). Each job
+# installs the package + dev extras into the runner's Python and overrides the
+# Makefile's PY so it uses that interpreter (the default PY points at a local
+# homebrew path).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install package + dev deps
+        run: python -m pip install -e '.[dev]'
+      - name: Ruff (matches `make lint-ci`)
+        run: make lint-ci
+
+  test:
+    name: test (${{ matrix.os }} / py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ['3.11', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install package + dev deps
+        run: python -m pip install -e '.[dev]'
+      - name: Hermetic test subset (matches `make test-ci`)
+        run: make test-ci PY=python

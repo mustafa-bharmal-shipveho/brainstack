@@ -79,23 +79,27 @@ def main():
     args = p.parse_args()
 
     # TTY gate (brainstack modification): graduation makes memory durable,
-    # so it must trace back to a human decision. With the default reviewer
-    # and no TTY on stdin, require the explicit acknowledgment flag so an
-    # injected prompt cannot silently promote a candidate through an agent.
-    if args.reviewer == "host-agent" and not sys.stdin.isatty():
+    # so it must trace back to a human decision. Off a TTY (hook/agent/pipe),
+    # require the explicit acknowledgment flag so an injected prompt cannot
+    # silently promote a candidate through an agent. The --reviewer label is
+    # self-reported, so the gate keys on the TTY, not the label: a custom
+    # reviewer string (e.g. --reviewer automation) must not bypass it.
+    if not sys.stdin.isatty():
         if not args.non_interactive_ack:
             print(
-                "ERROR: stdin is not a TTY and --reviewer is the default "
-                "'host-agent'. Graduation must be a human decision: run "
-                "this from an interactive terminal (e.g. `recall pending "
-                "--review`), or, if a human already approved this exact "
-                "promotion, re-run with --non-interactive-ack.",
+                "ERROR: stdin is not a TTY, so this graduation looks like an "
+                "agent, hook, or pipe rather than a human. Graduation makes "
+                "memory durable and must be a human decision: run this from an "
+                "interactive terminal (e.g. `recall pending --review`), or, if "
+                "a human already approved this exact promotion, re-run with "
+                "--non-interactive-ack.",
                 file=sys.stderr,
             )
             sys.exit(4)
         print(
             "WARNING: non-interactive graduation proceeding under "
-            "--non-interactive-ack (caller asserts a human approved it).",
+            f"--non-interactive-ack (reviewer={args.reviewer!r}; caller "
+            "asserts a human approved it).",
             file=sys.stderr,
         )
 

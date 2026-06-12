@@ -104,8 +104,26 @@ These are real and unresolved; adopt with them in mind:
 
 | Check | Status | Date |
 |---|---|---|
-| `trufflehog` or `gitleaks` run against the brain before publishing | pending | |
+| `trufflehog` run against the framework repo before publishing | passing | 2026-06-11 |
 | Built-in + private redaction patterns reviewed | pending | |
-| No network calls outside the three documented paths (code grep) | pending | |
+| No network calls outside the three documented paths (code grep) | passing | 2026-06-11 |
 | Sanitizer adversarial tests pass (`tests/recall/test_sanitize.py`) | passing | 2026-06-10 |
 | Write-path redaction tests pass (`tests/test_redact_write_path.py`) | passing | 2026-06-10 |
+
+Notes on the 2026-06-11 checks:
+
+- **trufflehog** (`trufflehog filesystem .`, v3.95.5, 622 chunks): 0 verified, 11
+  unverified secrets. All 11 are non-secrets: 9 are fake credentials in
+  `tests/test_redact.py` (the fixtures the redaction tests assert against) and 2
+  are documentation placeholders in `CHANGELOG.md` (`https://user:secret@host`
+  and an `ABCDEFGH`-placeholder Slack webhook). `gitleaks` is not installed on
+  the audit machine; trufflehog alone covered the scan. This scans the
+  *framework* repo (the published artifact); a user's personal brain is a
+  separate git repo whose pushes are gated by `sync.sh`'s secret scanner.
+- **Network-call grep**: no `requests`/`httpx`/`urllib`/`aiohttp`/`socket`
+  client imports or calls in `recall/`, `agent/`, or `runtime/`. The only
+  external-process egress is `git` (in `agent/tools/sync.sh`), the `claude`/
+  `codex` CLI for optional `--expand`, and the FastEmbed model download (inside
+  the `qdrant-client[fastembed]` dependency). These are the three documented paths.
+- **Redaction-pattern review** stays *pending*: it is a judgment review best
+  done by a human security reviewer, not an automated pass.

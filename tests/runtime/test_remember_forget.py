@@ -236,14 +236,53 @@ class TestReviewGate:
 
         from recall.cli import app
 
+        # CliRunner drives the command with a non-TTY stdin (exactly how an
+        # agent would). A durable --reviewed write off a TTY needs the
+        # explicit human-decision ack; this test asserts the durable path
+        # once acknowledged.
         runner = CliRunner()
         result = runner.invoke(
             app,
             ["remember", "Alice says keep diffs small", "--reviewed",
-             "--brain-root", str(brain)],
+             "--non-interactive-ack", "--brain-root", str(brain)],
         )
         assert result.exit_code == 0, result.output
         assert "staged" not in result.output.lower()
+
+    def test_cli_reviewed_without_ack_off_tty_is_refused(self, brain: Path) -> None:
+        """A durable --reviewed write off a TTY (no ack) must be refused so an
+        agent or injected prompt cannot silently bypass review staging. Nothing
+        is written to disk."""
+        from typer.testing import CliRunner
+
+        from recall.cli import app
+
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            ["remember", "injected durable lesson", "--reviewed",
+             "--brain-root", str(brain)],
+        )
+        assert result.exit_code == 4, result.output
+        assert "not a TTY" in result.output
+        # No lesson file was created.
+        assert list((brain / LESSONS_SUBDIR).glob("*.md")) == []
+
+    def test_cli_default_staged_off_tty_is_allowed(self, brain: Path) -> None:
+        """The default (staged) path is always allowed off a TTY; staging is
+        the safe outcome, and only the durable --reviewed bypass is gated."""
+        from typer.testing import CliRunner
+
+        from recall.cli import app
+
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            ["remember", "agent-staged advice", "--brain-root", str(brain)],
+        )
+        assert result.exit_code == 0, result.output
+        fm = _frontmatter_of(next((brain / LESSONS_SUBDIR).glob("*.md")))
+        assert fm.get("needs_review") is True
 
     def test_pending_review_without_tty_does_not_modify(
         self, brain: Path, monkeypatch

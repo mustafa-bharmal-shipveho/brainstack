@@ -640,6 +640,13 @@ def remember(
         help="write a durable, human-reviewed lesson immediately instead of "
              "staging it for review. Only pass this when a human made the call.",
     ),
+    non_interactive_ack: bool = typer.Option(
+        False, "--non-interactive-ack",
+        help="acknowledge a durable --reviewed write from a non-interactive "
+             "context (stdin is not a TTY). Without it, --reviewed is refused "
+             "off a TTY so an agent, hook, or injected prompt cannot silently "
+             "write durable memory.",
+    ),
     brain_root: Path = typer.Option(
         Path("~/.agent").expanduser(),
         "--brain-root",
@@ -654,12 +661,35 @@ def remember(
 
     By default the lesson carries `needs_review: true` so retrieval demotes
     (or excludes) it until a human accepts it via `recall pending --review`.
-    `--reviewed` skips staging; it asserts a human approved this write.
+    `--reviewed` skips staging; it asserts a human approved this write. Off a
+    TTY, `--reviewed` requires `--non-interactive-ack` (same human-decision
+    gate as `graduate.py`).
 
     Examples:
         recall remember "always use /agent-team for development"
         recall remember "use SELECT FOR UPDATE SKIP LOCKED for queue claims" --as postgres-locking --reviewed
     """
+    # Human-decision gate (mirrors agent/tools/graduate.py): a durable
+    # --reviewed write must trace to a human. Off a TTY (hook/agent/pipe), an
+    # injected `recall remember --reviewed` would otherwise bypass the review
+    # staging the default path enforces. Require the explicit ack instead.
+    if reviewed and not non_interactive_ack:
+        try:
+            is_tty = sys.stdin.isatty()
+        except (AttributeError, ValueError):
+            is_tty = False
+        if not is_tty:
+            typer.echo(
+                "refusing a durable --reviewed write: stdin is not a TTY, so "
+                "this looks like an agent, hook, or pipe rather than a human. "
+                "Durable memory must be a human decision. Run from an "
+                "interactive terminal, drop --reviewed to stage for review "
+                "(recall pending --review), or, if a human already approved "
+                "this exact lesson, re-run with --non-interactive-ack.",
+                err=True,
+            )
+            raise typer.Exit(4)
+
     from recall.remember import write_lesson
     try:
         path = write_lesson(
