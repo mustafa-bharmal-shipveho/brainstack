@@ -6,12 +6,12 @@
     "url": "https://github.com/mustafa-bharmal-shipveho/brainstack",
     "source": "github"
   },
-  "version": "0.6.0",
+  "version": "0.5.1",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "recall-brain",
-      "version": "0.6.0",
+      "version": "0.5.1",
       "transport": { "type": "stdio" },
       "runtimeHint": "uvx",
       "environmentVariables": [

@@ -12,10 +12,12 @@ of gravity every item below is weighed against.
 - **Minimal-first install.** `--minimal` as the on-ramp, a consent gate and a
   true `--dry-run` for the full install.
 - **Honest docs.** Every README claim matched to implemented behavior.
-- **CI.**
 
 ## Next
 
+- **CI.** A GitHub Actions workflow (lint + the hermetic test subset on Linux
+  and macOS) is prepared as `make test-ci` / `make lint-ci`; wiring it as a
+  `.github/workflows/ci.yml` that runs on push is the immediate next step.
 - **Benchmarks.** A LongMemEval run, plus an auto-recall on/off A/B on real
   agent tasks measuring re-explanation turns saved. Publish the numbers
   whatever they say.

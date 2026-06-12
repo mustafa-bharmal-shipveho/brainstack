@@ -4,7 +4,6 @@
 
 <b>Agent memory you can audit.</b>
 
-[![CI](https://github.com/mustafa-bharmal-shipveho/brainstack/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mustafa-bharmal-shipveho/brainstack/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Python 3.10 | 3.11 | 3.12 | 3.13](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue.svg)](pyproject.toml)
 
