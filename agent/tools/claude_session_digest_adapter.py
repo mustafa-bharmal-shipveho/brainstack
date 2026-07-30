@@ -37,6 +37,10 @@ import sys
 from pathlib import Path
 from typing import Callable, Iterator
 
+# Per-call LLM timeout. Large sessions (100MB+ transcripts) can exceed the
+# 180s default even after chunking — override via DIGEST_LLM_TIMEOUT_S.
+LLM_TIMEOUT_S = int(os.getenv("DIGEST_LLM_TIMEOUT_S", "180"))
+
 try:
     import fcntl  # POSIX — present on macOS + Linux
 except ImportError:  # pragma: no cover (Windows)
@@ -397,7 +401,7 @@ def _summarize_single(
     result = provider.invoke(
         SYSTEM_PROMPT, prompt,
         json_schema=DIGEST_SCHEMA,
-        timeout_s=180,
+        timeout_s=LLM_TIMEOUT_S,
     )
     if result.parsed_json is None:
         raise LLMError("provider returned no parsed digest")
@@ -428,7 +432,7 @@ def _summarize_chunks(
         )
         result = provider.invoke(
             CHUNK_SYSTEM_PROMPT, prompt,
-            json_schema=DIGEST_SCHEMA, timeout_s=180,
+            json_schema=DIGEST_SCHEMA, timeout_s=LLM_TIMEOUT_S,
         )
         if result.parsed_json is None:
             raise LLMError(f"chunk {i+1} returned no parsed digest")
@@ -442,7 +446,7 @@ def _summarize_chunks(
     )
     merged = provider.invoke(
         MERGE_SYSTEM_PROMPT, merge_prompt,
-        json_schema=DIGEST_SCHEMA, timeout_s=180,
+        json_schema=DIGEST_SCHEMA, timeout_s=LLM_TIMEOUT_S,
     )
     if merged.parsed_json is None:
         raise LLMError("merge call returned no parsed digest")
