@@ -184,13 +184,45 @@ Return JSON only — same required keys."""
 # Walking sessions
 # ---------------------------------------------------------------------------
 
+def _is_self_generated(ns: NormalizedSession) -> bool:
+    """True if this "session" is actually one of our own LLM calls.
+
+    Internal `claude -p` invocations used to persist a transcript per call, so
+    a later backfill would digest them and the brain would fill with digests
+    of its own digest calls. `--no-session-persistence` stops new ones being
+    written; this filter covers transcripts already on disk from before that.
+
+    Detected by prompt shape rather than by project directory: a chunk-digest
+    call's *content* is the user's real transcript, so its digest looks
+    genuine, and the calls inherit whatever cwd the runner had — which may
+    also be a directory holding real sessions.
+
+    The marker is the `SYSTEM:\\n...\\n\\nUSER:\\n` envelope every provider
+    call builds (see llm_providers/claude_code.py) appearing as the *first*
+    user turn. Later turns are not required to match: schema-enforced calls
+    add "[structured-output-enforce]" and "Structured output provided
+    successfully" turns, so these transcripts are not single-turn even though
+    they are one-shot `claude -p` runs.
+
+    Covers every internal call type (digest, chunk, merge, query expansion),
+    not just digests. A real session would have to open with that exact
+    machine-generated envelope to be misclassified."""
+    for m in ns.messages:
+        if getattr(m, "role", "") != "user":
+            continue
+        head = (getattr(m, "text", "") or "")[:2000]
+        return head.startswith("SYSTEM:\n") and "\nUSER:\n" in head
+    return False
+
+
 def iter_claude_sessions(
     projects_root: Path,
 ) -> Iterator[NormalizedSession]:
     """Yield NormalizedSession for every <slug>/<uuid>.jsonl under
     `projects_root`. Skips files that yield None (no conversational
-    turns) and any that can't be parsed at all. Output order is
-    deterministic (sorted by slug + filename)."""
+    turns), any that can't be parsed at all, and our own internal LLM
+    calls (see `_is_self_generated`). Output order is deterministic
+    (sorted by slug + filename)."""
     if not projects_root.is_dir():
         return
     for slug_dir in sorted(projects_root.iterdir()):
@@ -203,6 +235,8 @@ def iter_claude_sessions(
             except Exception:
                 continue
             if ns is None:
+                continue
+            if _is_self_generated(ns):
                 continue
             yield ns
 
