@@ -34,6 +34,7 @@ import hashlib
 import json
 import os
 import sys
+from dataclasses import replace as dc_replace
 from pathlib import Path
 from typing import Callable, Iterator
 
@@ -368,18 +369,46 @@ def _format_messages_for_prompt(messages: list, brain_root: Path) -> str:
     return "\n\n".join(parts)
 
 
+def _split_oversized(m, target_tokens: int) -> list:
+    """Slice a single message whose own text exceeds `target_tokens` into
+    sequential pieces that each fit. Without this, one giant message becomes
+    a chunk larger than the model's input budget and the provider rejects the
+    call outright (`claude -p` returns is_error with zero token usage), which
+    no timeout increase can fix. Real case: a 145K-token (581KB) tool result
+    inside a 138MB session.
+
+    Falls back to returning the message untouched if it is not a dataclass we
+    can copy, so an unexpected message type degrades to the old behavior
+    rather than raising."""
+    text = getattr(m, "text", "") or ""
+    cap = max(1, target_tokens * 4)  # same 4-chars-per-token estimate
+    if len(text) <= cap:
+        return [m]
+    pieces: list = []
+    total = (len(text) + cap - 1) // cap
+    for i in range(0, len(text), cap):
+        marker = f"[oversized message, part {len(pieces) + 1}/{total}]\n"
+        try:
+            pieces.append(dc_replace(m, text=marker + text[i:i + cap]))
+        except Exception:
+            return [m]
+    return pieces
+
+
 def _chunk_messages(messages: list, target_tokens: int) -> list[list]:
     """Split messages into chunks whose ~token estimates stay below
-    `target_tokens`. Preserves order; never splits inside a message."""
+    `target_tokens`. Preserves order; splits inside a message only when that
+    single message would not fit in a chunk on its own."""
     chunks: list[list] = [[]]
     used = 0
     for m in messages:
-        t = (len(getattr(m, "text", "") or "") // 4) + 1
-        if used + t > target_tokens and chunks[-1]:
-            chunks.append([])
-            used = 0
-        chunks[-1].append(m)
-        used += t
+        for part in _split_oversized(m, target_tokens):
+            t = (len(getattr(part, "text", "") or "") // 4) + 1
+            if used + t > target_tokens and chunks[-1]:
+                chunks.append([])
+                used = 0
+            chunks[-1].append(part)
+            used += t
     return [c for c in chunks if c]
 
 
@@ -415,8 +444,12 @@ def _summarize_chunks(
     # crossed the threshold actually splits into ≥2 chunks. Cap at
     # CHUNK_TOKEN_TARGET so production runs use the production target;
     # use the smaller of (production target, half the single-pass limit).
-    chunk_target = min(CHUNK_TOKEN_TARGET,
-                       max(1, SINGLE_PASS_TOKEN_LIMIT // 2))
+    # DIGEST_CHUNK_TOKEN_TARGET overrides both, for outlier sessions where the
+    # derived target yields so many chunks that wall time becomes hours (a
+    # 4.5M-token session gives 154 chunks at 30K vs 41 at 120K). Unset keeps
+    # the derived value, so default and test behavior are unchanged.
+    chunk_target = int(os.getenv("DIGEST_CHUNK_TOKEN_TARGET", "0")) or min(
+        CHUNK_TOKEN_TARGET, max(1, SINGLE_PASS_TOKEN_LIMIT // 2))
     chunks = _chunk_messages(ns.messages, chunk_target)
     if len(chunks) < 2:
         # Threshold edge case — fall back to single-pass
