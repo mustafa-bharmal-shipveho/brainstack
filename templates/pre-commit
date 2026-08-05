@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# brainstack-managed pre-commit hook — safe for install.sh to replace.
+# Delete this marker line if you customise the hook and want upgrades to
+# leave it alone.
+#
 # Pre-commit hook for the brain repo at ~/.agent/.
 # Runs the redact.py scanner over staged files; blocks the commit on any hit.
 #
