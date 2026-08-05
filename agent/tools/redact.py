@@ -329,8 +329,57 @@ ENTROPY_IGNORE = re.compile(
     # ignored wrapping (defense-in-depth, mirrors the same gate on
     # the `pattern_` prefix below).
     r"|n?\d{4}-\d{2}-\d{2}__[a-z0-9\-]+__[a-f0-9]+"
+    # MCP tool-result artifact names — `mcp-<server>-<tool>-<epoch_ms>`,
+    # written by the harness and quoted verbatim in runtime event logs.
+    # Same strict-lowercase rule as the shapes above: an uppercase
+    # AKIA-prefixed key cannot be smuggled inside the ignored wrapping.
+    r"|mcp-[a-z0-9_\-]+-\d{10,}"
     r")$"
 )
+
+# ---- Scan allowlist (shared with scan_gate.py) ----------------------
+#
+# redact-private.txt ADDS patterns. This file REMOVES findings: one
+# regex per line, matched against the detected value, for things that
+# are provably not credentials in THIS brain (Google Drive file ids,
+# internal ticket slugs, …).
+#
+# It has to be honoured by BOTH gates. sync.sh's scan_gate.py decides
+# which files to hold back; this hook decides whether a commit may
+# proceed. If only scan_gate honoured the allowlist, an allowlisted file
+# would get staged and then rejected here — turning a per-file skip back
+# into a total block, which is the exact failure this whole mechanism
+# exists to prevent.
+SCAN_ALLOWLIST_FILENAME = ".secret-scan-allowlist.txt"
+
+
+def load_scan_allowlist(root: Path) -> list[re.Pattern[str]]:
+    """Regexes for known-false-positive values. Fails open per line."""
+    path = Path(root) / SCAN_ALLOWLIST_FILENAME
+    patterns: list[re.Pattern[str]] = []
+    if not path.is_file():
+        return patterns
+    try:
+        lines = path.read_text().splitlines()
+    except OSError as e:
+        sys.stderr.write(f"redact: WARN cannot read {path} ({e})\n")
+        return patterns
+    for lineno, line in enumerate(lines, 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if _is_redos_dangerous(line):
+            sys.stderr.write(
+                f"redact: WARN {path}:{lineno} ReDoS-prone regex, skipped\n"
+            )
+            continue
+        try:
+            patterns.append(re.compile(line))
+        except re.error as e:
+            sys.stderr.write(
+                f"redact: WARN {path}:{lineno} bad regex, skipped ({e})\n"
+            )
+    return patterns
 
 
 def scan_file(
@@ -425,9 +474,22 @@ def scan_file(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Scan a directory for secrets before committing."
+        description="Scan a directory (or specific files) for secrets "
+                    "before committing."
     )
-    parser.add_argument("target", help="Directory to scan")
+    parser.add_argument(
+        "target", nargs="+",
+        help="Directory to scan, or one or more files. Passing explicit "
+             "files lets the pre-commit hook scan only what is staged, so "
+             "an unrelated file elsewhere in the tree cannot block the "
+             "commit.",
+    )
+    parser.add_argument(
+        "--pattern-root",
+        help="Directory to load redact-private.txt from. Defaults to the "
+             "target when it is a directory; required for useful private "
+             "patterns when scanning individual files.",
+    )
     parser.add_argument(
         "--no-entropy",
         action="store_true",
@@ -441,26 +503,67 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    root = Path(args.target).resolve()
-    if not root.exists():
-        sys.stderr.write(f"redact: target not found: {root}\n")
-        return 2
+    targets = [Path(t).resolve() for t in args.target]
+    missing = [t for t in targets if not t.exists()]
+    if missing:
+        # A staged path can vanish between `git diff --cached` and the scan
+        # (e.g. a concurrent rebase). Only complain if NOTHING is scannable.
+        for t in missing:
+            sys.stderr.write(f"redact: target not found: {t}\n")
+        targets = [t for t in targets if t.exists()]
+        if not targets:
+            return 2
+
+    if args.pattern_root:
+        root = Path(args.pattern_root).resolve()
+    elif len(targets) == 1 and targets[0].is_dir():
+        root = targets[0]
+    else:
+        root = Path.cwd()
 
     extra_patterns = load_private_patterns(root)
+    allowlist = load_scan_allowlist(root)
     entropy_threshold = None if args.no_entropy else args.entropy_threshold
 
-    # Skip the redact-private.txt file itself — its own pattern bodies would
-    # otherwise match themselves on whole-tree scans, training users to
-    # bypass the pre-commit hook with --no-verify.
-    skip_files = {root / "redact-private.txt"}
+    # Skip redact-private.txt and the allowlist themselves — their own
+    # pattern bodies would otherwise match themselves on whole-tree scans,
+    # training users to bypass the pre-commit hook with --no-verify.
+    skip_files = {
+        root / "redact-private.txt",
+        root / SCAN_ALLOWLIST_FILENAME,
+    }
+
+    def _walk():
+        seen: set[Path] = set()
+        for t in targets:
+            paths = iter_files(t, skip_files=skip_files) if t.is_dir() else [t]
+            for p in paths:
+                if p in seen or p.resolve() in {s.resolve() for s in skip_files}:
+                    continue
+                # is_binary is applied by iter_files for directory walks;
+                # explicit file arguments need the same guard.
+                if not t.is_dir() and is_binary(p):
+                    continue
+                seen.add(p)
+                yield p
 
     total_hits = 0
-    for f in iter_files(root, skip_files=skip_files):
+    allowed = 0
+    for f in _walk():
         hits = scan_file(f, extra_patterns, entropy_threshold)
         for line_no, pattern_name, matched in hits:
+            if any(p.search(matched) for p in allowlist):
+                allowed += 1
+                continue
             display = matched[:8] + "..." if len(matched) > 12 else matched
             print(f"{f}:{line_no}:{pattern_name}: {display}")
             total_hits += 1
+
+    if allowed:
+        sys.stderr.write(
+            f"redact: {allowed} finding(s) ignored via "
+            f"{SCAN_ALLOWLIST_FILENAME}\n"
+        )
 
     if total_hits:
         sys.stderr.write(

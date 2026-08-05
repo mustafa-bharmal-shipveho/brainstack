@@ -180,38 +180,83 @@ if [ -z "$SCANNER" ]; then
     fi
 fi
 
-# Optional: $BRAIN_ROOT/.trufflehog-exclude.txt lets the user exclude paths
-# from the local scan (e.g. .git/objects/ which carries historical commits'
-# objects). Going-forward content is already covered by the pre-commit hook
-# and JSONL scrubber; the server-side workflow catches --no-verify bypasses.
-TH_EXCLUDE="$BRAIN_ROOT/.trufflehog-exclude.txt"
+# Path- and value-level scan tuning both live next to the brain and are
+# read by scan_gate.py, not by this script:
+#   .trufflehog-exclude.txt      paths the scanner never looks at
+#   .secret-scan-allowlist.txt   regexes for known false-positive values
+# Going-forward content is already covered by the pre-commit hook and the
+# JSONL scrubber; the server-side workflow catches --no-verify bypasses.
 
-case "$SCANNER" in
-    trufflehog)
-        # `Privacy` and `NpmToken` detectors pattern-match UUIDs
-        # (including the UUIDv7s brainstack itself emits for session and
-        # event ids), producing zero verified hits but constant
-        # unverified false positives that block sync.sh for days. Disable
-        # them. The structural detectors (AnthropicKey, SlackToken,
-        # OpenAIKey, AWS, Stripe, GitHub, …) remain active.
-        TH_ARGS=(filesystem . --no-update --fail
-                 --exclude-detectors Privacy,NpmToken)
-        [ -f "$TH_EXCLUDE" ] && TH_ARGS+=(--exclude-paths "$TH_EXCLUDE")
-        if ! trufflehog "${TH_ARGS[@]}" >/dev/null 2>>"$LOG_FILE"; then
-            echo "$(date -u +%FT%TZ) sync: trufflehog flagged secrets; refusing to push" >> "$LOG_FILE"
-            exit 1
-        fi
-        ;;
-    gitleaks)
-        if ! gitleaks detect --source . --no-git --redact >/dev/null 2>>"$LOG_FILE"; then
-            echo "$(date -u +%FT%TZ) sync: gitleaks flagged secrets; refusing to push" >> "$LOG_FILE"
-            exit 1
-        fi
-        ;;
-esac
+# ---- Scan, then quarantine per-file (NOT fail-closed globally) ----
+#
+# History: this gate used to be `trufflehog --fail` + `exit 1`. One
+# unverified false positive anywhere in the brain — a bare git SHA in a
+# logged `gh api ...?ref=<sha>` URL, which the `Circle` detector reads as
+# a CircleCI token — blocked every hourly sync for a MONTH, silently.
+# A whole month of memories sat unpushed and nothing surfaced it.
+#
+# Policy now: if we're not sure about a file, skip THAT FILE and push
+# everything else. scan_gate.py prints the repo-relative path of each
+# risky file on stdout; we unstage exactly those and commit the rest.
+# Quarantined files stay dirty, so the next run re-checks them and they
+# sync themselves once clean. See agent/tools/scan_gate.py.
+SCAN_GATE="$BRAIN_ROOT/tools/scan_gate.py"
+QUARANTINE=""
+if [ -n "$SCANNER" ] && [ -f "$SCAN_GATE" ]; then
+    set +e
+    QUARANTINE="$("$PYTHON_BIN" "$SCAN_GATE" --brain-root "$BRAIN_ROOT" \
+                    --scanner "$SCANNER" 2>>"$LOG_FILE")"
+    gate_rc=$?
+    set -e
+    # rc=2 means the scan itself could not run. An unscannable brain is
+    # not a clean brain — fail closed, as before.
+    if [ "$gate_rc" -eq 2 ]; then
+        echo "$(date -u +%FT%TZ) sync: secret scan could not run; refusing to push" >> "$LOG_FILE"
+        _refresh_pending_summary
+        exit 1
+    fi
+elif [ -n "$SCANNER" ]; then
+    echo "$(date -u +%FT%TZ) sync: WARNING scan_gate.py missing at $SCAN_GATE" >> "$LOG_FILE"
+fi
 
-# ---- Stage all changes ----
+# ---- Stage all changes, minus anything quarantined ----
 git add -A
+
+if [ -n "$QUARANTINE" ]; then
+    # An unborn HEAD (fresh brain, first ever sync) can't be reset against;
+    # `git rm --cached` is the only way to unstage there.
+    if git rev-parse --verify -q HEAD >/dev/null 2>&1; then
+        HAVE_HEAD=1
+    else
+        HAVE_HEAD=0
+    fi
+
+    N_QUARANTINED=0
+    while IFS= read -r qfile; do
+        [ -z "$qfile" ] && continue
+        # Leave the file dirty in the working tree — we only pull it out of
+        # THIS commit, so the next run re-checks it and it syncs itself
+        # once clean.
+        unstaged=0
+        if [ "$HAVE_HEAD" -eq 1 ]; then
+            git reset -q HEAD -- "$qfile" 2>>"$LOG_FILE" && unstaged=1
+        else
+            git rm --cached -q --force -- "$qfile" 2>>"$LOG_FILE" && unstaged=1
+        fi
+        # If we could NOT pull it back out, the file is still staged and a
+        # commit would publish it. Fail closed — never trade a possible
+        # secret for a successful sync.
+        if [ "$unstaged" -ne 1 ]; then
+            echo "$(date -u +%FT%TZ) sync: could not unstage $qfile; refusing to push" >> "$LOG_FILE"
+            git reset -q 2>>"$LOG_FILE" || true
+            _refresh_pending_summary
+            exit 1
+        fi
+        N_QUARANTINED=$((N_QUARANTINED + 1))
+        echo "$(date -u +%FT%TZ) sync: quarantined (not pushed): $qfile" >> "$LOG_FILE"
+    done <<< "$QUARANTINE"
+    echo "$(date -u +%FT%TZ) sync: held back $N_QUARANTINED file(s) with possible secrets; syncing the rest" >> "$LOG_FILE"
+fi
 
 # Anything to commit?
 if git diff --cached --quiet; then
