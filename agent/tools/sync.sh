@@ -216,7 +216,14 @@ if [ -n "$SCANNER" ] && [ -f "$SCAN_GATE" ]; then
         exit 1
     fi
 elif [ -n "$SCANNER" ]; then
-    echo "$(date -u +%FT%TZ) sync: WARNING scan_gate.py missing at $SCAN_GATE" >> "$LOG_FILE"
+    # A scanner is installed but the gate that drives it is not — e.g. a
+    # half-finished upgrade. Proceeding here would push the whole brain
+    # with NO secret scan whatsoever, which is strictly worse than the
+    # all-or-nothing behaviour this commit replaced. Fail closed.
+    echo "$(date -u +%FT%TZ) sync: scan_gate.py missing at $SCAN_GATE; refusing to push" >> "$LOG_FILE"
+    echo "$(date -u +%FT%TZ) sync: reinstall with ./install.sh to restore the secret gate" >> "$LOG_FILE"
+    _refresh_pending_summary
+    exit 2
 fi
 
 # ---- Stage all changes, minus anything quarantined ----
@@ -231,22 +238,75 @@ if [ -n "$QUARANTINE" ]; then
         HAVE_HEAD=0
     fi
 
+    # Is exactly this path still in the index? `-z` avoids core.quotepath
+    # mangling, and the :(literal) pathspec keeps the query exact.
+    _is_staged() {
+        local want="$1" got
+        while IFS= read -r -d '' got; do
+            [ "$got" = "$want" ] && return 0
+        done < <(git diff --cached --name-only -z -- ":(literal)$want")
+        return 1
+    }
+
+    # If the quarantined path is the DESTINATION of a staged rename, the
+    # matching source deletion is a separate index entry. Unstaging only
+    # the destination would commit the deletion while withholding the new
+    # content — the remote would lose that memory entirely until the
+    # quarantine clears. Restore the source too, so a rename+secret is a
+    # clean no-op for this commit.
+    #
+    # `--name-status -z -M` emits R/C entries as three NUL fields
+    # (status, old, new) and everything else as two.
+    _restore_rename_source() {
+        local want="$1" st old new
+        while IFS= read -r -d '' st; do
+            case "$st" in
+                R*|C*)
+                    IFS= read -r -d '' old || break
+                    IFS= read -r -d '' new || break
+                    if [ "$new" = "$want" ]; then
+                        git reset -q HEAD -- ":(literal)$old" 2>>"$LOG_FILE" || true
+                        echo "$(date -u +%FT%TZ) sync: also restored rename source of quarantined file: $old" >> "$LOG_FILE"
+                    fi
+                    ;;
+                *)
+                    IFS= read -r -d '' new || break
+                    ;;
+            esac
+        done < <(git diff --cached --name-status -z -M)
+    }
+
     N_QUARANTINED=0
     while IFS= read -r qfile; do
         [ -z "$qfile" ] && continue
+        # Not in this commit anyway — gitignored, or unchanged since the
+        # last sync. There is nothing to hold back, so don't count it and
+        # don't raise a partial-sync warning that would never clear.
+        if ! _is_staged "$qfile"; then
+            continue
+        fi
         # Leave the file dirty in the working tree — we only pull it out of
         # THIS commit, so the next run re-checks it and it syncs itself
         # once clean.
-        unstaged=0
+        #
+        # :(literal) is load-bearing. Without it git treats the path as a
+        # glob pathspec, so a note named `Meeting [2026-08-05].md` both
+        # fails to match itself AND unstages every innocent file the
+        # pattern happens to hit — silently withholding files we never
+        # reported as quarantined.
+        # Must run while the rename pairing is still staged.
+        [ "$HAVE_HEAD" -eq 1 ] && _restore_rename_source "$qfile"
         if [ "$HAVE_HEAD" -eq 1 ]; then
-            git reset -q HEAD -- "$qfile" 2>>"$LOG_FILE" && unstaged=1
+            git reset -q HEAD -- ":(literal)$qfile" 2>>"$LOG_FILE" || true
         else
-            git rm --cached -q --force -- "$qfile" 2>>"$LOG_FILE" && unstaged=1
+            git rm --cached -q --force -- ":(literal)$qfile" 2>>"$LOG_FILE" || true
         fi
-        # If we could NOT pull it back out, the file is still staged and a
-        # commit would publish it. Fail closed — never trade a possible
-        # secret for a successful sync.
-        if [ "$unstaged" -ne 1 ]; then
+        # Check the postcondition, not the exit code: `git reset` exits 0
+        # even when the pathspec matched nothing, so its status proves
+        # nothing. If the file is still staged, committing would publish
+        # it — fail closed rather than trade a possible secret for a
+        # successful sync.
+        if _is_staged "$qfile"; then
             echo "$(date -u +%FT%TZ) sync: could not unstage $qfile; refusing to push" >> "$LOG_FILE"
             git reset -q 2>>"$LOG_FILE" || true
             _refresh_pending_summary
@@ -255,7 +315,13 @@ if [ -n "$QUARANTINE" ]; then
         N_QUARANTINED=$((N_QUARANTINED + 1))
         echo "$(date -u +%FT%TZ) sync: quarantined (not pushed): $qfile" >> "$LOG_FILE"
     done <<< "$QUARANTINE"
-    echo "$(date -u +%FT%TZ) sync: held back $N_QUARANTINED file(s) with possible secrets; syncing the rest" >> "$LOG_FILE"
+    # Only claim a partial sync if something was ACTUALLY held back. When
+    # every reported path was skipped as unchanged or ignored, logging
+    # "held back 0 file(s)" would pin render_pending_summary to the
+    # 'quarantined' warning forever — it matches on the phrase alone.
+    if [ "$N_QUARANTINED" -gt 0 ]; then
+        echo "$(date -u +%FT%TZ) sync: held back $N_QUARANTINED file(s) with possible secrets; syncing the rest" >> "$LOG_FILE"
+    fi
 fi
 
 # Anything to commit?

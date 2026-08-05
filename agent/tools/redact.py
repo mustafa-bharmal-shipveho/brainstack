@@ -352,6 +352,115 @@ ENTROPY_IGNORE = re.compile(
 # exists to prevent.
 SCAN_ALLOWLIST_FILENAME = ".secret-scan-allowlist.txt"
 
+# ---- Shared false-positive suppression -------------------------------
+#
+# Lives here, not in scan_gate.py, because BOTH gates must reach the same
+# verdict. scan_gate.py decides which files sync.sh holds back; this
+# module decides whether the commit may proceed. If scan_gate suppressed
+# a finding that this module still reported, the file would be staged and
+# then rejected by the hook — a per-file skip turned back into a total
+# block, which is the bug the quarantine mechanism exists to prevent.
+
+# Values that are structurally a digest or an id, not a credential.
+# Anchored on the WHOLE value — a prefixed vendor token cannot match.
+STRUCTURAL_FP = (
+    re.compile(r"\A[0-9a-f]{40}\Z", re.I),  # git SHA-1
+    re.compile(r"\A[0-9a-f]{64}\Z", re.I),  # SHA-256
+    re.compile(  # UUID (incl. the UUIDv7s brainstack mints)
+        r"\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z",
+        re.I,
+    ),
+)
+
+# Documentation / template placeholders. These live in .env templates and
+# in the command logs that quote them, e.g. the literal string
+# `u+your-pagerduty-api-key-here` that PagerDutyApiKey flags.
+#
+# Marker words match as substrings, NOT \b-delimited, because canonical
+# placeholders run them straight into the token body: AWS's own docs
+# access key ends in a literal "EXAMPLE" preceded by a digit, so
+# \bexample\b never matches it.
+#
+# (Deliberately no literal sample keys in this file — this module scans
+# its own source tree, and a realistic constant here would self-flag.)
+PLACEHOLDER_FP = re.compile(
+    r"""(?ix)
+      your[-_]           # your-pagerduty-api-key
+    | [-_]here\b         # …-key-here
+    | example            # …7EXAMPLE, as in AWS's published sample key
+    | changeme
+    | placeholder
+    | dummy
+    | redacted
+    | x{8,}              # xxxxxxxxxxxx
+    | \*{4,}             # ****
+    | \A<.*>\Z           # <YOUR_TOKEN>
+    """
+)
+
+
+# High-confidence vendor credential shapes. A value carrying one of these
+# is NEVER excused by a placeholder word — only by an explicit allowlist
+# entry. Without this, AWS's published docs key `AKIA…7EXAMPLE` would be
+# suppressed by the `example` marker, and so would any real AKIA key an
+# attacker (or a careless paste) padded with the word "example". The
+# project's own tests assert these stay blocked.
+#
+# Matched with search(), not fullmatch: a real key embedded in a longer
+# token (`pattern_AKIA…_other_stuff`) must still count.
+VENDOR_CREDENTIAL_SHAPES = (
+    re.compile(r"(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}"),      # AWS key id
+    re.compile(r"sk-ant-[A-Za-z0-9_\-]{20,}"),               # Anthropic
+    re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),             # Slack
+    re.compile(r"gh[pousr]_[A-Za-z0-9]{36,}"),               # GitHub
+    re.compile(r"glpat-[A-Za-z0-9_\-]{20,}"),                # GitLab
+    re.compile(r"AIza[0-9A-Za-z_\-]{35}"),                   # Google API
+    re.compile(r"[sr]k_(?:live|test)_[0-9A-Za-z]{10,}"),     # Stripe
+)
+
+
+def looks_like_vendor_credential(raw: str) -> bool:
+    """True if ``raw`` carries a high-confidence vendor credential shape."""
+    return any(p.search(raw) for p in VENDOR_CREDENTIAL_SHAPES)
+
+
+def is_false_positive(
+    raw: str,
+    allowlist: list[re.Pattern[str]],
+    *,
+    verification_conclusive: bool = False,
+) -> str | None:
+    """Reason string if ``raw`` cannot be a real credential, else None.
+
+    ``verification_conclusive`` must be True ONLY when a scanner actually
+    attempted to verify the value against the vendor and got a definitive
+    "not valid" answer. It gates the structural (hash/UUID) suppression,
+    because that check is genuinely ambiguous: a legacy 40-hex GitHub
+    token and a CircleCI token are shape-identical to a git SHA. Live
+    ones are distinguishable only by verification, so without a
+    conclusive verdict we must NOT suppress on shape.
+
+    gitleaks performs no verification at all, and trufflehog reports
+    Verified=false both for "checked, invalid" and "could not check" —
+    so callers must pass False in both of those cases.
+
+    Placeholder and allowlist suppression are content judgements that do
+    not depend on verification, so they always apply — except that a
+    value carrying a real vendor credential shape is never excused by a
+    placeholder word, only by an explicit allowlist entry.
+    """
+    if not raw:
+        return "empty"
+    if verification_conclusive and any(p.match(raw) for p in STRUCTURAL_FP):
+        return "hash-or-uuid shape"
+    if PLACEHOLDER_FP.search(raw) and not looks_like_vendor_credential(raw):
+        return "documentation placeholder"
+    # Explicit user opt-in is the only thing that can clear a value with a
+    # vendor credential shape.
+    if any(p.search(raw) for p in allowlist):
+        return f"{SCAN_ALLOWLIST_FILENAME} match"
+    return None
+
 
 def load_scan_allowlist(root: Path) -> list[re.Pattern[str]]:
     """Regexes for known-false-positive values. Fails open per line."""
@@ -552,7 +661,12 @@ def main() -> int:
     for f in _walk():
         hits = scan_file(f, extra_patterns, entropy_threshold)
         for line_no, pattern_name, matched in hits:
-            if any(p.search(matched) for p in allowlist):
+            # This module performs no verification, so structural
+            # suppression stays off (verification_conclusive=False) —
+            # placeholders and the allowlist still apply. scan_gate.py
+            # calls the same helper the same way for redact findings, so
+            # the two gates cannot disagree.
+            if is_false_positive(matched, allowlist):
                 allowed += 1
                 continue
             display = matched[:8] + "..." if len(matched) > 12 else matched
@@ -561,7 +675,7 @@ def main() -> int:
 
     if allowed:
         sys.stderr.write(
-            f"redact: {allowed} finding(s) ignored via "
+            f"redact: {allowed} finding(s) ignored as placeholders or via "
             f"{SCAN_ALLOWLIST_FILENAME}\n"
         )
 

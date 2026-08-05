@@ -221,6 +221,14 @@ _SYNC_BLOCKED_MARKERS: tuple[tuple[str, str], ...] = (
     # silently never pushes. Most specific marker first so it isn't
     # shadowed by the generic ones below.
     ("no secret scanner installed", "blocked-noscanner"),
+    # The gate itself could not run (missing scan_gate.py, scanner crash).
+    # These MUST precede the generic "refusing to push" below, or they
+    # render as "verified secret in your tree" and send the user hunting
+    # for a secret that does not exist.
+    ("scan_gate.py missing",      "blocked-scanner"),
+    ("secret scan could not run", "blocked-scanner"),
+    # We identified a risky file but could not pull it out of the commit.
+    ("could not unstage",         "blocked-unstage"),
     # Trufflehog hit: a verified secret in the working tree.
     ("trufflehog flagged",       "blocked-trufflehog"),
     ("refusing to push",         "blocked-trufflehog"),
@@ -272,6 +280,8 @@ def _check_sync_status(brain_root: Path) -> str:
       - 'blocked-trufflehog'  — trufflehog flagged a verified secret
       - 'blocked-precommit'   — local pre-commit hook (redact.py etc.) blocked commit
       - 'blocked-network'     — commit succeeded but push failed (remote unreachable)
+      - 'blocked-scanner'     — the secret gate could not run (not a secret hit)
+      - 'blocked-unstage'     — a risky file could not be removed from the commit
       - 'quarantined'         — push succeeded but some file(s) were held back
       - 'stale'               — last sync line is > 2 hours old
       - 'ok'                  — last line is a successful push or no-op
@@ -463,6 +473,12 @@ def compose_summary(
         elif sync_status == "blocked-network":
             lines.append("- Commit succeeded locally but the push failed — usually a network/remote-reachability issue, NOT a secret.")
             lines.append("- The brain repo is committed locally; the next hourly sync will retry. Run `~/.agent/tools/sync.sh` manually to retry now.")
+        elif sync_status == "blocked-scanner":
+            lines.append("- The secret scanner could not run, so sync.sh refused to push. This is NOT a secret in your tree — the gate itself is broken.")
+            lines.append("- Usually a half-finished upgrade: re-run `./install.sh` to restore `~/.agent/tools/scan_gate.py`, then `~/.agent/tools/sync.sh`.")
+        elif sync_status == "blocked-unstage":
+            lines.append("- A risky file was identified but could not be removed from the commit, so the push was refused rather than risk publishing it.")
+            lines.append("- See the `could not unstage` line in `~/.agent/sync.log` for the path; check for an unusual filename or a locked index (`.git/index.lock`).")
         elif sync_status == "quarantined":
             lines.append("- Last sync pushed, but held back one or more files whose contents tripped the secret scanner. **Those memories are NOT on the remote.**")
             lines.append("- See the `quarantined (not pushed)` lines in `~/.agent/sync.log` for the exact paths.")

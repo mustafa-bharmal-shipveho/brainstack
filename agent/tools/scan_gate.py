@@ -60,74 +60,22 @@ from pathlib import Path
 # for the same reason (they pattern-match UUIDs).
 NOISY_DETECTORS = ("Privacy", "NpmToken")
 
-# Raw values that are structurally a digest or an id, not a credential.
-# Anchored on the WHOLE raw value — a prefixed vendor token cannot match.
-_STRUCTURAL_FP = (
-    re.compile(r"\A[0-9a-f]{40}\Z", re.I),  # git SHA-1
-    re.compile(r"\A[0-9a-f]{64}\Z", re.I),  # SHA-256
-    re.compile(  # UUID (incl. the UUIDv7s brainstack mints)
-        r"\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z",
-        re.I,
-    ),
-)
-
-# Documentation / template placeholders. These live in .env templates and
-# in the command logs that quote them, e.g. the literal string
-# `u+your-pagerduty-api-key-here` that PagerDutyApiKey flags.
-#
-# The marker words are matched as substrings, NOT \b-delimited, because
-# the canonical placeholders run them straight into the token body: AWS's
-# own docs access key ends in a literal "EXAMPLE" preceded by a digit, so
-# \bexample\b never matches it. A real credential that happens to contain
-# "example" or "dummy" is vanishingly unlikely — and if it is live,
-# verification catches it regardless, since verified hits skip this
-# filter entirely.
-#
-# (Deliberately no literal sample keys in this file: the brain's own
-# redact.py pre-commit hook scans this source, and a realistic-looking
-# constant here would block every commit. Samples live in the tests.)
-_PLACEHOLDER_FP = re.compile(
-    r"""(?ix)
-      your[-_]           # your-pagerduty-api-key
-    | [-_]here\b         # …-key-here
-    | example            # …7EXAMPLE, as in AWS's published sample key
-    | changeme
-    | placeholder
-    | dummy
-    | redacted
-    | x{8,}              # xxxxxxxxxxxx
-    | \*{4,}             # ****
-    | \A<.*>\Z           # <YOUR_TOKEN>
-    """
-)
-
 # Path setup so we can import sibling modules without packaging — same
 # idiom as _redact_common.py.
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
-# ONE allowlist, shared with redact.py / the pre-commit hook. If the two
-# gates disagreed about what counts as a false positive, allowlisting a
-# file here would only get it staged and then rejected by the hook —
-# converting a per-file skip back into a total block.
+# ONE allowlist AND one suppression function, shared with redact.py / the
+# pre-commit hook. If the two gates disagreed about what counts as a false
+# positive, suppressing a finding here would only get the file staged and
+# then rejected by the hook — converting a per-file skip back into a total
+# block.
 from redact import (  # noqa: E402
     SCAN_ALLOWLIST_FILENAME as ALLOWLIST_FILENAME,
+    is_false_positive,
     load_scan_allowlist as load_allowlist,
 )
-
-
-def is_false_positive(raw: str, allowlist: list[re.Pattern]) -> str | None:
-    """Return a reason string if ``raw`` cannot be a real credential."""
-    if not raw:
-        return "empty"
-    if any(p.match(raw) for p in _STRUCTURAL_FP):
-        return "hash-or-uuid shape"
-    if _PLACEHOLDER_FP.search(raw):
-        return "documentation placeholder"
-    if any(p.search(raw) for p in allowlist):
-        return f"{ALLOWLIST_FILENAME} match"
-    return None
 
 
 def _rel(path_str: str, brain_root: Path) -> str | None:
@@ -186,10 +134,17 @@ def _run_trufflehog(brain_root: Path) -> list[dict]:
         meta = (
             d.get("SourceMetadata", {}).get("Data", {}).get("Filesystem", {})
         )
+        # Verified=false means BOTH "checked the vendor, invalid" and
+        # "could not check". Only the former is a conclusive verdict, and
+        # only a conclusive verdict may license shape-based suppression.
+        # trufflehog emits a verification-error field only in the latter
+        # case; accept either spelling across versions.
+        verr = d.get("VerificationError") or d.get("verification_error")
         findings.append(
             {
                 "detector": d.get("DetectorName", "?"),
                 "verified": bool(d.get("Verified")),
+                "conclusive": not verr,
                 "raw": d.get("Raw", "") or "",
                 "file": meta.get("file", ""),
                 "line": meta.get("line"),
@@ -216,9 +171,12 @@ def _run_gitleaks(brain_root: Path) -> list[dict]:
     return [
         {
             "detector": item.get("RuleID", "?"),
-            # gitleaks has no verification step — treat every hit as
-            # unverified so the shape filters apply.
+            # gitleaks has no verification step at all. That makes every
+            # hit inconclusive, so shape-based suppression must stay off:
+            # otherwise a real 40-hex CircleCI or legacy GitHub token
+            # would be waved through as "just a git SHA".
             "verified": False,
+            "conclusive": False,
             "raw": item.get("Secret", "") or "",
             "file": item.get("File", ""),
             "line": item.get("StartLine"),
@@ -263,6 +221,10 @@ def _run_redact(brain_root: Path) -> list[dict]:
                 {
                     "detector": f"redact:{pattern_name}",
                     "verified": False,
+                    # redact.py performs no verification either, and the
+                    # hook applies is_false_positive with the same flag —
+                    # keeping the two gates in lockstep.
+                    "conclusive": False,
                     "raw": matched,
                     "file": str(f),
                     "line": line_no,
@@ -302,7 +264,10 @@ def main() -> int:
         if rel is None:
             continue
         if not f["verified"]:
-            reason = is_false_positive(f["raw"], allowlist)
+            reason = is_false_positive(
+                f["raw"], allowlist,
+                verification_conclusive=f.get("conclusive", False),
+            )
             if reason:
                 filtered += 1
                 sys.stderr.write(
@@ -311,6 +276,20 @@ def main() -> int:
                 )
                 continue
         quarantine.setdefault(rel, []).append(f)
+
+    # sync.sh reads this list one path per line (bash cannot hold NUL bytes
+    # in a variable, so NUL-separation is not available). A path containing
+    # a newline would split into two bogus paths, and the real file would
+    # stay staged and get pushed. Refuse the whole run instead: exit 2 makes
+    # sync.sh fail closed. Brain paths are framework-generated, so this
+    # should never fire — but "should never" is not a security guarantee.
+    unsafe = [r for r in quarantine if "\n" in r or "\r" in r]
+    if unsafe:
+        sys.stderr.write(
+            f"scan_gate: {len(unsafe)} quarantine path(s) contain a newline "
+            f"and cannot be safely passed to sync.sh; refusing the run\n"
+        )
+        return 2
 
     for rel, hits in sorted(quarantine.items()):
         worst = "VERIFIED" if any(h["verified"] for h in hits) else "unverified"

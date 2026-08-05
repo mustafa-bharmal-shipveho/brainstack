@@ -36,10 +36,13 @@ fi
 # Scanning the staged set restores the hook's documented contract and
 # lets sync.sh's per-file quarantine work: it unstages a suspect file,
 # and the commit for everything else goes through.
+# --diff-filter=d excludes only deletions. Naming the wanted statuses
+# instead (ACM) silently skipped staged renames and type changes, so a
+# commit that renamed a file AND added a secret to it went unscanned.
 STAGED=()
 while IFS= read -r -d '' f; do
     [ -f "$f" ] && STAGED+=("$BRAIN_ROOT/$f")
-done < <(git diff --cached --name-only --diff-filter=ACM -z)
+done < <(git diff --cached --name-only --diff-filter=d -z)
 
 if [ "${#STAGED[@]}" -eq 0 ]; then
     exit 0
