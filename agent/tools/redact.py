@@ -329,8 +329,166 @@ ENTROPY_IGNORE = re.compile(
     # ignored wrapping (defense-in-depth, mirrors the same gate on
     # the `pattern_` prefix below).
     r"|n?\d{4}-\d{2}-\d{2}__[a-z0-9\-]+__[a-f0-9]+"
+    # MCP tool-result artifact names — `mcp-<server>-<tool>-<epoch_ms>`,
+    # written by the harness and quoted verbatim in runtime event logs.
+    # Same strict-lowercase rule as the shapes above: an uppercase
+    # AKIA-prefixed key cannot be smuggled inside the ignored wrapping.
+    r"|mcp-[a-z0-9_\-]+-\d{10,}"
     r")$"
 )
+
+# ---- Scan allowlist (shared with scan_gate.py) ----------------------
+#
+# redact-private.txt ADDS patterns. This file REMOVES findings: one
+# regex per line, matched against the detected value, for things that
+# are provably not credentials in THIS brain (Google Drive file ids,
+# internal ticket slugs, …).
+#
+# It has to be honoured by BOTH gates. sync.sh's scan_gate.py decides
+# which files to hold back; this hook decides whether a commit may
+# proceed. If only scan_gate honoured the allowlist, an allowlisted file
+# would get staged and then rejected here — turning a per-file skip back
+# into a total block, which is the exact failure this whole mechanism
+# exists to prevent.
+SCAN_ALLOWLIST_FILENAME = ".secret-scan-allowlist.txt"
+
+# ---- Shared false-positive suppression -------------------------------
+#
+# Lives here, not in scan_gate.py, because BOTH gates must reach the same
+# verdict. scan_gate.py decides which files sync.sh holds back; this
+# module decides whether the commit may proceed. If scan_gate suppressed
+# a finding that this module still reported, the file would be staged and
+# then rejected by the hook — a per-file skip turned back into a total
+# block, which is the bug the quarantine mechanism exists to prevent.
+
+# Values that are structurally a digest or an id, not a credential.
+# Anchored on the WHOLE value — a prefixed vendor token cannot match.
+STRUCTURAL_FP = (
+    re.compile(r"\A[0-9a-f]{40}\Z", re.I),  # git SHA-1
+    re.compile(r"\A[0-9a-f]{64}\Z", re.I),  # SHA-256
+    re.compile(  # UUID (incl. the UUIDv7s brainstack mints)
+        r"\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z",
+        re.I,
+    ),
+)
+
+# Documentation / template placeholders. These live in .env templates and
+# in the command logs that quote them, e.g. the literal string
+# `u+your-pagerduty-api-key-here` that PagerDutyApiKey flags.
+#
+# Marker words match as substrings, NOT \b-delimited, because canonical
+# placeholders run them straight into the token body: AWS's own docs
+# access key ends in a literal "EXAMPLE" preceded by a digit, so
+# \bexample\b never matches it.
+#
+# (Deliberately no literal sample keys in this file — this module scans
+# its own source tree, and a realistic constant here would self-flag.)
+PLACEHOLDER_FP = re.compile(
+    r"""(?ix)
+      your[-_]           # your-pagerduty-api-key
+    | [-_]here\b         # …-key-here
+    | example            # …7EXAMPLE, as in AWS's published sample key
+    | changeme
+    | placeholder
+    | dummy
+    | redacted
+    | x{8,}              # xxxxxxxxxxxx
+    | \*{4,}             # ****
+    | \A<.*>\Z           # <YOUR_TOKEN>
+    """
+)
+
+
+# High-confidence vendor credential shapes. A value carrying one of these
+# is NEVER excused by a placeholder word — only by an explicit allowlist
+# entry. Without this, AWS's published docs key `AKIA…7EXAMPLE` would be
+# suppressed by the `example` marker, and so would any real AKIA key an
+# attacker (or a careless paste) padded with the word "example". The
+# project's own tests assert these stay blocked.
+#
+# Matched with search(), not fullmatch: a real key embedded in a longer
+# token (`pattern_AKIA…_other_stuff`) must still count.
+VENDOR_CREDENTIAL_SHAPES = (
+    re.compile(r"(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}"),      # AWS key id
+    re.compile(r"sk-ant-[A-Za-z0-9_\-]{20,}"),               # Anthropic
+    re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),             # Slack
+    re.compile(r"gh[pousr]_[A-Za-z0-9]{36,}"),               # GitHub
+    re.compile(r"glpat-[A-Za-z0-9_\-]{20,}"),                # GitLab
+    re.compile(r"AIza[0-9A-Za-z_\-]{35}"),                   # Google API
+    re.compile(r"[sr]k_(?:live|test)_[0-9A-Za-z]{10,}"),     # Stripe
+)
+
+
+def looks_like_vendor_credential(raw: str) -> bool:
+    """True if ``raw`` carries a high-confidence vendor credential shape."""
+    return any(p.search(raw) for p in VENDOR_CREDENTIAL_SHAPES)
+
+
+def is_false_positive(
+    raw: str,
+    allowlist: list[re.Pattern[str]],
+    *,
+    verification_conclusive: bool = False,
+) -> str | None:
+    """Reason string if ``raw`` cannot be a real credential, else None.
+
+    ``verification_conclusive`` must be True ONLY when a scanner actually
+    attempted to verify the value against the vendor and got a definitive
+    "not valid" answer. It gates the structural (hash/UUID) suppression,
+    because that check is genuinely ambiguous: a legacy 40-hex GitHub
+    token and a CircleCI token are shape-identical to a git SHA. Live
+    ones are distinguishable only by verification, so without a
+    conclusive verdict we must NOT suppress on shape.
+
+    gitleaks performs no verification at all, and trufflehog reports
+    Verified=false both for "checked, invalid" and "could not check" —
+    so callers must pass False in both of those cases.
+
+    Placeholder and allowlist suppression are content judgements that do
+    not depend on verification, so they always apply — except that a
+    value carrying a real vendor credential shape is never excused by a
+    placeholder word, only by an explicit allowlist entry.
+    """
+    if not raw:
+        return "empty"
+    if verification_conclusive and any(p.match(raw) for p in STRUCTURAL_FP):
+        return "hash-or-uuid shape"
+    if PLACEHOLDER_FP.search(raw) and not looks_like_vendor_credential(raw):
+        return "documentation placeholder"
+    # Explicit user opt-in is the only thing that can clear a value with a
+    # vendor credential shape.
+    if any(p.search(raw) for p in allowlist):
+        return f"{SCAN_ALLOWLIST_FILENAME} match"
+    return None
+
+
+def load_scan_allowlist(root: Path) -> list[re.Pattern[str]]:
+    """Regexes for known-false-positive values. Fails open per line."""
+    path = Path(root) / SCAN_ALLOWLIST_FILENAME
+    patterns: list[re.Pattern[str]] = []
+    if not path.is_file():
+        return patterns
+    try:
+        lines = path.read_text().splitlines()
+    except OSError as e:
+        sys.stderr.write(f"redact: WARN cannot read {path} ({e})\n")
+        return patterns
+    for lineno, line in enumerate(lines, 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if _is_redos_dangerous(line):
+            sys.stderr.write(
+                f"redact: WARN {path}:{lineno} ReDoS-prone regex, skipped\n"
+            )
+            continue
+        try:
+            patterns.append(re.compile(line))
+        except re.error as e:
+            sys.stderr.write(
+                f"redact: WARN {path}:{lineno} bad regex, skipped ({e})\n"
+            )
+    return patterns
 
 
 def scan_file(
@@ -425,9 +583,22 @@ def scan_file(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Scan a directory for secrets before committing."
+        description="Scan a directory (or specific files) for secrets "
+                    "before committing."
     )
-    parser.add_argument("target", help="Directory to scan")
+    parser.add_argument(
+        "target", nargs="+",
+        help="Directory to scan, or one or more files. Passing explicit "
+             "files lets the pre-commit hook scan only what is staged, so "
+             "an unrelated file elsewhere in the tree cannot block the "
+             "commit.",
+    )
+    parser.add_argument(
+        "--pattern-root",
+        help="Directory to load redact-private.txt from. Defaults to the "
+             "target when it is a directory; required for useful private "
+             "patterns when scanning individual files.",
+    )
     parser.add_argument(
         "--no-entropy",
         action="store_true",
@@ -441,26 +612,72 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    root = Path(args.target).resolve()
-    if not root.exists():
-        sys.stderr.write(f"redact: target not found: {root}\n")
-        return 2
+    targets = [Path(t).resolve() for t in args.target]
+    missing = [t for t in targets if not t.exists()]
+    if missing:
+        # A staged path can vanish between `git diff --cached` and the scan
+        # (e.g. a concurrent rebase). Only complain if NOTHING is scannable.
+        for t in missing:
+            sys.stderr.write(f"redact: target not found: {t}\n")
+        targets = [t for t in targets if t.exists()]
+        if not targets:
+            return 2
+
+    if args.pattern_root:
+        root = Path(args.pattern_root).resolve()
+    elif len(targets) == 1 and targets[0].is_dir():
+        root = targets[0]
+    else:
+        root = Path.cwd()
 
     extra_patterns = load_private_patterns(root)
+    allowlist = load_scan_allowlist(root)
     entropy_threshold = None if args.no_entropy else args.entropy_threshold
 
-    # Skip the redact-private.txt file itself — its own pattern bodies would
-    # otherwise match themselves on whole-tree scans, training users to
-    # bypass the pre-commit hook with --no-verify.
-    skip_files = {root / "redact-private.txt"}
+    # Skip redact-private.txt and the allowlist themselves — their own
+    # pattern bodies would otherwise match themselves on whole-tree scans,
+    # training users to bypass the pre-commit hook with --no-verify.
+    skip_files = {
+        root / "redact-private.txt",
+        root / SCAN_ALLOWLIST_FILENAME,
+    }
+
+    def _walk():
+        seen: set[Path] = set()
+        for t in targets:
+            paths = iter_files(t, skip_files=skip_files) if t.is_dir() else [t]
+            for p in paths:
+                if p in seen or p.resolve() in {s.resolve() for s in skip_files}:
+                    continue
+                # is_binary is applied by iter_files for directory walks;
+                # explicit file arguments need the same guard.
+                if not t.is_dir() and is_binary(p):
+                    continue
+                seen.add(p)
+                yield p
 
     total_hits = 0
-    for f in iter_files(root, skip_files=skip_files):
+    allowed = 0
+    for f in _walk():
         hits = scan_file(f, extra_patterns, entropy_threshold)
         for line_no, pattern_name, matched in hits:
+            # This module performs no verification, so structural
+            # suppression stays off (verification_conclusive=False) —
+            # placeholders and the allowlist still apply. scan_gate.py
+            # calls the same helper the same way for redact findings, so
+            # the two gates cannot disagree.
+            if is_false_positive(matched, allowlist):
+                allowed += 1
+                continue
             display = matched[:8] + "..." if len(matched) > 12 else matched
             print(f"{f}:{line_no}:{pattern_name}: {display}")
             total_hits += 1
+
+    if allowed:
+        sys.stderr.write(
+            f"redact: {allowed} finding(s) ignored as placeholders or via "
+            f"{SCAN_ALLOWLIST_FILENAME}\n"
+        )
 
     if total_hits:
         sys.stderr.write(

@@ -180,38 +180,149 @@ if [ -z "$SCANNER" ]; then
     fi
 fi
 
-# Optional: $BRAIN_ROOT/.trufflehog-exclude.txt lets the user exclude paths
-# from the local scan (e.g. .git/objects/ which carries historical commits'
-# objects). Going-forward content is already covered by the pre-commit hook
-# and JSONL scrubber; the server-side workflow catches --no-verify bypasses.
-TH_EXCLUDE="$BRAIN_ROOT/.trufflehog-exclude.txt"
+# Path- and value-level scan tuning both live next to the brain and are
+# read by scan_gate.py, not by this script:
+#   .trufflehog-exclude.txt      paths the scanner never looks at
+#   .secret-scan-allowlist.txt   regexes for known false-positive values
+# Going-forward content is already covered by the pre-commit hook and the
+# JSONL scrubber; the server-side workflow catches --no-verify bypasses.
 
-case "$SCANNER" in
-    trufflehog)
-        # `Privacy` and `NpmToken` detectors pattern-match UUIDs
-        # (including the UUIDv7s brainstack itself emits for session and
-        # event ids), producing zero verified hits but constant
-        # unverified false positives that block sync.sh for days. Disable
-        # them. The structural detectors (AnthropicKey, SlackToken,
-        # OpenAIKey, AWS, Stripe, GitHub, …) remain active.
-        TH_ARGS=(filesystem . --no-update --fail
-                 --exclude-detectors Privacy,NpmToken)
-        [ -f "$TH_EXCLUDE" ] && TH_ARGS+=(--exclude-paths "$TH_EXCLUDE")
-        if ! trufflehog "${TH_ARGS[@]}" >/dev/null 2>>"$LOG_FILE"; then
-            echo "$(date -u +%FT%TZ) sync: trufflehog flagged secrets; refusing to push" >> "$LOG_FILE"
-            exit 1
-        fi
-        ;;
-    gitleaks)
-        if ! gitleaks detect --source . --no-git --redact >/dev/null 2>>"$LOG_FILE"; then
-            echo "$(date -u +%FT%TZ) sync: gitleaks flagged secrets; refusing to push" >> "$LOG_FILE"
-            exit 1
-        fi
-        ;;
-esac
+# ---- Scan, then quarantine per-file (NOT fail-closed globally) ----
+#
+# History: this gate used to be `trufflehog --fail` + `exit 1`. One
+# unverified false positive anywhere in the brain — a bare git SHA in a
+# logged `gh api ...?ref=<sha>` URL, which the `Circle` detector reads as
+# a CircleCI token — blocked every hourly sync for a MONTH, silently.
+# A whole month of memories sat unpushed and nothing surfaced it.
+#
+# Policy now: if we're not sure about a file, skip THAT FILE and push
+# everything else. scan_gate.py prints the repo-relative path of each
+# risky file on stdout; we unstage exactly those and commit the rest.
+# Quarantined files stay dirty, so the next run re-checks them and they
+# sync themselves once clean. See agent/tools/scan_gate.py.
+SCAN_GATE="$BRAIN_ROOT/tools/scan_gate.py"
+QUARANTINE=""
+if [ -n "$SCANNER" ] && [ -f "$SCAN_GATE" ]; then
+    set +e
+    QUARANTINE="$("$PYTHON_BIN" "$SCAN_GATE" --brain-root "$BRAIN_ROOT" \
+                    --scanner "$SCANNER" 2>>"$LOG_FILE")"
+    gate_rc=$?
+    set -e
+    # rc=2 means the scan itself could not run. An unscannable brain is
+    # not a clean brain — fail closed, as before.
+    if [ "$gate_rc" -eq 2 ]; then
+        echo "$(date -u +%FT%TZ) sync: secret scan could not run; refusing to push" >> "$LOG_FILE"
+        _refresh_pending_summary
+        exit 1
+    fi
+elif [ -n "$SCANNER" ]; then
+    # A scanner is installed but the gate that drives it is not — e.g. a
+    # half-finished upgrade. Proceeding here would push the whole brain
+    # with NO secret scan whatsoever, which is strictly worse than the
+    # all-or-nothing behaviour this commit replaced. Fail closed.
+    echo "$(date -u +%FT%TZ) sync: scan_gate.py missing at $SCAN_GATE; refusing to push" >> "$LOG_FILE"
+    echo "$(date -u +%FT%TZ) sync: reinstall with ./install.sh to restore the secret gate" >> "$LOG_FILE"
+    _refresh_pending_summary
+    exit 2
+fi
 
-# ---- Stage all changes ----
+# ---- Stage all changes, minus anything quarantined ----
 git add -A
+
+if [ -n "$QUARANTINE" ]; then
+    # An unborn HEAD (fresh brain, first ever sync) can't be reset against;
+    # `git rm --cached` is the only way to unstage there.
+    if git rev-parse --verify -q HEAD >/dev/null 2>&1; then
+        HAVE_HEAD=1
+    else
+        HAVE_HEAD=0
+    fi
+
+    # Is exactly this path still in the index? `-z` avoids core.quotepath
+    # mangling, and the :(literal) pathspec keeps the query exact.
+    _is_staged() {
+        local want="$1" got
+        while IFS= read -r -d '' got; do
+            [ "$got" = "$want" ] && return 0
+        done < <(git diff --cached --name-only -z -- ":(literal)$want")
+        return 1
+    }
+
+    # If the quarantined path is the DESTINATION of a staged rename, the
+    # matching source deletion is a separate index entry. Unstaging only
+    # the destination would commit the deletion while withholding the new
+    # content — the remote would lose that memory entirely until the
+    # quarantine clears. Restore the source too, so a rename+secret is a
+    # clean no-op for this commit.
+    #
+    # `--name-status -z -M` emits R/C entries as three NUL fields
+    # (status, old, new) and everything else as two.
+    _restore_rename_source() {
+        local want="$1" st old new
+        while IFS= read -r -d '' st; do
+            case "$st" in
+                R*|C*)
+                    IFS= read -r -d '' old || break
+                    IFS= read -r -d '' new || break
+                    if [ "$new" = "$want" ]; then
+                        git reset -q HEAD -- ":(literal)$old" 2>>"$LOG_FILE" || true
+                        echo "$(date -u +%FT%TZ) sync: also restored rename source of quarantined file: $old" >> "$LOG_FILE"
+                    fi
+                    ;;
+                *)
+                    IFS= read -r -d '' new || break
+                    ;;
+            esac
+        done < <(git diff --cached --name-status -z -M)
+    }
+
+    N_QUARANTINED=0
+    while IFS= read -r qfile; do
+        [ -z "$qfile" ] && continue
+        # Not in this commit anyway — gitignored, or unchanged since the
+        # last sync. There is nothing to hold back, so don't count it and
+        # don't raise a partial-sync warning that would never clear.
+        if ! _is_staged "$qfile"; then
+            continue
+        fi
+        # Leave the file dirty in the working tree — we only pull it out of
+        # THIS commit, so the next run re-checks it and it syncs itself
+        # once clean.
+        #
+        # :(literal) is load-bearing. Without it git treats the path as a
+        # glob pathspec, so a note named `Meeting [2026-08-05].md` both
+        # fails to match itself AND unstages every innocent file the
+        # pattern happens to hit — silently withholding files we never
+        # reported as quarantined.
+        # Must run while the rename pairing is still staged.
+        [ "$HAVE_HEAD" -eq 1 ] && _restore_rename_source "$qfile"
+        if [ "$HAVE_HEAD" -eq 1 ]; then
+            git reset -q HEAD -- ":(literal)$qfile" 2>>"$LOG_FILE" || true
+        else
+            git rm --cached -q --force -- ":(literal)$qfile" 2>>"$LOG_FILE" || true
+        fi
+        # Check the postcondition, not the exit code: `git reset` exits 0
+        # even when the pathspec matched nothing, so its status proves
+        # nothing. If the file is still staged, committing would publish
+        # it — fail closed rather than trade a possible secret for a
+        # successful sync.
+        if _is_staged "$qfile"; then
+            echo "$(date -u +%FT%TZ) sync: could not unstage $qfile; refusing to push" >> "$LOG_FILE"
+            git reset -q 2>>"$LOG_FILE" || true
+            _refresh_pending_summary
+            exit 1
+        fi
+        N_QUARANTINED=$((N_QUARANTINED + 1))
+        echo "$(date -u +%FT%TZ) sync: quarantined (not pushed): $qfile" >> "$LOG_FILE"
+    done <<< "$QUARANTINE"
+    # Only claim a partial sync if something was ACTUALLY held back. When
+    # every reported path was skipped as unchanged or ignored, logging
+    # "held back 0 file(s)" would pin render_pending_summary to the
+    # 'quarantined' warning forever — it matches on the phrase alone.
+    if [ "$N_QUARANTINED" -gt 0 ]; then
+        echo "$(date -u +%FT%TZ) sync: held back $N_QUARANTINED file(s) with possible secrets; syncing the rest" >> "$LOG_FILE"
+    fi
+fi
 
 # Anything to commit?
 if git diff --cached --quiet; then

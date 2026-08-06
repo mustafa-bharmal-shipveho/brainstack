@@ -221,6 +221,14 @@ _SYNC_BLOCKED_MARKERS: tuple[tuple[str, str], ...] = (
     # silently never pushes. Most specific marker first so it isn't
     # shadowed by the generic ones below.
     ("no secret scanner installed", "blocked-noscanner"),
+    # The gate itself could not run (missing scan_gate.py, scanner crash).
+    # These MUST precede the generic "refusing to push" below, or they
+    # render as "verified secret in your tree" and send the user hunting
+    # for a secret that does not exist.
+    ("scan_gate.py missing",      "blocked-scanner"),
+    ("secret scan could not run", "blocked-scanner"),
+    # We identified a risky file but could not pull it out of the commit.
+    ("could not unstage",         "blocked-unstage"),
     # Trufflehog hit: a verified secret in the working tree.
     ("trufflehog flagged",       "blocked-trufflehog"),
     ("refusing to push",         "blocked-trufflehog"),
@@ -235,6 +243,31 @@ _SYNC_BLOCKED_MARKERS: tuple[tuple[str, str], ...] = (
     ("push failed",              "blocked-network"),
 )
 
+# Lines that terminate one sync run in the log. Used to scope a backward
+# scan to the most recent run only.
+_RUN_TERMINAL_MARKERS: tuple[str, ...] = (
+    "sync: pushed", "sync: no changes", "refusing to push",
+    "commit blocked", "push failed", "skipping push",
+)
+
+
+def _last_run_quarantined(tail_lines: list[str]) -> bool:
+    """True if the most recent sync run held files back from the commit.
+
+    A run can push successfully AND still have skipped a file whose
+    contents tripped the secret scanner. The terminal line then reads
+    "sync: pushed", so the plain last-line check returns 'ok' and the
+    partial sync is invisible. That silence is precisely the failure mode
+    that let a month of memories sit unpushed — surface it instead.
+    """
+    for line in reversed(tail_lines[:-1]):
+        low = line.lower()
+        if any(m in low for m in _RUN_TERMINAL_MARKERS):
+            break  # walked back into the previous run
+        if "sync: held back" in low:
+            return True
+    return False
+
 
 def _check_sync_status(brain_root: Path) -> str:
     """Return a precise sync-status string so the banner can render an
@@ -247,6 +280,9 @@ def _check_sync_status(brain_root: Path) -> str:
       - 'blocked-trufflehog'  — trufflehog flagged a verified secret
       - 'blocked-precommit'   — local pre-commit hook (redact.py etc.) blocked commit
       - 'blocked-network'     — commit succeeded but push failed (remote unreachable)
+      - 'blocked-scanner'     — the secret gate could not run (not a secret hit)
+      - 'blocked-unstage'     — a risky file could not be removed from the commit
+      - 'quarantined'         — push succeeded but some file(s) were held back
       - 'stale'               — last sync line is > 2 hours old
       - 'ok'                  — last line is a successful push or no-op
 
@@ -267,6 +303,9 @@ def _check_sync_status(brain_root: Path) -> str:
         for marker, reason in _SYNC_BLOCKED_MARKERS:
             if marker in last:
                 return reason
+        # Pushed, but not everything went. Never let this pass as 'ok'.
+        if _last_run_quarantined(tail_lines):
+            return "quarantined"
     try:
         mtime = log.stat().st_mtime
     except OSError:
@@ -434,6 +473,16 @@ def compose_summary(
         elif sync_status == "blocked-network":
             lines.append("- Commit succeeded locally but the push failed — usually a network/remote-reachability issue, NOT a secret.")
             lines.append("- The brain repo is committed locally; the next hourly sync will retry. Run `~/.agent/tools/sync.sh` manually to retry now.")
+        elif sync_status == "blocked-scanner":
+            lines.append("- The secret scanner could not run, so sync.sh refused to push. This is NOT a secret in your tree — the gate itself is broken.")
+            lines.append("- Usually a half-finished upgrade: re-run `./install.sh` to restore `~/.agent/tools/scan_gate.py`, then `~/.agent/tools/sync.sh`.")
+        elif sync_status == "blocked-unstage":
+            lines.append("- A risky file was identified but could not be removed from the commit, so the push was refused rather than risk publishing it.")
+            lines.append("- See the `could not unstage` line in `~/.agent/sync.log` for the path; check for an unusual filename or a locked index (`.git/index.lock`).")
+        elif sync_status == "quarantined":
+            lines.append("- Last sync pushed, but held back one or more files whose contents tripped the secret scanner. **Those memories are NOT on the remote.**")
+            lines.append("- See the `quarantined (not pushed)` lines in `~/.agent/sync.log` for the exact paths.")
+            lines.append("- If a hit is a false positive, add a regex for it to `~/.agent/.secret-scan-allowlist.txt`; if it is a real secret, scrub the file. Either way the next sync picks it up automatically.")
         elif sync_status == "missing":
             lines.append("- No sync.log yet (sync never ran).")
         lines.append("")

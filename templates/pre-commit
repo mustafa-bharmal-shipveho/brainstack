@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# brainstack-managed pre-commit hook — safe for install.sh to replace.
+# Delete this marker line if you customise the hook and want upgrades to
+# leave it alone.
+#
 # Pre-commit hook for the brain repo at ~/.agent/.
 # Runs the redact.py scanner over staged files; blocks the commit on any hit.
 #
@@ -25,5 +29,30 @@ if ! "$PYTHON_BIN" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) els
     done
 fi
 
-# Run redact on the entire brain (cheap; markdown + jsonl only)
-"$PYTHON_BIN" "$BRAIN_ROOT/tools/redact.py" "$BRAIN_ROOT"
+# Scan ONLY what is staged.
+#
+# This used to scan the whole brain, which made the hook all-or-nothing:
+# a single false positive in any file — even one nobody was committing —
+# blocked every commit, so sync.sh could never push anything. Combined
+# with the same bug in sync.sh's trufflehog gate, a month of memories
+# silently never reached the remote.
+#
+# Scanning the staged set restores the hook's documented contract and
+# lets sync.sh's per-file quarantine work: it unstages a suspect file,
+# and the commit for everything else goes through.
+# --diff-filter=d excludes only deletions. Naming the wanted statuses
+# instead (ACM) silently skipped staged renames and type changes, so a
+# commit that renamed a file AND added a secret to it went unscanned.
+STAGED=()
+while IFS= read -r -d '' f; do
+    [ -f "$f" ] && STAGED+=("$BRAIN_ROOT/$f")
+done < <(git diff --cached --name-only --diff-filter=d -z)
+
+if [ "${#STAGED[@]}" -eq 0 ]; then
+    exit 0
+fi
+
+# --pattern-root keeps redact-private.txt loading from the brain even
+# though the targets are individual files.
+"$PYTHON_BIN" "$BRAIN_ROOT/tools/redact.py" \
+    --pattern-root "$BRAIN_ROOT" "${STAGED[@]}"

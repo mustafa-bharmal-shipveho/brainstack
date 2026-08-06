@@ -892,6 +892,9 @@ if [ "$MODE" = "verify" ]; then
     check "AGENT_LEARNINGS.jsonl present" "test -f '$BRAIN_ROOT/memory/episodic/AGENT_LEARNINGS.jsonl'"
     check "redact.py executable" "test -x '$BRAIN_ROOT/tools/redact.py' -o -f '$BRAIN_ROOT/tools/redact.py'"
     check "redact_jsonl.py present" "test -f '$BRAIN_ROOT/tools/redact_jsonl.py'"
+    # sync.sh refuses to push without this, so a partial install is a
+    # silently non-syncing brain unless we surface it here.
+    check "scan_gate.py present" "test -f '$BRAIN_ROOT/tools/scan_gate.py'"
     check "dream_runner.py present" "test -f '$BRAIN_ROOT/tools/dream_runner.py'"
     check "atomic helper present" "test -f '$BRAIN_ROOT/memory/_atomic.py'"
     check "global wrapper hook present" "test -f '$BRAIN_ROOT/harness/hooks/agentic_post_tool_global.py'"
@@ -932,6 +935,47 @@ if [ "$MODE" = "verify" ]; then
 fi
 
 # ----- Mode: upgrade -----
+# Install or refresh the redaction pre-commit hook in the brain repo.
+#
+# The hook USED to be installed only when absent, and only during initial
+# setup — so an existing brain never received hook fixes. That mattered:
+# the hook once scanned the whole tree instead of the staged set, which
+# made sync.sh's per-file quarantine impossible (a false positive
+# anywhere blocked every commit). Shipping that fix while never updating
+# installed hooks would have left it unreachable for exactly the users
+# hitting the bug.
+#
+# A hook carrying the brainstack marker is ours and gets refreshed in
+# place. Anything else is treated as user-customised and left untouched.
+install_precommit_hook() {
+    local hook_repo hook_src hook_dst
+    hook_repo="$1"
+    hook_src="$REPO_DIR/templates/pre-commit"
+    hook_dst="$hook_repo/.git/hooks/pre-commit"
+    [ -f "$hook_src" ] || return 0
+    [ -d "$hook_repo/.git" ] || return 0
+    mkdir -p "$hook_repo/.git/hooks"
+
+    if [ ! -f "$hook_dst" ]; then
+        cp "$hook_src" "$hook_dst"
+        chmod +x "$hook_dst"
+        echo "    Pre-commit redaction hook installed."
+        return 0
+    fi
+    if grep -q "brainstack-managed pre-commit hook" "$hook_dst" 2>/dev/null \
+       || grep -q "Pre-commit hook for the brain repo" "$hook_dst" 2>/dev/null; then
+        if cmp -s "$hook_src" "$hook_dst"; then
+            return 0  # already current
+        fi
+        cp "$hook_src" "$hook_dst"
+        chmod +x "$hook_dst"
+        echo "    Pre-commit redaction hook upgraded."
+    else
+        echo "    Pre-commit hook is customised — left as-is."
+        echo "    To adopt the current one: cp $hook_src $hook_dst"
+    fi
+}
+
 if [ "$MODE" = "upgrade" ]; then
     if [ "$DRY_RUN" = "1" ]; then
         echo "==> DRY RUN (--upgrade): would refresh $BRAIN_ROOT/{tools,harness,memory/*.py} from $REPO_DIR and refresh the recall CLI. Nothing was changed."
@@ -1018,6 +1062,10 @@ if [ "$MODE" = "upgrade" ]; then
        && [ -x "$REPO_DIR/bin/install-recall-cli.sh" ]; then
         bash "$REPO_DIR/bin/install-recall-cli.sh" --quiet || true
     fi
+
+    # Refresh the pre-commit hook. rsync covers tools/, but the hook
+    # lives in .git/hooks/ and would otherwise never be updated.
+    install_precommit_hook "$BRAIN_ROOT"
 
     # Record what version this brain was upgraded TO so the NEXT
     # `--upgrade` can compute and surface the transition.
@@ -2844,11 +2892,7 @@ if [ -n "$BRAIN_REMOTE" ]; then
         echo "    Initial commit created."
     fi
     # Install pre-commit hook automatically (it's defense-in-depth; cheap to add)
-    if [ -f "$REPO_DIR/templates/pre-commit" ] && [ ! -f .git/hooks/pre-commit ]; then
-        cp "$REPO_DIR/templates/pre-commit" .git/hooks/pre-commit
-        chmod +x .git/hooks/pre-commit
-        echo "    Pre-commit redaction hook installed."
-    fi
+    install_precommit_hook "$BRAIN_ROOT"
     if [ "$PUSH_INITIAL_COMMIT" -eq 1 ]; then
         echo "==> Pushing initial commit"
         if git push -u origin main 2>&1 | tail -3; then
