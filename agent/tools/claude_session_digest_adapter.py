@@ -34,8 +34,13 @@ import hashlib
 import json
 import os
 import sys
+from dataclasses import replace as dc_replace
 from pathlib import Path
 from typing import Callable, Iterator
+
+# Per-call LLM timeout. Large sessions (100MB+ transcripts) can exceed the
+# 180s default even after chunking — override via DIGEST_LLM_TIMEOUT_S.
+LLM_TIMEOUT_S = int(os.getenv("DIGEST_LLM_TIMEOUT_S", "180"))
 
 try:
     import fcntl  # POSIX — present on macOS + Linux
@@ -179,13 +184,45 @@ Return JSON only — same required keys."""
 # Walking sessions
 # ---------------------------------------------------------------------------
 
+def _is_self_generated(ns: NormalizedSession) -> bool:
+    """True if this "session" is actually one of our own LLM calls.
+
+    Internal `claude -p` invocations used to persist a transcript per call, so
+    a later backfill would digest them and the brain would fill with digests
+    of its own digest calls. `--no-session-persistence` stops new ones being
+    written; this filter covers transcripts already on disk from before that.
+
+    Detected by prompt shape rather than by project directory: a chunk-digest
+    call's *content* is the user's real transcript, so its digest looks
+    genuine, and the calls inherit whatever cwd the runner had — which may
+    also be a directory holding real sessions.
+
+    The marker is the `SYSTEM:\\n...\\n\\nUSER:\\n` envelope every provider
+    call builds (see llm_providers/claude_code.py) appearing as the *first*
+    user turn. Later turns are not required to match: schema-enforced calls
+    add "[structured-output-enforce]" and "Structured output provided
+    successfully" turns, so these transcripts are not single-turn even though
+    they are one-shot `claude -p` runs.
+
+    Covers every internal call type (digest, chunk, merge, query expansion),
+    not just digests. A real session would have to open with that exact
+    machine-generated envelope to be misclassified."""
+    for m in ns.messages:
+        if getattr(m, "role", "") != "user":
+            continue
+        head = (getattr(m, "text", "") or "")[:2000]
+        return head.startswith("SYSTEM:\n") and "\nUSER:\n" in head
+    return False
+
+
 def iter_claude_sessions(
     projects_root: Path,
 ) -> Iterator[NormalizedSession]:
     """Yield NormalizedSession for every <slug>/<uuid>.jsonl under
     `projects_root`. Skips files that yield None (no conversational
-    turns) and any that can't be parsed at all. Output order is
-    deterministic (sorted by slug + filename)."""
+    turns), any that can't be parsed at all, and our own internal LLM
+    calls (see `_is_self_generated`). Output order is deterministic
+    (sorted by slug + filename)."""
     if not projects_root.is_dir():
         return
     for slug_dir in sorted(projects_root.iterdir()):
@@ -198,6 +235,8 @@ def iter_claude_sessions(
             except Exception:
                 continue
             if ns is None:
+                continue
+            if _is_self_generated(ns):
                 continue
             yield ns
 
@@ -364,18 +403,46 @@ def _format_messages_for_prompt(messages: list, brain_root: Path) -> str:
     return "\n\n".join(parts)
 
 
+def _split_oversized(m, target_tokens: int) -> list:
+    """Slice a single message whose own text exceeds `target_tokens` into
+    sequential pieces that each fit. Without this, one giant message becomes
+    a chunk larger than the model's input budget and the provider rejects the
+    call outright (`claude -p` returns is_error with zero token usage), which
+    no timeout increase can fix. Real case: a 145K-token (581KB) tool result
+    inside a 138MB session.
+
+    Falls back to returning the message untouched if it is not a dataclass we
+    can copy, so an unexpected message type degrades to the old behavior
+    rather than raising."""
+    text = getattr(m, "text", "") or ""
+    cap = max(1, target_tokens * 4)  # same 4-chars-per-token estimate
+    if len(text) <= cap:
+        return [m]
+    pieces: list = []
+    total = (len(text) + cap - 1) // cap
+    for i in range(0, len(text), cap):
+        marker = f"[oversized message, part {len(pieces) + 1}/{total}]\n"
+        try:
+            pieces.append(dc_replace(m, text=marker + text[i:i + cap]))
+        except Exception:
+            return [m]
+    return pieces
+
+
 def _chunk_messages(messages: list, target_tokens: int) -> list[list]:
     """Split messages into chunks whose ~token estimates stay below
-    `target_tokens`. Preserves order; never splits inside a message."""
+    `target_tokens`. Preserves order; splits inside a message only when that
+    single message would not fit in a chunk on its own."""
     chunks: list[list] = [[]]
     used = 0
     for m in messages:
-        t = (len(getattr(m, "text", "") or "") // 4) + 1
-        if used + t > target_tokens and chunks[-1]:
-            chunks.append([])
-            used = 0
-        chunks[-1].append(m)
-        used += t
+        for part in _split_oversized(m, target_tokens):
+            t = (len(getattr(part, "text", "") or "") // 4) + 1
+            if used + t > target_tokens and chunks[-1]:
+                chunks.append([])
+                used = 0
+            chunks[-1].append(part)
+            used += t
     return [c for c in chunks if c]
 
 
@@ -397,7 +464,7 @@ def _summarize_single(
     result = provider.invoke(
         SYSTEM_PROMPT, prompt,
         json_schema=DIGEST_SCHEMA,
-        timeout_s=180,
+        timeout_s=LLM_TIMEOUT_S,
     )
     if result.parsed_json is None:
         raise LLMError("provider returned no parsed digest")
@@ -411,8 +478,12 @@ def _summarize_chunks(
     # crossed the threshold actually splits into ≥2 chunks. Cap at
     # CHUNK_TOKEN_TARGET so production runs use the production target;
     # use the smaller of (production target, half the single-pass limit).
-    chunk_target = min(CHUNK_TOKEN_TARGET,
-                       max(1, SINGLE_PASS_TOKEN_LIMIT // 2))
+    # DIGEST_CHUNK_TOKEN_TARGET overrides both, for outlier sessions where the
+    # derived target yields so many chunks that wall time becomes hours (a
+    # 4.5M-token session gives 154 chunks at 30K vs 41 at 120K). Unset keeps
+    # the derived value, so default and test behavior are unchanged.
+    chunk_target = int(os.getenv("DIGEST_CHUNK_TOKEN_TARGET", "0")) or min(
+        CHUNK_TOKEN_TARGET, max(1, SINGLE_PASS_TOKEN_LIMIT // 2))
     chunks = _chunk_messages(ns.messages, chunk_target)
     if len(chunks) < 2:
         # Threshold edge case — fall back to single-pass
@@ -428,7 +499,7 @@ def _summarize_chunks(
         )
         result = provider.invoke(
             CHUNK_SYSTEM_PROMPT, prompt,
-            json_schema=DIGEST_SCHEMA, timeout_s=180,
+            json_schema=DIGEST_SCHEMA, timeout_s=LLM_TIMEOUT_S,
         )
         if result.parsed_json is None:
             raise LLMError(f"chunk {i+1} returned no parsed digest")
@@ -442,7 +513,7 @@ def _summarize_chunks(
     )
     merged = provider.invoke(
         MERGE_SYSTEM_PROMPT, merge_prompt,
-        json_schema=DIGEST_SCHEMA, timeout_s=180,
+        json_schema=DIGEST_SCHEMA, timeout_s=LLM_TIMEOUT_S,
     )
     if merged.parsed_json is None:
         raise LLMError("merge call returned no parsed digest")

@@ -97,6 +97,14 @@ class ClaudeCodeProvider(LLMProvider):
             "--output-format", "json",
             "--model", model,
             "--max-budget-usd", str(max_budget_usd),
+            # Without this, every internal call writes its own transcript into
+            # ~/.claude/projects/, which the next backfill then digests — the
+            # brain fills with digests of its own digest calls, and each run
+            # makes the next one worse. Measured: one backfill produced 238
+            # self-transcripts and grew the brain 80 → 121 digests, ~all noise.
+            # These digests are hard to spot because a chunk-digest call's
+            # content is the user's real transcript, so titles look genuine.
+            "--no-session-persistence",
         ]
         if json_schema is not None:
             cmd += ["--json-schema", json.dumps(json_schema)]
