@@ -403,6 +403,11 @@ def test_launch_agents_pass_all_loaded(make_env, tmp_path: Path):
     assert res.status == "PASS"
     assert "auto-migrate" not in res.evidence
     assert "recall-daemon" not in res.evidence
+    # launchd is per-USER, not per-brain: run against a sandbox brain root
+    # this check still reports the developer's live agents. Say whose
+    # launchd it is so the line is not read as a fact about the brain root
+    # printed above it (2026-09-04 smoke test, "Read as a human" #9).
+    assert res.evidence.startswith("user launchd: loaded:")
 
 
 # ---------- brain_push -------------------------------------------------
@@ -445,6 +450,23 @@ def test_brain_push_pass_ahead_recent(make_env, tmp_path: Path):
 
     assert res.status == "PASS"
     assert "2 commits ahead of origin/main" in res.evidence
+
+
+def test_brain_push_evidence_is_singular_for_one_commit(make_env, tmp_path: Path):
+    """"1 commits ahead" reads as a bug in the tool, which costs the whole
+    line its credibility (2026-09-04 smoke test)."""
+    brain = tmp_path / "brain"
+    brain.mkdir(parents=True, exist_ok=True)
+    env = make_env(
+        tmp_path,
+        run_map=_push_run_map(brain, ahead=1, last_push_hours_ago=1.0),
+    )
+    (brain / ".git").mkdir(exist_ok=True)
+
+    res = health.check_brain_push(env)
+
+    assert "1 commit ahead of origin/main" in res.evidence
+    assert "1 commits" not in res.evidence
 
 
 def test_brain_push_fail_ahead_stale_quotes_remote_error(make_env, tmp_path: Path):
@@ -492,7 +514,32 @@ def test_sync_log_remote_error_prefers_remote_error_line(tmp_path: Path):
     assert "100.00 MB" in got
 
 
-def test_sync_log_remote_error_scoped_to_last_run_and_skips_health_lines(tmp_path: Path):
+def test_sync_log_remote_error_scoped_to_last_run(tmp_path: Path):
+    """Two consecutive runs, in the order sync.sh actually writes them:
+    each run's terminal marker is followed by its EXIT trap's `health:`
+    line. Only the newer run's error may be quoted."""
+    text = "\n".join([
+        "2026-09-03T10:00:00Z remote: error: OLD-RUN-ERROR should not be quoted",
+        "2026-09-03T10:00:01Z sync: commit succeeded but push failed",
+        "2026-09-03T10:00:02Z health: wrote runtime/health.json",
+        "2026-09-04T12:00:00Z remote: error: NEW-RUN-ERROR exceeds GitHub's file "
+        "size limit of 100.00 MB",
+        "2026-09-04T12:00:01Z sync: commit succeeded but push failed",
+        "2026-09-04T12:00:02Z health: wrote runtime/health.json",
+    ]) + "\n"
+
+    got = health._sync_log_remote_error(text)
+
+    assert got is not None
+    assert "NEW-RUN-ERROR" in got
+    assert "OLD-RUN-ERROR" not in got
+    assert "health:" not in got
+
+
+def test_sync_log_remote_error_skips_interleaved_health_lines(tmp_path: Path):
+    """A `health:` line can also land mid-run (a manual `sync.sh` while the
+    hourly agent is writing). It is still transparent: it neither ends the
+    run nor gets quoted, even when it contains the word "error:"."""
     text = "\n".join([
         "2026-09-03T10:00:00Z remote: error: OLD-RUN-ERROR should not be quoted",
         "2026-09-03T10:00:01Z sync: pushed",
@@ -509,6 +556,92 @@ def test_sync_log_remote_error_scoped_to_last_run_and_skips_health_lines(tmp_pat
     assert "NEW-RUN-ERROR" in got
     assert "OLD-RUN-ERROR" not in got
     assert "health:" not in got
+
+
+# The exact tail `sync.sh` writes when a push is rejected: git's stderr,
+# then the run's terminal marker, then the EXIT trap's `health:` line. The
+# trap fires on EVERY exit path, so the terminal marker is never physically
+# the last line — the scan has to treat `health:` as transparent or it
+# breaks one line above the error it was sent to find (2026-09-04 smoke
+# test, Defect 1). The twin parser in
+# `agent/tools/render_pending_summary.py` is pinned on this same text by
+# `tests/test_render_pending.py::...::test_remote_error_parsers_agree`.
+REMOTE_ERROR_LINE = (
+    "remote: error: File memory/semantic/digests/huge-transcript-dump.md is "
+    "51.00 MB; this exceeds GitHub's file size limit of 100.00 MB"
+)
+SYNC_TAIL_WITH_HEALTH_TRAILER = [
+    "2026-09-04T15:36:20Z sync: starting",
+    f"2026-09-04T15:36:22Z {REMOTE_ERROR_LINE}",
+    "2026-09-04T15:36:23Z sync: commit succeeded but push failed; brain is "
+    "committed locally",
+    "2026-09-04T15:36:24Z health: wrote runtime/health.json",
+]
+
+# A dead remote: git never reaches GitHub, so there is no `remote: error:`
+# at all — only `fatal:`. The first one names the cause; the second is
+# boilerplate.
+FIRST_FATAL_LINE = (
+    "fatal: '/tmp/rsd-smoke-oAQ6/remote.git' does not appear to be a git repository"
+)
+SYNC_TAIL_TWO_FATALS = [
+    "2026-09-04T15:36:20Z sync: starting",
+    f"2026-09-04T15:36:21Z {FIRST_FATAL_LINE}",
+    "2026-09-04T15:36:21Z fatal: Could not read from remote repository.",
+    "2026-09-04T15:36:22Z sync: commit succeeded but push failed; brain is "
+    "committed locally",
+    "2026-09-04T15:36:23Z health: wrote runtime/health.json",
+]
+
+
+def test_sync_log_remote_error_survives_the_trailing_health_line():
+    """The shape production actually writes: ERR, terminal marker, `health:`.
+
+    Before the fix this returned `None` on every real sync failure, because
+    the marker was never at the physical last index and the scan broke
+    before reaching git's stderr.
+    """
+    got = health._sync_log_remote_error("\n".join(SYNC_TAIL_WITH_HEALTH_TRAILER) + "\n")
+
+    assert got == REMOTE_ERROR_LINE
+
+
+def test_sync_log_remote_error_returns_first_fatal_when_no_remote_error():
+    """Client-side failures (dead remote, bad auth, DNS) print `fatal:`,
+    never `remote: error:`. Quote the first one — it carries the cause."""
+    got = health._sync_log_remote_error("\n".join(SYNC_TAIL_TWO_FATALS) + "\n")
+
+    assert got == FIRST_FATAL_LINE
+
+
+@pytest.mark.parametrize("tail", [
+    ["2026-09-04T15:36:23Z sync: pushed",
+     "2026-09-04T15:36:24Z health: error: could not write runtime/health.json"],
+    ["2026-09-04T15:36:23Z sync: pushed",
+     "2026-09-04T15:36:24Z health: fatal: runtime/health.json is unwritable"],
+])
+def test_sync_log_remote_error_never_quotes_a_health_line(tail):
+    """`health:` lines are brainstack's own output, not git's. A clean push
+    followed by a failed health write must not look like a push failure."""
+    assert health._sync_log_remote_error("\n".join(tail) + "\n") is None
+
+
+def test_brain_push_quotes_remote_error_past_the_health_trailer(make_env, tmp_path: Path):
+    """End to end: the FAIL evidence carries the git line even though the
+    EXIT trap appended a `health:` line after the run's terminal marker."""
+    brain = tmp_path / "brain"
+    brain.mkdir(parents=True, exist_ok=True)
+    env = make_env(
+        tmp_path,
+        run_map=_push_run_map(brain, ahead=2, last_push_hours_ago=6.0),
+    )
+    (brain / ".git").mkdir(exist_ok=True)
+    _write(brain / "sync.log", "\n".join(SYNC_TAIL_WITH_HEALTH_TRAILER) + "\n")
+
+    res = health.check_brain_push(env)
+
+    assert res.status == "FAIL"
+    assert f"last remote error: {REMOTE_ERROR_LINE}" in res.evidence
 
 
 # ---------- large_tracked_files ----------------------------------------
@@ -542,6 +675,26 @@ def test_large_tracked_files_fail_lists_path_and_mb(make_env, tmp_path: Path):
     assert "memory/episodic/AGENT_LEARNINGS.jsonl " not in res.evidence
     assert "MEMORY.md" not in res.evidence
     assert "rm --cached" in res.fix
+    assert "exceed 50 MB" in res.evidence
+
+
+def test_large_tracked_files_verb_agrees_with_one_file(make_env, tmp_path: Path):
+    """One file exceedS. The banner shows this line verbatim, so the
+    disagreement is read by a human every session (2026-09-04 smoke test)."""
+    brain = tmp_path / "brain"
+    brain.mkdir(parents=True, exist_ok=True)
+    tracked = ["memory/semantic/digests/huge-transcript-dump.md", "MEMORY.md"]
+    for rel, size in zip(tracked, [51 * MB, 4 * 1024]):
+        _sparse(brain / rel, size)
+    env = make_env(tmp_path, run_map={
+        _git_ls_files(brain): (0, "\0".join(tracked) + "\0", ""),
+    })
+
+    res = health.check_large_tracked_files(env)
+
+    assert res.status == "FAIL"
+    assert "exceeds 50 MB" in res.evidence
+    assert "exceed 50 MB" not in res.evidence
 
 
 def test_large_tracked_files_pass(make_env, tmp_path: Path):
@@ -598,6 +751,16 @@ def test_log_sizes_warn_over_20mb_includes_rolled_and_namespaces(
     assert "exceed 20 MB" in res.evidence
     assert res.evidence.count("events.log") == 1
     assert res.evidence.count("AGENT_LEARNINGS") == 1
+
+
+def test_log_sizes_verb_agrees_with_one_file(make_env, tmp_path: Path):
+    env = make_env(tmp_path)
+    _sparse(env.brain_root / "runtime" / "logs" / "events.log.jsonl", 30 * MB)
+
+    res = health.check_log_sizes(env)
+
+    assert res.status == "WARN"
+    assert "exceeds 20 MB" in res.evidence
 
 
 def test_log_sizes_pass(make_env, tmp_path: Path):
@@ -763,7 +926,12 @@ def test_drift_skip_without_pin_or_repo(make_env, tmp_path: Path, monkeypatch):
 _RUNTIME_SECTION = "[tool.recall.runtime]\nenable_auto_recall = {}\n"
 
 
-def test_auto_recall_fail_names_shadowing_file(make_env, tmp_path: Path, monkeypatch):
+def test_auto_recall_fail_names_the_layer_that_wrote_false(
+    make_env, tmp_path: Path, monkeypatch
+):
+    """S1 merges per key, so an incomplete cwd section shadows nothing. The
+    only way to be OFF is a layer that writes `false` — name that file and
+    that value, not whichever layer happens to rank highest."""
     env = make_env(tmp_path)
     monkeypatch.delenv("RECALL_RUNTIME_CONFIG", raising=False)
     monkeypatch.setenv("HOME", str(env.home))
@@ -777,8 +945,33 @@ def test_auto_recall_fail_names_shadowing_file(make_env, tmp_path: Path, monkeyp
     assert res.status == "FAIL"
     assert "auto-recall OFF" in res.evidence
     assert str(env.cwd) in res.evidence
-    assert str(cwd_cfg) in res.evidence
+    assert f"{cwd_cfg} sets enable_auto_recall = false" in res.evidence
+    assert f"set enable_auto_recall = true in {cwd_cfg}" in res.fix
+    assert "remove the key" in res.fix
     assert "[tool.recall.runtime]" in res.fix
+    # The pre-S1 wording promised a merge that has since landed.
+    assert "S1 merges per key once landed" not in res.fix
+    assert "shadows" not in res.evidence
+
+
+def test_auto_recall_fail_names_the_env_override_layer(
+    make_env, tmp_path: Path, monkeypatch
+):
+    """`$RECALL_RUNTIME_CONFIG` outranks everything. Saying so is the
+    difference between a 5-second fix and a hunt through three files."""
+    env = make_env(tmp_path)
+    monkeypatch.setenv("HOME", str(env.home))
+    _write(env.brain_root / "runtime" / "pyproject.toml",
+           _RUNTIME_SECTION.format("true"))
+    _write(env.cwd / "pyproject.toml", _RUNTIME_SECTION.format("true"))
+    override = _write(tmp_path / "override.toml", _RUNTIME_SECTION.format("false"))
+    monkeypatch.setenv("RECALL_RUNTIME_CONFIG", str(override))
+
+    res = health.check_auto_recall_config(env)
+
+    assert res.status == "FAIL"
+    assert f"{override} (via $RECALL_RUNTIME_CONFIG)" in res.evidence
+    assert str(override) in res.fix
 
 
 def test_auto_recall_pass_when_enabled(make_env, tmp_path: Path, monkeypatch):
@@ -809,16 +1002,21 @@ def test_auto_recall_skip_when_not_enabled_globally(make_env, tmp_path: Path, mo
 # ---------- daemon -----------------------------------------------------
 
 
-def test_daemon_skip_when_not_configured(make_env, tmp_path: Path):
+def test_daemon_skip_when_not_configured(make_env, tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("RECALL_DAEMON_SOCKET", raising=False)
     env = make_env(tmp_path)
 
     res = health.check_daemon(env)
 
     assert res.status == "SKIP"
     assert "not configured" in res.evidence
+    # Even the SKIP names the path it looked at: "no socket" is only
+    # believable if the reader can see WHICH socket was probed.
+    assert str(env.brain_root / "runtime" / "recall.sock") in res.evidence
 
 
-def test_daemon_fail_when_socket_refuses(make_env, tmp_path: Path):
+def test_daemon_fail_when_socket_refuses(make_env, tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("RECALL_DAEMON_SOCKET", raising=False)
     calls: list[Path] = []
 
     def _connect(path, timeout):
@@ -839,13 +1037,40 @@ def test_daemon_fail_when_socket_refuses(make_env, tmp_path: Path):
     assert "launchctl kickstart" in res.fix
 
 
-def test_daemon_pass_when_connect_ok(make_env, tmp_path: Path):
+def test_daemon_pass_when_connect_ok(make_env, tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("RECALL_DAEMON_SOCKET", raising=False)
     env = make_env(tmp_path, connect=lambda p, t: True)
     _write(env.brain_root / "runtime" / "recall.sock", "")
 
     res = health.check_daemon(env)
 
     assert res.status == "PASS"
+
+
+def test_daemon_honours_recall_daemon_socket_env(make_env, tmp_path: Path, monkeypatch):
+    """`recall doctor` and the hook resolve the socket through
+    `recall.config.daemon_socket_path()`. Health was a fourth surface with
+    its own hardcoded `<brain>/runtime/recall.sock`, so a daemon started
+    with `$RECALL_DAEMON_SOCKET` elsewhere was reported as absent while
+    `recall doctor` reported it running (2026-09-04 smoke test, Defect 2)."""
+    sock = tmp_path / "elsewhere" / "recall.sock"
+    _write(sock, "")
+    monkeypatch.setenv("RECALL_DAEMON_SOCKET", str(sock))
+    calls: list[Path] = []
+
+    def _connect(path, timeout):
+        calls.append(Path(path))
+        return True
+
+    env = make_env(tmp_path, connect=_connect)
+    # No plist, and nothing at the brain-root default: the old code SKIPped.
+    assert not (env.brain_root / "runtime" / "recall.sock").exists()
+
+    res = health.check_daemon(env)
+
+    assert res.status == "PASS"
+    assert calls == [sock]
+    assert str(sock) in res.evidence
 
 
 # ---------- report model ------------------------------------------------
