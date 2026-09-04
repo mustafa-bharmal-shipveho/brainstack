@@ -99,13 +99,40 @@ def _write_watermark(path: str, last_event_id: str,
 
 # --- Episodic walker -------------------------------------------------
 
-def _episodic_paths(brain_root: str, namespace: str = "default") -> List[str]:
-    """List every AGENT_LEARNINGS.jsonl for a namespace.
+def _episodic_stream(current: str) -> List[str]:
+    """Every existing file in the episodic stream at `current`: rolled
+    siblings (ascending by name) then the current file.
 
-    Default namespace walks the top-level `memory/episodic/AGENT_LEARNINGS.jsonl`
-    plus every sub-namespace directory containing its own
-    `AGENT_LEARNINGS.jsonl` (so we see ALL producer streams from one
-    consolidation run).
+    Rotation moves history into `AGENT_LEARNINGS.<day>.jsonl` siblings, so
+    a consolidator that only read the current file would stop seeing every
+    event older than the last roll. Sibling streams (`_imported.jsonl`)
+    have a different stem and are skipped.
+    """
+    directory, name = os.path.split(current)
+    stem, suffix = os.path.splitext(name)
+    try:
+        rolled = sorted(
+            os.path.join(directory, f)
+            for f in os.listdir(directory)
+            if f != name and f.startswith(stem + ".") and f.endswith(suffix)
+            and os.path.isfile(os.path.join(directory, f))
+        )
+    except OSError:
+        rolled = []
+    if os.path.isfile(current):
+        rolled.append(current)
+    return rolled
+
+
+def _episodic_paths(brain_root: str, namespace: str = "default") -> List[str]:
+    """List every AGENT_LEARNINGS*.jsonl for a namespace.
+
+    Default namespace walks the top-level `memory/episodic/` stream plus
+    every sub-namespace directory holding its own stream (so we see ALL
+    producer streams from one consolidation run). Within each directory the
+    order is rolled files ascending, then the current file — chronological
+    for the consolidator's watermark. `snapshots/` is skipped: files there
+    are archived history, already consolidated.
     """
     if namespace != "default" and not _NAMESPACE_RE.match(namespace or ""):
         raise ValueError(f"invalid namespace: {namespace!r}")
@@ -115,19 +142,19 @@ def _episodic_paths(brain_root: str, namespace: str = "default") -> List[str]:
         return []
     paths: List[str] = []
     if namespace == "default":
-        top = os.path.join(ep_root, "AGENT_LEARNINGS.jsonl")
-        if os.path.isfile(top):
-            paths.append(top)
+        paths.extend(_episodic_stream(os.path.join(ep_root, "AGENT_LEARNINGS.jsonl")))
         # Also include sub-namespaces — producers may write under
         # `episodic/<their-namespace>/AGENT_LEARNINGS.jsonl`.
         for name in sorted(os.listdir(ep_root)):
-            sub = os.path.join(ep_root, name, "AGENT_LEARNINGS.jsonl")
-            if os.path.isfile(sub) and name not in ("snapshots",):
-                paths.append(sub)
+            if name == "snapshots" or not os.path.isdir(os.path.join(ep_root, name)):
+                continue
+            paths.extend(
+                _episodic_stream(os.path.join(ep_root, name, "AGENT_LEARNINGS.jsonl"))
+            )
     else:
-        sub = os.path.join(ep_root, namespace, "AGENT_LEARNINGS.jsonl")
-        if os.path.isfile(sub):
-            paths.append(sub)
+        paths.extend(
+            _episodic_stream(os.path.join(ep_root, namespace, "AGENT_LEARNINGS.jsonl"))
+        )
     return paths
 
 

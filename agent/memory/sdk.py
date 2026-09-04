@@ -294,20 +294,49 @@ def read_policy(
 
 # --- Stats (PR5) -----------------------------------------------------
 
+def _episodic_stream_files(path: str) -> List[str]:
+    """Every file in the episodic stream at `path`: rolled siblings
+    (ascending by name) then `path` itself.
+
+    Mirrors `_atomic.episodic_files`, inlined so `stats()` keeps working
+    from callers that have not put `agent/memory/` on sys.path.
+    """
+    directory, name = os.path.split(path)
+    stem, suffix = os.path.splitext(name)
+    try:
+        rolled = sorted(
+            os.path.join(directory, f)
+            for f in os.listdir(directory or ".")
+            if f != name and f.startswith(stem + ".") and f.endswith(suffix)
+        )
+    except OSError:
+        rolled = []
+    return [*rolled, path]
+
+
+def _stream_has_any_file(path: str) -> bool:
+    """True if the episodic stream at `path` has a current OR a rolled
+    file. A namespace whose current file was just rolled away still
+    exists — without this it would vanish from `stats` until the next
+    append."""
+    return any(os.path.isfile(p) for p in _episodic_stream_files(path))
+
+
 def _list_namespaces(brain_root: Optional[str]) -> List[str]:
     """Walk `<root>/memory/episodic/` and return the namespaces present.
 
-    The default namespace is reported as "default" if the bare
-    `AGENT_LEARNINGS.jsonl` exists at the top level (v0.1 layout).
-    Each subdir under episodic/ that contains an AGENT_LEARNINGS.jsonl
-    is also reported. `snapshots/` and other reserved names are excluded.
+    The default namespace is reported as "default" if the top-level
+    `AGENT_LEARNINGS.jsonl` stream exists (v0.1 layout). Each subdir under
+    episodic/ holding its own stream is also reported. `snapshots/` and
+    other reserved names are excluded. A stream counts as present when
+    EITHER the current file or any rolled sibling is on disk.
     """
     root = _resolve_brain_root(brain_root)
     epi_root = os.path.join(root, "memory", "episodic")
     if not os.path.isdir(epi_root):
         return []
     out: List[str] = []
-    if os.path.isfile(os.path.join(epi_root, "AGENT_LEARNINGS.jsonl")):
+    if _stream_has_any_file(os.path.join(epi_root, "AGENT_LEARNINGS.jsonl")):
         out.append("default")
     try:
         for name in sorted(os.listdir(epi_root)):
@@ -316,7 +345,7 @@ def _list_namespaces(brain_root: Optional[str]) -> List[str]:
                 continue
             if name in _RESERVED_NAMESPACE_NAMES:
                 continue
-            if os.path.isfile(os.path.join(full, "AGENT_LEARNINGS.jsonl")):
+            if _stream_has_any_file(os.path.join(full, "AGENT_LEARNINGS.jsonl")):
                 out.append(name)
     except OSError:
         pass
@@ -390,7 +419,9 @@ def stats(
         epath = _episodic_path(ns, brain_root)
         sdir = _semantic_dir(ns, brain_root)
         lpath = os.path.join(sdir, "lessons.jsonl")
-        episodes = _count_jsonl_lines(epath)
+        # Episode counts span rolled history, not just the current file —
+        # otherwise a rotation would look like the brain lost episodes.
+        episodes = sum(_count_jsonl_lines(p) for p in _episodic_stream_files(epath))
         lessons = _count_jsonl_lines(lpath)
         candidates = _count_candidates(ns, brain_root)
         per_ns[ns] = {

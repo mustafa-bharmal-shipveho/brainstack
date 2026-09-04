@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -24,28 +25,88 @@ from typing import Any
 ROTATE_BYTES = 20 * 1024 * 1024
 
 
+def _today() -> str:
+    """UTC calendar day as `YYYY-MM-DD`, the stamp `rolled_name` inserts."""
+    return datetime.now(timezone.utc).date().isoformat()
+
+
 def rolled_name(path: Path, day: str) -> Path:
-    """Compute the rotated sibling name for `path` on day `day`
-    (`AGENT_LEARNINGS.jsonl` -> `AGENT_LEARNINGS.<day>.jsonl`, with a
-    `.1`, `.2`, ... counter inserted before the suffix on a same-day
-    collision). Scaffold: signature only. See
-    tests/test_rotation_episodic.py."""
-    raise NotImplementedError("scaffold")
+    """Compute the rotated sibling name for `path` on day `day`.
+
+    Only the FINAL suffix counts as the extension, so a compound stem
+    survives: `AGENT_LEARNINGS.jsonl` -> `AGENT_LEARNINGS.<day>.jsonl`. On
+    a same-day collision a counter goes before the suffix
+    (`AGENT_LEARNINGS.<day>.1.jsonl`, `.2`, ...), so a day that rolls
+    several times never overwrites an earlier roll.
+    """
+    path = Path(path)
+    stem, suffix = path.stem, path.suffix
+    candidate = path.parent / f"{stem}.{day}{suffix}"
+    counter = 0
+    while candidate.exists():
+        counter += 1
+        candidate = path.parent / f"{stem}.{day}.{counter}{suffix}"
+    return candidate
 
 
 def rotate_if_oversize(
-    path: Path, *, max_bytes: int = ROTATE_BYTES, today: str | None = None
+    path: Path, *, max_bytes: int | None = None, today: str | None = None
 ) -> Path | None:
-    """Rename `path` to `rolled_name(path, today or _today())` if it is
-    at/over `max_bytes`, returning the rolled path (or `None` if
-    untouched). Scaffold: signature only."""
-    raise NotImplementedError("scaffold")
+    """Rename `path` out of the way when it is STRICTLY LARGER than
+    `max_bytes`, returning the rolled path (or `None` if untouched).
+
+    Strictly greater, not at-or-over: a file sitting exactly at the
+    threshold must not roll, or a brain hovering at the limit would roll on
+    every write. `max_bytes` defaults to `ROTATE_BYTES` resolved HERE
+    rather than as a def-time default, so callers that thread no threshold
+    through (the codex / claude-session adapters) still see a
+    monkeypatched value.
+
+    This is the rotation site for the full-file REWRITERS. They read the
+    whole namespace file and write it back, so without a roll first an
+    oversize file is re-read and re-written on every import and never
+    shrinks. Callers hold the `.auto-migrate.lock` for their namespace.
+    """
+    limit = ROTATE_BYTES if max_bytes is None else max_bytes
+    path = Path(path)
+    if not limit:
+        return None
+    try:
+        if path.stat().st_size <= limit:
+            return None
+    except OSError:
+        return None  # missing / unreadable — nothing to roll
+    rolled = rolled_name(path, today or _today())
+    try:
+        os.replace(path, rolled)
+    except OSError:
+        return None
+    return rolled
 
 
 def episodic_files(current: Path) -> list[Path]:
-    """Rolled siblings of `current` (ascending by name), then `current`
-    itself. Scaffold: signature only."""
-    raise NotImplementedError("scaffold")
+    """Rolled siblings of `current` (ascending by name), then `current`.
+
+    The read side of rotation: history that moved into a rolled file must
+    stay visible to `sdk.stats`, the dream cycle, the consolidator and the
+    adapters' dedup preload. The glob is `<stem>*<suffix>`, which matches
+    every roll of this stream and skips sibling streams like
+    `_imported.jsonl`. Order is name-ascending, NOT chronological — byte
+    order puts `AGENT_LEARNINGS.<day>.1.jsonl` before
+    `AGENT_LEARNINGS.<day>.jsonl`.
+
+    `current` is always last, even when it does not exist yet (every
+    consumer already tolerates a missing episodic file).
+    """
+    current = Path(current)
+    pattern = f"{current.stem}*{current.suffix}"
+    try:
+        rolled = sorted(
+            p for p in current.parent.glob(pattern) if p.name != current.name
+        )
+    except OSError:
+        rolled = []
+    return [*rolled, current]
 
 
 def atomic_write_bytes(path: os.PathLike[str] | str, data: bytes) -> None:
