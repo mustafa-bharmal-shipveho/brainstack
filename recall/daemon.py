@@ -16,13 +16,13 @@ Protocol (pinned; see docs/recall-daemon.md):
   * Retrieval is serialized under one lock (`_query_lock`); a background
     thread runs `refresh_once()` (via `recall.index.refresh_index_chunked`)
     on `refresh_interval_s`, so the daemon — not the CLI — owns index
-    freshness.
+    freshness. Only ONE refresh pass runs at a time: the `reindex` op joins
+    a pass already in flight instead of double-embedding the brain.
 """
 
 from __future__ import annotations
 
 import hashlib
-import inspect
 import json
 import os
 import socket
@@ -31,7 +31,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from recall import __version__
 
@@ -71,11 +71,33 @@ QUERY_LOCK_TIMEOUT_S = 2.0
 
 # How long a query waits when the lock is simply held by ANOTHER QUERY.
 # Retrieval is serialized on purpose (embedded Qdrant is not thread-safe),
-# so four concurrent hook fires legitimately queue: with the cross-encoder
-# on CPU that is seconds, not milliseconds. Answering `busy` there would
-# turn the daemon's own design into an error, and each client already
-# bounds its own wait with `budget_ms`.
-QUERY_QUEUE_TIMEOUT_S = 60.0
+# so a few concurrent hook fires legitimately queue: with the cross-encoder
+# on CPU that is seconds, not milliseconds. Answering `busy` immediately
+# would turn the daemon's own design into an error.
+#
+# But the wait has to be BOUNDED near the client's own budget. The hook
+# gives up at 800 ms; a request thread that queues for a minute and then
+# runs the query is pure waste — the answer goes to a socket nobody is
+# reading, while it holds the lock against clients that are still waiting.
+# 2 s is ~2x the hook budget. Override with `RECALL_DAEMON_QUEUE_TIMEOUT_S`
+# (or the `queue_timeout_s` constructor argument); a client that knows it
+# will wait longer may also send `budget_ms` on a `query` request, and the
+# daemon then queues for up to 2x that, capped at
+# `QUERY_QUEUE_TIMEOUT_MAX_S`.
+QUERY_QUEUE_TIMEOUT_S = 2.0
+QUERY_QUEUE_TIMEOUT_MAX_S = 60.0
+
+# Granularity of the queue wait. Short enough that a client that hung up
+# is noticed promptly, long enough not to spin.
+QUERY_QUEUE_POLL_S = 0.1
+
+# How long `recall serve` sleeps before exiting 1 when another daemon
+# already owns the socket. Under launchd `KeepAlive` a bare exit 1 is
+# respawned every `ThrottleInterval` (10 s) forever, so the log fills with
+# the same refusal several times a minute. Sleeping first turns that into
+# roughly two lines a minute. Override with `RECALL_DAEMON_BUSY_BACKOFF_S`
+# (tests set 0).
+ALREADY_RUNNING_BACKOFF_S = 30.0
 
 # Reranking is OPT-IN on the warm path (calibrated 2026-09-04, S4).
 #
@@ -190,9 +212,58 @@ def _error(error: str, message: str) -> dict:
     return {"v": PROTOCOL_VERSION, "ok": False, "error": error, "message": message}
 
 
+def _env_seconds(name: str, default: float) -> float:
+    """Read a float number of seconds from the environment, falling back to
+    `default` on anything unparseable or negative. A typo in a launchd plist
+    must not stop the daemon from starting."""
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 0 else default
+
+
+class DaemonAlreadyRunning(RuntimeError):
+    """Another daemon already answers on this socket.
+
+    A `RuntimeError` subclass so existing callers that catch `RuntimeError`
+    keep working; distinct so `run_daemon` can back off before exiting,
+    instead of letting launchd respawn into the same refusal every 10 s.
+    """
+
+    def __init__(self, message: str, *, pid: "int | None" = None):
+        super().__init__(message)
+        self.pid = pid
+
+
 # ---------------------------------------------------------------------------
 # Socket plumbing
 # ---------------------------------------------------------------------------
+
+
+def _peer_gone(conn: socket.socket) -> bool:
+    """Whether the client has closed its end (best effort, never blocks).
+
+    A zero-length `MSG_PEEK` read means EOF: the client gave up on its own
+    budget and nothing is left to answer. Anything else — buffered bytes, a
+    would-block — means the connection is still worth serving. Errors are
+    treated as "gone", since a socket that cannot be peeked cannot be
+    written either.
+    """
+    try:
+        conn.setblocking(False)
+        try:
+            data = conn.recv(1, socket.MSG_PEEK)
+        finally:
+            conn.settimeout(RECV_TIMEOUT_S)
+    except (BlockingIOError, InterruptedError, TimeoutError):
+        return False
+    except OSError:
+        return True
+    return data == b""
 
 
 class _DaemonServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
@@ -210,17 +281,44 @@ class _DaemonServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
 
     def __init__(self, socket_path: str, handler, *, owner: "RecallDaemon"):
         self.owner = owner
+        self._logged_error_types: set[str] = set()
+        self._error_log_lock = threading.Lock()
         super().__init__(socket_path, handler)
 
     def server_bind(self) -> None:
-        super().server_bind()
-        # Owner-only: any local user could otherwise query the brain.
+        # umask, not chmod-after-bind: `bind()` creates the socket file with
+        # the process umask applied, so on a typical 0022 umask there is a
+        # window between bind and chmod where any local user can connect and
+        # query the brain. `~/.agent/runtime` is usually 0755, so the path is
+        # reachable. Restoring the old umask matters — the daemon writes
+        # other files (Qdrant storage) after this.
+        old_umask = os.umask(0o077)
+        try:
+            super().server_bind()
+        finally:
+            os.umask(old_umask)
+        # Belt and braces: umask can only REMOVE bits, so this is the only
+        # thing that guarantees exactly 0600 whatever the file was created
+        # with.
         os.chmod(self.server_address, 0o600)
 
     def handle_error(self, request, client_address) -> None:
         # One bad connection must never take the daemon down or spew a
-        # traceback into the launchd stderr log on every fire.
-        pass
+        # traceback into the launchd stderr log on every fire — but a
+        # PERSISTENT crash in `handle()` (outside `handle_request`, which
+        # swallows its own) would otherwise be completely invisible. One
+        # line per exception TYPE: enough to diagnose, bounded even if every
+        # connection fails.
+        exc_type, exc, _tb = sys.exc_info()
+        name = getattr(exc_type, "__name__", None) or "unknown"
+        with self._error_log_lock:
+            if name in self._logged_error_types:
+                return
+            self._logged_error_types.add(name)
+        RecallDaemon._log(
+            f"connection handler raised {name}: {exc} "
+            f"(further {name} errors are not logged)"
+        )
 
 
 class _RequestHandler(socketserver.BaseRequestHandler):
@@ -269,7 +367,9 @@ class _RequestHandler(socketserver.BaseRequestHandler):
                         response = _error("bad_request", f"malformed JSON: {exc}")
                     else:
                         owner.note_activity()
-                        response = owner.handle_request(req)
+                        response = owner.handle_request(
+                            req, is_connected=lambda: not _peer_gone(conn)
+                        )
         except OSError:
             return
 
@@ -298,6 +398,58 @@ class _RequestHandler(socketserver.BaseRequestHandler):
 # ---------------------------------------------------------------------------
 
 
+class _RefreshTrackedLock:
+    """The retrieval lock, as handed to `refresh_index_chunked`.
+
+    Identical semantics to the raw `threading.Lock` — it IS the same lock —
+    plus a depth counter that is non-zero only while the refresh actually
+    holds it. `refresh_index_chunked` deliberately does its slow discovery
+    and `stat()` phase OUTSIDE the lock, so "a refresh pass is running" and
+    "a refresh is blocking queries" are different facts. Reporting `busy` on
+    the first is a lie: with a big brain the discovery phase alone is
+    seconds, during which the lock is free and every wait is just other
+    queries queueing.
+    """
+
+    def __init__(self, lock: threading.Lock, on_change: "Callable[[int], None]"):
+        self._lock = lock
+        self._on_change = on_change
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        acquired = self._lock.acquire(blocking, timeout)
+        if acquired:
+            self._on_change(1)
+        return acquired
+
+    def release(self) -> None:
+        # Decrement BEFORE releasing: a query waiting on the lock must never
+        # wake up, win the lock, and still see "a refresh holds it".
+        self._on_change(-1)
+        self._lock.release()
+
+    def locked(self) -> bool:
+        return self._lock.locked()
+
+    def __enter__(self) -> "_RefreshTrackedLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, *_exc) -> bool:
+        self.release()
+        return False
+
+
+class _RefreshPass:
+    """One in-flight `refresh_once` pass. Late callers wait on `done` and
+    read `result` instead of starting a second pass over the same brain."""
+
+    __slots__ = ("done", "result")
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.result: "dict | None" = None
+
+
 class RecallDaemon:
     """Warm retrieval server: one retriever, one Qdrant store, one socket.
 
@@ -322,6 +474,7 @@ class RecallDaemon:
         idle_timeout_s: float = 0.0,
         refresh_interval_s: float = 300.0,
         chunk_size: int = 4,
+        queue_timeout_s: "float | None" = None,
     ):
         self.socket_path = Path(socket_path)
         self.cfg = cfg
@@ -332,6 +485,11 @@ class RecallDaemon:
         self.idle_timeout_s = idle_timeout_s
         self.refresh_interval_s = refresh_interval_s
         self.chunk_size = chunk_size
+        self.queue_timeout_s = (
+            _env_seconds("RECALL_DAEMON_QUEUE_TIMEOUT_S", QUERY_QUEUE_TIMEOUT_S)
+            if queue_timeout_s is None
+            else max(0.0, float(queue_timeout_s))
+        )
 
         # Resolved when the retriever is built; reported by `status` so a
         # health check can compare what is running against what was
@@ -359,10 +517,18 @@ class RecallDaemon:
         self._query_lock = threading.Lock()
         self._started_ts = time.time()
         self._last_success_ts: "float | None" = None
-        # True for the whole duration of a refresh pass. Distinguishes "the
-        # lock is held by a refresh" (report `busy`) from "the lock is held
-        # by another query" (queue behind it).
-        self._refresh_in_flight = False
+        # Non-zero ONLY while a refresh pass is actually holding the
+        # retrieval lock (see `_RefreshTrackedLock`). That is what
+        # distinguishes "the lock is held by a refresh" (report `busy`,
+        # the client can usefully retry) from "the lock is held by another
+        # query" (queue behind it, bounded).
+        self._refresh_lock_depth = 0
+        self._refresh_depth_lock = threading.Lock()
+        # Mutual exclusion for refresh passes: the background loop and the
+        # `reindex` op must never walk and embed the same brain twice at
+        # once. Guards `_refresh_running`, the pass a late caller joins.
+        self._refresh_gate = threading.Lock()
+        self._refresh_running: "_RefreshPass | None" = None
         self._last_activity = time.monotonic()
         self._stop = threading.Event()
         self._server: "_DaemonServer | None" = None
@@ -435,27 +601,20 @@ class RecallDaemon:
         )
         return self.retriever
 
-    @staticmethod
-    def _accepts_rerank(retriever) -> bool:
-        """`HybridRetriever.query(rerank=)` arrives with slice D. Probe once
-        so this daemon works against both signatures during the merge
-        window."""
-        try:
-            return "rerank" in inspect.signature(retriever.query).parameters
-        except (TypeError, ValueError):  # pragma: no cover - exotic callables
-            return False
-
     def _model_info(self) -> dict:
         retriever = self.retriever
         cfg = self._cfg_cache
-        embedder = getattr(retriever, "_embedder_model", None) or getattr(
-            retriever, "_embedder", None
-        )
+        # `HybridRetriever` stores the resolved model names as `_dense_model`
+        # / `_reranker` / `_reranker_model` / `_rerank_n` (recall/core.py).
+        # Reading the real attributes matters: `status()` is what a health
+        # check compares against the calibrated model, so falling back to the
+        # config value would report what was ASKED for, not what is loaded.
+        embedder = getattr(retriever, "_dense_model", None)
         if not isinstance(embedder, str):
             embedder = cfg.ranking.embedder if cfg is not None else None
         reranker = getattr(retriever, "_reranker", None)
         if not isinstance(reranker, str):
-            reranker = ("cross_encoder" if self.rerank else "none")
+            reranker = "cross_encoder" if self.rerank else "none"
 
         # Prefer what the daemon actually resolved, then whatever the
         # injected retriever reports, then the calibrated default. A health
@@ -485,9 +644,16 @@ class RecallDaemon:
 
     # -- dispatch -----------------------------------------------------------
 
-    def handle_request(self, req: dict) -> dict:
+    def handle_request(
+        self, req: dict, *, is_connected: "Callable[[], bool] | None" = None
+    ) -> dict:
         """Pure dispatch: a parsed request dict in, a response dict out.
         No socket I/O — this is the seam the pure-dispatch tests exercise.
+
+        `is_connected` is an optional liveness probe supplied by the socket
+        handler; a query that is still queued when its client hangs up is
+        dropped rather than run for nobody. It is keyword-only and optional
+        so `handle_request({...})` stays the pure, socket-free seam.
 
         Nothing escapes as an exception. An unhandled error here would kill
         the connection thread WITHOUT answering, so the client would sit
@@ -495,11 +661,13 @@ class RecallDaemon:
         learn something went wrong.
         """
         try:
-            return self._dispatch(req)
+            return self._dispatch(req, is_connected=is_connected)
         except Exception as exc:  # noqa: BLE001 - reported to the client
             return _error("internal", f"{type(exc).__name__}: {exc}")
 
-    def _dispatch(self, req: dict) -> dict:
+    def _dispatch(
+        self, req: dict, *, is_connected: "Callable[[], bool] | None" = None
+    ) -> dict:
         if not isinstance(req, dict):
             return _error("bad_request", "request must be a JSON object")
         version = req.get("v")
@@ -511,7 +679,7 @@ class RecallDaemon:
             )
         op = req.get("op")
         if op == "query":
-            return self._op_query(req)
+            return self._op_query(req, is_connected=is_connected)
         if op == "status":
             return self.status()
         if op == "reindex":
@@ -520,7 +688,9 @@ class RecallDaemon:
             return {"v": PROTOCOL_VERSION, "ok": True, "stopping": True}
         return _error("bad_request", f"unknown op {op!r}")
 
-    def _op_query(self, req: dict) -> dict:
+    def _op_query(
+        self, req: dict, *, is_connected: "Callable[[], bool] | None" = None
+    ) -> dict:
         prompt = req.get("prompt")
         if not isinstance(prompt, str) or not prompt:
             return _error("bad_request", "query requires a non-empty 'prompt' string")
@@ -545,21 +715,21 @@ class RecallDaemon:
         type_filter = req.get("type")
 
         started = time.perf_counter()
-        if not self._acquire_for_query():
-            return _error(
-                "busy",
-                "retrieval lock is held by an index refresh; retry shortly",
-            )
+        busy = self._acquire_for_query(
+            queue_timeout_s=self._queue_timeout_for(req),
+            is_connected=is_connected,
+        )
+        if busy is not None:
+            return _error("busy", busy)
         try:
             retriever = self._ensure_retriever()
-            kwargs: dict = {
-                "k": k,
-                "type_filter": type_filter,
-                "source_filter": source_filter,
-            }
-            if self._accepts_rerank(retriever):
-                kwargs["rerank"] = effective_rerank
-            results = retriever.query(prompt, **kwargs)
+            results = retriever.query(
+                prompt,
+                k=k,
+                type_filter=type_filter,
+                source_filter=source_filter,
+                rerank=effective_rerank,
+            )
             # Counted under the lock so concurrent queries cannot lose an
             # increment, and only on success — `queries_served` means
             # "queries answered", not "queries attempted".
@@ -582,21 +752,71 @@ class RecallDaemon:
             "model": {"embedder": model["embedder"], "reranker": model["reranker"]},
         }
 
-    def _acquire_for_query(self) -> bool:
-        """Take the retrieval lock, distinguishing a queue from a blockage.
+    def _note_refresh_lock(self, delta: int) -> None:
+        with self._refresh_depth_lock:
+            self._refresh_lock_depth += delta
 
-        Two different waits share one lock. Another QUERY holding it is the
-        design working — retrieval is serialized because embedded Qdrant is
-        not thread-safe — so the caller queues, bounded by its own
-        `budget_ms`. A REFRESH holding it past `QUERY_LOCK_TIMEOUT_S` is a
-        blockage worth reporting, because the client can retry against an
-        index that will be fresher.
+    def _refresh_holds_lock(self) -> bool:
+        with self._refresh_depth_lock:
+            return self._refresh_lock_depth > 0
+
+    def _queue_timeout_for(self, req: dict) -> float:
+        """How long this request may queue behind other queries.
+
+        The default is `queue_timeout_s` (~2x the hook's budget). A client
+        that knows it will wait longer — `recall query` allows 60 s — may
+        say so with `budget_ms`, and the daemon then queues for up to twice
+        that. The daemon never waits materially longer than the client will:
+        finishing a query nobody is reading is pure lock contention.
+        """
+        budget_ms = req.get("budget_ms")
+        if isinstance(budget_ms, bool) or not isinstance(budget_ms, (int, float)):
+            return self.queue_timeout_s
+        if budget_ms <= 0:
+            return self.queue_timeout_s
+        client = min(2.0 * (float(budget_ms) / 1000.0), QUERY_QUEUE_TIMEOUT_MAX_S)
+        return max(self.queue_timeout_s, client)
+
+    def _acquire_for_query(
+        self,
+        *,
+        queue_timeout_s: float,
+        is_connected: "Callable[[], bool] | None" = None,
+    ) -> "str | None":
+        """Take the retrieval lock. Returns None on success, else the `busy`
+        message explaining what the wait was actually blocked on.
+
+        Two different waits share one lock, and the difference is reported
+        HONESTLY — the flag is set only while a refresh really holds the
+        lock, never for the discovery phase it runs lock-free:
+
+          * A REFRESH holding it past `QUERY_LOCK_TIMEOUT_S` is a blockage
+            worth reporting: the client can retry against a fresher index.
+          * Another QUERY holding it is the design working (embedded Qdrant
+            is not thread-safe), so the caller queues — but only for
+            `queue_timeout_s`, near the client's own budget, and not at all
+            once the client has hung up.
         """
         if self._query_lock.acquire(timeout=QUERY_LOCK_TIMEOUT_S):
-            return True
-        if self._refresh_in_flight:
-            return False
-        return self._query_lock.acquire(timeout=QUERY_QUEUE_TIMEOUT_S)
+            return None
+        if self._refresh_holds_lock():
+            return "retrieval lock is held by an index refresh; retry shortly"
+
+        deadline = time.monotonic() + max(0.0, queue_timeout_s)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if is_connected is not None and not is_connected():
+                return "client closed the connection while queued; request dropped"
+            if self._query_lock.acquire(timeout=min(QUERY_QUEUE_POLL_S, remaining)):
+                return None
+            if self._refresh_holds_lock():
+                return "retrieval lock is held by an index refresh; retry shortly"
+        return (
+            f"retrieval is serialized and another query still holds it after "
+            f"{QUERY_LOCK_TIMEOUT_S + queue_timeout_s:g}s; retry shortly"
+        )
 
     def _op_reindex(self) -> dict:
         result = self.refresh_once()
@@ -622,7 +842,16 @@ class RecallDaemon:
         mode = None
         if cfg is not None:
             collections = [s.name for s in cfg.sources]
-            mode = cfg.ranking.mode
+            # `effective_mode`, not `cfg.ranking.mode`: the retriever was
+            # built with the effective mode ($RECALL_MODE beats the config
+            # file), so reporting the raw config value would tell a health
+            # check the daemon is running something it is not.
+            try:
+                from recall.config import effective_mode
+
+                mode = effective_mode(cfg)
+            except Exception:  # noqa: BLE001 - status must never raise
+                mode = cfg.ranking.mode
         index_age_s = (
             None
             if self._last_success_ts is None
@@ -663,16 +892,70 @@ class RecallDaemon:
     # -- freshness ----------------------------------------------------------
 
     def refresh_once(self) -> dict:
-        """Run one freshness pass via `recall.index.refresh_index_chunked`,
-        updating the freshness state. Used by the background loop, the
-        `reindex` op, and directly by tests.
+        """Run one freshness pass, or join the one already running.
+
+        Passes are MUTUALLY EXCLUSIVE. The background loop and the `reindex`
+        op (i.e. `recall reindex`, possibly twice) would otherwise walk and
+        embed the whole brain concurrently, and — worse — the pass that
+        finished second would clear `refresh_pending` while the first was
+        still upserting, so `index_stale()` reported False in the middle of
+        a refresh. A caller that arrives while a pass is in flight waits for
+        it and gets ITS result, which is what `reindex` means anyway:
+        "make sure the index is current before you answer me".
+        """
+        with self._refresh_gate:
+            running = self._refresh_running
+            if running is None:
+                running = self._refresh_running = _RefreshPass()
+                mine = running
+            else:
+                mine = None
+
+        if mine is None:
+            # Someone else's pass. Wait it out and report what it found.
+            running.done.wait()
+            if running.result is None:  # pragma: no cover - defensive
+                return {
+                    "ok": False,
+                    "error": "refresh pass ended without a result",
+                    "changed": 0,
+                    "deleted": 0,
+                    "ms": 0,
+                }
+            return dict(running.result)
+
+        result = {
+            "ok": False,
+            "error": "refresh pass did not complete",
+            "changed": 0,
+            "deleted": 0,
+            "ms": 0,
+        }
+        try:
+            result = self._refresh_pass()
+            return result
+        finally:
+            mine.result = result
+            with self._refresh_gate:
+                if self._refresh_running is mine:
+                    self._refresh_running = None
+            mine.done.set()
+
+    def refresh_in_flight(self) -> bool:
+        """Whether a refresh pass is running (lock held or not)."""
+        with self._refresh_gate:
+            return self._refresh_running is not None
+
+    def _refresh_pass(self) -> dict:
+        """One freshness pass via `recall.index.refresh_index_chunked`,
+        updating the freshness state. Callers go through `refresh_once`,
+        which serializes passes.
 
         A failed pass is recorded, not raised: the daemon keeps answering
         queries but reports `index_stale`, which is strictly better than
         dying and letting launchd respawn into the same failure.
         """
         started = time.perf_counter()
-        self._refresh_in_flight = True
         try:
             from recall.config import effective_mode
 
@@ -680,7 +963,11 @@ class RecallDaemon:
             result = refresh_index_chunked(
                 self._iter_sources(),
                 mode=mode,
-                lock=self._query_lock,
+                # Wrapped, not raw: the wrapper marks the windows where the
+                # refresh actually holds the lock, so a query that waits
+                # behind ANOTHER QUERY is never told an index refresh is in
+                # the way.
+                lock=_RefreshTrackedLock(self._query_lock, self._note_refresh_lock),
                 chunk_size=self.chunk_size,
                 on_pending=self._set_refresh_pending,
             )
@@ -698,7 +985,6 @@ class RecallDaemon:
             }
         finally:
             self.refresh_pending = False
-            self._refresh_in_flight = False
 
         self.last_refresh_ok = True
         self.last_refresh_error = None
@@ -769,15 +1055,18 @@ class RecallDaemon:
                 # cleanly. `status()` would flatten this to None and we would
                 # unlink a live daemon's socket, leaving two processes
                 # fighting over an exclusively locked store.
-                raise RuntimeError(
+                raise DaemonAlreadyRunning(
                     f"recall serve: already running at {path}, but it did not "
                     f"answer a status probe ({exc.reason}: {exc}). Stop it "
                     f"with 'recall serve --stop' before starting another."
                 ) from exc
         else:
-            raise RuntimeError(
-                f"recall serve: already running (pid {probe.get('pid')}) at {path}. "
-                f"Use 'recall serve --stop' to stop it."
+            pid = probe.get("pid")
+            raise DaemonAlreadyRunning(
+                f"recall serve: already running (pid {pid}) at {path}. "
+                f"Use 'recall serve --stop' to stop it, or "
+                f"'kill {pid}' if it is a manual daemon you forgot about.",
+                pid=pid if isinstance(pid, int) else None,
             )
 
         # Only reachable via no_socket / connection_refused: the file is a
@@ -819,10 +1108,7 @@ class RecallDaemon:
             with self._query_lock:
                 try:
                     retriever = self._ensure_retriever()
-                    kwargs: dict = {"k": 1}
-                    if self._accepts_rerank(retriever):
-                        kwargs["rerank"] = self.rerank
-                    retriever.query("warmup", **kwargs)
+                    retriever.query("warmup", k=1, rerank=self.rerank)
                 except Exception as exc:  # noqa: BLE001 - logged, not fatal
                     warm_ok = False
                     self._log(f"warm-up query failed: {type(exc).__name__}: {exc}")
@@ -882,45 +1168,15 @@ class RecallDaemon:
 
 
 def _dense_fallback_active() -> bool:
-    """`qdrant_backend.dense_fallback_active()` arrives with slice D; treat
-    its absence as "not degraded" rather than crashing a query."""
+    """Whether this process is answering from the BM25-only fallback because
+    the dense embedder was unavailable. Reported as `degraded` on every
+    query and in `status`; a probe failure must never take a query down."""
     try:
-        from recall import qdrant_backend as qb
+        from recall.qdrant_backend import dense_fallback_active
 
-        probe = getattr(qb, "dense_fallback_active", None)
-        return bool(probe()) if callable(probe) else False
-    except Exception:  # noqa: BLE001
+        return bool(dense_fallback_active())
+    except Exception:  # noqa: BLE001 - degraded reporting is best-effort
         return False
-
-
-def resolve_daemon_socket(raw: "str | None" = None) -> Path:
-    """Resolve the daemon socket path.
-
-    Delegates to `recall.config.daemon_socket_path` (slice A) and falls back
-    to an equivalent local resolution while that lands, so this slice works
-    before and after the merge. Precedence is identical either way:
-    `$RECALL_DAEMON_SOCKET` > `raw` > `$BRAIN_ROOT/runtime/recall.sock` >
-    `$BRAIN_HOME`'s parent > `~/.agent/runtime/recall.sock`.
-    """
-    try:
-        from recall.config import daemon_socket_path
-
-        return Path(daemon_socket_path(raw))
-    except (ImportError, AttributeError, NotImplementedError):
-        pass
-
-    env = os.environ.get("RECALL_DAEMON_SOCKET")
-    if env:
-        return Path(os.path.expanduser(os.path.expandvars(env)))
-    if raw:
-        return Path(os.path.expanduser(os.path.expandvars(raw)))
-    brain_root_env = os.environ.get("BRAIN_ROOT")
-    if brain_root_env:
-        return Path(os.path.expanduser(brain_root_env)) / "runtime" / "recall.sock"
-    brain_home = os.environ.get("BRAIN_HOME")
-    if brain_home:
-        return Path(os.path.expanduser(brain_home)).parent / "runtime" / "recall.sock"
-    return Path(os.path.expanduser("~/.agent")) / "runtime" / "recall.sock"
 
 
 def run_daemon(
@@ -966,6 +1222,25 @@ def run_daemon(
 
     try:
         daemon.serve_forever()
+    except DaemonAlreadyRunning as exc:
+        print(str(exc), file=sys.stderr, flush=True)
+        # launchd's KeepAlive respawns us every ThrottleInterval (10 s). If
+        # a manual `recall serve` owns the socket, exiting straight away
+        # means the same refusal six times a minute in
+        # recall-daemon.stderr.log until someone notices. Sleep first: the
+        # message still lands, roughly twice a minute.
+        backoff = _env_seconds(
+            "RECALL_DAEMON_BUSY_BACKOFF_S", ALREADY_RUNNING_BACKOFF_S
+        )
+        if backoff > 0:
+            print(
+                f"recall serve: sleeping {backoff:g}s before exiting so a "
+                f"KeepAlive respawn does not repeat this every few seconds.",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(backoff)
+        return 1
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr, flush=True)
         return 1
@@ -980,8 +1255,9 @@ __all__ = [
     "MAX_REQUEST_BYTES",
     "BODY_WIRE_CAP",
     "FRONTMATTER_WHITELIST",
+    "QUERY_QUEUE_TIMEOUT_S",
+    "DaemonAlreadyRunning",
     "RecallDaemon",
     "result_to_wire",
-    "resolve_daemon_socket",
     "run_daemon",
 ]

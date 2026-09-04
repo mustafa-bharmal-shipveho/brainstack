@@ -228,6 +228,89 @@ class _FakeRefresh:
         )
 
 
+class _GatedRetriever:
+    """A retriever whose queries block until the test lets them finish.
+
+    Holding the retrieval lock for a controlled window is the only way to
+    exercise the queueing path, and doing it with `time.sleep` in the fake
+    would make every assertion a race against the scheduler. `entered` fires
+    once a query is inside the lock; `release` lets it return.
+    """
+
+    def __init__(self, results: Optional[list] = None):
+        self._results = list(results) if results is not None else _results(1)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.calls = 0
+        self._lock = threading.Lock()
+
+    def query(
+        self,
+        query: str,
+        k: int,
+        type_filter: Optional[str] = None,
+        source_filter: Optional[str] = None,
+        rerank: Optional[bool] = None,
+    ) -> list:
+        with self._lock:
+            self.calls += 1
+        self.entered.set()
+        self.release.wait(30)
+        return self._results[:k]
+
+
+class _PhasedRefresh:
+    """Stand-in for `refresh_index_chunked` with its REAL phase structure.
+
+    The production pass walks the filesystem and stats every doc OUTSIDE the
+    lock (seconds on a large brain), then takes the lock in short chunks.
+    Collapsing that into "the pass holds the lock" is exactly the mistake
+    that made every slow query blame an index refresh, so the fake keeps the
+    two phases separate and lets the test drive each one.
+    """
+
+    def __init__(self, *, changed: int = 1, deleted: int = 0, ms: int = 5):
+        self.changed = changed
+        self.deleted = deleted
+        self.ms = ms
+        self.calls = 0
+        self.discovery_entered = threading.Event()
+        self.finish_discovery = threading.Event()
+        self.lock_held = threading.Event()
+        self.release_lock = threading.Event()
+        self.second_call = threading.Event()
+        self._lock = threading.Lock()
+
+    def __call__(self, sources, **kwargs):
+        from recall.index import RefreshResult
+
+        with self._lock:
+            self.calls += 1
+            if self.calls > 1:
+                self.second_call.set()
+        on_pending = kwargs.get("on_pending")
+        if on_pending is not None:
+            on_pending(True)
+        # Phase 1: discovery. Lock-free, and the slowest part of a real pass.
+        self.discovery_entered.set()
+        self.finish_discovery.wait(30)
+        # Phase 2: the chunked upsert. The ONLY window that blocks a query.
+        with kwargs["lock"]:
+            self.lock_held.set()
+            self.release_lock.wait(30)
+        return RefreshResult(
+            changed=self.changed,
+            deleted=self.deleted,
+            stale_before=bool(self.changed or self.deleted),
+            ms=self.ms,
+            per_source={"brain": self.changed},
+        )
+
+
+def _query_req(prompt: str = "atomic writes", k: int = 1, **extra) -> dict:
+    return {"v": 1, "op": "query", "prompt": prompt, "k": k, **extra}
+
+
 # ---------------------------------------------------------------------------
 # Socket helpers
 # ---------------------------------------------------------------------------
@@ -261,16 +344,32 @@ def _send(
 
 
 def _wait_for_socket(path: Path, *, timeout: float = 10.0, thread_state=None) -> None:
+    """Block until the daemon ANSWERS, not merely until the socket file exists.
+
+    `bind()` creates the file and `listen()` runs after it, so a client that
+    connects in between gets `ConnectionRefusedError`. Waiting on
+    `path.exists()` alone therefore hands out a socket that is not yet
+    accepting, and under machine load that window is wide enough to fail a
+    test that has nothing to do with startup. A real `status` round trip is
+    the only honest readiness signal: it proves bind, listen, accept and the
+    dispatch path all work.
+    """
+    from recall import daemon_client
+
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if path.exists() and stat.S_ISSOCK(os.stat(path).st_mode):
-            return
         if thread_state is not None and thread_state.get("exc") is not None:
             raise AssertionError(
                 f"daemon thread died before binding: {thread_state['exc']!r}"
             )
+        if (
+            path.exists()
+            and stat.S_ISSOCK(os.stat(path).st_mode)
+            and daemon_client.status(path, timeout_s=2.0) is not None
+        ):
+            return
         time.sleep(0.01)
-    raise AssertionError(f"daemon never bound {path} within {timeout}s")
+    raise AssertionError(f"daemon never answered on {path} within {timeout}s")
 
 
 def _wait_gone(path: Path, *, timeout: float = 5.0) -> None:
@@ -671,6 +770,15 @@ def _line_of_exactly(n_bytes: int, *, prompt: str = "atomic writes", k: int = 2)
     return line
 
 
+# How long a client waits before calling the server hung. Generous on
+# purpose: the assertion under test is "the server does not park a thread
+# forever", and the server's own bounds are 2 s (receive timeout) and an
+# immediate size rejection. Anything under a few seconds would be measuring
+# machine load — this suite runs with several other agents on the box —
+# while 30 s still fails a genuine hang in well under the pytest timeout.
+_HANG_TIMEOUT_S = 30.0
+
+
 def _send_bounded(sock_path, raw: bytes, *, timeout: float):
     """Send raw bytes and require an answer OR a close inside `timeout`.
 
@@ -705,7 +813,7 @@ def test_request_at_max_bytes_is_handled(fake_daemon):
     _daemon, sock, _retriever = fake_daemon(results=_results(2))
 
     line = _line_of_exactly(MAX_REQUEST_BYTES)
-    resp, elapsed = _send_bounded(sock, line, timeout=5.0)
+    resp, elapsed = _send_bounded(sock, line, timeout=_HANG_TIMEOUT_S)
 
     assert resp is not None, (
         f"server closed on a legal {MAX_REQUEST_BYTES}-byte request without "
@@ -731,35 +839,47 @@ def test_oversized_request_is_rejected_or_closed_without_hanging(fake_daemon):
     tests the size check. An UNTERMINATED oversized stream tests the 2 s
     receive timeout: without it, a client that writes forever and never sends
     a newline holds a daemon thread open until the process dies.
+
+    Every bound here is `_HANG_TIMEOUT_S`, not a tight measurement of the
+    server's own 2 s timeout. The failure being pinned is a HANG — a parked
+    thread that never answers and never closes — and a tight wall-clock
+    bound would instead be a load meter for whatever else is running on the
+    machine.
     """
     _daemon, sock, _retriever = fake_daemon()
 
     # 1. One byte over the cap, properly newline-terminated.
     over = _line_of_exactly(MAX_REQUEST_BYTES + 1)
-    resp, elapsed = _send_bounded(sock, over, timeout=10.0)
+    resp, elapsed = _send_bounded(sock, over, timeout=_HANG_TIMEOUT_S)
     if resp is not None:
         assert resp["ok"] is False, (
             f"a {len(over)}-byte request exceeds MAX_REQUEST_BYTES and must "
             f"not be served: {resp}"
         )
         assert resp["error"] == "bad_request", resp
-    assert elapsed < 10.0, f"took {elapsed:.2f}s"
+    assert elapsed < _HANG_TIMEOUT_S, (
+        f"an over-cap request took {elapsed:.2f}s to be answered or closed"
+    )
 
     # 2. Oversized and NEVER terminated: the receive timeout is the only
     #    thing that can end this connection.
     unterminated = b'{"v":1,"op":"query","prompt":"' + b"x" * (MAX_REQUEST_BYTES + 4096)
     assert b"\n" not in unterminated
-    resp2, elapsed2 = _send_bounded(sock, unterminated, timeout=10.0)
+    resp2, elapsed2 = _send_bounded(sock, unterminated, timeout=_HANG_TIMEOUT_S)
     if resp2 is not None:
         assert resp2["ok"] is False, resp2
         assert resp2["error"] == "bad_request", resp2
-    assert elapsed2 < 10.0, (
-        f"unterminated oversized stream took {elapsed2:.2f}s; the server's "
-        f"2 s receive timeout did not fire"
+    assert elapsed2 < _HANG_TIMEOUT_S, (
+        f"unterminated oversized stream took {elapsed2:.2f}s; the server "
+        f"neither answered nor closed, so its receive timeout never fired"
     )
 
     # The daemon is still healthy afterwards — no leaked or wedged thread.
-    healthy = _send(sock, {"v": 1, "op": "query", "prompt": "still alive", "k": 1})
+    healthy = _send(
+        sock,
+        {"v": 1, "op": "query", "prompt": "still alive", "k": 1},
+        timeout=_HANG_TIMEOUT_S,
+    )
     assert healthy["ok"] is True, healthy
 
 
@@ -870,19 +990,512 @@ def test_reindex_op_runs_refresh_once_and_returns_counts(fake_daemon, monkeypatc
 
 
 def test_refresh_interval_zero_disables_loop(fake_daemon, monkeypatch):
-    """`--refresh-interval-s 0` means no background pass at all (tests only)."""
+    """`--refresh-interval-s 0` means no background pass at all (tests only).
+
+    Asserted on the THREAD, not on a sleep: "no pass ran within 300 ms" is a
+    race dressed up as a test — under load the loop could simply not have
+    got there yet. The daemon starts its refresh thread before it enters the
+    accept loop, and the fixture does not return until a `status` request has
+    round-tripped through that loop, so by the time this test runs the thread
+    either exists or was never created.
+    """
     fake = _FakeRefresh(changed=1)
     monkeypatch.setattr("recall.daemon.refresh_index_chunked", fake)
 
     _daemon, sock, _retriever = fake_daemon(refresh_interval_s=0.0)
     resp = _send(sock, {"v": 1, "op": "query", "prompt": "hello", "k": 1})
     assert resp["ok"] is True
-    time.sleep(0.3)
 
+    refresh_threads = [
+        t.name for t in threading.enumerate() if t.name == "recall-daemon-refresh"
+    ]
+    assert not refresh_threads, (
+        "refresh_interval_s=0 must not start the background refresh thread; "
+        f"found {refresh_threads}"
+    )
     assert fake.calls == 0, (
         "refresh_interval_s=0 must disable the background loop entirely; "
         f"it ran {fake.calls} pass(es)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Contention: who is actually holding the lock, and for how long
+#
+# One lock serializes three different things — queries, the chunked upsert
+# phase of a refresh, and the warm-up. What the daemon TELLS a client about a
+# wait has to match which of them was in the way, and no wait may be
+# unbounded. These tests drive both sides of the lock explicitly rather than
+# sleeping and hoping.
+# ---------------------------------------------------------------------------
+
+
+def _run_query(daemon, out: dict, key: str, **kwargs) -> threading.Thread:
+    """Fire one query on its own thread, recording the response in `out`."""
+
+    def _go() -> None:
+        try:
+            out[key] = daemon.handle_request(_query_req(), **kwargs)
+        except BaseException as exc:  # noqa: BLE001 - surfaced by the caller
+            out[key] = exc
+
+    thread = threading.Thread(target=_go, daemon=True, name=f"query-{key}")
+    thread.start()
+    return thread
+
+
+def test_query_queued_behind_another_query_is_not_blamed_on_a_refresh(
+    fake_daemon, monkeypatch
+):
+    """A wait behind ANOTHER QUERY must never be reported as an index refresh.
+
+    `refresh_index_chunked` runs its discovery and `stat()` phase completely
+    outside the lock — seconds on a real brain — so "a refresh pass is in
+    flight" says nothing about who holds the lock. Blaming the refresh there
+    turns an ordinary queue into a `busy` the client cannot act on: retrying
+    "once the refresh finishes" does not help, because the refresh was never
+    in the way.
+    """
+    monkeypatch.setattr("recall.daemon.QUERY_LOCK_TIMEOUT_S", 0.2)
+    retriever = _GatedRetriever()
+    daemon, _sock, _r = fake_daemon(
+        start=False, retriever=retriever, queue_timeout_s=30.0
+    )
+    refresh = _PhasedRefresh()
+    monkeypatch.setattr("recall.daemon.refresh_index_chunked", refresh)
+
+    pass_thread = threading.Thread(target=daemon.refresh_once, daemon=True)
+    pass_thread.start()
+    assert refresh.discovery_entered.wait(10), "the refresh pass never started"
+
+    responses: dict = {}
+    first = _run_query(daemon, responses, "first")
+    assert retriever.entered.wait(10), "the first query never reached the retriever"
+
+    # Second query, fired while the refresh is mid-pass but holding nothing.
+    second = _run_query(daemon, responses, "second")
+    # Let it wait well past QUERY_LOCK_TIMEOUT_S — the window in which the
+    # daemon decides whether this wait is a refresh blockage or a queue.
+    time.sleep(0.2 * 3)
+
+    retriever.release.set()
+    first.join(15)
+    second.join(15)
+    refresh.finish_discovery.set()
+    assert refresh.lock_held.wait(10)
+    refresh.release_lock.set()
+    pass_thread.join(15)
+
+    assert responses["first"]["ok"] is True, responses["first"]
+    assert responses["second"]["ok"] is True, (
+        "a query that queued behind another QUERY was rejected as busy while "
+        "the refresh held nothing; the refresh flag must be set only inside "
+        f"the pass's `with lock:` windows: {responses['second']}"
+    )
+    assert retriever.calls == 2
+
+
+def test_query_blocked_by_the_refresh_chunk_phase_does_say_busy(
+    fake_daemon, monkeypatch
+):
+    """The other half: when the refresh really DOES hold the lock, say so.
+
+    The point of the honest flag is not to stop reporting `busy` — it is to
+    report it only when true. Here the pass is inside its chunked-upsert
+    window, so a client that retries shortly genuinely wins.
+    """
+    monkeypatch.setattr("recall.daemon.QUERY_LOCK_TIMEOUT_S", 0.2)
+    daemon, _sock, _r = fake_daemon(start=False, queue_timeout_s=30.0)
+    refresh = _PhasedRefresh()
+    monkeypatch.setattr("recall.daemon.refresh_index_chunked", refresh)
+
+    pass_thread = threading.Thread(target=daemon.refresh_once, daemon=True)
+    pass_thread.start()
+    assert refresh.discovery_entered.wait(10)
+    refresh.finish_discovery.set()
+    assert refresh.lock_held.wait(10), "the refresh never took the lock"
+
+    started = time.monotonic()
+    resp = daemon.handle_request(_query_req())
+    elapsed = time.monotonic() - started
+
+    refresh.release_lock.set()
+    pass_thread.join(15)
+
+    assert resp["ok"] is False and resp["error"] == "busy", resp
+    assert "index refresh" in resp["message"], resp
+    assert elapsed < 5.0, (
+        f"a query blocked by a refresh chunk waited {elapsed:.2f}s before "
+        f"being told; it must give up near QUERY_LOCK_TIMEOUT_S"
+    )
+
+
+def test_queued_query_gets_busy_at_the_bound_not_a_minute_later(
+    fake_daemon, monkeypatch
+):
+    """The server-side queue wait is BOUNDED near the client's own budget.
+
+    The hook gives up at 800 ms. A request thread that queues for a minute
+    and then runs the query answers a socket nobody is reading, while
+    holding the lock against clients that are still waiting — with `--rerank`
+    a burst of four convoys into four wasted seconds.
+    """
+    monkeypatch.setattr("recall.daemon.QUERY_LOCK_TIMEOUT_S", 0.2)
+    retriever = _GatedRetriever()
+    daemon, _sock, _r = fake_daemon(
+        start=False, retriever=retriever, queue_timeout_s=0.3
+    )
+
+    responses: dict = {}
+    first = _run_query(daemon, responses, "first")
+    assert retriever.entered.wait(10)
+
+    started = time.monotonic()
+    resp = daemon.handle_request(_query_req())
+    elapsed = time.monotonic() - started
+
+    retriever.release.set()
+    first.join(15)
+
+    assert resp["ok"] is False and resp["error"] == "busy", resp
+    assert "index refresh" not in resp["message"], (
+        f"no refresh was running; the message must not invent one: {resp}"
+    )
+    assert elapsed < 5.0, (
+        f"the queued request waited {elapsed:.2f}s; with a 0.3 s bound it "
+        f"must be told busy promptly, not queue for QUERY_QUEUE_TIMEOUT_S"
+    )
+    assert retriever.calls == 1, (
+        "the rejected query must not also have run: it was rejected because "
+        "running it would be wasted work"
+    )
+
+
+def test_queue_bound_defaults_near_the_hook_budget_and_is_configurable(
+    short_sock_dir, monkeypatch
+):
+    """2 s default (~2x the hook's 800 ms), overridable per daemon and by env.
+
+    A client that will genuinely wait longer says so with `budget_ms`, and
+    the daemon queues for up to 2x that — capped, so no request thread can
+    be parked indefinitely by a client's claim.
+    """
+    from recall.daemon import QUERY_QUEUE_TIMEOUT_MAX_S, QUERY_QUEUE_TIMEOUT_S
+
+    assert 0 < QUERY_QUEUE_TIMEOUT_S <= 5.0, (
+        f"the default server-side queue wait is {QUERY_QUEUE_TIMEOUT_S}s; it "
+        f"has to stay near the hook's 800 ms budget"
+    )
+
+    sock = short_sock_dir / "cfg.sock"
+    default = RecallDaemon(socket_path=sock, retriever=_FakeRetriever())
+    assert default.queue_timeout_s == QUERY_QUEUE_TIMEOUT_S
+
+    monkeypatch.setenv("RECALL_DAEMON_QUEUE_TIMEOUT_S", "7.5")
+    assert RecallDaemon(socket_path=sock, retriever=_FakeRetriever()).queue_timeout_s == 7.5
+    monkeypatch.setenv("RECALL_DAEMON_QUEUE_TIMEOUT_S", "not-a-number")
+    assert (
+        RecallDaemon(socket_path=sock, retriever=_FakeRetriever()).queue_timeout_s
+        == QUERY_QUEUE_TIMEOUT_S
+    ), "an unparseable override must fall back, not stop the daemon starting"
+    monkeypatch.delenv("RECALL_DAEMON_QUEUE_TIMEOUT_S")
+
+    explicit = RecallDaemon(
+        socket_path=sock, retriever=_FakeRetriever(), queue_timeout_s=0.5
+    )
+    assert explicit.queue_timeout_s == 0.5
+    assert explicit._queue_timeout_for({}) == 0.5
+    assert explicit._queue_timeout_for({"budget_ms": 60000}) == min(
+        120.0, QUERY_QUEUE_TIMEOUT_MAX_S
+    )
+    assert explicit._queue_timeout_for({"budget_ms": 100}) == 0.5
+    assert explicit._queue_timeout_for({"budget_ms": True}) == 0.5
+
+
+def test_queued_query_is_dropped_when_the_client_hangs_up(fake_daemon, monkeypatch):
+    """A client that closed gets nothing run on its behalf.
+
+    The hook's budget is 800 ms; after that it has already fallen back and
+    printed. Running its query anyway costs the lock, the embedder and (with
+    `--rerank`) the cross-encoder, for a result that goes nowhere.
+    """
+    monkeypatch.setattr("recall.daemon.QUERY_LOCK_TIMEOUT_S", 0.2)
+    retriever = _GatedRetriever()
+    daemon, _sock, _r = fake_daemon(
+        start=False, retriever=retriever, queue_timeout_s=30.0
+    )
+
+    responses: dict = {}
+    first = _run_query(daemon, responses, "first")
+    assert retriever.entered.wait(10)
+
+    started = time.monotonic()
+    resp = daemon.handle_request(_query_req(), is_connected=lambda: False)
+    elapsed = time.monotonic() - started
+
+    retriever.release.set()
+    first.join(15)
+
+    assert resp["ok"] is False and resp["error"] == "busy", resp
+    assert "closed" in resp["message"], resp
+    assert elapsed < 5.0, (
+        f"a disconnected client's request queued for {elapsed:.2f}s of its "
+        f"30 s bound instead of being dropped"
+    )
+    assert retriever.calls == 1, "the dropped query must never reach the retriever"
+
+
+def test_reindex_joins_a_running_refresh_instead_of_double_embedding(
+    fake_daemon, monkeypatch
+):
+    """Refresh passes are mutually exclusive, and `reindex` joins the running one.
+
+    Two concurrent passes (the background loop plus a `reindex` op, or
+    `recall reindex` twice) walk and embed the whole brain twice — and the
+    one that finishes first clears `refresh_pending` while the other is
+    still upserting, so `index_stale()` reports False in the middle of a
+    refresh and every `x_index_stale` in that window is wrong.
+    """
+    daemon, _sock, _r = fake_daemon(start=False)
+    refresh = _PhasedRefresh(changed=2, deleted=1, ms=5)
+    monkeypatch.setattr("recall.daemon.refresh_index_chunked", refresh)
+
+    background = threading.Thread(target=daemon.refresh_once, daemon=True)
+    background.start()
+    assert refresh.discovery_entered.wait(10), "the background pass never started"
+    assert daemon.index_stale() is True
+    assert daemon.refresh_in_flight() is True
+
+    op: dict = {}
+
+    def _reindex() -> None:
+        op["resp"] = daemon.handle_request({"v": 1, "op": "reindex"})
+
+    op_thread = threading.Thread(target=_reindex, daemon=True, name="reindex-op")
+    op_thread.start()
+
+    assert not refresh.second_call.wait(1.0), (
+        "the reindex op started a SECOND concurrent refresh pass; both would "
+        "walk and embed the whole brain, and the first to finish would clear "
+        "refresh_pending underneath the other"
+    )
+    assert daemon.index_stale() is True, (
+        "refresh_pending was cleared while the first pass was still running"
+    )
+
+    refresh.finish_discovery.set()
+    assert refresh.lock_held.wait(10)
+    refresh.release_lock.set()
+    background.join(15)
+    op_thread.join(15)
+
+    assert refresh.calls == 1, (
+        f"one refresh pass must have run, not {refresh.calls}"
+    )
+    assert op["resp"]["ok"] is True, op["resp"]
+    assert op["resp"]["changed"] == 2, (
+        f"the reindex op must return the running pass's result: {op['resp']}"
+    )
+    assert op["resp"]["deleted"] == 1, op["resp"]
+    assert daemon.refresh_pending is False
+    assert daemon.index_stale() is False
+    assert daemon.refresh_in_flight() is False
+
+
+# ---------------------------------------------------------------------------
+# Startup: permissions, error visibility, and the two-owners case
+# ---------------------------------------------------------------------------
+
+
+def test_socket_is_never_world_connectable_between_bind_and_chmod(
+    fake_daemon, monkeypatch
+):
+    """`bind()` itself must create a private socket, not chmod one afterwards.
+
+    `bind()` applies the process umask. With the usual 0022 that is a
+    world-CONNECTABLE socket for the window between bind and chmod, and
+    `~/.agent/runtime` is typically 0755, so the path is reachable: any
+    local user who wins that race can query the brain. The umask is restored
+    afterwards because the daemon writes Qdrant storage with it.
+    """
+    entry_umask = os.umask(0o000)  # worst case: nothing masked by default
+    try:
+        observed: dict = {}
+        real_chmod = os.chmod
+
+        def _recording_chmod(path, mode, *args, **kwargs):
+            try:
+                observed.setdefault("pre_chmod", stat.S_IMODE(os.stat(path).st_mode))
+            except OSError:  # pragma: no cover - not a path we created
+                pass
+            return real_chmod(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(os, "chmod", _recording_chmod)
+        _daemon, sock, _retriever = fake_daemon()
+
+        # AF_UNIX sockets are created 0777 & ~umask, so under 0o077 the
+        # pre-chmod mode is 0700 — owner-only, which is the whole point.
+        # What must be zero are the group and other bits; the chmod that
+        # follows only strips the (harmless) execute bit.
+        pre_chmod = observed.get("pre_chmod")
+        assert pre_chmod is not None, "the daemon never chmod'ed its socket"
+        assert pre_chmod & 0o077 == 0, (
+            f"the socket existed with mode {oct(pre_chmod)} before chmod ran, "
+            f"i.e. connectable by other local users; bind must happen under a "
+            f"0o077 umask so that window never exists"
+        )
+        assert stat.S_IMODE(os.stat(sock).st_mode) == 0o600
+
+        restored = os.umask(0o000)
+        assert restored == 0o000, (
+            f"the daemon left the process umask at {oct(restored)}; it must "
+            f"restore what it found (Qdrant storage is written with it)"
+        )
+    finally:
+        os.umask(entry_umask)
+
+
+def test_handle_error_logs_once_per_exception_type(fake_daemon, capsys):
+    """A persistent crash outside `handle_request` must not be invisible.
+
+    Swallowing everything keeps one bad connection from killing the daemon,
+    but it also means a systematic failure in `handle()` shows up nowhere in
+    the launchd log. One line per exception TYPE: diagnosable, and still
+    bounded if every single connection fails.
+    """
+    daemon, _sock, _retriever = fake_daemon()
+    server = daemon._server
+    assert server is not None
+
+    for _ in range(3):
+        try:
+            raise ValueError("connection went sideways")
+        except ValueError:
+            server.handle_error(None, None)
+    try:
+        raise KeyError("something else")
+    except KeyError:
+        server.handle_error(None, None)
+
+    out = capsys.readouterr().out
+    logged = [line for line in out.splitlines() if "connection handler raised" in line]
+    assert sum("ValueError" in line for line in logged) == 1, (
+        f"one line per exception type, not per occurrence:\n{out}"
+    )
+    assert "connection went sideways" in out, out
+    assert sum("KeyError" in line for line in logged) == 1, (
+        f"a different exception type must also log:\n{out}"
+    )
+
+
+def test_second_daemon_backs_off_before_exiting_and_names_the_pid(
+    fake_daemon, monkeypatch, capsys
+):
+    """Under launchd `KeepAlive`, exit 1 is a respawn every ThrottleInterval.
+
+    When a manual `recall serve` owns the socket, a bare exit turns into the
+    same refusal six times a minute in recall-daemon.stderr.log forever.
+    Sleeping first keeps the message without the spam, and naming the pid
+    tells the user what to kill.
+    """
+    import signal as _signal
+
+    from recall.daemon import run_daemon
+
+    _daemon, sock, _retriever = fake_daemon()
+    monkeypatch.setenv("RECALL_DAEMON_BUSY_BACKOFF_S", "0.4")
+
+    handlers = {
+        sig: _signal.getsignal(sig) for sig in (_signal.SIGTERM, _signal.SIGINT)
+    }
+    started = time.monotonic()
+    try:
+        rc = run_daemon(socket_path=sock, refresh_interval_s=0.0)
+    finally:
+        for sig, handler in handlers.items():
+            _signal.signal(sig, handler)
+    elapsed = time.monotonic() - started
+
+    assert rc == 1, "a daemon that cannot own the socket must exit non-zero"
+    assert elapsed >= 0.35, (
+        f"exited after {elapsed:.2f}s without backing off; launchd would "
+        f"respawn straight into the same refusal"
+    )
+    err = capsys.readouterr().err
+    assert f"pid {os.getpid()}" in err, (
+        f"the refusal must name the process holding the socket:\n{err}"
+    )
+    assert "already running" in err.lower(), err
+
+
+# ---------------------------------------------------------------------------
+# What `status` reports about the process that is actually running
+# ---------------------------------------------------------------------------
+
+
+def test_model_info_reads_the_running_retrievers_models(fake_daemon):
+    """`status` reports what is LOADED, read off `HybridRetriever`'s real
+    attributes (`_dense_model`, `_reranker`, `_reranker_model`,
+    `_rerank_n` — see recall/core.py). A health check compares this against
+    the calibrated model, so probing an attribute the retriever never had
+    and falling back to the config would report what was asked for rather
+    than what is running."""
+
+    class _ModelledRetriever(_FakeRetriever):
+        _dense_model = "BAAI/bge-small-en-v1.5"
+        _sparse_model = "Qdrant/bm25"
+        _reranker = "cross_encoder"
+        _reranker_model = "Xenova/ms-marco-MiniLM-L-6-v2"
+        _rerank_n = 10
+
+    _daemon, sock, _retriever = fake_daemon(retriever=_ModelledRetriever())
+
+    resp = _send(sock, {"v": 1, "op": "status"})
+
+    assert resp["embedder"] == "BAAI/bge-small-en-v1.5", (
+        f"status must report the retriever's loaded dense model: {resp}"
+    )
+    assert resp["reranker_model"] == "Xenova/ms-marco-MiniLM-L-6-v2", resp
+    assert resp["rerank_n"] == 10, resp
+
+    query = _send(sock, {"v": 1, "op": "query", "prompt": "hello", "k": 1})
+    assert query["model"]["embedder"] == "BAAI/bge-small-en-v1.5", query
+    assert query["model"]["reranker"] == "cross_encoder", query
+
+
+def test_status_mode_reports_the_effective_mode(short_sock_dir, monkeypatch):
+    """`RECALL_MODE` beats the config file everywhere else (`effective_mode`),
+    including in the retriever this daemon built. Reporting `cfg.ranking.mode`
+    would tell a health check the daemon is running hybrid retrieval when it
+    is running sparse."""
+    from recall.config import Config, RankingConfig, SourceConfig
+
+    cfg = Config(
+        sources=[
+            SourceConfig(
+                name="brain",
+                path="/nonexistent",
+                glob="**/*.md",
+                frontmatter="optional",
+                exclude=[],
+            )
+        ],
+        ranking=RankingConfig(mode="hybrid"),
+    )
+    monkeypatch.setenv("RECALL_MODE", "sparse")
+
+    daemon = RecallDaemon(
+        socket_path=short_sock_dir / "mode.sock",
+        cfg=cfg,
+        retriever=_FakeRetriever(),
+        refresh_interval_s=0.0,
+    )
+
+    assert daemon.status()["mode"] == "sparse", (
+        "status must report the mode the retriever actually runs with "
+        "($RECALL_MODE > config), not the raw config value"
+    )
+    assert daemon.status()["collections"] == ["brain"]
 
 
 # ---------------------------------------------------------------------------

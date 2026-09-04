@@ -36,14 +36,18 @@ def _query_via_daemon(
         return None
     try:
         from recall import daemon_client
-        from recall.daemon import resolve_daemon_socket
+
+        # `recall.config`, not `recall.daemon`: resolving a path must not
+        # drag in `recall.index` -> `qdrant_client` (~0.9 s) on a code path
+        # whose whole point is to avoid loading retrieval in this process.
+        from recall.config import daemon_socket_path
     except ImportError:
         return None
     try:
         resp = daemon_client.query(
             query,
             k=k,
-            socket_path=resolve_daemon_socket(),
+            socket_path=daemon_socket_path(),
             budget_ms=_DAEMON_BUDGET_MS,
             source_filter=source,
             type_filter=type,
