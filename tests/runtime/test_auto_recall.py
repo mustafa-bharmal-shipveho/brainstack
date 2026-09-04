@@ -357,6 +357,78 @@ class TestRelevanceGates:
         assert telemetry["x_k_returned"] == 2
         assert telemetry["x_rerank_scores"] == []
 
+    def test_negative_threshold_still_gates(self):
+        """Calibrated cross-encoder thresholds are RAW LOGITS, and the
+        chosen one is NEGATIVE (eval/RESULTS.md: -1.9547). A `> 0.0`
+        enable-check therefore silently disabled the gate for exactly the
+        value the calibration tells us to ship. Any float enables it."""
+        from runtime.adapters.claude_code.auto_recall import build_recall_block
+        retr = _FakeRetriever(results=[
+            _FakeQueryResult(path="/brain/low.md", source="brain", name="low",
+                             score=0.88, rerank_score=-3.10, body="off topic"),
+            _FakeQueryResult(path="/brain/high.md", source="brain", name="high",
+                             score=0.61, rerank_score=-0.50, body="on topic"),
+        ])
+        block, telemetry = build_recall_block(
+            "q", retr, k=5, budget_tokens=1500, min_rerank=-1.9547,
+        )
+        assert "/brain/high.md" in block
+        assert "/brain/low.md" not in block
+        assert telemetry["x_outcome"] == "hit"
+        assert telemetry["x_k_gated_out"] == 1
+        assert telemetry["x_k_returned"] == 1
+
+    def test_none_threshold_disables_the_gate(self):
+        """`None` — not `0.0` — is the OFF switch. With the gate off even
+        a deeply negative rerank score is injected."""
+        from runtime.adapters.claude_code.auto_recall import build_recall_block
+        retr = _FakeRetriever(results=[
+            _FakeQueryResult(path="/brain/a.md", source="brain", name="a",
+                             score=0.88, rerank_score=-9.0, body="a"),
+            _FakeQueryResult(path="/brain/b.md", source="brain", name="b",
+                             score=0.61, rerank_score=0.4, body="b"),
+        ])
+        block, telemetry = build_recall_block(
+            "q", retr, k=5, budget_tokens=1500, min_rerank=None,
+        )
+        assert "/brain/a.md" in block
+        assert "/brain/b.md" in block
+        assert telemetry["x_k_gated_out"] == 0
+        assert telemetry["x_k_returned"] == 2
+
+    def test_zero_threshold_gates_negative_scores(self):
+        """0.0 is a THRESHOLD, not a sentinel: it admits scores >= 0 and
+        rejects negative ones. Callers that want the gate off pass None."""
+        from runtime.adapters.claude_code.auto_recall import build_recall_block
+        retr = _FakeRetriever(results=[
+            _FakeQueryResult(path="/brain/neg.md", source="brain", name="neg",
+                             score=0.88, rerank_score=-0.01, body="neg"),
+            _FakeQueryResult(path="/brain/zero.md", source="brain", name="zero",
+                             score=0.61, rerank_score=0.0, body="zero"),
+        ])
+        block, telemetry = build_recall_block(
+            "q", retr, k=5, budget_tokens=1500, min_rerank=0.0,
+        )
+        assert "/brain/neg.md" not in block
+        assert "/brain/zero.md" in block
+        assert telemetry["x_k_gated_out"] == 1
+        assert telemetry["x_k_returned"] == 1
+
+    def test_rerank_none_passes_under_a_negative_threshold(self):
+        """The in-process fallback supplies no rerank scores at all. That
+        must keep degrading to RRF-only under a negative threshold too,
+        otherwise auto-recall goes silent whenever the daemon is down."""
+        from runtime.adapters.claude_code.auto_recall import build_recall_block
+        retr = _FakeRetriever(results=[
+            _FakeQueryResult(path="/brain/a.md", source="brain", name="a",
+                             score=0.91, rerank_score=None, body="a"),
+        ])
+        block, telemetry = build_recall_block(
+            "q", retr, k=5, budget_tokens=1500, min_rerank=-1.9547,
+        )
+        assert "/brain/a.md" in block
+        assert telemetry["x_k_gated_out"] == 0
+
     def test_x_top_scores_are_candidate_scores(self):
         """`x_top_scores` / `x_rerank_scores` describe the CANDIDATES that
         survived the RRF pre-filter, before the rerank gate and dedup.

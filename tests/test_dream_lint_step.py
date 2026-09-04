@@ -222,6 +222,53 @@ class TestSubprocessFallback:
         assert "--brain" in args
         assert str(brain) in args
 
+    def test_exit_1_with_findings_is_not_an_error(self, brain, tmp_path,
+                                                  monkeypatch):
+        """`recall lint --mark --json` exits 1 BY DESIGN when residual
+        findings exist (recall/cli.py raises `typer.Exit(code=1)`), and
+        prints the findings JSON to stdout first. Treating that as a
+        failure reported `lint_error=` on every night the brain had
+        anything stale — i.e. exactly the nights lint is for."""
+        argv_log = tmp_path / "argv.txt"
+        findings = json.dumps([
+            {"file": "a.md", "line": 1, "kind": "dead_path",
+             "severity": "stale", "detail": "d", "evidence": "e"},
+            {"file": "b.md", "line": 2, "kind": "broken_wikilink",
+             "severity": "stale", "detail": "d", "evidence": "e"},
+            {"file": "c.md", "line": 3, "kind": "dead_path",
+             "severity": "stale", "detail": "d", "evidence": "e"},
+        ])
+        root = self._fake_install_root(tmp_path, argv_log, findings)
+        # Same script, but exiting 1 the way the real CLI does.
+        py = root / ".venv" / "bin" / "python"
+        py.write_text(py.read_text(encoding="utf-8") + "exit 1\n",
+                      encoding="utf-8")
+        py.chmod(0o755)
+        (brain / ".brainstack-repo-path").write_text(str(root), encoding="utf-8")
+        monkeypatch.setitem(sys.modules, "recall.lint", None)
+
+        summary = _lint_step(brain)
+
+        assert "lint_findings=3" in summary
+        assert "lint_error=" not in summary
+
+    def test_exit_1_with_unparseable_stdout_reports_an_error(
+            self, brain, tmp_path, monkeypatch):
+        """rc=1 is only benign when the JSON contract held. A crash that
+        happens to exit 1 with garbage on stdout is still an error."""
+        argv_log = tmp_path / "argv.txt"
+        root = self._fake_install_root(tmp_path, argv_log, "Traceback (most recent")
+        py = root / ".venv" / "bin" / "python"
+        py.write_text(py.read_text(encoding="utf-8") + "exit 1\n",
+                      encoding="utf-8")
+        py.chmod(0o755)
+        (brain / ".brainstack-repo-path").write_text(str(root), encoding="utf-8")
+        monkeypatch.setitem(sys.modules, "recall.lint", None)
+
+        summary = _lint_step(brain)
+        assert "lint_error=" in summary
+        assert "lint_findings=" not in summary
+
     def test_missing_repo_path_pin_reports_an_error(self, brain, monkeypatch):
         monkeypatch.setitem(sys.modules, "recall.lint", None)
         summary = _lint_step(brain)

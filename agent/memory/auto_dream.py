@@ -622,6 +622,14 @@ def _lint_step_subprocess(brain_root):
     `import recall` can fail there. `<brain>/.brainstack-repo-path` pins
     the install root precisely so this fallback has an interpreter that
     can. Raises on any problem so `_lint_step` can report it.
+
+    Exit code 1 is SUCCESS here. `recall lint` deliberately exits 1 when
+    residual findings remain (recall/cli.py: `raise typer.Exit(code=1)`),
+    having already written the findings JSON to stdout — it is a CI
+    signal, not a crash. Treating it as failure reported `lint_error=` on
+    exactly the nights the brain had something stale, i.e. every night
+    the step was doing its job. Only rc >= 2, stdout that is empty or not
+    JSON, or a timeout is a real error.
     """
     import subprocess
 
@@ -636,10 +644,22 @@ def _lint_step_subprocess(brain_root):
          "--brain", str(brain_root)],
         capture_output=True, text=True, timeout=_LINT_TIMEOUT_S,
     )
-    if proc.returncode != 0:
+    if proc.returncode not in (0, 1):
         raise RuntimeError(
             f"recall lint exited {proc.returncode}: {proc.stderr.strip()[:200]}")
-    findings = json.loads(proc.stdout)
+    stdout = proc.stdout.strip()
+    if not stdout:
+        raise RuntimeError(
+            f"recall lint exited {proc.returncode} with empty stdout: "
+            f"{proc.stderr.strip()[:200]}")
+    try:
+        findings = json.loads(stdout)
+    except ValueError as exc:
+        # rc=1 is only benign when the JSON contract held. A traceback
+        # that happens to exit 1 must not be counted as zero findings.
+        raise RuntimeError(
+            f"recall lint exited {proc.returncode} with unparseable stdout "
+            f"({exc}): {stdout[:200]}") from exc
     if isinstance(findings, dict):
         findings = findings.get("findings", [])
     return f" lint_findings={len(findings)} lint_via=subprocess"
