@@ -496,6 +496,101 @@ class TestJoin:
             fh.write("not json at all\n{\"truncated\":\n")
         assert _compute(world).used_docs == 1
 
+    def test_many_hits_in_one_session_match_the_naive_join(self, world: World,
+                                                           t0: int):
+        """`compute_utilization` builds the attachment / uuid / tool_use
+        lookups once per session and reuses them for every hit in that
+        session. The 207-hour session with 248 injections is the shape
+        that made the old per-hit rescan O(hits x lines).
+
+        Sharing state across hits is exactly where an indexed rewrite
+        goes wrong, so this pins the answers against the naive join —
+        the same public helpers called one hit at a time, each rescanning
+        the transcript. Fifty injections in one session, docs read at two
+        points in the middle, so `tool_refs_after` returns a different
+        suffix for almost every hit and any off-by-one in the shared
+        index changes the total."""
+        from recall.utilization import (
+            doc_use,
+            extract_prompt,
+            find_injection_attachment,
+            find_transcript,
+            load_transcript,
+            norm_brain_path,
+            tool_refs_after,
+        )
+
+        n_hits = 50
+        spacing = 10 * MINUTE_MS  # >> the 120s join window: no ambiguity
+        base = t0 - (n_hits + 1) * spacing
+        records: list[dict] = []
+        events: list[tuple[int, list[str]]] = []
+        parent: str | None = None
+        for i in range(n_hits):
+            turn_ts = base + i * spacing
+            docs = [(DOC_A if i % 2 == 0 else DOC_B, 0.80 - i / 1000)]
+            if i % 5 == 0:
+                docs.append((DOC_C, 0.55))
+            records.append(_user(f"u-{i}", parent, turn_ts,
+                                 f"{PROMPT} (turn {i})"))
+            att_ts = turn_ts + 1000
+            records.append(_attachment(f"a-{i}", f"u-{i}", att_ts,
+                                       world.block(docs)))
+            blocks: list[dict] = [_text(f"Answering turn {i} now.")]
+            if i == 10:
+                blocks.append(_tool_use(
+                    "Read", {"file_path": world.abs_path(DOC_A)}))
+            if i == 30:
+                blocks.append(_tool_use("Bash", {"command": f"cat {DOC_B}"}))
+            records.append(_assistant(f"r-{i}", f"a-{i}", att_ts + 1000, blocks))
+            parent = f"r-{i}"
+            events.append((att_ts, [rel for rel, _ in docs]))
+        world.write_session(SID_A, records)
+        for att_ts, paths in events:
+            world.write_event(sid=SID_A, ts_ms=att_ts, paths=paths)
+
+        report = _compute(world)
+
+        # Naive reference: one hit at a time, every helper rescanning the
+        # whole transcript, exactly as the pre-index loop did.
+        transcript = find_transcript(world.projects, SID_A)
+        assert transcript is not None
+        lines = load_transcript(transcript)
+        n_joined = 0
+        n_injected = 0
+        n_used = 0
+        naive_by_tool: dict[str, int] = {}
+        naive_prompts: list[str | None] = []
+        for att_ts, paths in events:
+            idx = find_injection_attachment(
+                lines, att_ts,
+                prefer_paths={norm_brain_path(p, world.brain) for p in paths},
+                brain_root=world.brain,
+            )
+            assert idx is not None
+            n_joined += 1
+            n_injected += len(paths)
+            refs = tool_refs_after(lines, idx)
+            for doc in paths:
+                tool = doc_use(doc, refs, world.brain)
+                if tool:
+                    n_used += 1
+                    naive_by_tool[tool] = naive_by_tool.get(tool, 0) + 1
+            naive_prompts.append(extract_prompt(lines, idx))
+
+        assert report.hit_events == n_hits
+        assert report.joined_events == n_joined == n_hits
+        assert report.unjoined_events == 0
+        assert report.injected_docs == n_injected
+        assert report.used_docs == n_used
+        assert report.used_by_tool == naive_by_tool
+        # Not a vacuous match: the reads land mid-session, so only the
+        # injections before them count and the totals are strictly
+        # between "nothing used" and "everything used".
+        assert 0 < n_used < n_injected
+        # Every prompt still resolves through the shared uuid map.
+        assert naive_prompts == [f"{PROMPT} (turn {i})" for i in range(n_hits)]
+
 
 class TestParseInjectionBlock:
     def test_parses_path_score_and_excerpt(self, world: World):

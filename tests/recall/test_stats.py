@@ -284,7 +284,66 @@ class TestAggregateEvents:
         report = aggregate_events(log)
         assert report.path_split == {"daemon": 2, "inproc": 1, "unknown": 1}
         assert report.daemon_error_count == 1
+        assert report.daemon_error_by_reason == {"connection_refused": 1}
         assert report.degraded_count == 1
+
+    def test_daemon_errors_bucketed_by_reason(self, tmp_path: Path):
+        """`daemon_error_count` alone cannot tell "the daemon was never
+        installed" (`no_socket`) from "the daemon is alive but busy"
+        (`timeout`) — and those two need opposite fixes. The hook writes
+        `x_daemon_error` as `"<reason>: <detail>"`, so bucket by the
+        reason prefix. Anything outside the known reason set lands in
+        `other` rather than being dropped: a bucket nobody recognizes is
+        still a signal, and silently discarding it would make the
+        breakdown disagree with `daemon_error_count`."""
+        from recall.stats import aggregate_events
+        log = tmp_path / "events.log.jsonl"
+        _v12(log, x_outcome="miss", x_path="inproc",
+             x_daemon_error="no_socket: /run/recall.sock missing")
+        _v12(log, x_outcome="miss", x_path="inproc",
+             x_daemon_error="no_socket: /run/recall.sock missing")
+        _v12(log, x_outcome="unavailable", x_path="daemon",
+             x_daemon_error="timeout: budget 800ms exceeded")
+        _v12(log, x_outcome="unavailable", x_path="daemon",
+             x_daemon_error="server_error: store locked")
+        _v12(log, x_outcome="miss", x_path="inproc",
+             x_daemon_error="protocol_error: short read")
+        _v12(log, x_outcome="miss", x_path="inproc",
+             x_daemon_error="import_error: No module named 'recall'")
+        _v12(log, x_outcome="miss", x_path="inproc",
+             x_daemon_error="connection_refused: no listener")
+        # No `<reason>:` prefix at all — the hook's `fail_reason or
+        # "unknown"` fallback and any future reason land here.
+        _v12(log, x_outcome="miss", x_path="inproc", x_daemon_error="unknown")
+        # Counted but never bucketed away: a skip never started a worker.
+        _v12(log, x_outcome="skip", x_skip_reason="slash",
+             x_daemon_error="no_socket: never reached")
+        _v12(log, x_outcome="hit", x_k_returned=1, x_path="daemon")
+
+        report = aggregate_events(log)
+        assert report.daemon_error_count == 8
+        assert report.daemon_error_by_reason == {
+            "no_socket": 2,
+            "connection_refused": 1,
+            "timeout": 1,
+            "server_error": 1,
+            "protocol_error": 1,
+            "import_error": 1,
+            "other": 1,
+        }
+        # The breakdown is a partition of the count, never a subset.
+        assert sum(report.daemon_error_by_reason.values()) == report.daemon_error_count
+
+    def test_daemon_error_by_reason_empty_when_no_errors(self, tmp_path: Path):
+        """No errors means no breakdown — an empty dict, not a dict of
+        zeros. `render_human` keys the parenthetical off emptiness."""
+        from recall.stats import aggregate_events
+        log = tmp_path / "events.log.jsonl"
+        _v12(log, x_outcome="hit", x_k_returned=1, x_path="daemon",
+             x_daemon_error=None)
+        report = aggregate_events(log)
+        assert report.daemon_error_count == 0
+        assert report.daemon_error_by_reason == {}
 
     def test_index_stale_absent_is_unknown_not_false(self, tmp_path: Path):
         """`x_index_stale` is emitted only on the daemon path, and only
@@ -541,6 +600,30 @@ class TestRawReader:
         report = aggregate_events(log)
         assert report.fired_count == 1
 
+    def test_non_auto_recall_malformed_line_is_skipped(self, tmp_path: Path):
+        """The log is tens of MB and only a slice of it is AutoRecall, so
+        the reader rejects a line on a substring probe before paying for
+        `json.loads`. The probe must not change what the reader accepts:
+        a truncated non-AutoRecall line is still skipped silently, and a
+        record whose `event` merely *mentions* AutoRecall is still
+        rejected on the parsed value rather than on the raw bytes."""
+        from recall.stats import iter_auto_recall_records
+        log = tmp_path / "events.log.jsonl"
+        log.write_text(
+            # truncated PostToolUse write — never parses, never matters
+            '{"schema_version": "1.2", "event": "PostToolUse", "x_tool": "Ba\n'
+            # well-formed, but a different event that names ours in a field
+            '{"schema_version": "1.2", "event": "SessionStart",'
+            ' "note": "next up: AutoRecall"}\n'
+            # compact separators, as a hand-rolled writer emits them
+            '{"schema_version":"1.2","event":"AutoRecall","ts_ms":1,'
+            '"session_id":"s","turn":0,"x_outcome":"miss","x_path":"daemon"}\n'
+        )
+        _v12(log, x_outcome="hit", x_k_returned=1)
+
+        records = list(iter_auto_recall_records(log))
+        assert [r.get("x_outcome") for r in records] == ["miss", "hit"]
+
     def test_rotated_siblings_are_read(self, tmp_path: Path):
         """logrotate leaves `events.log.<date>.jsonl` next to the live
         file. A 7d window that ignored them would silently report a
@@ -668,6 +751,7 @@ def _sample_report(**overrides):
         timeout_pct=100 * 5 / 180,
         path_split={"daemon": 171, "inproc": 9},
         daemon_error_count=9,
+        daemon_error_by_reason={"no_socket": 6, "timeout": 3},
         degraded_count=0,
         index_stale_count=3,
         index_stale_known=160,
@@ -720,7 +804,8 @@ class TestRenderHuman:
         assert "  Miss:         61 (34%) nothing passed the relevance gate" in out
         assert "  Dedup:        14 (8%) every passing doc was already shown this session" in out
         assert "  Timeout:      5 (3%) · unavailable 2 · error 1" in out
-        assert ("  Path:         daemon 171, inproc 9 (daemon_error 9, degraded 0)"
+        assert ("  Path:         daemon 171, inproc 9"
+                " (daemon_error 9 (no_socket 6, timeout 3), degraded 0)"
                 " · index stale 3 / 160 fires that reported staleness") in out
         assert "  Latency:      worker p50 240ms, p95 810ms · query p50 95ms, p95 400ms" in out
         assert ("  Docs:         301 injected (avg 3.1 per hit) · repeat-injection 0.0%"
@@ -744,14 +829,35 @@ class TestRenderHuman:
         read as "the index is fresh" when the truth is "nobody checked"."""
         from recall.stats import render_human
         out = render_human(_sample_report())
-        assert ("  Path:         daemon 171, inproc 9 (daemon_error 9, degraded 0)"
+        assert ("  Path:         daemon 171, inproc 9"
+                " (daemon_error 9 (no_socket 6, timeout 3), degraded 0)"
                 " · index stale 3 / 160 fires that reported staleness") in out
 
         unknown = render_human(_sample_report(index_stale_count=0,
                                               index_stale_known=0))
         assert ("  Path:         daemon 171, inproc 9"
-                " (daemon_error 9, degraded 0)") in unknown
+                " (daemon_error 9 (no_socket 6, timeout 3), degraded 0)") in unknown
         assert "index stale" not in unknown
+
+    def test_render_path_line_breaks_daemon_errors_out_by_reason(self):
+        """"daemon_error 9" alone reads the same whether the daemon was
+        never installed or was merely slow, and those need opposite
+        fixes. The breakdown is ordered by count so the dominant reason
+        reads first, ties alphabetically so the line is stable between
+        runs, and is omitted entirely when there were no errors (an
+        empty "()" would look like a truncated report)."""
+        from recall.stats import render_human
+        out = render_human(_sample_report(
+            daemon_error_count=6,
+            daemon_error_by_reason={"timeout": 2, "no_socket": 2,
+                                    "connection_refused": 2},
+        ))
+        assert ("daemon_error 6 (connection_refused 2, no_socket 2, timeout 2)"
+                in out)
+
+        clean = render_human(_sample_report(daemon_error_count=0,
+                                            daemon_error_by_reason={}))
+        assert "(daemon_error 0, degraded 0)" in clean
 
     def test_render_repeat_injection_rate_is_a_percentage(self):
         """`repeat_injection_rate` is a fraction on the report; the human
@@ -1053,7 +1159,8 @@ class TestStatsJsonContract:
             "miss_count", "dedup_count",
             "total_fires", "total_prompts",
             "coverage_pct", "miss_pct", "dedup_pct", "timeout_pct",
-            "path_split", "daemon_error_count", "degraded_count",
+            "path_split", "daemon_error_count", "daemon_error_by_reason",
+            "degraded_count",
             "index_stale_count", "index_stale_known",
             "query_p50_ms", "query_p95_ms",
             "k_candidates_total", "k_gated_out_total", "k_dedup_total",

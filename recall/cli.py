@@ -1843,9 +1843,13 @@ def stats(
             typer.echo(f"recall stats: {e}", err=True)
             raise typer.Exit(code=2)
         td = transcripts_dir or (Path.home() / ".claude" / "projects")
-        effective_brain_root = brain_root or Path(
-            os.environ.get("BRAIN_ROOT", str(Path.home() / ".agent"))
-        )
+        # `--brain-root` wins; otherwise defer to the one resolver
+        # ($BRAIN_ROOT, else the brain home, else its parent when that
+        # home is the `memory/` dir). Re-deriving it here would report
+        # utilization against ~/.agent for anyone whose brain lives
+        # elsewhere.
+        from recall.config import brain_root as _config_brain_root
+        effective_brain_root = brain_root or _config_brain_root()
         # Raw prompt/response text must never land under the brain root: sync.sh
         # would push it to the remote on the next hourly tick (runtime/core/events.py
         # data policy). Default to the recall cache dir instead.
