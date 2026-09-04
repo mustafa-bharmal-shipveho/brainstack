@@ -519,8 +519,13 @@ def check_drift(env: HealthEnv) -> CheckResult:
     )
 
 
-def check_auto_recall_config(env: HealthEnv) -> CheckResult:
-    """Whether `env.cwd`'s resolved runtime config leaves auto-recall on."""
+def check_auto_recall_config(env: HealthEnv, *, config=None) -> CheckResult:
+    """Whether `env.cwd`'s resolved runtime config leaves auto-recall on.
+
+    `config=` lets a caller that has ALREADY loaded the runtime config for
+    `env.cwd` (the SessionStart hook) hand it over instead of paying for a
+    second three-file TOML parse. Omit it and the config is loaded here.
+    """
     global_path = env.brain_root / "runtime" / "pyproject.toml"
     if not global_path.is_file():
         global_path = env.home / ".agent" / "runtime" / "pyproject.toml"
@@ -530,7 +535,7 @@ def check_auto_recall_config(env: HealthEnv) -> CheckResult:
             f"auto-recall not enabled globally (no enable_auto_recall = true in {global_path})",
         )
 
-    cfg = _load_runtime_config_at(env.cwd)
+    cfg = _load_runtime_config_at(env.cwd, config=config)
     if cfg is None:
         return CheckResult(
             "auto_recall_config", "SKIP",
@@ -770,16 +775,50 @@ def load_report(
         report = HealthReport.from_dict(data)
     except Exception:  # noqa: BLE001 - unusable payload is the same as no payload
         return None
-    if max_age_hours and max_age_hours > 0:
-        ts = _parse_iso_z(report.generated_at)
-        if ts is None:
-            return None
-        moment = now or datetime.now(timezone.utc)
-        if moment.tzinfo is None:
-            moment = moment.replace(tzinfo=timezone.utc)
-        if (moment - ts).total_seconds() / 3600.0 > max_age_hours:
-            return None
+    if _is_stale(report, now=now, max_age_hours=max_age_hours):
+        return None
     return report
+
+
+def read_report(
+    path: Path, *, now: Optional[datetime] = None
+) -> "tuple[Optional[HealthReport], bool]":
+    """Parse `path` ONCE and return `(report, stale)`.
+
+    `report` is `None` when the file is missing, unreadable, or unusable —
+    three cases that mean the same thing to every caller: there is no
+    report. `stale` is True when the report parsed but its `generated_at`
+    is older than `HEALTH_STALE_HOURS` (an unparseable timestamp counts as
+    stale: it is not evidence of freshness).
+
+    `load_report` collapses missing, corrupt AND stale into a single
+    `None`, which forced the SessionStart banner — a hook on the session
+    open path — to read and parse health.json twice just to tell "say
+    nothing" apart from "the hourly agent looks dead".
+    """
+    report = load_report(path, now=now, max_age_hours=0)
+    if report is None:
+        return None, False
+    return report, _is_stale(report, now=now, max_age_hours=HEALTH_STALE_HOURS)
+
+
+def _is_stale(
+    report: HealthReport, *, now: Optional[datetime], max_age_hours: float
+) -> bool:
+    """True when `report.generated_at` is more than `max_age_hours` old.
+
+    `max_age_hours` of 0 (or less) disables the check entirely; an
+    unparseable `generated_at` is treated as stale rather than fresh.
+    """
+    if not max_age_hours or max_age_hours <= 0:
+        return False
+    ts = _parse_iso_z(report.generated_at)
+    if ts is None:
+        return True
+    moment = now or datetime.now(timezone.utc)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return (moment - ts).total_seconds() / 3600.0 > max_age_hours
 
 
 # ---------------------------------------------------------------------------
@@ -895,9 +934,18 @@ def _newest_mtime(paths) -> Optional[float]:
     return newest
 
 
-def _load_runtime_config_at(cwd: Path):
+def _load_runtime_config_at(cwd: Path, *, config=None):
     """`RuntimeConfig.load()` as resolved from `cwd` (chdir guarded by
-    try/finally)."""
+    try/finally).
+
+    `config=` short-circuits the load. `RuntimeConfig.load()` parses up to
+    three TOML files, and the SessionStart hook has already done exactly
+    that for exactly this directory; passing it back in is the difference
+    between one parse per session open and two. The CALLER owns the
+    precondition that `config` was resolved from `cwd`.
+    """
+    if config is not None:
+        return config
     try:
         from runtime.adapters.claude_code.config import RuntimeConfig
     except ImportError:
