@@ -2293,32 +2293,63 @@ if [ "$MODE" = "setup-daemon" ] || [ "$MODE" = "remove-daemon" ]; then
 
     mkdir -p "$BRAIN_ROOT/runtime/logs"
     mkdir -p "$HOME/Library/LaunchAgents"
-    sed -e "s|__BRAIN_ROOT__|$BRAIN_ROOT|g" \
-        -e "s|__PYTHON_ABS__|$daemon_python|g" \
-        -e "s|__REPO_DIR__|$REPO_DIR|g" \
-        -e "s|__HOME__|$HOME|g" \
-        "$daemon_template" > "$daemon_plist_path"
+    # Rendered through Python, not sed: a REPO_DIR/BRAIN_ROOT/HOME containing
+    # `|`, `&`, or a backslash corrupts a `sed s|...|...|g` substitution (`&`
+    # re-inserts the whole match, `\1` etc. are backreferences). Python's
+    # str.replace() is a literal substring swap with no such injection
+    # surface, and plistlib.loads validates the rendered text for real
+    # before any of it touches disk.
+    if ! "$PYTHON_BIN" - "$daemon_template" "$daemon_plist_path" \
+            "__PYTHON_ABS__" "$daemon_python" \
+            "__REPO_DIR__" "$REPO_DIR" \
+            "__BRAIN_ROOT__" "$BRAIN_ROOT" \
+            "__HOME__" "$HOME" <<'PYEOF'
+import plistlib
+import sys
+from xml.sax.saxutils import escape
+
+template_path, out_path, *pairs = sys.argv[1:]
+subs = list(zip(pairs[0::2], pairs[1::2]))
+
+try:
+    with open(template_path, encoding="utf-8") as fh:
+        text = fh.read()
+    for token, value in subs:
+        # Every placeholder sits inside a <string> element's text content,
+        # never an attribute, so escaping &/</> is the only XML rule that
+        # applies. Without it a value containing a literal & (a legitimate
+        # macOS username like "Bob & Co") renders XML plistlib rejects.
+        text = text.replace(token, escape(value))
+    # plutil is lenient about malformed XML comments (two consecutive
+    # hyphens); a strict parser is not, and neither is launchd. Parse it
+    # for real before handing it over.
+    plistlib.loads(text.encode("utf-8"))
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+except Exception as exc:  # noqa: BLE001 - surfaced to the caller, not swallowed
+    print(f"install: failed to render {out_path}: {exc}", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+    then
+        exit 2
+    fi
 
     # An unsubstituted placeholder yields a unit launchd refuses at load,
-    # and the refusal is silent — the user simply never gets a daemon.
-    # This is the claude-extras 2026-05 failure; catch it here instead.
-    if grep -q '__' "$daemon_plist_path"; then
+    # and the refusal is silent — the user simply never gets a daemon. This
+    # is the claude-extras 2026-05 failure; catch it here instead. Check
+    # only the exact placeholder tokens: a REPO_DIR/BRAIN_ROOT/HOME value
+    # that legitimately contains a double underscore (e.g. .../foo__bar)
+    # must not trip this.
+    daemon_placeholder_re='__PYTHON_ABS__|__REPO_DIR__|__BRAIN_ROOT__|__HOME__'
+    if grep -qE "$daemon_placeholder_re" "$daemon_plist_path"; then
         echo "install: unsubstituted placeholder left in $daemon_plist_path; not loading." >&2
-        grep -n '__' "$daemon_plist_path" >&2
+        grep -nE "$daemon_placeholder_re" "$daemon_plist_path" >&2
         rm -f "$daemon_plist_path"
         exit 2
     fi
     if command -v plutil >/dev/null 2>&1 \
        && ! plutil -lint "$daemon_plist_path" >/dev/null 2>&1; then
         echo "install: rendered plist failed plutil -lint; not loading. See $daemon_plist_path" >&2
-        exit 2
-    fi
-    # plutil is lenient about malformed XML comments (two consecutive
-    # hyphens); a strict parser is not, and neither is launchd. Parse it
-    # for real before handing it over.
-    if ! "$PYTHON_BIN" -c 'import plistlib,sys; plistlib.load(open(sys.argv[1],"rb"))' \
-         "$daemon_plist_path" 2>/dev/null; then
-        echo "install: rendered plist is not valid XML; not loading. See $daemon_plist_path" >&2
         exit 2
     fi
 
@@ -3169,6 +3200,7 @@ DEFAULT_LAUNCHD_STATUS="pending"
 DEFAULT_RECALL_FIRST_STATUS="pending"
 DEFAULT_AUTO_RECALL_STATUS="pending"
 DEFAULT_DAEMON_STATUS="pending"
+DEFAULT_DAEMON_LOG_TAIL=""
 
 echo ""
 echo "==> Applying default setup (opt out per-mode with --no-X)"
@@ -3364,10 +3396,17 @@ if [ "$NO_DAEMON" = "1" ]; then
 elif [ "$PLATFORM" != "Darwin" ]; then
     DEFAULT_DAEMON_STATUS="skipped"
 else
-    if BRAIN_ROOT="$BRAIN_ROOT" PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-daemon >/dev/null 2>&1; then
+    # `>/dev/null 2>&1` alone leaves a bare "failed" in the summary with no
+    # way to find out why. Capture stderr to a log so the summary can point
+    # at it instead of making the user re-run --setup-daemon by hand.
+    daemon_install_log="$BRAIN_ROOT/runtime/logs/install-daemon.log"
+    mkdir -p "$BRAIN_ROOT/runtime/logs"
+    if BRAIN_ROOT="$BRAIN_ROOT" PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-daemon \
+            >/dev/null 2>"$daemon_install_log"; then
         DEFAULT_DAEMON_STATUS="done"
     else
         DEFAULT_DAEMON_STATUS="failed"
+        DEFAULT_DAEMON_LOG_TAIL="$(tail -n 1 "$daemon_install_log" 2>/dev/null)"
     fi
 fi
 
@@ -3410,7 +3449,8 @@ Defaults applied (skip on next install with the flag in parens):
 $SCHEDULER_SUMMARY
   $(_mark_for "$DEFAULT_RECALL_FIRST_STATUS") Recall-first directive: $DEFAULT_RECALL_FIRST_STATUS                                                   (--no-recall-first)
   $(_mark_for "$DEFAULT_AUTO_RECALL_STATUS") Claude Code auto-recall: $DEFAULT_AUTO_RECALL_STATUS                                                 (--no-auto-recall)
-  $(_mark_for "$DEFAULT_DAEMON_STATUS") Warm recall daemon: $DEFAULT_DAEMON_STATUS                                                      (--no-daemon)
+  $(_mark_for "$DEFAULT_DAEMON_STATUS") Warm recall daemon: $DEFAULT_DAEMON_STATUS                                                      (--no-daemon)${DEFAULT_DAEMON_LOG_TAIL:+
+      $DEFAULT_DAEMON_LOG_TAIL}
 
 Next: open Claude Code / Codex CLI / Cursor and ask a question.
       Your brain context will surface in their replies automatically.

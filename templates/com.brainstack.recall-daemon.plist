@@ -53,7 +53,7 @@
         <key>PYTHONUNBUFFERED</key>
         <string>1</string>
         <key>PATH</key>
-        <string>__REPO_DIR__/.venv/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>__HOME__/.local/bin:__REPO_DIR__/.venv/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     </dict>
 
     <key>KeepAlive</key>
