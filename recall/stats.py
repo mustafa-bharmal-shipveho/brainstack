@@ -20,6 +20,11 @@ from typing import Iterable
 
 from runtime.core.events import EventRecord, load_events
 
+# Cross-encoder score histogram bucket edges for `rerank_distribution`.
+# One constant so retuning against the observed score range (see
+# eval/RESULTS.md) is a one-line change rather than a code change.
+RERANK_BUCKET_EDGES: tuple[float, float, float, float] = (0.1, 0.3, 0.5, 0.7)
+
 
 @dataclass
 class StatsReport:
@@ -62,6 +67,37 @@ class StatsReport:
     # CHANGELOG entry on routing-coverage removal.
     mcp_calls: dict[str, int] = field(default_factory=dict)
     tool_calls_other: dict[str, int] = field(default_factory=dict)
+
+    # -----------------------------------------------------------------
+    # v1.2 telemetry-contract additions (scaffold only — see
+    # `_build_report`/`_build_legacy`, still on the pre-1.2 aggregator).
+    # Every field below defaults to a zero value so `asdict(StatsReport())`
+    # is a stable, complete schema even before the aggregator is updated
+    # to populate them.
+    # -----------------------------------------------------------------
+    miss_count: int = 0
+    dedup_count: int = 0
+    total_fires: int = 0
+    total_prompts: int = 0
+    coverage_pct: float = 0.0
+    miss_pct: float = 0.0
+    dedup_pct: float = 0.0
+    timeout_pct: float = 0.0
+    path_split: dict[str, int] = field(default_factory=dict)
+    daemon_error_count: int = 0
+    degraded_count: int = 0
+    index_stale_count: int = 0
+    index_stale_known: int = 0
+    query_p50_ms: int = 0
+    query_p95_ms: int = 0
+    k_candidates_total: int = 0
+    k_gated_out_total: int = 0
+    k_dedup_total: int = 0
+    repeat_injection_rate: float = 0.0
+    rerank_distribution: dict[str, int] = field(default_factory=dict)
+    # Pre-1.2 events summarized separately; never merged into the fields
+    # above. See `_build_legacy` for the expected key set.
+    legacy: dict = field(default_factory=dict)
 
 
 def aggregate_events(
@@ -146,6 +182,53 @@ def _build_report(events: list[EventRecord],
         window_end_ts_ms=max((e.ts_ms for e in events), default=None),
         other_outcomes=dict(other_outcomes),
     )
+
+
+def iter_auto_recall_records(log_path: Path | str) -> Iterable[dict]:
+    """Tolerant raw-JSON reader over `events.log.jsonl` + rotated siblings.
+
+    Replaces `runtime.core.events.load_events` for stats: that loader
+    rejects any line whose `schema_version` isn't the runtime's current
+    constant, so a log spanning a schema upgrade raises on the first line
+    written by the other version. This reader streams raw dicts (no
+    `EventRecord` construction), skips malformed lines, and also reads
+    `events.log*.jsonl` siblings in the same directory so a rotated log
+    doesn't silently drop out of the window.
+
+    Scaffold: signature + docstring only. See tests/recall/test_stats.py
+    ``TestRawReader`` for the pinned contract.
+    """
+    raise NotImplementedError("scaffold")
+
+
+def is_v12(rec: dict) -> bool:
+    """True when `rec` carries full v1.2 AutoRecall semantics.
+
+    A record can claim ``schema_version == "1.2"`` and still be pre-1.2 in
+    substance: a ``hit`` with no ``x_paths`` cannot be joined to a
+    transcript and may be a phantom, so it is classified legacy. A v1.2
+    ``miss``/``dedup``/etc. has no paths by definition and stays in the
+    1.2 population.
+
+    Scaffold: signature + docstring only. See
+    tests/recall/test_stats.py::TestRawReader::test_is_v12_predicate.
+    """
+    raise NotImplementedError("scaffold")
+
+
+def _bucket_rerank(score: float) -> str:
+    """Bucket a raw cross-encoder score at `RERANK_BUCKET_EDGES`."""
+    raise NotImplementedError("scaffold")
+
+
+def _build_legacy(records: list[dict]) -> dict:
+    """Summarize pre-1.2 (or 1.2-without-x_paths) records into the
+    `StatsReport.legacy` block. Keys: events, hit_logged, phantom_hits,
+    real_hits, skip, timeout, unavailable, error, query_p50_ms,
+    query_p95_ms, surfaced_count, top_sources. Never merged into the
+    1.2-population fields on `StatsReport`.
+    """
+    raise NotImplementedError("scaffold")
 
 
 def _percentile(values: Iterable[int], p: int) -> int:

@@ -48,3 +48,19 @@ PENDING_REVIEW.md
 # plugins, hotkeys, and graph state, all of which are machine-specific.
 # Syncing across machines would cause noisy conflicts.
 .obsidian/
+
+# S5: size-triggered rotation (agent/harness/hooks/_episodic_io.py,
+# agent/memory/_atomic.py, runtime/core/locking.py) renames an oversize
+# AGENT_LEARNINGS.jsonl / events.log.jsonl to a dated sibling instead of
+# letting it grow past GitHub's 100 MB blob limit. Rolled files and the
+# import sidecar are regenerable from source (the native tool's own
+# history / the current file's tail), so none of this needs to sync.
+memory/episodic/AGENT_LEARNINGS*.jsonl
+memory/episodic/**/AGENT_LEARNINGS*.jsonl
+memory/episodic/**/_imported.jsonl*
+*.preCodexFix.bak
+runtime/logs/*.jsonl
+runtime/logs/injected/
+runtime/health.json
+runtime/dream_status.json
+runtime/recall.sock

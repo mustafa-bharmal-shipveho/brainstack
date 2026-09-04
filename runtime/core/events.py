@@ -31,6 +31,21 @@ EVENT_LOG_SCHEMA_VERSION = "1.1"
 # 1.0 -> 1.1 added items_added: list[InjectionItemSnapshot] so replay can
 # reconstruct manifests deterministically without external state. Phase 3
 # Skeptic finding #2.
+#
+# 1.1 -> 1.2 (S2, in progress): AutoRecall telemetry contract v1.2 adds
+# x_path, x_daemon_error, x_index_stale, x_k_gated_out, x_k_dedup and
+# widens x_outcome with "dedup". The constant stays at "1.1" until that
+# extension semantics is actually wired (events.py:load_event rejects
+# anything not equal to EVENT_LOG_SCHEMA_VERSION today) — bumping it here
+# alone, before the writer catches up, would make every legacy line on the
+# live ~120k-line log fail to load. SUPPORTED_EVENT_SCHEMA_VERSIONS exists
+# so the loader can accept a SET once that day comes.
+SUPPORTED_EVENT_SCHEMA_VERSIONS = frozenset({"1.0", "1.1", "1.2"})
+
+# Rotation threshold shared with runtime/core/locking.py's locked_append
+# (rotate_bytes kwarg). 20 MiB matches the live events.log.jsonl size that
+# motivated S5's rotation work.
+EVENT_LOG_ROTATE_BYTES = 20 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -302,8 +317,26 @@ def load_events(log_path: Path | str) -> list[EventRecord]:
     return out
 
 
+def load_events_all(log_path: Path | str) -> list[EventRecord]:
+    """Read every event across the rolled history AND the current log.
+
+    `load_events` reads the current file only (reinjection's contract:
+    replay from the live log). This variant is for anything auditing
+    history across a rotation boundary (`recall stats`, the S5 stats
+    planner). Rolled files are read oldest-first via
+    `runtime.core.locking.iter_log_paths`, imported lazily so this module
+    doesn't take a hard dependency on the rotation helper landing first.
+
+    Scaffold: signature + docstring only. See
+    tests/runtime/test_events_rotation.py.
+    """
+    raise NotImplementedError("scaffold")
+
+
 __all__ = [
     "EVENT_LOG_SCHEMA_VERSION",
+    "SUPPORTED_EVENT_SCHEMA_VERSIONS",
+    "EVENT_LOG_ROTATE_BYTES",
     "EventRecord",
     "OutputSummary",
     "append_event",
@@ -311,5 +344,6 @@ __all__ = [
     "event_id_for",
     "load_event",
     "load_events",
+    "load_events_all",
     "summarize_output",
 ]

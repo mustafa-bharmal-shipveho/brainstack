@@ -11,9 +11,10 @@ reindex so the cache layout stays clean.
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 from recall import qdrant_backend as qb
 from recall.config import SourceConfig, cache_dir
@@ -83,6 +84,41 @@ def load_index(sources: Iterable[SourceConfig]) -> Optional[IndexCache]:
     for source in sources_list:
         all_docs.extend(discover_documents(source))
     return IndexCache(cache_dir=cache_dir(), documents=all_docs)
+
+
+@dataclass
+class RefreshResult:
+    """Outcome of one `refresh_index_chunked` pass (S3 daemon freshness)."""
+
+    changed: int
+    deleted: int
+    stale_before: bool
+    ms: int
+    per_source: dict[str, int] = field(default_factory=dict)
+
+
+def refresh_index_chunked(
+    sources: Iterable[SourceConfig],
+    *,
+    mode: str,
+    lock: "threading.Lock",
+    chunk_size: int = 4,
+    on_pending: "Callable[[bool], None] | None" = None,
+) -> RefreshResult:
+    """Daemon-owned index refresh: discovery outside the lock, upserts in
+    small chunks under it (S3).
+
+    Discovery and mtime comparison (the slow filesystem walk) run OUTSIDE
+    `lock` entirely. Embedding + upsert take `lock` in chunks of
+    `chunk_size` docs, so a concurrent query waits at most one chunk. The
+    stale-point delete takes `lock` once at the end. `on_pending(True)`
+    fires as soon as the pass knows there is work, before the first chunk
+    is upserted, so the daemon can report `index_stale` mid-pass.
+
+    Scaffold: signature + docstring only. See
+    tests/recall/test_index_refresh.py.
+    """
+    raise NotImplementedError("scaffold")
 
 
 def needs_refresh(sources: Iterable[SourceConfig]) -> bool:

@@ -289,6 +289,14 @@ def query(
         "--expand-n",
         help="Number of paraphrases to generate when --expand is on.",
     ),
+    no_daemon: bool = typer.Option(
+        False,
+        "--no-daemon",
+        help="Force the in-process retrieval path even if a `recall serve` "
+             "daemon is running (debugging, or a wedged daemon). This is "
+             "today's default behavior either way; daemon-first routing is "
+             "not wired up yet.",
+    ),
 ):
     """Search the brain for memories relevant to QUERY. Outputs JSON."""
     try:
@@ -372,6 +380,87 @@ def reindex():
         _exit_qdrant_store_error(exc)
     finally:
         close_client_cache()
+
+
+@app.command()
+def serve(
+    socket: Optional[Path] = typer.Option(
+        None, "--socket",
+        help="AF_UNIX socket path (default: recall.config.daemon_socket_path()).",
+    ),
+    rerank: bool = typer.Option(
+        True, "--rerank/--no-rerank",
+        help="Load the cross-encoder reranker in the daemon process.",
+    ),
+    idle_timeout_s: float = typer.Option(
+        0.0, "--idle-timeout-s",
+        help="Exit after this many idle seconds with no requests (0 = never).",
+    ),
+    refresh_interval_s: float = typer.Option(
+        300.0, "--refresh-interval-s",
+        help="Background index-freshness pass interval, in seconds.",
+    ),
+    status: bool = typer.Option(
+        False, "--status",
+        help="Scriptable probe: print daemon status and exit 0 if running, "
+             "1 if not (does not start a daemon).",
+    ),
+    stop: bool = typer.Option(
+        False, "--stop",
+        help="Shut down a running daemon and exit (does not start one).",
+    ),
+    json_out: bool = typer.Option(
+        False, "--json",
+        help="With --status, emit the status payload as JSON.",
+    ),
+):
+    """Run the warm retrieval daemon: one long-lived `HybridRetriever`
+    (reranker pre-loaded) serving NDJSON requests over an AF_UNIX socket,
+    so `recall query`/the auto-recall hook skip the cold-start + Qdrant
+    store-lock cost on every call.
+
+    While a daemon owns the store, anything that opens it directly (a
+    second `recall serve`, a bare `recall query` without daemon routing)
+    gets "index is busy" — `recall query` routes through the socket
+    instead of racing it (S3); `--no-daemon` on `query` is the escape
+    hatch.
+    """
+    import json as _json
+
+    from recall import daemon_client
+    from recall.config import daemon_socket_path
+
+    sock = socket or daemon_socket_path()
+
+    if status:
+        result = daemon_client.status(sock)
+        if result is None:
+            typer.echo(f"recall serve: not running at {sock}")
+            raise typer.Exit(code=1)
+        if json_out:
+            typer.echo(_json.dumps(result, indent=2))
+        else:
+            typer.echo(f"recall serve: running (pid {result.get('pid')}) at {sock}")
+        return
+
+    if stop:
+        ok = daemon_client.shutdown(sock)
+        if ok:
+            typer.echo(f"recall serve: stopped daemon at {sock}")
+        else:
+            typer.echo(f"recall serve: no daemon running at {sock}", err=True)
+            raise typer.Exit(code=1)
+        return
+
+    from recall.daemon import run_daemon
+
+    exit_code = run_daemon(
+        socket_path=sock,
+        rerank=rerank,
+        idle_timeout_s=idle_timeout_s,
+        refresh_interval_s=refresh_interval_s,
+    )
+    raise typer.Exit(code=exit_code or 0)
 
 
 @app.command("eval")
@@ -483,6 +572,26 @@ def lint(
         None, "--brain",
         help="Memory root to lint (default: resolved brain memory dir).",
     ),
+    fix_digests: bool = typer.Option(
+        False, "--fix-digests",
+        help="Backfill missing name/description/type frontmatter keys onto "
+             "session digests (memory/semantic/digests/*.md). Splices into "
+             "the existing frontmatter block; never rewrites the body. "
+             "Dry-run by default; add --apply to write.",
+    ),
+    dedupe_claims: bool = typer.Option(
+        False, "--dedupe-claims",
+        help="Archive duplicate/stub claims (memory/semantic/claims/*.md) to "
+             "semantic/archived/ and retract them in claim_overrides.jsonl so "
+             "the next consolidation doesn't recreate them. Dry-run by "
+             "default; add --apply to write.",
+    ),
+    stub_min_chars: int = typer.Option(
+        0, "--stub-min-chars",
+        help="With --dedupe-claims, also flag claim bodies shorter than N "
+             "chars as stubs. Off (0) by default: claims are one-liners by "
+             "construction, so length alone is not a content-free signal.",
+    ),
 ):
     """Find stale or broken memories (deterministic, offline, high-precision).
 
@@ -575,6 +684,73 @@ def lint(
                     f"couldn't fix automatically — review by hand.", err=True,
                 )
 
+    # --fix-digests / --dedupe-claims: independent surfaces from the
+    # dead-path/wikilink checks above. Both dry-run by default (--apply
+    # required to write); both print their own manifest instead of the
+    # findings list above when --json is set.
+    pending_digest_fixes: list = []
+    if fix_digests:
+        from recall.lint_digests import (
+            apply_digest_fixes,
+            plan_digest_fixes,
+            render_digest_manifest,
+        )
+
+        fixes = plan_digest_fixes(brain_root)
+        applied_digests = apply_digest_fixes(fixes, dry_run=False) if apply else None
+        if json_out:
+            typer.echo(_json.dumps(
+                [
+                    {
+                        "file": str(f.file),
+                        "missing": list(f.missing),
+                        "proposed": f.proposed,
+                        "skipped_reason": f.skipped_reason,
+                    }
+                    for f in fixes
+                ],
+                indent=2,
+            ))
+        else:
+            typer.echo(render_digest_manifest(fixes, brain_root, applied=applied_digests))
+        pending_digest_fixes = (
+            plan_digest_fixes(brain_root) if apply else fixes
+        )
+
+    pending_claim_actions: list = []
+    if dedupe_claims:
+        from recall.lint_claims import (
+            apply_claim_dedupe,
+            plan_claim_dedupe,
+            render_claim_manifest,
+        )
+
+        actions = plan_claim_dedupe(brain_root, stub_min_chars=stub_min_chars)
+        applied_claims = (
+            apply_claim_dedupe(actions, brain_root, dry_run=False) if apply else None
+        )
+        if json_out:
+            typer.echo(_json.dumps(
+                [
+                    {
+                        "file": str(a.file),
+                        "claim_id": a.claim_id,
+                        "source_event_id": a.source_event_id,
+                        "reason": a.reason,
+                        "keep": str(a.keep) if a.keep else None,
+                        "detail": a.detail,
+                    }
+                    for a in actions
+                ],
+                indent=2,
+            ))
+        else:
+            typer.echo(render_claim_manifest(actions, brain_root, applied=applied_claims))
+        pending_claim_actions = (
+            plan_claim_dedupe(brain_root, stub_min_chars=stub_min_chars)
+            if apply else actions
+        )
+
     if mark:
         # Reconcile flags against the FULL check suite, independent of the
         # --stale display filter: needs_review is a single per-file boolean
@@ -603,7 +779,8 @@ def lint(
     # clean, so re-scan rather than trust the pre-repair snapshot (otherwise a
     # CI `recall lint --repair` that fixes everything would still fail).
     residual = lint_brain(brain_root, kinds=kinds) if repair else findings
-    if residual:
+    residual_digest_proposals = any(f.proposed for f in pending_digest_fixes)
+    if residual or residual_digest_proposals or pending_claim_actions:
         raise typer.Exit(code=1)
 
 
@@ -925,8 +1102,85 @@ def _check_secret_scanner(brain: Path, notes: list[str], issues: list[str]) -> N
         )
 
 
+def _check_daemon(notes: list[str]) -> None:
+    """Doctor sub-check: note whether the `recall serve` daemon is
+    running. The daemon is a soft dependency (S3) — never let a probe
+    failure (module not yet available, socket error, etc.) break the
+    rest of doctor's report."""
+    try:
+        from recall import daemon_client
+        from recall.config import daemon_socket_path
+
+        sock = daemon_socket_path()
+        result = daemon_client.status(sock)
+    except Exception:
+        return
+    if result is None:
+        notes.append(
+            f"Daemon: not running at {sock} — hooks use the slow in-process "
+            "path; ./install.sh --setup-daemon"
+        )
+        return
+    pid = result.get("pid")
+    uptime_m = int((result.get("uptime_s") or 0) // 60)
+    queries = result.get("queries_served")
+    rerank = "on" if result.get("rerank") else "off"
+    notes.append(
+        f"Daemon: running (pid {pid}, up {uptime_m}m, {queries} queries, "
+        f"rerank {rerank})"
+    )
+
+
 @app.command()
-def doctor():
+def health(
+    json_out: bool = typer.Option(
+        False, "--json",
+        help="Emit the health report as JSON instead of the human-readable view.",
+    ),
+    brain_root: Optional[Path] = typer.Option(
+        None, "--brain-root",
+        help="Brain root to check (default: $BRAIN_ROOT or resolve_brain_home()).",
+    ),
+    cwd: Optional[Path] = typer.Option(
+        None, "--cwd",
+        help="Directory to resolve the auto-recall config from (default: os.getcwd()).",
+    ),
+    write: Optional[Path] = typer.Option(
+        None, "--write",
+        help="Also write the JSON report to this path (e.g. runtime/health.json).",
+    ),
+):
+    """Run the brainstack health-check catalogue (drift, sync, log sizes,
+    dream freshness, launch agents, daemon, auto-recall config, ...).
+
+    Exit code is 1 when the overall status is FAIL, 0 for PASS/WARN/SKIP —
+    a WARN is information, not a failure, so an hourly LaunchAgent running
+    this doesn't record a spurious non-zero exit.
+    """
+    import json as _json
+
+    from recall import health as _health
+
+    env = _health.build_env(brain_root=brain_root, cwd=cwd)
+    report = _health.run_health(env)
+    if write is not None:
+        _health.write_report(report, write)
+    if json_out:
+        typer.echo(_json.dumps(report.to_dict(), indent=2))
+    else:
+        typer.echo(report.render_human())
+    if report.status == "FAIL":
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def doctor(
+    health: bool = typer.Option(
+        False, "--health",
+        help="Append the `recall health` report and factor a FAIL into "
+             "doctor's exit code (alias for users who only remember `doctor`).",
+    ),
+):
     """Diagnose configuration and dependency issues."""
     import tempfile
 
@@ -1032,6 +1286,7 @@ def doctor():
     # Hook interpreter + secret scanner deep checks.
     _check_hook_interpreters(notes, issues)
     _check_secret_scanner(brain, notes, issues)
+    _check_daemon(notes)
 
     if importlib.util.find_spec("mcp") is None:
         notes.append("mcp: not installed (recall-mcp unavailable)")
@@ -1045,8 +1300,22 @@ def doctor():
         typer.echo("\nIssues:")
         for i in issues:
             typer.echo(f"  ! {i}")
+    else:
+        typer.echo("\nNo issues detected.")
+
+    # `--health`: append the `recall health` report. A health FAIL alone
+    # is enough to exit 1, independent of doctor's own issues above.
+    health_failed = False
+    if health:
+        from recall import health as _health
+
+        health_report = _health.run_health(_health.build_env())
+        typer.echo("")
+        typer.echo(health_report.render_human())
+        health_failed = health_report.status == "FAIL"
+
+    if issues or health_failed:
         raise typer.Exit(code=1)
-    typer.echo("\nNo issues detected.")
 
 
 def _staged_remember_lessons(brain_root: Path) -> list[Path]:
@@ -1264,6 +1533,26 @@ def stats(
         None, "--transcripts-dir",
         help="Override Claude Code transcripts root (default: ~/.claude/projects).",
     ),
+    utilization: bool = typer.Option(
+        False, "--utilization",
+        help="Join schema-1.2 AutoRecall hits to their Claude Code transcripts: "
+             "were the injected docs actually opened? Replaces the base report "
+             "(rather than appending to it) and writes an LLM-judge sample.",
+    ),
+    sample_out: Optional[Path] = typer.Option(
+        None, "--sample-out",
+        help="Where to write the --utilization LLM-judge sample JSON "
+             "(default: <log_dir>/utilization_sample.json).",
+    ),
+    sample_n: int = typer.Option(
+        24, "--sample-n",
+        help="Max cases to write to the --utilization LLM-judge sample.",
+    ),
+    brain_root: Optional[Path] = typer.Option(
+        None, "--brain-root",
+        help="Brain root for --utilization path normalization "
+             "(default: $BRAIN_ROOT or ~/.agent).",
+    ),
 ):
     """Auto-recall ROI + cross-source visibility.
 
@@ -1294,6 +1583,35 @@ def stats(
 
     runtime_cfg = RuntimeConfig.load()
     log_path = runtime_cfg.event_log_path
+
+    if utilization:
+        from recall.utilization import compute_utilization, render_utilization
+
+        try:
+            util_since_ts_ms = parse_since(since or "14d")
+        except ValueError as e:
+            typer.echo(f"recall stats: {e}", err=True)
+            raise typer.Exit(code=2)
+        td = transcripts_dir or (Path.home() / ".claude" / "projects")
+        effective_brain_root = brain_root or Path(
+            os.environ.get("BRAIN_ROOT", str(Path.home() / ".agent"))
+        )
+        effective_sample_out = sample_out or (log_path.parent / "utilization_sample.json")
+        util_report = compute_utilization(
+            log_path, td,
+            brain_root=effective_brain_root,
+            since_ts_ms=util_since_ts_ms,
+            sample_n=sample_n,
+            sample_out=effective_sample_out,
+        )
+        if json_out:
+            from dataclasses import asdict
+            data = asdict(util_report)
+            data["used_docs_top"] = [list(t) for t in data["used_docs_top"]]
+            typer.echo(_json.dumps(data, indent=2))
+        else:
+            typer.echo(render_utilization(util_report))
+        return
 
     if session_current:
         since_ts_ms = _session_current_ts_ms(log_path) if log_path.exists() else None

@@ -312,6 +312,33 @@ def resolve_brain_home() -> Path:
     return xdg_data_home() / "brain"
 
 
+def daemon_socket_path(raw: "str | None" = None) -> Path:
+    """Resolve the warm recall daemon's AF_UNIX socket path (S3).
+
+    Single resolution order shared by the hook, the CLI, and the daemon
+    itself: `$RECALL_DAEMON_SOCKET` env override > `raw` (config literal,
+    with `$BRAIN_ROOT`/`~` expansion) > `$BRAIN_ROOT/runtime/recall.sock` >
+    `$BRAIN_HOME`'s parent > `~/.agent/runtime/recall.sock`.
+
+    Scaffold: signature + docstring only. See
+    tests/runtime/test_runtime_config.py::TestDaemonSocketPathResolution.
+    """
+    raise NotImplementedError("scaffold")
+
+
+def brain_root() -> Path:
+    """Resolve the brain's root directory (parent of the `memory/` tree).
+
+    `$BRAIN_ROOT` if set; else the parent of `resolve_brain_home()` when
+    that resolves to a `memory` directory; else `resolve_brain_home()`
+    itself.
+
+    Scaffold: signature + docstring only. See
+    tests/runtime/test_runtime_config.py::TestBrainRootResolution.
+    """
+    raise NotImplementedError("scaffold")
+
+
 def config_path() -> Path:
     return xdg_config_home() / "recall" / "config.json"
 

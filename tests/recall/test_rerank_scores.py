@@ -1,0 +1,210 @@
+"""Red-phase tests (S4): RRF score and rerank score travel side by side.
+
+Planned contract (not implemented yet):
+
+  - `QueryResult` gains `rerank_score: float | None = None`, declared AFTER
+    `score` so `QueryResult(doc, 0.4, 0.9)` stays valid positionally. Today
+    `query_hybrid_rerank` REPLACES `score` with the cross-encoder score; the
+    S4 relevance gate needs both — the cheap RRF `score` as a pre-filter and
+    the cross-encoder `rerank_score` as the decision.
+  - `apply_review_policy(..., "demote", penalty)` scales BOTH `score` and
+    `rerank_score` (when present) and re-sorts by the rerank score when the
+    results carry one, falling back to `score` when they don't.
+  - `serialize_results` ALWAYS emits a `rerank_score` key: `null` when the
+    result has none, a 6-dp rounded float otherwise. The daemon wire format
+    and the CLI JSON are pinned to that shape.
+  - `qdrant_backend.dense_fallback_active() -> bool` exposes the
+    once-per-process sparse-fallback flag so the hook can report
+    `x_degraded` honestly.
+
+Hermetic: no embedder, no cross-encoder, no Qdrant client, no disk reads.
+Every synthetic Document carries non-empty frontmatter so
+`_is_needs_review` never falls back to reading the (nonexistent) file.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from recall import qdrant_backend
+from recall.core import Document, QueryResult, apply_review_policy
+from recall.serialize import serialize_results
+
+
+def _doc(name: str, *, needs_review: bool | None = None) -> Document:
+    fm: dict = {
+        "name": name,
+        "description": f"synthetic description for {name}",
+        "type": "reference",
+    }
+    if needs_review is not None:
+        fm["needs_review"] = needs_review
+    return Document(
+        path=f"/synth/brain/{name}.md",
+        source="brain",
+        title=name,
+        frontmatter=fm,
+        body=f"body of {name}",
+        text=f"{name} body of {name}",
+    )
+
+
+def _qr(
+    name: str,
+    score: float,
+    rerank_score: float | None = None,
+    *,
+    needs_review: bool | None = None,
+) -> QueryResult:
+    return QueryResult(
+        document=_doc(name, needs_review=needs_review),
+        score=score,
+        rerank_score=rerank_score,
+    )
+
+
+def _names(results: list[QueryResult]) -> list[str]:
+    return [r.document.frontmatter["name"] for r in results]
+
+
+class TestQueryResultRerankScore:
+    def test_default_rerank_score_is_none(self):
+        # Every existing caller constructs QueryResult(document=, score=)
+        # only; they must keep working and report "no rerank score".
+        r = QueryResult(document=_doc("a"), score=0.42)
+        assert r.rerank_score is None
+
+    def test_rerank_score_is_third_positional_field(self):
+        # Field ORDER is part of the contract: qdrant_backend builds these
+        # in tight loops and the daemon wire projection reads them by name,
+        # but tests and adapters construct them positionally.
+        r = QueryResult(_doc("a"), 0.4, 0.9)
+        assert r.score == pytest.approx(0.4)
+        assert r.rerank_score == pytest.approx(0.9)
+
+    def test_rerank_score_accepts_none_explicitly(self):
+        r = QueryResult(document=_doc("a"), score=0.4, rerank_score=None)
+        assert r.rerank_score is None
+
+
+class TestReviewPolicySortsByRerankScore:
+    def test_sorts_by_rerank_score_desc_when_present(self):
+        # RRF order (c, b, a) disagrees with rerank order (a, b, c). The
+        # reranker wins: it is the more accurate signal and the one the gate
+        # thresholds on.
+        results = [
+            _qr("c", score=0.9, rerank_score=0.1),
+            _qr("b", score=0.5, rerank_score=0.5),
+            _qr("a", score=0.1, rerank_score=0.9),
+        ]
+        out = apply_review_policy(results, "demote", 0.5)
+        assert _names(out) == ["a", "b", "c"]
+
+    def test_falls_back_to_rrf_score_when_no_rerank_scores(self):
+        # In-process / reranker="none" path: today's behaviour unchanged.
+        results = [
+            _qr("low", score=0.1),
+            _qr("high", score=0.9),
+            _qr("mid", score=0.5),
+        ]
+        out = apply_review_policy(results, "demote", 0.5)
+        assert _names(out) == ["high", "mid", "low"]
+
+    def test_ties_break_on_document_path(self):
+        results = [
+            _qr("zulu", score=0.5, rerank_score=0.7),
+            _qr("alpha", score=0.5, rerank_score=0.7),
+        ]
+        out = apply_review_policy(results, "demote", 0.5)
+        assert _names(out) == ["alpha", "zulu"]
+
+
+class TestReviewPolicyDemoteScalesBothScores:
+    def test_demote_scales_score_and_rerank_score(self):
+        flagged = _qr("stale", score=0.8, rerank_score=0.9, needs_review=True)
+        fresh = _qr("fresh", score=0.4, rerank_score=0.5)
+        out = apply_review_policy([flagged, fresh], "demote", 0.5)
+
+        demoted = next(r for r in out if r.document.frontmatter["name"] == "stale")
+        kept = next(r for r in out if r.document.frontmatter["name"] == "fresh")
+
+        assert demoted.score == pytest.approx(0.4)
+        assert demoted.rerank_score == pytest.approx(0.45)
+        # Untouched result keeps both scores exactly.
+        assert kept.score == pytest.approx(0.4)
+        assert kept.rerank_score == pytest.approx(0.5)
+        # 0.45 < 0.5, so the penalty actually reorders the pair.
+        assert _names(out) == ["fresh", "stale"]
+
+    def test_demote_leaves_missing_rerank_score_as_none(self):
+        flagged = _qr("stale", score=0.8, needs_review=True)
+        out = apply_review_policy([flagged], "demote", 0.5)
+        assert out[0].score == pytest.approx(0.4)
+        assert out[0].rerank_score is None
+
+    def test_exclude_policy_drops_flagged_and_preserves_rerank_score(self):
+        flagged = _qr("stale", score=0.8, rerank_score=0.9, needs_review=True)
+        fresh = _qr("fresh", score=0.4, rerank_score=0.5)
+        out = apply_review_policy([flagged, fresh], "exclude", 0.5)
+        assert _names(out) == ["fresh"]
+        assert out[0].rerank_score == pytest.approx(0.5)
+
+    def test_ignore_policy_returns_input_unchanged(self):
+        results = [
+            _qr("c", score=0.9, rerank_score=0.1),
+            _qr("a", score=0.1, rerank_score=0.9),
+        ]
+        out = apply_review_policy(results, "ignore", 0.5)
+        assert out == results
+
+
+class TestSerializeRerankScore:
+    def test_rerank_score_key_is_null_when_absent(self):
+        out = serialize_results([_qr("a", score=0.5)])
+        assert len(out) == 1
+        assert "rerank_score" in out[0], "key must always be present"
+        assert out[0]["rerank_score"] is None
+
+    def test_rerank_score_rounded_to_six_decimals(self):
+        out = serialize_results([_qr("a", score=0.5, rerank_score=0.1234567891)])
+        assert out[0]["rerank_score"] == pytest.approx(0.123457)
+
+    def test_rrf_score_still_serialized_alongside(self):
+        out = serialize_results([_qr("a", score=0.0328123456, rerank_score=0.9)])
+        assert out[0]["score"] == pytest.approx(0.032812)
+        assert out[0]["rerank_score"] == pytest.approx(0.9)
+        # Existing keys are untouched.
+        assert out[0]["path"] == "/synth/brain/a.md"
+        assert out[0]["source"] == "brain"
+
+    def test_zero_rerank_score_is_not_confused_with_none(self):
+        out = serialize_results([_qr("a", score=0.5, rerank_score=0.0)])
+        assert out[0]["rerank_score"] == 0.0
+        assert out[0]["rerank_score"] is not None
+
+
+class TestDenseFallbackActive:
+    """`dense_fallback_active()` mirrors the once-per-process warn flag.
+
+    The flag is module-global, so it is cleared before AND after each test
+    here — otherwise a set flag leaks into every later test in the session
+    (and a fallback triggered by an earlier test would leak into this one).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_flag(self):
+        qdrant_backend._SPARSE_FALLBACK_WARN_ONCE.clear()
+        yield
+        qdrant_backend._SPARSE_FALLBACK_WARN_ONCE.clear()
+
+    def test_false_by_default(self):
+        assert qdrant_backend.dense_fallback_active() is False
+
+    def test_true_after_sparse_fallback_warned(self):
+        qdrant_backend._SPARSE_FALLBACK_WARN_ONCE.set()
+        assert qdrant_backend.dense_fallback_active() is True
+
+    def test_reset_hook_clears_it_again(self):
+        qdrant_backend._SPARSE_FALLBACK_WARN_ONCE.set()
+        qdrant_backend._reset_sparse_fallback_warning_for_tests()
+        assert qdrant_backend.dense_fallback_active() is False

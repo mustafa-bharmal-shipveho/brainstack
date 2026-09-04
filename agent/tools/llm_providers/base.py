@@ -22,6 +22,30 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from pathlib import Path
+
+# S5 requirement 6: launchd/systemd jobs run with a minimal PATH that
+# omits `~/.local/bin`, `~/.claude/local`, nvm, etc. — where `claude` /
+# `codex` are actually installed on many machines. `find_cli` searches
+# these directories (in order) after `shutil.which` comes up empty.
+FALLBACK_BIN_DIRS = (
+    "~/.local/bin", "~/.claude/local", "/opt/homebrew/bin",
+    "/usr/local/bin", "~/.npm-global/bin", "~/.bun/bin",
+)
+
+
+def nvm_bin_dirs(home: Path) -> list[str]:
+    """`~/.nvm/versions/node/v*/bin`, newest version first (parsed
+    version tuple, not string sort). Scaffold: signature only. See
+    tests/test_provider_fallback_paths.py."""
+    raise NotImplementedError("scaffold")
+
+
+def find_cli(name: str, *, home: Path | None = None) -> tuple[str | None, list[str]]:
+    """Resolve `name` to an absolute path: `shutil.which` first, then
+    `FALLBACK_BIN_DIRS`, then `nvm_bin_dirs`. Returns
+    `(path_or_None, dirs_searched)`. Scaffold: signature only."""
+    raise NotImplementedError("scaffold")
 
 
 class LLMError(Exception):

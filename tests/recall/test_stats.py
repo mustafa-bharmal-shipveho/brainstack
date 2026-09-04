@@ -1,47 +1,111 @@
 """Tests for `recall stats` and the underlying aggregator.
 
-The aggregator reads `events.log.jsonl` (written by the auto-recall hook),
-filters AutoRecall events, and computes a StatsReport. The CLI command
-`recall stats` renders the report; `--since 7d`, `--session-current`
-narrow the window.
+The aggregator reads RAW JSON lines from `events.log.jsonl` (written by
+the auto-recall hook) and from its rotated siblings `events.log*.jsonl`
+in the same directory, filters AutoRecall records, and computes a
+`StatsReport`. It deliberately does NOT go through
+`runtime.core.events.load_events`: that loader rejects any record whose
+`schema_version` differs from the runtime's current constant, so a log
+spanning the 1.1 -> 1.2 hook upgrade raises on the first line written by
+the other version. The live log is 70 MB of mixed versions.
 
-Telemetry shape comes from auto_recall.build_recall_block:
-    x_outcome: hit | skip | timeout | unavailable | error
-    x_skip_reason: too_short | slash | ack       (only when outcome=skip)
-    x_latency_ms: int                            (only when fired)
-    x_k_requested: int
-    x_k_returned: int
-    x_top_scores: list[float] (rounded to 2dp, max 3)
-    x_sources: dict[name -> count]
+Telemetry contract v1.2 (see the hook plan, "Telemetry contract v1.2"):
+
+    x_outcome      hit | miss | dedup | skip | timeout | unavailable | error
+    x_skip_reason  too_short | slash | ack        (skip only)
+    x_latency_ms   full worker wall, on EVERY non-skip outcome (incl. timeout)
+    x_query_ms     retrieval-only wall
+    x_path         daemon | inproc
+    x_daemon_error str | null            x_degraded  bool
+    x_index_stale  bool — daemon hit/miss/dedup ONLY; absent = unknown
+    x_k_requested / x_k_candidates / x_k_gated_out / x_k_dedup / x_k_returned
+    x_paths        injected doc paths, brain-relative (+ x_paths_truncated)
+    x_top_scores   RRF scores           x_rerank_scores  cross-encoder scores
+    x_sources      per-source counts of injected docs
+
+Records written before v1.2 — or that claim 1.2 but log a `hit` with no
+`x_paths` — carry the OLD semantics, where "hit" could mean zero docs
+were actually injected (a phantom hit). Those are summarized in a
+separate `legacy` block and are NEVER mixed into the 1.2 numbers.
 """
 from __future__ import annotations
 
+import datetime
 import json
 import time
 from pathlib import Path
 
 import pytest
 
-from runtime.core.events import EVENT_LOG_SCHEMA_VERSION, EventRecord, append_event
-
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+class _Omit:
+    """Sentinel: pass `x_paths=OMIT` to leave the key out of the record."""
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "OMIT"
+
+
+OMIT = _Omit()
+
+
+def _write_raw(log_path: Path, record: dict) -> dict:
+    """Append one RAW JSON line. No schema validation, no EventRecord.
+
+    The aggregator has to survive whatever is already on disk, so the
+    tests write bytes the same way the hook does rather than going
+    through the strict dump/load pair.
+    """
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, sort_keys=True) + "\n")
+    return record
+
+
 def _write_event(log_path: Path, *, event: str = "AutoRecall",
                  ts_ms: int | None = None, session_id: str = "s",
-                 **extensions) -> None:
-    """Helper: append one event to the log with given extension fields."""
-    record = EventRecord(
-        schema_version=EVENT_LOG_SCHEMA_VERSION,
-        ts_ms=ts_ms if ts_ms is not None else _now_ms(),
-        event=event,
-        session_id=session_id,
-        turn=0,
-        extensions={k: v for k, v in extensions.items() if k.startswith("x_")},
-    )
-    append_event(log_path, record)
+                 turn: int = 0, schema_version: str = "1.2",
+                 **extensions) -> dict:
+    """Append one AutoRecall event. Defaults to the v1.2 contract.
+
+    Extension keys are flattened to the top level of the record, exactly
+    as `runtime.core.events._event_to_dict` writes them. For 1.2 hits we
+    auto-fill `x_paths` (a 1.2 hit without paths is legacy by
+    definition) and `x_path="daemon"` for every non-skip outcome.
+    """
+    ext = {k: v for k, v in extensions.items() if k.startswith("x_")}
+    omitted = {k for k, v in ext.items() if isinstance(v, _Omit)}
+    for key in omitted:
+        ext.pop(key)
+    outcome = ext.get("x_outcome")
+    if schema_version == "1.2" and event == "AutoRecall":
+        if outcome == "hit" and "x_paths" not in ext and "x_paths" not in omitted:
+            k_returned = int(ext.get("x_k_returned", 1) or 1)
+            ext["x_paths"] = [f"memory/d{i}.md" for i in range(k_returned)]
+            ext.setdefault("x_paths_truncated", False)
+        if (outcome not in (None, "skip") and "x_path" not in ext
+                and "x_path" not in omitted):
+            ext["x_path"] = "daemon"
+    record = {
+        "schema_version": schema_version,
+        "ts_ms": ts_ms if ts_ms is not None else _now_ms(),
+        "event": event,
+        "session_id": session_id,
+        "turn": turn,
+    }
+    record.update(ext)
+    return _write_raw(log_path, record)
+
+
+def _v12(log_path: Path, **fields) -> dict:
+    return _write_event(log_path, schema_version="1.2", **fields)
+
+
+def _v11(log_path: Path, **fields) -> dict:
+    return _write_event(log_path, schema_version="1.1", **fields)
 
 
 class TestAggregateEvents:
@@ -55,21 +119,25 @@ class TestAggregateEvents:
         assert report.surfaced_count == 0
         assert report.skip_reasons == {}
         assert report.top_sources == []
+        assert report.total_fires == 0
+        assert report.total_prompts == 0
+        assert report.coverage_pct == 0.0
+        assert int(report.legacy.get("events", 0)) == 0
 
     def test_basic_aggregation_counts_hits_and_skips(self, tmp_path: Path):
         from recall.stats import aggregate_events
         log = tmp_path / "events.log.jsonl"
         # 3 hits, 2 skips
         for i in range(3):
-            _write_event(
+            _v12(
                 log, x_outcome="hit", x_k_requested=5, x_k_returned=4,
                 x_latency_ms=20 + i, x_top_scores=[0.8, 0.7, 0.6],
                 x_sources={"brain": 2, "imports": 2},
             )
-        _write_event(log, x_outcome="skip", x_skip_reason="too_short")
-        _write_event(log, x_outcome="skip", x_skip_reason="ack")
+        _v12(log, x_outcome="skip", x_skip_reason="too_short")
+        _v12(log, x_outcome="skip", x_skip_reason="ack")
         # Plus an unrelated UserPromptSubmit event — must not be counted
-        _write_event(log, event="UserPromptSubmit")
+        _v12(log, event="UserPromptSubmit")
 
         report = aggregate_events(log)
         assert report.fired_count == 3
@@ -77,13 +145,17 @@ class TestAggregateEvents:
         assert report.surfaced_count == 12  # 3 hits * 4 returned
         assert report.skip_reasons == {"too_short": 1, "ack": 1}
         assert dict(report.top_sources) == {"brain": 6, "imports": 6}
+        # Retrieval was attempted 3 times; 5 prompts reached the hook.
+        assert report.total_fires == 3
+        assert report.total_prompts == 5
+        assert report.coverage_pct == pytest.approx(100.0)
 
     def test_latency_percentiles(self, tmp_path: Path):
         from recall.stats import aggregate_events
         log = tmp_path / "events.log.jsonl"
         # Latencies 10, 20, 30, ... 100 → p50=55ms-ish, p95~95ms
         for i in range(10):
-            _write_event(
+            _v12(
                 log, x_outcome="hit", x_k_requested=5, x_k_returned=1,
                 x_latency_ms=(i + 1) * 10, x_top_scores=[0.8],
                 x_sources={"brain": 1},
@@ -98,12 +170,12 @@ class TestAggregateEvents:
         log = tmp_path / "events.log.jsonl"
         old = _now_ms() - 10 * 24 * 60 * 60 * 1000  # 10 days ago
         recent = _now_ms() - 60 * 60 * 1000          # 1 hour ago
-        _write_event(log, ts_ms=old, x_outcome="hit", x_k_requested=5,
-                     x_k_returned=3, x_latency_ms=20, x_top_scores=[0.7],
-                     x_sources={"brain": 3})
-        _write_event(log, ts_ms=recent, x_outcome="hit", x_k_requested=5,
-                     x_k_returned=2, x_latency_ms=15, x_top_scores=[0.8],
-                     x_sources={"imports": 2})
+        _v12(log, ts_ms=old, x_outcome="hit", x_k_requested=5,
+             x_k_returned=3, x_latency_ms=20, x_top_scores=[0.7],
+             x_sources={"brain": 3})
+        _v12(log, ts_ms=recent, x_outcome="hit", x_k_requested=5,
+             x_k_returned=2, x_latency_ms=15, x_top_scores=[0.8],
+             x_sources={"imports": 2})
         # 7d window should include only the recent event
         seven_days_ago = _now_ms() - 7 * 24 * 60 * 60 * 1000
         report = aggregate_events(log, since_ts_ms=seven_days_ago)
@@ -116,14 +188,399 @@ class TestAggregateEvents:
         # imports gets 7 hits, brain gets 3, personal gets 1
         for sources, n in [({"imports": 1}, 7), ({"brain": 1}, 3), ({"personal": 1}, 1)]:
             for _ in range(n):
-                _write_event(log, x_outcome="hit", x_k_requested=5,
-                             x_k_returned=1, x_latency_ms=10,
-                             x_top_scores=[0.9], x_sources=sources)
+                _v12(log, x_outcome="hit", x_k_requested=5,
+                     x_k_returned=1, x_latency_ms=10,
+                     x_top_scores=[0.9], x_sources=sources)
         report = aggregate_events(log)
         # First entry must be the most frequent source
         assert report.top_sources[0] == ("imports", 7)
         # Order: imports > brain > personal
         assert [s for s, _ in report.top_sources] == ["imports", "brain", "personal"]
+
+    # ---- v1.2 outcome classification -----------------------------------
+
+    def test_v12_outcomes_split_hit_miss_dedup_timeout(self, tmp_path: Path):
+        """Every 1.2 outcome lands in its own counter, and the two
+        denominators are distinct: `total_fires` counts prompts where
+        retrieval actually ran, `total_prompts` adds the skips."""
+        from recall.stats import aggregate_events
+        log = tmp_path / "events.log.jsonl"
+        for _ in range(2):
+            _v12(log, x_outcome="hit", x_k_returned=2)
+        for _ in range(3):
+            _v12(log, x_outcome="miss", x_k_candidates=4, x_k_gated_out=4)
+        _v12(log, x_outcome="dedup", x_k_dedup=3)
+        _v12(log, x_outcome="timeout")
+        _v12(log, x_outcome="unavailable")
+        _v12(log, x_outcome="error")
+        _v12(log, x_outcome="skip", x_skip_reason="too_short")
+        _v12(log, x_outcome="skip", x_skip_reason="slash")
+
+        report = aggregate_events(log)
+        assert report.fired_count == 2
+        assert report.miss_count == 3
+        assert report.dedup_count == 1
+        assert report.other_outcomes == {"timeout": 1, "unavailable": 1, "error": 1}
+        assert report.skipped_count == 2
+        assert report.skip_reasons == {"too_short": 1, "slash": 1}
+        # hit + miss + dedup + timeout + unavailable + error
+        assert report.total_fires == 9
+        assert report.total_prompts == 11
+        assert report.coverage_pct == pytest.approx(100 * 2 / 9)
+        assert report.miss_pct == pytest.approx(100 * 3 / 9)
+        assert report.dedup_pct == pytest.approx(100 * 1 / 9)
+        assert report.timeout_pct == pytest.approx(100 * 1 / 9)
+
+    def test_worker_latency_includes_timeout_and_miss(self, tmp_path: Path):
+        """`x_latency_ms` is the full worker wall on every NON-skip
+        outcome. Skips (which never start a worker) must stay out of the
+        population or they drag p50 to ~0 and hide real slowness."""
+        from recall.stats import aggregate_events
+        log = tmp_path / "events.log.jsonl"
+        _v12(log, x_outcome="hit", x_k_returned=1, x_latency_ms=100)
+        _v12(log, x_outcome="miss", x_latency_ms=100)
+        _v12(log, x_outcome="dedup", x_latency_ms=100)
+        _v12(log, x_outcome="timeout", x_latency_ms=900)
+        for _ in range(5):
+            _v12(log, x_outcome="skip", x_skip_reason="too_short", x_latency_ms=1)
+
+        report = aggregate_events(log)
+        # 5 skip latencies of 1ms would pull p50 down to 1
+        assert report.latency_p50_ms == 100
+        # the 900ms timeout must be inside the population
+        assert report.latency_p95_ms >= 500
+
+    def test_query_latency_from_x_query_ms(self, tmp_path: Path):
+        """Retrieval-only latency is a separate population from the full
+        worker wall — the whole point of splitting them in v1.2."""
+        from recall.stats import aggregate_events
+        log = tmp_path / "events.log.jsonl"
+        for outcome in ("hit", "miss", "dedup"):
+            _v12(log, x_outcome=outcome, x_k_returned=1,
+                 x_latency_ms=900, x_query_ms=50)
+        # timeout has a worker wall but never produced a query time
+        _v12(log, x_outcome="timeout", x_latency_ms=900)
+
+        report = aggregate_events(log)
+        assert report.query_p50_ms == 50
+        assert report.query_p95_ms == 50
+        assert report.latency_p50_ms == 900
+
+    def test_path_split_and_daemon_errors(self, tmp_path: Path):
+        """daemon vs in-process split, plus the two degradation counters.
+        Skips never ran a worker, so they are outside the split; a
+        non-skip event with no `x_path` is reported as unknown rather
+        than silently attributed to either path."""
+        from recall.stats import aggregate_events
+        log = tmp_path / "events.log.jsonl"
+        _v12(log, x_outcome="hit", x_k_returned=1, x_path="daemon",
+             x_daemon_error=None)
+        _v12(log, x_outcome="miss", x_path="daemon", x_degraded=True)
+        _v12(log, x_outcome="dedup", x_path="inproc",
+             x_daemon_error="connection_refused: no listener")
+        _v12(log, x_outcome="error", x_path=OMIT)
+        _v12(log, x_outcome="skip", x_skip_reason="slash")
+
+        report = aggregate_events(log)
+        assert report.path_split == {"daemon": 2, "inproc": 1, "unknown": 1}
+        assert report.daemon_error_count == 1
+        assert report.degraded_count == 1
+
+    def test_index_stale_absent_is_unknown_not_false(self, tmp_path: Path):
+        """`x_index_stale` is emitted only on the daemon path, and only
+        for hit/miss/dedup. The in-process path has no way to know
+        whether the index is stale, so an absent flag means UNKNOWN.
+        Counting absent as false would report a fresh index the daemon
+        never vouched for — which is exactly the failure the flag exists
+        to catch. `index_stale_known` is therefore the denominator, not
+        the daemon event count."""
+        from recall.stats import aggregate_events
+        log = tmp_path / "events.log.jsonl"
+        _v12(log, x_outcome="hit", x_k_returned=1, x_path="daemon",
+             x_index_stale=True)
+        _v12(log, x_outcome="miss", x_path="daemon", x_index_stale=False)
+        _v12(log, x_outcome="dedup", x_path="daemon", x_index_stale=False)
+        # daemon timeout: the worker was killed before a response arrived
+        _v12(log, x_outcome="timeout", x_path="daemon")
+        # in-process path never carries the flag
+        _v12(log, x_outcome="hit", x_k_returned=1, x_path="inproc")
+        _v12(log, x_outcome="miss", x_path="inproc")
+        _v12(log, x_outcome="skip", x_skip_reason="too_short")
+
+        report = aggregate_events(log)
+        assert report.index_stale_count == 1
+        # only the three events that actually carried the flag
+        assert report.index_stale_known == 3
+
+    def test_index_stale_known_is_zero_when_no_daemon_events(self, tmp_path: Path):
+        from recall.stats import aggregate_events
+        log = tmp_path / "events.log.jsonl"
+        _v12(log, x_outcome="hit", x_k_returned=1, x_path="inproc")
+        _v12(log, x_outcome="miss", x_path="inproc")
+        report = aggregate_events(log)
+        assert report.index_stale_count == 0
+        assert report.index_stale_known == 0
+
+    def test_k_counters_summed_over_non_skip(self, tmp_path: Path):
+        from recall.stats import aggregate_events
+        log = tmp_path / "events.log.jsonl"
+        _v12(log, x_outcome="hit", x_k_returned=2, x_k_candidates=10,
+             x_k_gated_out=4, x_k_dedup=1)
+        _v12(log, x_outcome="miss", x_k_candidates=10, x_k_gated_out=4,
+             x_k_dedup=1)
+        # A skip never ran retrieval; its counters must not leak in.
+        _v12(log, x_outcome="skip", x_skip_reason="ack", x_k_candidates=99,
+             x_k_gated_out=99, x_k_dedup=99)
+
+        report = aggregate_events(log)
+        assert report.k_candidates_total == 20
+        assert report.k_gated_out_total == 8
+        assert report.k_dedup_total == 2
+
+    def test_repeat_injection_rate_same_session_only(self, tmp_path: Path):
+        """A doc re-injected into the SAME session is a repeat (the model
+        already saw it). The same doc injected into a different session
+        is a fresh injection, not a repeat."""
+        from recall.stats import aggregate_events
+
+        cross = tmp_path / "cross.log.jsonl"
+        _v12(cross, session_id="a", ts_ms=1_000, x_outcome="hit",
+             x_k_returned=1, x_paths=["memory/x.md"])
+        _v12(cross, session_id="b", ts_ms=2_000, x_outcome="hit",
+             x_k_returned=1, x_paths=["memory/x.md"])
+        assert aggregate_events(cross).repeat_injection_rate == pytest.approx(0.0)
+
+        same = tmp_path / "same.log.jsonl"
+        _v12(same, session_id="a", ts_ms=1_000, x_outcome="hit",
+             x_k_returned=1, x_paths=["memory/x.md"])
+        _v12(same, session_id="a", ts_ms=2_000, x_outcome="hit",
+             x_k_returned=1, x_paths=["memory/x.md"])
+        # 2 injected paths, 1 of them already seen this session
+        assert aggregate_events(same).repeat_injection_rate == pytest.approx(0.5)
+
+    def test_rerank_histogram_buckets(self, tmp_path: Path):
+        """Cross-encoder scores bucket at the (0.1, 0.3, 0.5, 0.7) edges,
+        each bucket half-open on the left (a score exactly at an edge
+        belongs to the bucket that starts there)."""
+        from recall.stats import aggregate_events
+        log = tmp_path / "events.log.jsonl"
+        _v12(log, x_outcome="hit", x_k_returned=1,
+             x_rerank_scores=[0.0, 0.1, 0.3])
+        _v12(log, x_outcome="hit", x_k_returned=1,
+             x_rerank_scores=[0.5, 0.7, 0.95])
+        report = aggregate_events(log)
+        assert report.rerank_distribution == {
+            "<0.1": 1, "0.1-0.3": 1, "0.3-0.5": 1, "0.5-0.7": 1, "0.7+": 2,
+        }
+
+    def test_rrf_score_histogram_unchanged(self, tmp_path: Path):
+        from recall.stats import aggregate_events
+        log = tmp_path / "events.log.jsonl"
+        _v12(log, x_outcome="hit", x_k_returned=1,
+             x_top_scores=[0.9, 0.75, 0.55, 0.4])
+        report = aggregate_events(log)
+        assert report.score_distribution == {
+            "0.85+": 1, "0.70-0.85": 1, "0.50-0.70": 1, "<0.50": 1,
+        }
+
+    def test_top_paths_populated_from_x_paths(self, tmp_path: Path):
+        """`top_paths` was permanently empty before v1.2 because paths
+        were never logged. v1.2 logs brain-relative paths, so the field
+        now carries the ten most-injected docs."""
+        from recall.stats import aggregate_events
+        log = tmp_path / "events.log.jsonl"
+        for i in range(3):
+            _v12(log, session_id=f"s{i}", x_outcome="hit", x_k_returned=2,
+                 x_paths=["memory/semantic/lessons/foo.md",
+                          "imports/claude/plans/bar.md"])
+        _v12(log, session_id="s9", x_outcome="hit", x_k_returned=1,
+             x_paths=["memory/semantic/lessons/foo.md"])
+        report = aggregate_events(log)
+        assert report.top_paths[0] == ("memory/semantic/lessons/foo.md", 4)
+        assert ("imports/claude/plans/bar.md", 3) in report.top_paths
+        assert len(report.top_paths) <= 10
+
+    def test_top_paths_capped_at_ten(self, tmp_path: Path):
+        from recall.stats import aggregate_events
+        log = tmp_path / "events.log.jsonl"
+        _v12(log, x_outcome="hit", x_k_returned=15,
+             x_paths=[f"memory/p{i}.md" for i in range(15)])
+        assert len(aggregate_events(log).top_paths) == 10
+
+
+class TestLegacyBlock:
+    """Pre-1.2 events are summarized separately and never merged into the
+    1.2 numbers: in 1.1 a logged `hit` could carry zero injected docs, so
+    averaging the two populations produces a number that means nothing."""
+
+    def test_v11_events_go_to_legacy_only(self, tmp_path: Path):
+        from recall.stats import aggregate_events
+        log = tmp_path / "events.log.jsonl"
+        _v11(log, x_outcome="hit", x_k_returned=3, x_latency_ms=500,
+             x_sources={"imports": 3})
+        _v11(log, x_outcome="skip", x_skip_reason="too_short")
+        _v11(log, x_outcome="timeout")
+        _v12(log, x_outcome="hit", x_k_returned=2, x_sources={"brain": 2})
+
+        report = aggregate_events(log)
+        # 1.2 population untouched by the legacy rows
+        assert report.fired_count == 1
+        assert report.skipped_count == 0
+        assert report.other_outcomes == {}
+        assert report.total_fires == 1
+        assert report.total_prompts == 1
+        assert report.surfaced_count == 2
+        assert dict(report.top_sources) == {"brain": 2}
+        # legacy rolled up on its own
+        assert report.legacy["events"] == 3
+        assert report.legacy["hit_logged"] == 1
+        assert report.legacy["skip"] == 1
+        assert report.legacy["timeout"] == 1
+        assert report.legacy["surfaced_count"] == 3
+        assert dict(report.legacy["top_sources"]) == {"imports": 3}
+
+    def test_phantom_is_hit_with_zero_k(self, tmp_path: Path):
+        """The 1.1 hook logged `hit` even when it injected nothing. That
+        is the single biggest reason the old coverage number was wrong,
+        so the legacy block names it explicitly."""
+        from recall.stats import aggregate_events
+        log = tmp_path / "events.log.jsonl"
+        _v11(log, x_outcome="hit", x_k_returned=0)
+        _v11(log, x_outcome="hit", x_k_returned=0)
+        _v11(log, x_outcome="hit", x_k_returned=2)
+
+        legacy = aggregate_events(log).legacy
+        assert legacy["hit_logged"] == 3
+        assert legacy["phantom_hits"] == 2
+        assert legacy["real_hits"] == 1
+
+    def test_v12_hit_without_x_paths_is_legacy(self, tmp_path: Path):
+        """A record can claim 1.2 and still be pre-1.2 in substance. A
+        hit with no `x_paths` cannot be joined to a transcript and may be
+        a phantom, so it is classified legacy — but a 1.2 MISS has no
+        paths by definition and stays in the 1.2 population."""
+        from recall.stats import aggregate_events
+        log = tmp_path / "events.log.jsonl"
+        _v12(log, x_outcome="hit", x_k_returned=2, x_paths=OMIT)
+        _v12(log, x_outcome="miss")
+
+        report = aggregate_events(log)
+        assert report.fired_count == 0
+        assert report.miss_count == 1
+        assert report.total_fires == 1
+        assert report.legacy["events"] == 1
+        assert report.legacy["hit_logged"] == 1
+
+    def test_legacy_query_latency_from_x_latency_ms(self, tmp_path: Path):
+        """In 1.1 `x_latency_ms` measured retrieval only, so it maps to
+        the legacy block's query-latency fields — not to the 1.2
+        full-worker percentiles."""
+        from recall.stats import aggregate_events
+        log = tmp_path / "events.log.jsonl"
+        for _ in range(3):
+            _v11(log, x_outcome="hit", x_k_returned=1, x_latency_ms=500)
+
+        report = aggregate_events(log)
+        assert report.legacy["query_p50_ms"] == 500
+        assert report.legacy["query_p95_ms"] == 500
+        assert report.latency_p50_ms == 0
+        assert report.query_p50_ms == 0
+
+    def test_legacy_block_has_documented_keys(self, tmp_path: Path):
+        from recall.stats import aggregate_events
+        log = tmp_path / "events.log.jsonl"
+        _v11(log, x_outcome="hit", x_k_returned=1, x_latency_ms=10)
+        legacy = aggregate_events(log).legacy
+        for key in ("events", "hit_logged", "phantom_hits", "real_hits",
+                    "skip", "timeout", "unavailable", "error",
+                    "query_p50_ms", "query_p95_ms", "surfaced_count",
+                    "top_sources"):
+            assert key in legacy, f"missing legacy field: {key}"
+
+    def test_legacy_empty_when_all_events_are_v12(self, tmp_path: Path):
+        from recall.stats import aggregate_events
+        log = tmp_path / "events.log.jsonl"
+        _v12(log, x_outcome="hit", x_k_returned=1)
+        assert aggregate_events(log).legacy["events"] == 0
+
+
+class TestRawReader:
+    """`iter_auto_recall_records` is the tolerant reader that replaced
+    `runtime.core.events.load_events` for stats."""
+
+    def test_mixed_schema_lines_do_not_raise(self, tmp_path: Path):
+        """The live log spans the 1.1 -> 1.2 upgrade. A strict loader
+        raises on whichever version isn't the current constant; this one
+        reads both and classifies them."""
+        from recall.stats import aggregate_events
+        log = tmp_path / "events.log.jsonl"
+        _v12(log, x_outcome="hit", x_k_returned=2)
+        _v11(log, x_outcome="hit", x_k_returned=3)
+        _write_event(log, schema_version="1.0", x_outcome="hit", x_k_returned=4)
+
+        report = aggregate_events(log)
+        assert report.fired_count == 1
+        assert report.surfaced_count == 2
+        assert report.legacy["events"] == 2
+        assert report.legacy["hit_logged"] == 2
+        assert report.legacy["surfaced_count"] == 7
+
+    def test_malformed_line_skipped(self, tmp_path: Path):
+        from recall.stats import aggregate_events
+        log = tmp_path / "events.log.jsonl"
+        log.write_text(
+            "this is not json\n"
+            '{"truncated":\n'
+            "\n"
+            "[1, 2, 3]\n"
+            '"just a string"\n'
+        )
+        _v12(log, x_outcome="hit", x_k_returned=1)
+        report = aggregate_events(log)
+        assert report.fired_count == 1
+
+    def test_rotated_siblings_are_read(self, tmp_path: Path):
+        """logrotate leaves `events.log.<date>.jsonl` next to the live
+        file. A 7d window that ignored them would silently report a
+        fraction of the real traffic — and must not double-count the
+        live file either."""
+        from recall.stats import aggregate_events
+        log = tmp_path / "events.log.jsonl"
+        rotated = tmp_path / "events.log.2026-09-01.jsonl"
+        unrelated = tmp_path / "other.jsonl"
+        _v12(log, x_outcome="hit", x_k_returned=1)
+        _v12(rotated, x_outcome="hit", x_k_returned=1)
+        _v12(rotated, x_outcome="hit", x_k_returned=1)
+        for _ in range(5):
+            _v12(unrelated, x_outcome="hit", x_k_returned=1)
+
+        report = aggregate_events(log)
+        assert report.fired_count == 3
+
+    def test_iter_yields_only_auto_recall_records_as_dicts(self, tmp_path: Path):
+        from recall.stats import iter_auto_recall_records
+        log = tmp_path / "events.log.jsonl"
+        _v12(log, x_outcome="hit", x_k_returned=1)
+        _v12(log, event="UserPromptSubmit")
+        _v12(log, event="PostToolUse")
+
+        records = list(iter_auto_recall_records(log))
+        assert len(records) == 1
+        rec = records[0]
+        assert isinstance(rec, dict)
+        # extensions are flattened to the top level, as the hook writes them
+        assert rec["x_outcome"] == "hit"
+        assert rec["schema_version"] == "1.2"
+
+    def test_is_v12_predicate(self):
+        from recall.stats import is_v12
+        assert is_v12({"schema_version": "1.2", "x_outcome": "hit",
+                       "x_paths": ["memory/a.md"]}) is True
+        assert is_v12({"schema_version": "1.2", "x_outcome": "miss"}) is True
+        assert is_v12({"schema_version": "1.2", "x_outcome": "hit"}) is False
+        assert is_v12({"schema_version": "1.1", "x_outcome": "hit",
+                       "x_paths": ["memory/a.md"]}) is False
+        assert is_v12({"x_outcome": "hit"}) is False
 
 
 class TestParseSince:
@@ -146,7 +603,6 @@ class TestParseSince:
         from recall.stats import parse_since
         ts = parse_since("2026-01-01")
         # Should produce midnight UTC ts for that date
-        import datetime
         expected = int(datetime.datetime(2026, 1, 1,
                                           tzinfo=datetime.timezone.utc).timestamp() * 1000)
         assert ts == expected
@@ -162,40 +618,145 @@ class TestParseSince:
             parse_since("nonsense")
 
 
+# ---------------------------------------------------------------------------
+# Human renderer
+# ---------------------------------------------------------------------------
+
+
+def _ts_2026_08_21() -> int:
+    return int(datetime.datetime(
+        2026, 8, 21, tzinfo=datetime.timezone.utc).timestamp() * 1000)
+
+
+def _legacy_block(**overrides) -> dict:
+    block = {
+        "events": 1204,
+        "hit_logged": 900,
+        "phantom_hits": 486,
+        "real_hits": 414,
+        "skip": 200,
+        "timeout": 104,
+        "unavailable": 0,
+        "error": 0,
+        "query_p50_ms": 620,
+        "query_p95_ms": 2900,
+        "surfaced_count": 1500,
+        "top_sources": [("imports", 700), ("brain", 300)],
+    }
+    block.update(overrides)
+    return block
+
+
+def _sample_report(**overrides):
+    """The worked example from the stats plan, field for field. The
+    rendered output for this report is pinned line by line below."""
+    from recall.stats import StatsReport
+    fields = dict(
+        fired_count=97,
+        skipped_count=32,
+        skip_reasons={"too_short": 20, "slash": 12},
+        miss_count=61,
+        dedup_count=14,
+        other_outcomes={"timeout": 5, "unavailable": 2, "error": 1},
+        total_fires=180,
+        total_prompts=212,
+        coverage_pct=100 * 97 / 180,
+        miss_pct=100 * 61 / 180,
+        dedup_pct=100 * 14 / 180,
+        timeout_pct=100 * 5 / 180,
+        path_split={"daemon": 171, "inproc": 9},
+        daemon_error_count=9,
+        degraded_count=0,
+        index_stale_count=3,
+        index_stale_known=160,
+        latency_p50_ms=240,
+        latency_p95_ms=810,
+        query_p50_ms=95,
+        query_p95_ms=400,
+        surfaced_count=301,
+        k_candidates_total=900,
+        k_gated_out_total=540,
+        k_dedup_total=59,
+        repeat_injection_rate=0.0,
+        top_sources=[("imports", 160), ("brain", 141)],
+        top_paths=[("memory/semantic/lessons/foo.md", 12),
+                   ("imports/claude/plans/bar.md", 9)],
+        score_distribution={"0.85+": 40, "0.70-0.85": 200, "0.50-0.70": 61},
+        rerank_distribution={"<0.1": 12, "0.1-0.3": 30,
+                             "0.3-0.5": 110, "0.5-0.7": 149},
+        window_start_ts_ms=_ts_2026_08_21(),
+        window_end_ts_ms=_ts_2026_08_21() + 86_400_000,
+    )
+    fields.update(overrides)
+    return StatsReport(**fields)
+
+
 class TestRenderHuman:
-    """Pretty-printer is what the user sees. Pin the major sections so a
-    refactor doesn't accidentally drop the ROI framing — that line is
-    the whole point of the feature."""
+    """The pretty-printer is what the user sees. v1.2 replaced the old
+    ROI paragraph — which multiplied a phantom-inflated fire count by a
+    doc count nobody had opened — with counters that state what actually
+    happened. Pin the new lines so the invented framing can't come back.
+    """
 
-    def test_render_includes_roi_framing(self, tmp_path: Path):
-        from recall.stats import StatsReport, render_human
-        report = StatsReport(
-            fired_count=47,
-            skipped_count=6,
-            skip_reasons={"too_short": 4, "slash": 2},
-            latency_p50_ms=38,
-            latency_p95_ms=89,
-            surfaced_count=234,
-            top_sources=[("imports", 89), ("brain", 74)],
-            top_paths=[],
-            score_distribution={},
-            window_start_ts_ms=_now_ms() - 7 * 24 * 60 * 60 * 1000,
-            window_end_ts_ms=_now_ms(),
-        )
-        out = render_human(report)
-        # ROI framing — the line that justifies auto-recall to the user
-        assert "Without auto-recall" in out or "without auto-recall" in out.lower()
-        # Anchor counts with surrounding context to avoid false positives
-        # from numbers colliding with timestamps or other report fields
-        assert "47 turns" in out
-        assert "234 docs" in out
-        # Latency labelled with p50/p95 markers
-        assert "p50 38ms" in out
-        assert "p95 89ms" in out
-        # Top sources line lists imports with its count
-        assert "imports (89)" in out
+    def test_render_headline_counts(self):
+        from recall.stats import render_human
+        out = render_human(_sample_report())
+        assert "brainstack: auto-recall (since 2026-08-21)" in out
+        assert "  Prompts:      212 (180 fires, 32 skipped: 20 too_short, 12 slash)" in out
+        assert "  Injected:     97 / 180 fires (54%) carried at least one doc" in out
 
-    def test_render_counts_diagnostic_outcomes(self, tmp_path: Path):
+    def test_render_honest_lines_no_roi(self):
+        from recall.stats import render_human
+        out = render_human(_sample_report())
+        # The removed copy — it claimed value the telemetry cannot support
+        assert "Without auto-recall" not in out
+        assert "without auto-recall" not in out.lower()
+        assert "would have started with only" not in out
+        assert "ROI" not in out
+        # Every line of the worked example, verbatim
+        assert "  Injected:     97 / 180 fires (54%) carried at least one doc" in out
+        assert "  Miss:         61 (34%) nothing passed the relevance gate" in out
+        assert "  Dedup:        14 (8%) every passing doc was already shown this session" in out
+        assert "  Timeout:      5 (3%) · unavailable 2 · error 1" in out
+        assert ("  Path:         daemon 171, inproc 9 (daemon_error 9, degraded 0)"
+                " · index stale 3 / 160 daemon fires") in out
+        assert "  Latency:      worker p50 240ms, p95 810ms · query p50 95ms, p95 400ms" in out
+        assert ("  Docs:         301 injected (avg 3.1 per hit) · repeat-injection 0.0%"
+                " · candidates 900, gated out 540, dedup 59") in out
+        assert "  Sources:      imports (160), brain (141)" in out
+        assert "  RRF scores:   40 in 0.85+, 200 in 0.70-0.85, 61 in 0.50-0.70" in out
+        assert "  Rerank:       12 in <0.1, 30 in 0.1-0.3, 110 in 0.3-0.5, 149 in 0.5-0.7" in out
+        assert ("  Top docs:     memory/semantic/lessons/foo.md (12),"
+                " imports/claude/plans/bar.md (9)") in out
+        # The honest caveat that replaces the ROI claim
+        assert "These count docs injected, not docs used" in out
+        assert "recall stats --utilization" in out
+
+    def test_render_path_line_reports_index_staleness(self):
+        """The staleness segment reads "N / M daemon fires" where M is
+        `index_stale_known`, not the daemon count — the two differ
+        whenever a daemon call timed out before reporting. With nothing
+        known the segment is omitted; printing "0 / 0" would read as
+        "the index is fresh" when the truth is "nobody checked"."""
+        from recall.stats import render_human
+        out = render_human(_sample_report())
+        assert ("  Path:         daemon 171, inproc 9 (daemon_error 9, degraded 0)"
+                " · index stale 3 / 160 daemon fires") in out
+
+        unknown = render_human(_sample_report(index_stale_count=0,
+                                              index_stale_known=0))
+        assert ("  Path:         daemon 171, inproc 9"
+                " (daemon_error 9, degraded 0)") in unknown
+        assert "index stale" not in unknown
+
+    def test_render_repeat_injection_rate_is_a_percentage(self):
+        """`repeat_injection_rate` is a fraction on the report; the human
+        view shows it as a percentage."""
+        from recall.stats import render_human
+        out = render_human(_sample_report(repeat_injection_rate=0.5))
+        assert "repeat-injection 50.0%" in out
+
+    def test_render_counts_diagnostic_outcomes(self):
         """When the window contains only timeouts/errors/unavailable
         (no hits, no skips), `render_human` must NOT say "no events" —
         it should report the diagnostic count and roll those into the
@@ -205,16 +766,17 @@ class TestRenderHuman:
             fired_count=0,
             skipped_count=0,
             other_outcomes={"timeout": 5, "unavailable": 2},
+            total_fires=7,
+            total_prompts=7,
         )
         out = render_human(report)
         # Must NOT be the "no events" message
         assert "no auto-recall events" not in out.lower()
-        # Diagnostic count surfaces
-        assert "5 timeout" in out or "timeout" in out
-        # Coverage denominator includes the diagnostic outcomes
-        assert "0 turns / 7 prompts" in out
+        # Diagnostic count surfaces, and retrieval was attempted 7 times
+        assert "Timeout:      5" in out
+        assert "Prompts:      7" in out
 
-    def test_render_zero_count_message(self, tmp_path: Path):
+    def test_render_zero_count_message(self):
         """No events yet — the report should still produce a sensible
         message rather than divide-by-zero or empty output."""
         from recall.stats import StatsReport, render_human
@@ -227,6 +789,40 @@ class TestRenderHuman:
         out = render_human(empty)
         # Some indication that there's nothing to report — anti-empty-output guard
         assert "no" in out.lower() or "0 turns" in out.lower() or "0 fires" in out.lower()
+
+    def test_render_legacy_block_separate(self):
+        """Legacy events get their own block with their own labels. They
+        must never be folded into the 1.2 counters above."""
+        from recall.stats import render_human
+        out = render_human(_sample_report(legacy=_legacy_block()))
+        assert "  Legacy (pre-1.2 semantics, not comparable): 1204 events" in out
+        assert ("    logged hit 900 (phantom 486 = hit with 0 docs, real 414)"
+                " · skip 200 · timeout 104") in out
+        assert ("    query-only latency p50 620ms, p95 2900ms"
+                " · sources imports (700), brain (300)") in out
+        # 1.2 numbers unchanged by the presence of legacy rows
+        assert "  Injected:     97 / 180 fires (54%) carried at least one doc" in out
+        assert "  Prompts:      212 (180 fires, 32 skipped: 20 too_short, 12 slash)" in out
+
+    def test_render_omits_legacy_block_when_empty(self):
+        from recall.stats import render_human
+        out = render_human(_sample_report(legacy=_legacy_block(events=0)))
+        assert "Legacy" not in out
+
+    def test_render_only_legacy_says_no_v12_events(self):
+        """A user who hasn't upgraded their hook has 100% legacy events.
+        Rendering zeros would read as "auto-recall did nothing"; the
+        honest answer names the cause and the fix."""
+        from recall.stats import StatsReport, render_human
+        report = StatsReport(
+            legacy=_legacy_block(),
+            window_start_ts_ms=_ts_2026_08_21(),
+        )
+        out = render_human(report)
+        assert "no auto-recall events" not in out.lower()
+        assert ("  No schema-1.2 events in this window — hooks predate v1.2"
+                " (./install.sh --upgrade).") in out
+        assert "  Legacy (pre-1.2 semantics, not comparable): 1204 events" in out
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +898,6 @@ class TestToolCallAggregation:
             proj / "s.jsonl", ts_iso=recent_ts, tool_name="mcp__minerva__search_code"
         )
         # Window starting May 1 → only the recent call counts
-        import datetime
         cutoff = int(datetime.datetime(2026, 5, 1,
                                         tzinfo=datetime.timezone.utc).timestamp() * 1000)
         result = aggregate_tool_calls(tmp_path / "projects", since_ts_ms=cutoff)
@@ -351,6 +946,15 @@ class TestStatsCliNoToolsFlag:
         # No transcripts at all — should not raise
         report = aggregate_events(log)
         assert report.fired_count == 0
+
+    def test_aggregate_events_with_v12_events_and_no_transcripts(self, tmp_path: Path):
+        from recall.stats import aggregate_events
+        log = tmp_path / "events.log.jsonl"
+        _v12(log, x_outcome="hit", x_k_returned=2, x_sources={"brain": 2})
+        report = aggregate_events(log)
+        assert report.fired_count == 1
+        assert report.mcp_calls == {}
+        assert report.tool_calls_other == {}
 
 
 class TestRenderCrossSourceSection:
@@ -435,10 +1039,49 @@ class TestStatsJsonContract:
         from recall.stats import StatsReport
         data = asdict(StatsReport())
         for required in [
+            # pre-1.2 keys, kept with 1.2-only semantics
             "fired_count", "skipped_count", "skip_reasons",
             "latency_p50_ms", "latency_p95_ms", "surfaced_count",
             "top_sources", "top_paths", "score_distribution",
             "window_start_ts_ms", "window_end_ts_ms",
             "other_outcomes", "mcp_calls", "tool_calls_other",
+            # v1.2 additions
+            "miss_count", "dedup_count",
+            "total_fires", "total_prompts",
+            "coverage_pct", "miss_pct", "dedup_pct", "timeout_pct",
+            "path_split", "daemon_error_count", "degraded_count",
+            "index_stale_count", "index_stale_known",
+            "query_p50_ms", "query_p95_ms",
+            "k_candidates_total", "k_gated_out_total", "k_dedup_total",
+            "repeat_injection_rate", "rerank_distribution",
+            "legacy",
         ]:
             assert required in data, f"missing schema field: {required}"
+
+    def test_legacy_is_nested_dict(self):
+        """`legacy` is a nested object, never flattened into the
+        top-level counters — a consumer must not be able to read a
+        phantom-inflated hit count by accident."""
+        from dataclasses import asdict
+        from recall.stats import StatsReport
+        data = asdict(StatsReport())
+        assert isinstance(data["legacy"], dict)
+        assert int(data["legacy"].get("events", 0)) == 0
+        assert "phantom_hits" not in data
+
+    def test_json_serializable_after_aggregate(self, tmp_path: Path):
+        """`recall stats --json` dumps `asdict(report)` after converting
+        tuple lists; the rest must already be JSON-native."""
+        from dataclasses import asdict
+        from recall.stats import aggregate_events
+        log = tmp_path / "events.log.jsonl"
+        _v12(log, x_outcome="hit", x_k_returned=2, x_sources={"brain": 2},
+             x_top_scores=[0.9], x_rerank_scores=[0.6])
+        _v11(log, x_outcome="hit", x_k_returned=0, x_sources={"imports": 1})
+
+        data = asdict(aggregate_events(log))
+        data["top_sources"] = [list(t) for t in data["top_sources"]]
+        data["top_paths"] = [list(t) for t in data["top_paths"]]
+        data["legacy"]["top_sources"] = [list(t) for t in data["legacy"]["top_sources"]]
+        text = json.dumps(data)
+        assert json.loads(text)["legacy"]["phantom_hits"] == 1

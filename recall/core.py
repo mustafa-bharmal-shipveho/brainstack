@@ -28,6 +28,12 @@ class Document:
 class QueryResult:
     document: Document
     score: float
+    # S4: cross-encoder rerank score, travels alongside the cheap RRF
+    # `score` rather than replacing it. None on any path that never loaded
+    # a reranker (in-process auto-recall fallback, reranker="none").
+    # Declared AFTER score so existing positional callers
+    # (`QueryResult(doc, score)`) keep working unchanged.
+    rerank_score: Optional[float] = None
 
 
 _NEEDS_REVIEW_RAW_RE = re.compile(
@@ -192,6 +198,11 @@ class HybridRetriever:
         k: int,
         type_filter: Optional[str] = None,
         source_filter: Optional[str] = None,
+        # S4: explicit override for whether to rerank. `None` (default)
+        # preserves today's behavior (driven by `self._reranker`); a caller
+        # (the daemon) may force True/False. Scaffold: accepted, not yet
+        # wired into `use_rerank` below.
+        rerank: Optional[bool] = None,
     ) -> list[QueryResult]:
         from recall import qdrant_backend as qb
 

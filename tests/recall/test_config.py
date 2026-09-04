@@ -88,6 +88,18 @@ class TestDefaultConfig:
         assert any("working" in e for e in brain_excludes)
         assert any("scripts" in e for e in brain_excludes)
 
+    def test_brain_excludes_archived(self, isolated_xdg):
+        """`semantic/archived/` holds tombstoned memories: recoverable by
+        hand, but never retrievable and never injectable. Without this
+        exclude, `recall forget` and `lint --dedupe-claims` leave their
+        archived copies in the index, so "forgetting" only hides a file."""
+        assert any("archived" in e for e in default_config().sources[0].exclude)
+
+    def test_loaded_config_excludes_archived(self, isolated_xdg):
+        """The exclude has to survive the write-then-read round trip a
+        fresh install performs, not just live in `default_config()`."""
+        assert any("archived" in e for e in load_config().sources[0].exclude)
+
     def test_imports_excludes_non_markdown_and_caches(self, isolated_xdg):
         """Imports tier mirrors raw tool memory + KBs; we want only .md
         retrievable. JSONL/JSON/TXT cover Claude session logs + Codex

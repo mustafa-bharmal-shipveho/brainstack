@@ -152,6 +152,19 @@ def write_config(brain_root: Path, config: dict) -> None:
 # ---- Plist generation ----
 
 
+def _launchd_path() -> str:
+    """PATH for generated launchd/systemd units — S5 requirement 6.
+
+    launchd/systemd jobs run with a minimal PATH that omits
+    `~/.local/bin` and `~/.claude/local`, where `claude`/`codex`/`recall`
+    are actually installed on many machines. Lead with those so the
+    adapters this dispatcher shells out to resolve the same binaries the
+    user's shell does.
+    """
+    home = os.environ.get("HOME", str(Path.home()))
+    return f"{home}/.local/bin:{home}/.claude/local:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+
+
 def generate_plist(
     brain_root: Path,
     python_abs: Path,
@@ -184,7 +197,7 @@ def generate_plist(
         "EnvironmentVariables": {
             "BRAIN_ROOT": str(brain_root),
             "HOME": os.environ.get("HOME", str(Path.home())),
-            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+            "PATH": _launchd_path(),
         },
         "StandardOutPath": log_path,
         "StandardErrorPath": log_path,
@@ -225,6 +238,7 @@ def generate_systemd_units(
         f"ExecStart={python_abs} {dispatcher_path} auto-migrate-all --brain-root {brain_root}",
         f"Environment=BRAIN_ROOT={brain_root}",
         f"Environment=HOME={os.environ.get('HOME', str(Path.home()))}",
+        f"Environment=PATH={_launchd_path()}",
         "",
     ])
     timer = "\n".join([

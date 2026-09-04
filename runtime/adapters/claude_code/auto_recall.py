@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import time
 from collections import Counter
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 
@@ -56,6 +57,60 @@ class _Retriever(Protocol):
               source_filter: Any = None) -> list[Any]: ...
 
 
+@dataclass
+class RecallCandidate:
+    """Normalized shape of one retrieval result, independent of whether it
+    came from a `recall.core.QueryResult` (in-process path) or a daemon
+    wire dict (`recall.daemon.result_to_wire`) via `DaemonResults`.
+
+    Field order is part of the contract: `dedup.py` and the gate pipeline
+    construct these positionally in a few places.
+    """
+
+    path: str
+    source: str
+    title: str
+    score: float
+    rerank_score: "float | None"
+    body: str
+    frontmatter: dict
+    content_sha256: str
+
+
+def normalize_results(raw: "list[Any]") -> "list[RecallCandidate]":
+    """Convert raw retriever results (QueryResult objects OR daemon wire
+    dicts) into `RecallCandidate`s. `content_sha256` is computed from the
+    body when the source result doesn't already carry one.
+
+    Scaffold: signature + docstring only. See the S2 gate/dedup pipeline
+    in tests/runtime/test_auto_recall.py.
+    """
+    raise NotImplementedError("scaffold")
+
+
+class DaemonResults:
+    """Adapts one `recall.daemon_client.query()` wire response to the
+    `_Retriever` protocol, so `build_recall_block` never learns whether
+    results came from the daemon or the in-process retriever.
+
+    Carries the daemon's OWN measurements (`query_ms`, `degraded`,
+    `index_stale`) — the builder prefers these over a local stopwatch,
+    which would otherwise include socket + JSON round-trip time.
+    """
+
+    def __init__(self, response: dict[str, Any]):
+        self._response = response
+        self.query_ms: "int | None" = response.get("query_ms")
+        self.degraded: bool = bool(response.get("degraded", False))
+        self.index_stale: "bool | None" = response.get("index_stale")
+
+    def query(self, prompt: str, *, k: int = 5,
+              type_filter: Any = None,
+              source_filter: Any = None) -> list[dict]:
+        results = self._response.get("results") or []
+        return list(results[:k])
+
+
 def should_skip(prompt: str, *, min_chars: int) -> tuple[bool, str | None]:
     """Decide whether to skip auto-recall for this prompt.
 
@@ -80,6 +135,13 @@ def build_recall_block(
     k: int,
     budget_tokens: int,
     min_score: float = 0.0,
+    # --- v1.2 contract additions below. Accepted so callers (hooks.py,
+    # and the new tests exercising the S2/S4 gate + dedup pipeline) can
+    # pass them; NOT YET wired into the body, which is unchanged from the
+    # pre-S2 implementation so every currently-green test keeps passing.
+    min_rerank: float = 0.0,
+    dedup_store: "Any | None" = None,
+    brain_root: "Any | None" = None,
 ) -> tuple[str, dict]:
     """Run recall, render the injection block, return (block, telemetry).
 

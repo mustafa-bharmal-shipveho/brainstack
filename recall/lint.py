@@ -526,6 +526,26 @@ def lint_brain(
     return findings
 
 
+def lint_dirs(
+    brain_root: Path,
+    *,
+    subdirs: tuple[str, ...] = ("memory", "imports"),
+    kinds: frozenset[str] | None = None,
+) -> list[Finding]:
+    """Lint only the files under ``brain_root/<sub>`` for each ``sub`` in
+    ``subdirs`` (nightly dream scope), but resolve wikilinks against known
+    keys computed brain-wide (once) — a plan under ``imports/`` linking a
+    lesson in ``memory/`` is a live link, and scoping the known-key set to
+    one subdir at a time would falsely report every cross-tree link as
+    broken. Missing subdirs are tolerated. Findings sorted like
+    ``lint_brain``.
+
+    Scaffold: signature + docstring only. See
+    tests/recall/test_lint.py::test_lint_dirs_resolves_wikilinks_across_memory_and_imports.
+    """
+    raise NotImplementedError("scaffold")
+
+
 def _atomic_write(file: Path, new_raw: str) -> bool:
     """Write ``new_raw`` to ``file`` atomically and symlink-safely.
 

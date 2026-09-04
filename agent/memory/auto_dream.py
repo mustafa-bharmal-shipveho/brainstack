@@ -358,6 +358,32 @@ def _refresh_pending_summary(brain_root=None):
         pass
 
 
+def _archive_expired_rolls(episodic_path, snapshots_dir, now=None) -> int:
+    """Move a rolled sibling of `episodic_path` to `snapshots_dir` once
+    every entry inside it is older than `decay.DECAY_DAYS`. Returns the
+    count archived. Called for the default namespace AND for every
+    `memory/episodic/<ns>/` dir, so codex/claude-sessions/digests are
+    bounded on disk without a registered clusterer.
+
+    Scaffold: signature only, NOT wired into run_dream_cycle()/run() yet.
+    See tests/test_rotation_episodic.py::
+    test_auto_dream_archives_roll_when_all_entries_expired and
+    test_auto_dream_archives_rolls_in_unregistered_namespaces.
+    """
+    raise NotImplementedError("scaffold")
+
+
+def _write_cycle_status(brain_root, namespace, summary_line, *, ok=True, error=None) -> None:
+    """Write `runtime/dream_status.json` (schema in plans/guards.md) via
+    `_atomic.atomic_write_json`. Called before `_refresh_pending_summary()`
+    in both `run_dream_cycle()` paths and in `run()`.
+
+    Scaffold: signature only, NOT wired into run_dream_cycle()/run() yet.
+    See tests/test_dream_status.py.
+    """
+    raise NotImplementedError("scaffold")
+
+
 def run_dream_cycle():
     # Hold the lock across the FULL read-modify-write window. Any
     # append_jsonl() call from another harness blocks until we release.

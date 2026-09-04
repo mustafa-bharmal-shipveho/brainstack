@@ -269,6 +269,34 @@ def _last_run_quarantined(tail_lines: list[str]) -> bool:
     return False
 
 
+def _last_remote_error(tail_lines: list[str]) -> Optional[str]:
+    """The `remote: error: ...` line git printed during the most recent
+    sync run, or `None` if the tail carries no such line.
+
+    Scaffold: signature only. See tests/test_render_pending.py::
+    TestSyncErrorAndHealthSections.
+    """
+    raise NotImplementedError("scaffold")
+
+
+def _held_back_paths(tail_lines: list[str]) -> dict[str, list[str]]:
+    """Paths a sync run quarantined (secret hit) or held back (oversize),
+    keyed `"secret"` / `"oversize"`. Scaffold: signature only."""
+    raise NotImplementedError("scaffold")
+
+
+def _last_run_oversize(tail_lines: list[str]) -> bool:
+    """True if the most recent sync run held back an oversize file.
+    Scaffold: signature only."""
+    raise NotImplementedError("scaffold")
+
+
+def _load_health(brain_root: Path) -> Optional[dict]:
+    """Load `<brain>/runtime/health.json`, adding a `"stale"` bool (> 26h
+    old). `None` if missing or unreadable. Scaffold: signature only."""
+    raise NotImplementedError("scaffold")
+
+
 def _check_sync_status(brain_root: Path) -> str:
     """Return a precise sync-status string so the banner can render an
     accurate reason instead of a single misleading "TruffleHog blocked"
@@ -326,9 +354,23 @@ def compose_summary(
     brain_root: Path,
     drift_report: Optional[dict] = None,
     sync_status: str = "ok",
+    *,
+    sync_error: Optional[str] = None,
+    held_back: Optional[dict] = None,
+    health: Optional[dict] = None,
 ) -> str:
     """Build the markdown body. Returns a one-liner if everything's clean
-    (so SessionStart hook can suppress chatter on healthy days)."""
+    (so SessionStart hook can suppress chatter on healthy days).
+
+    `sync_error`, `held_back`, and `health` are S5 additions (requirements
+    2 and 3): quoting the actual git error behind a blocked-network sync,
+    naming oversize-held-back paths, and rendering the `## Health`
+    section from `runtime/health.json`. Scaffold: the parameters are
+    accepted so callers can pass them, but the rendering they drive is
+    not yet wired — see tests/test_render_pending.py::
+    TestSyncErrorAndHealthSections for the target behaviour. Existing
+    callers (none of which pass these) are unaffected.
+    """
     counts = count_pending_per_namespace(brain_root)
     total = sum(counts.values())
     misplaced = count_misplaced_per_namespace(brain_root)

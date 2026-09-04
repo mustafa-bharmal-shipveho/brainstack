@@ -291,6 +291,51 @@ def _append_auto_recall_event(config: RuntimeConfig, session_id: str,
         print(f"[runtime] auto-recall telemetry write failed: {e!r}", file=sys.stderr)
 
 
+def _resolve_daemon_socket(config: RuntimeConfig) -> Path:
+    """Resolve the warm recall daemon's socket path for this hook fire.
+
+    Scaffold: signature + docstring only (S3). See
+    tests/runtime/test_hook_daemon_path.py.
+    """
+    raise NotImplementedError("scaffold")
+
+
+def _daemon_query(
+    prompt: str,
+    *,
+    k: int,
+    session_id: str,
+    socket_path: "Path",
+    budget_ms: int,
+) -> "tuple[dict | None, str | None]":
+    """Query the warm recall daemon over its Unix socket.
+
+    Returns `(response, None)` on success or `(None, reason)` on failure,
+    where `reason` is one of the `recall.daemon_client.DaemonUnavailable`
+    reasons (`no_socket`, `connection_refused`, `timeout`,
+    `protocol_error`, `server_error`) or `import_error` when
+    `recall.daemon_client` itself is unavailable.
+
+    Scaffold stub (S3): always reports the daemon as absent so every
+    caller falls back to the in-process path unchanged. See
+    tests/runtime/test_hook_daemon_path.py.
+    """
+    return (None, "no_socket")
+
+
+def _print_health_banner(config: RuntimeConfig, payload: dict[str, Any]) -> None:
+    """Print one line per FAIL check from the cached `runtime/health.json`
+    report on SessionStart, plus a live re-check of this session's
+    auto-recall config (the cached report was written with the brain as
+    cwd, so it cannot see a worktree pyproject.toml shadowing the global
+    config). Never raises; never blocks; prints nothing on any error.
+
+    Scaffold stub: does nothing (S5 surfacing work, not yet wired into
+    `handle_hook`). See tests/runtime/test_session_start_health.py.
+    """
+    return None
+
+
 def _build_reinjection_for_session(config) -> str:
     """Replay the event log to current state, then ask the composer to
     build a re-injection block. Returns empty string if nothing useful."""

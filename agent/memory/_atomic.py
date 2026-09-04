@@ -18,6 +18,35 @@ import os
 from pathlib import Path
 from typing import Any
 
+# S5 rotation threshold (20 MiB) — shared naming rule with
+# agent/harness/hooks/_episodic_io.ROTATE_BYTES and
+# runtime/core/events.EVENT_LOG_ROTATE_BYTES.
+ROTATE_BYTES = 20 * 1024 * 1024
+
+
+def rolled_name(path: Path, day: str) -> Path:
+    """Compute the rotated sibling name for `path` on day `day`
+    (`AGENT_LEARNINGS.jsonl` -> `AGENT_LEARNINGS.<day>.jsonl`, with a
+    `.1`, `.2`, ... counter inserted before the suffix on a same-day
+    collision). Scaffold: signature only. See
+    tests/test_rotation_episodic.py."""
+    raise NotImplementedError("scaffold")
+
+
+def rotate_if_oversize(
+    path: Path, *, max_bytes: int = ROTATE_BYTES, today: str | None = None
+) -> Path | None:
+    """Rename `path` to `rolled_name(path, today or _today())` if it is
+    at/over `max_bytes`, returning the rolled path (or `None` if
+    untouched). Scaffold: signature only."""
+    raise NotImplementedError("scaffold")
+
+
+def episodic_files(current: Path) -> list[Path]:
+    """Rolled siblings of `current` (ascending by name), then `current`
+    itself. Scaffold: signature only."""
+    raise NotImplementedError("scaffold")
+
 
 def atomic_write_bytes(path: os.PathLike[str] | str, data: bytes) -> None:
     p = Path(path)

@@ -20,3 +20,4 @@ Type=oneshot
 ExecStart=REPLACE_PYTHON REPLACE_BRAIN_ROOT/tools/migrate_dispatcher.py auto-migrate-all --brain-root REPLACE_BRAIN_ROOT
 Environment=BRAIN_ROOT=REPLACE_BRAIN_ROOT
 Environment=HOME=REPLACE_HOME
+Environment=PATH=REPLACE_HOME/.local/bin:REPLACE_HOME/.claude/local:/usr/local/bin:/usr/bin:/bin

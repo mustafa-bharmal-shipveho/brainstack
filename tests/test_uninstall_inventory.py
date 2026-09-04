@@ -8,10 +8,16 @@ and the dry-run inventory list had the wrong names.
 
 Fix: align the inventory plist-name list with what `--setup-X` actually writes.
 
-This test seeds all 4 expected plists and runs `--dry-run`, then asserts
+This test seeds all 5 expected plists and runs `--dry-run`, then asserts
 each one appears in the "Will REMOVE" preview. If a future contributor
 adds a new --setup-X mode without updating the uninstall inventory, this
 test will fail with the missing-plist name in the failure message.
+
+The fifth is `com.brainstack.recall-daemon.plist` (`--setup-daemon`, S3).
+It is the one an incomplete uninstall hurts most: a leftover daemon unit
+keeps `KeepAlive` respawning a process that holds an exclusive lock on the
+Qdrant store, so a later reinstall reports "index is busy" with nothing
+obviously installed to explain it.
 """
 from __future__ import annotations
 
@@ -45,8 +51,8 @@ def _run_uninstall(*args: str, env: dict) -> subprocess.CompletedProcess:
     )
 
 
-def test_dry_run_lists_all_four_plists_when_present(tmp_path: Path):
-    """Seed all 4 plists the live install writes. --dry-run preview must
+def test_dry_run_lists_all_five_plists_when_present(tmp_path: Path):
+    """Seed all 5 plists the live install writes. --dry-run preview must
     list every one of them in 'Will REMOVE'."""
     fake_home = tmp_path / "fakehome"
     env = _fresh_env(fake_home)
@@ -57,6 +63,7 @@ def test_dry_run_lists_all_four_plists_when_present(tmp_path: Path):
         "com.user.agent-sync.plist",
         "com.brainstack.auto-migrate.plist",
         "com.brainstack.claude-extras.plist",
+        "com.brainstack.recall-daemon.plist",
     ]
     for name in expected:
         (plist_dir / name).write_text(
@@ -83,7 +90,8 @@ def test_dry_run_only_lists_plists_that_exist(tmp_path: Path):
     env = _fresh_env(fake_home)
     plist_dir = fake_home / "Library" / "LaunchAgents"
 
-    # Only seed dream + sync; leave auto-migrate + claude-extras absent
+    # Only seed dream + sync; leave auto-migrate, claude-extras and
+    # recall-daemon absent
     (plist_dir / "com.user.agent-dream.plist").write_text("<plist/>")
     (plist_dir / "com.user.agent-sync.plist").write_text("<plist/>")
 
@@ -94,12 +102,14 @@ def test_dry_run_only_lists_plists_that_exist(tmp_path: Path):
     assert "com.user.agent-dream.plist" in combined
     assert "com.user.agent-sync.plist" in combined
     # Absent ones should NOT appear
-    assert "com.brainstack.auto-migrate.plist" not in combined, (
-        f"dry-run claimed to remove a plist that doesn't exist:\n{combined}"
-    )
-    assert "com.brainstack.claude-extras.plist" not in combined, (
-        f"dry-run claimed to remove a plist that doesn't exist:\n{combined}"
-    )
+    for absent in (
+        "com.brainstack.auto-migrate.plist",
+        "com.brainstack.claude-extras.plist",
+        "com.brainstack.recall-daemon.plist",
+    ):
+        assert absent not in combined, (
+            f"dry-run claimed to remove {absent}, which doesn't exist:\n{combined}"
+        )
 
 
 def test_dry_run_lists_systemd_units_when_present(tmp_path: Path):
@@ -225,7 +235,18 @@ def test_inventory_and_removal_use_same_plist_names(tmp_path: Path):
         f"  inventory only: {inv_names - rm_names}\n"
         f"  removal only:   {rm_names - inv_names}"
     )
-    assert len(inv_names) >= 4, (
-        f"plist name list shrunk below 4 entries — expected at least dream, "
-        f"sync, auto-migrate, claude-extras. Got: {inv_names}"
+    required = {
+        "com.user.agent-dream.plist",
+        "com.user.agent-sync.plist",
+        "com.brainstack.auto-migrate.plist",
+        "com.brainstack.claude-extras.plist",
+        "com.brainstack.recall-daemon.plist",
+    }
+    assert required <= inv_names, (
+        f"plist name list is missing {required - inv_names}. Every --setup-X "
+        f"mode that writes a plist must appear in both loops. Got: {inv_names}"
+    )
+    assert len(inv_names) >= 5, (
+        f"plist name list shrunk below 5 entries — expected at least dream, "
+        f"sync, auto-migrate, claude-extras, recall-daemon. Got: {inv_names}"
     )

@@ -183,8 +183,21 @@ def _yaml_list(items: list[str]) -> str:
     return "[" + ", ".join(safe) + "]"
 
 
-def render_markdown(digest: dict, meta: dict) -> str:
-    """Build the markdown body with YAML front matter."""
+def render_markdown(
+    digest: dict,
+    meta: dict,
+    *,
+    name: str | None = None,
+    description: str | None = None,
+    type: str | None = None,
+) -> str:
+    """Build the markdown body with YAML front matter.
+
+    ``name``/``description``/``type`` are accepted for the upcoming
+    identity-fields backfill (see recall/lint_digests.py and
+    tests/test_digest_render_frontmatter.py) but are not yet emitted —
+    scaffold only, no behavior change.
+    """
     domain_tags = digest.get("domain_tags") or []
     if not isinstance(domain_tags, list):
         domain_tags = []

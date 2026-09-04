@@ -69,21 +69,42 @@ class RuntimeConfig:
     enable_auto_recall: bool = False
     auto_recall_k: int = 5
     auto_recall_budget_tokens: int = 1500
-    # 3000ms default: every Claude Code hook is a fresh subprocess, so we
-    # pay Python startup (~200ms) + recall imports (~300ms) + qdrant /
-    # embedder load (~1500ms cold) per fire. 1500ms timed out on cold-start
-    # in real-world testing. Users with warm setups can lower this; users
-    # who hit timeouts can raise it. Tuned 2026-05-05 against live brain.
-    auto_recall_timeout_ms: int = 3000
+    # 1500ms default (was 3000ms pre-S3): a warm recall daemon answers in
+    # ~60-130ms + rerank, so the hard bound on the whole worker no longer
+    # needs to absorb a cold qdrant/embedder load. Cold in-process fallback
+    # (daemon down) will legitimately time out under this bound; that is
+    # reported honestly via x_outcome=timeout rather than silently widened.
+    auto_recall_timeout_ms: int = 1500
     auto_recall_min_chars: int = 8
     # Reject results below this similarity score before injecting. 0.0
     # disables the floor (all top-K results inject). On a hybrid retriever
     # with ~200 docs, ~0.30 cuts out the long-tail noise; raise toward
     # ~0.60 if you want only confident matches.
     auto_recall_min_score: float = 0.0
+    # S3 (warm daemon): socket connect+respond budget. Effective budget is
+    # min(this, auto_recall_timeout_ms) — the daemon path must still respect
+    # the hook's overall wall clock.
+    auto_recall_daemon_budget_ms: int = 800
+    # Resolved via recall.config.daemon_socket_path (env override > this
+    # literal > $BRAIN_ROOT/runtime > $BRAIN_HOME parent > ~/.agent). The
+    # "$BRAIN_ROOT" literal is expanded at resolution time, not load time,
+    # so it always reflects the CURRENT brain root.
+    auto_recall_daemon_socket: str = "$BRAIN_ROOT/runtime/recall.sock"
+    # S4 relevance gate: reject candidates below this cross-encoder score.
+    # 0.0 = gate off (matches pre-S4 behavior). Calibrated value is written
+    # to the user's global runtime config by eval/calibrate_rerank_gate.py.
+    auto_recall_min_rerank: float = 0.0
+    # Per-session dedup store kill switch (S2). True = don't re-inject a
+    # doc whose content hasn't changed since it was last shown this session.
+    auto_recall_dedup: bool = True
     budgets: dict[str, int] = field(default_factory=lambda: dict(_DEFAULT_BUDGETS))
     tool_bucket_overrides: dict[str, str] = field(default_factory=lambda: dict(_TOOL_BUCKET_OVERRIDES))
     config_path: Path | None = None
+    # Ordered list (highest precedence first) of the config layers that
+    # contributed to this instance. Today `load()` still reads a single
+    # file, so this is `[config_path]` or `[]` — the per-key layered merge
+    # (S1) will populate it with every layer consulted.
+    config_layers: list[Path] = field(default_factory=list)
 
     @property
     def event_log_path(self) -> Path:
@@ -93,8 +114,39 @@ class RuntimeConfig:
     def manifest_dir(self) -> Path:
         return self.log_dir / "manifest"
 
+    @property
+    def injected_dir(self) -> Path:
+        """Per-session dedup store directory (S2), sibling to the event log
+        so install.sh and the prune pass have exactly one directory tree to
+        reason about."""
+        return self.log_dir / "injected"
+
+    @property
+    def daemon_socket_path(self) -> Path:
+        """Resolved socket path for the warm recall daemon (S3).
+
+        Delegates to `recall.config.daemon_socket_path`, the single
+        resolution order shared by the hook, the CLI, and the daemon
+        itself. Imported lazily to avoid a hard import-time dependency
+        from this adapter module onto `recall`.
+        """
+        from recall.config import daemon_socket_path as _daemon_socket_path
+
+        return _daemon_socket_path(self.auto_recall_daemon_socket)
+
     def tool_to_bucket(self, tool_name: str) -> str:
         return self.tool_bucket_overrides.get(tool_name, _DEFAULT_TOOL_BUCKET)
+
+    @staticmethod
+    def global_config_path() -> Path:
+        """The lowest-precedence file layer: `$BRAIN_ROOT/runtime/pyproject.toml`,
+        defaulting to `~/.agent/runtime/pyproject.toml` when `$BRAIN_ROOT` is
+        unset."""
+        return (
+            Path(os.environ.get("BRAIN_ROOT") or "~/.agent").expanduser()
+            / "runtime"
+            / "pyproject.toml"
+        )
 
     @classmethod
     def load(cls, *, config_path: Path | None = None) -> "RuntimeConfig":
@@ -145,6 +197,11 @@ class RuntimeConfig:
             auto_recall_min_score=_float("auto_recall_min_score", 0.0),
             budgets=budgets,
             config_path=path,
+            # `load()` still reads a single file today (the per-key layered
+            # merge across $RECALL_RUNTIME_CONFIG / cwd / global lands in a
+            # later slice); record that one file as the sole layer so
+            # `config_layers` is at least truthful about current behavior.
+            config_layers=[path],
         )
 
     @staticmethod

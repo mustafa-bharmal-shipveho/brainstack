@@ -29,18 +29,52 @@ try:
 except ImportError:
     _HAVE_FLOCK = False
 
+# S5 rotation threshold (20 MiB) — matches agent/memory/_atomic.ROTATE_BYTES
+# and runtime/core/events.EVENT_LOG_ROTATE_BYTES. Read at call time by
+# `append_jsonl` (via `_rotate_if_oversize`, not yet wired — see the
+# module-level scaffold note below), so tests can monkeypatch this
+# constant instead of threading a threshold through every caller.
+ROTATE_BYTES = 20 * 1024 * 1024
+
 
 def _sentinel_path(data_path: str) -> str:
     """Return the lock sentinel sibling for a data file path."""
     return data_path + ".lock"
 
 
-def append_jsonl(path: str, entry: dict) -> dict:
+def _today() -> str:
+    """UTC calendar day as `YYYY-MM-DD`, the stamp `rolled_name` inserts.
+    Scaffold: signature only. See tests/test_rotation_episodic.py."""
+    raise NotImplementedError("scaffold")
+
+
+def rolled_name(path: str, day: str) -> str:
+    """Compute the rotated sibling name for `path` on day `day`
+    (`AGENT_LEARNINGS.jsonl` -> `AGENT_LEARNINGS.<day>.jsonl`, with a
+    `.1`, `.2`, ... counter inserted before the suffix on a same-day
+    collision). Scaffold: signature only."""
+    raise NotImplementedError("scaffold")
+
+
+def _rotate_if_oversize(path: str, max_bytes: int) -> str | None:
+    """Rename `path` to `rolled_name(path, _today())` if it is at/over
+    `max_bytes`, returning the rolled path (or `None` if untouched).
+    Scaffold: signature only."""
+    raise NotImplementedError("scaffold")
+
+
+def append_jsonl(path: str, entry: dict, *, max_bytes: int | None = None) -> dict:
     """Serialize `entry` to one JSON line and append to `path`.
 
     Lock identity lives on `path + ".lock"` so a concurrent atomic
     rewrite of `path` (which swaps its inode) does not invalidate
     in-flight appenders' lock acquisitions.
+
+    `max_bytes` is an S5 addition for size-triggered rotation (falling
+    back to `ROTATE_BYTES` when omitted). Scaffold: the parameter is
+    accepted so callers (and tests) can pass it, but no rotation happens
+    yet — behaviour is unchanged from the pre-S5 baseline. See
+    tests/test_rotation_episodic.py for the target behaviour.
 
     Failure handling: this hook fires per tool call, so any unhandled
     exception will dump a traceback to the user's terminal. Catch all

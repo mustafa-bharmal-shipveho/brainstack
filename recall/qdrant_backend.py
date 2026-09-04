@@ -72,6 +72,23 @@ def _reset_sparse_fallback_warning_for_tests() -> None:
     _SPARSE_FALLBACK_WARN_ONCE.clear()
 
 
+# S4: cross-encoder input cap in characters. Long docs cost rerank latency
+# roughly linearly in token count; capping keeps a burst of long memories
+# from blowing the daemon's per-query budget.
+RERANK_TEXT_CAP = 2000
+
+
+def dense_fallback_active() -> bool:
+    """True when this process has warned (and is running on) BM25-only
+    fallback because the dense embedder was unavailable.
+
+    Scaffold stub: always False. Real behavior mirrors
+    `_SPARSE_FALLBACK_WARN_ONCE.is_set()` so the hook can report
+    `x_degraded` honestly once wired up.
+    """
+    return False
+
+
 # FastEmbed types are imported lazily so unit tests that monkeypatch the
 # embedder factories don't pay the import cost.
 _DENSE_DEFAULT = "BAAI/bge-base-en-v1.5"

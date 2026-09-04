@@ -54,6 +54,11 @@ def serialize_results(results: Iterable[QueryResult]) -> list[dict]:
                 "type": _to_json_safe(fm.get("type")),
                 "description": _untrusted_field(fm.get("description") or ""),
                 "score": round(float(r.score), 6),
+                "rerank_score": (
+                    round(float(r.rerank_score), 6)
+                    if r.rerank_score is not None
+                    else None
+                ),
                 "provenance": provenance_label(fm),
             }
         )

@@ -24,3 +24,4 @@ ExecStart=/usr/bin/env bash REPLACE_BRAIN_ROOT/tools/sync.sh
 Environment=PYTHON_BIN=REPLACE_PYTHON
 Environment=BRAIN_ROOT=REPLACE_BRAIN_ROOT
 Environment=HOME=REPLACE_HOME
+Environment=PATH=REPLACE_HOME/.local/bin:REPLACE_HOME/.claude/local:/usr/local/bin:/usr/bin:/bin

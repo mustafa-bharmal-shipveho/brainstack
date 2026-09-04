@@ -21,6 +21,11 @@
 #   ./install.sh --setup-systemd / --remove-systemd
 #                             -- Linux scheduler parity: install/remove the
 #                                systemd user units (sync/dream/auto-migrate)
+#   ./install.sh --setup-daemon / --remove-daemon
+#                             -- (macOS) install/remove the recall query
+#                                daemon LaunchAgent (com.brainstack.recall-
+#                                daemon). --no-daemon skips it on the
+#                                default full install.
 #   ./install.sh --migrate <flat-memory-dir>
 #                             -- run tools/migrate.py against the given dir
 #
@@ -239,6 +244,14 @@ while [ $# -gt 0 ]; do
             MODE="remove-systemd"
             shift
             ;;
+        --setup-daemon)
+            MODE="setup-daemon"
+            shift
+            ;;
+        --remove-daemon)
+            MODE="remove-daemon"
+            shift
+            ;;
         --purge-data)
             UNINSTALL_PURGE_DATA=1
             shift
@@ -358,6 +371,15 @@ while [ $# -gt 0 ]; do
             NO_LAUNCHD=1
             shift
             ;;
+        --no-daemon)
+            # Fresh-install only opt-out; the daemon MODE itself is not
+            # yet wired into the default install (see the setup-daemon
+            # MODE block below). Kept for --help discoverability and so
+            # a wrapper script that already passes this flag doesn't hit
+            # "unknown argument".
+            NO_DAEMON=1
+            shift
+            ;;
         --no-recall-first)
             NO_RECALL_FIRST=1
             shift
@@ -452,6 +474,22 @@ maybe_install_scanner() {
         echo "install: $name installation finished but binary not on PATH; check your shell rc" >&2
         return 1
     fi
+}
+
+# ----- Helper: append missing gitignore rules from a template (S5 R4) -----
+# append_missing_gitignore_rules <template-path> <live-gitignore-path>
+#
+# For each non-blank, non-comment line in the template that is not already
+# present in the live file (exact match via `grep -qxF`), append it once
+# under a header naming this upgrade. Never removes a line the user wrote
+# by hand; running twice against the same template is a no-op.
+#
+# Scaffold: not yet implemented, and NOT called from --upgrade or the
+# fresh-install path yet (still the three ad-hoc grep/append blocks below).
+# See tests/test_brain_gitignore_upgrade.py.
+append_missing_gitignore_rules() {
+    echo "install: append_missing_gitignore_rules: not implemented" >&2
+    return 1
 }
 
 # ----- Helper: print the install plan -----
@@ -1148,6 +1186,7 @@ if [ "$MODE" = "setup-claude-extras" ] || [ "$MODE" = "remove-claude-extras" ]; 
     fi
     sed -e "s|__BRAIN_ROOT__|$BRAIN_ROOT|g" \
         -e "s|__PYTHON_ABS__|$PYTHON_ABS|g" \
+        -e "s|__HOME__|$HOME|g" \
         "$template" > "$plist_path"
     # Validate before loading. plutil exits non-zero on malformed plists.
     if ! plutil -lint "$plist_path" >/dev/null 2>&1; then
@@ -2138,6 +2177,26 @@ PYEOF
     exit 0
 fi
 
+# ----- Mode: setup-daemon / remove-daemon -----
+# Installs/removes the recall query daemon LaunchAgent
+# (com.brainstack.recall-daemon), modeled on the setup-claude-extras
+# block above. S3 owns the daemon itself (recall/daemon.py, the socket
+# protocol, recall serve); this scaffold only wires the installer's flag
+# surface + uninstall inventory (see plans/hook-path.md's install.sh
+# row) so those land independently without touching this file twice.
+#
+# Scaffold: not yet implemented. --dry-run still prints the plan and
+# exits 0 (the global contract every mode honors); the real render/load
+# path is a `not implemented` exit 1 until S3 lands it.
+if [ "$MODE" = "setup-daemon" ] || [ "$MODE" = "remove-daemon" ]; then
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "==> DRY RUN (setup-daemon): would install com.brainstack.recall-daemon.plist. Nothing was changed."
+        exit 0
+    fi
+    echo "recall-daemon: not implemented" >&2
+    exit 1
+fi
+
 # ----- Mode: uninstall -----
 # Single safe entry point for removing brainstack from a user's machine.
 # Default behavior: removes every host-side surface brainstack installed,
@@ -2174,7 +2233,8 @@ if [ "$MODE" = "uninstall" ]; then
         "$plist_dir/com.user.agent-dream.plist" \
         "$plist_dir/com.user.agent-sync.plist" \
         "$plist_dir/com.brainstack.auto-migrate.plist" \
-        "$plist_dir/com.brainstack.claude-extras.plist"; do
+        "$plist_dir/com.brainstack.claude-extras.plist" \
+        "$plist_dir/com.brainstack.recall-daemon.plist"; do
         [ -f "$plist" ] && inventory_present+=("launchd plist: $plist")
     done
 
@@ -2303,7 +2363,8 @@ if [ "$MODE" = "uninstall" ]; then
         "$plist_dir/com.user.agent-dream.plist" \
         "$plist_dir/com.user.agent-sync.plist" \
         "$plist_dir/com.brainstack.auto-migrate.plist" \
-        "$plist_dir/com.brainstack.claude-extras.plist"; do
+        "$plist_dir/com.brainstack.claude-extras.plist" \
+        "$plist_dir/com.brainstack.recall-daemon.plist"; do
         if [ -f "$plist" ]; then
             launchctl unload "$plist" 2>/dev/null || true
             rm -f "$plist"

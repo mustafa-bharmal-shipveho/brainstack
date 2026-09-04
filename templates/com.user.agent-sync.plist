@@ -38,7 +38,7 @@
         <key>PYTHON_BIN</key>
         <string>REPLACE_PYTHON</string>
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>REPLACE_HOME/.local/bin:REPLACE_HOME/.claude/local:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>HOME</key>
         <string>REPLACE_HOME</string>
     </dict>

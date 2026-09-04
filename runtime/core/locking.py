@@ -28,12 +28,34 @@ def sentinel_lock_path(data_path: Path) -> Path:
     return data_path.parent / f".{data_path.name}.lock"
 
 
-def locked_append(path: Path | str, line: str) -> None:
+def rolled_name(path: Path, day: str) -> Path:
+    """Compute the rotated sibling name for `path` on day `day`
+    (`events.log.jsonl` -> `events.log.<day>.jsonl`, with a `.1`, `.2`,
+    ... counter inserted before the suffix on a same-day collision).
+    Scaffold: signature only. See tests/runtime/test_events_rotation.py.
+    """
+    raise NotImplementedError("scaffold")
+
+
+def iter_log_paths(path: Path) -> list[Path]:
+    """Rolled siblings of `path` (ascending by name), then `path` itself.
+    Scaffold: signature only."""
+    raise NotImplementedError("scaffold")
+
+
+def locked_append(path: Path | str, line: str, *, rotate_bytes: int | None = None) -> None:
     """Append a line to `path` under an exclusive flock on a sentinel file.
 
     Parent dirs are created if missing. A trailing newline is added if the
     line doesn't already end with one. Concurrent calls produce one line
     each, in some interleaving — never corrupted bytes.
+
+    `rotate_bytes` is an S5 addition: when set, a current file at/over
+    the threshold is renamed to `rolled_name(path, <today>)` before the
+    append. Scaffold: the parameter is accepted so callers (and tests)
+    can pass it, but no rotation happens yet — behaviour is unchanged
+    from the pre-S5 baseline. See tests/runtime/test_events_rotation.py
+    for the target behaviour.
     """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -82,4 +104,7 @@ def locked_write(path: Path | str, content: str) -> None:
             fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
 
 
-__all__ = ["locked_append", "locked_write", "sentinel_lock_path"]
+__all__ = [
+    "iter_log_paths", "locked_append", "locked_write", "rolled_name",
+    "sentinel_lock_path",
+]
