@@ -131,6 +131,31 @@ Digest-derived features include profile rollups, theme clustering, and proactive
 context candidates. Keep prompts/framework code domain-agnostic; tags should be
 extracted from session content, not from a fixed company taxonomy.
 
+### Bounded incremental digests (per-hour budget)
+
+A single session digest costs several minutes of real LLM time (`claude -p`,
+haiku), so `sync_claude_extras.py`'s hourly LaunchAgent tick used to run
+`digest_cli.py incremental` under the same 600s timeout as the near-instant
+session/misc mirror adapters — on any hour with more than a couple of new
+sessions the digest step could never finish in time and got killed every run,
+so the LaunchAgent exited 1 forever even though the session and misc mirrors
+had actually succeeded. `digest_cli.py incremental` now takes `--limit N`
+(default 3) and `--max-seconds S` (default 1500): it processes at most N
+pending (not-yet-digested) sessions and stops cleanly — no partial LLM call,
+no kill — once S seconds have elapsed, printing a machine-readable
+`digests: processed=P pending=Q elapsed_s=E budget_hit=<bool>` line. Progress
+is sidecar-idempotent either way, so a bounded run never loses work, it just
+leaves the rest for the next tick. `sync_claude_extras.py` gives the digest
+step its own timeout (`BRAINSTACK_DIGEST_TIMEOUT_S`, default 1800s, separate
+from the 600s adapter ceiling), forwards `BRAINSTACK_DIGEST_LIMIT` /
+`BRAINSTACK_DIGEST_MAX_SECONDS` (defaults 3 / 1500) as `--limit`/
+`--max-seconds`, logs the summary line, and writes
+`runtime/digest_status.json` (`ts`, `processed`, `pending`, `elapsed_s`,
+`budget_hit`) so a future health check can WARN when `pending` grows for
+several ticks in a row. The run still exits 0 when the digest step completed
+even with `pending > 0` — that's a backlog, not a failure — and exits 1 only
+on a real failure (non-zero rc or an actual timeout kill).
+
 ## Auto-recall
 
 Auto-recall is on by default in the full install since v0.6.0 (opt out with

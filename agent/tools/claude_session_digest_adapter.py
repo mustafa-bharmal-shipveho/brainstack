@@ -34,6 +34,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Callable, Iterator
 
@@ -503,13 +504,26 @@ def backfill(
     codex_root: Path | None,
     provider: LLMProvider | None = None,
     log: Callable[[str], None] = lambda s: None,
+    limit: int | None = None,
+    max_seconds: float | None = None,
 ) -> dict:
     """Walk all configured sources and produce digests. Returns stats.
 
     Concurrency: holds an exclusive lock on `<brain>/.digest-backfill.lock`
     so two concurrent runs don't race on the sidecar / episodic /
     markdown writes. A second run while one is in progress is a clean
-    no-op (NOT an error — matches sync_claude_extras' lock semantics)."""
+    no-op (NOT an error — matches sync_claude_extras' lock semantics).
+
+    `limit` / `max_seconds` bound how much LLM work ONE call does — the
+    hourly LaunchAgent tick has a finite window, and each session digest
+    costs several minutes of LLM time. Sessions already digested (SHA
+    matches the sidecar) are free to skip and never count against either
+    budget. Once the budget is exhausted, remaining not-yet-digested
+    sessions are counted into `stats["pending"]` (a cheap SHA check, no
+    LLM call) rather than silently dropped, so the caller can report an
+    accurate backlog instead of just stopping quietly. `stats["budget_hit"]`
+    is true whenever any session is left pending at the end of the
+    call, for either reason (count or time)."""
     brain_root = Path(brain_root)
     brain_root.mkdir(parents=True, exist_ok=True)
     if provider is None:
@@ -520,10 +534,13 @@ def backfill(
     if not ok:
         raise ProviderNotAvailable({provider.name: reason or "unavailable"})
 
+    start_ts = time.monotonic()
     stats = {"discovered": 0, "digests_written": 0,
              "skipped_idempotent": 0, "failed": 0,
              "races_skipped": 0,
-             "tokens_in_total": 0, "tokens_out_total": 0}
+             "tokens_in_total": 0, "tokens_out_total": 0,
+             "processed": 0, "pending": 0,
+             "elapsed_s": 0.0, "budget_hit": False}
 
     ep_path = brain_root / "memory" / "episodic" / "digests" \
               / "AGENT_LEARNINGS.jsonl"
@@ -531,6 +548,7 @@ def backfill(
 
     with _backfill_lock(brain_root, log) as acquired:
         if not acquired:
+            stats["elapsed_s"] = time.monotonic() - start_ts
             return stats
 
         # Re-read sidecar AFTER acquiring the lock so a freshly-finished
@@ -546,6 +564,20 @@ def backfill(
             if sha_before and seen.get(ns.session_id) == sha_before:
                 stats["skipped_idempotent"] += 1
                 return
+
+            # This session is pending (not yet digested). Check the
+            # count/time budget BEFORE doing any LLM work — a session
+            # already over budget is counted as pending, never started
+            # (no kill mid-summarize, just a clean stop).
+            if limit is not None and stats["processed"] >= limit:
+                stats["pending"] += 1
+                return
+            if (max_seconds is not None
+                    and (time.monotonic() - start_ts) >= max_seconds):
+                stats["pending"] += 1
+                return
+
+            stats["processed"] += 1
             try:
                 if ns.raw_token_estimate <= SINGLE_PASS_TOKEN_LIMIT:
                     digest = _summarize_single(ns, provider, brain_root)
@@ -624,4 +656,6 @@ def backfill(
                 sp = _session_source_path(ns, claude_root=None)
                 _process(ns, sp)
 
+    stats["elapsed_s"] = time.monotonic() - start_ts
+    stats["budget_hit"] = stats["pending"] > 0
     return stats
