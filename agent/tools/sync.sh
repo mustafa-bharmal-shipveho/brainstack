@@ -285,45 +285,48 @@ else
     HAVE_HEAD=0
 fi
 
+# Is exactly this path still in the index? `-z` avoids core.quotepath
+# mangling, and the :(literal) pathspec keeps the query exact. Shared by
+# the quarantine gate and the size gate below.
+_is_staged() {
+    local want="$1" got
+    while IFS= read -r -d '' got; do
+        [ "$got" = "$want" ] && return 0
+    done < <(git diff --cached --name-only -z -- ":(literal)$want")
+    return 1
+}
+
+# If a held-back path (quarantined for a possible secret, or oversize) is
+# the DESTINATION of a staged rename, the matching source deletion is a
+# separate index entry. `git diff --cached --name-only` (which both gates
+# iterate over) reports only the destination — the paired deletion is
+# invisible there. Unstaging only the destination would commit that
+# deletion while withholding the new content: the remote would lose the
+# memory entirely, not just delay it. Restore the source too, so a
+# rename+hold-back is a clean no-op for this commit. Shared by both gates.
+#
+# `--name-status -z -M` emits R/C entries as three NUL fields
+# (status, old, new) and everything else as two.
+_restore_rename_source() {
+    local want="$1" label="${2:-held-back}" st old new
+    while IFS= read -r -d '' st; do
+        case "$st" in
+            R*|C*)
+                IFS= read -r -d '' old || break
+                IFS= read -r -d '' new || break
+                if [ "$new" = "$want" ]; then
+                    git reset -q HEAD -- ":(literal)$old" 2>>"$LOG_FILE" || true
+                    echo "$(date -u +%FT%TZ) sync: also restored rename source of $label file: $old" >> "$LOG_FILE"
+                fi
+                ;;
+            *)
+                IFS= read -r -d '' new || break
+                ;;
+        esac
+    done < <(git diff --cached --name-status -z -M)
+}
+
 if [ -n "$QUARANTINE" ]; then
-    # Is exactly this path still in the index? `-z` avoids core.quotepath
-    # mangling, and the :(literal) pathspec keeps the query exact.
-    _is_staged() {
-        local want="$1" got
-        while IFS= read -r -d '' got; do
-            [ "$got" = "$want" ] && return 0
-        done < <(git diff --cached --name-only -z -- ":(literal)$want")
-        return 1
-    }
-
-    # If the quarantined path is the DESTINATION of a staged rename, the
-    # matching source deletion is a separate index entry. Unstaging only
-    # the destination would commit the deletion while withholding the new
-    # content — the remote would lose that memory entirely until the
-    # quarantine clears. Restore the source too, so a rename+secret is a
-    # clean no-op for this commit.
-    #
-    # `--name-status -z -M` emits R/C entries as three NUL fields
-    # (status, old, new) and everything else as two.
-    _restore_rename_source() {
-        local want="$1" st old new
-        while IFS= read -r -d '' st; do
-            case "$st" in
-                R*|C*)
-                    IFS= read -r -d '' old || break
-                    IFS= read -r -d '' new || break
-                    if [ "$new" = "$want" ]; then
-                        git reset -q HEAD -- ":(literal)$old" 2>>"$LOG_FILE" || true
-                        echo "$(date -u +%FT%TZ) sync: also restored rename source of quarantined file: $old" >> "$LOG_FILE"
-                    fi
-                    ;;
-                *)
-                    IFS= read -r -d '' new || break
-                    ;;
-            esac
-        done < <(git diff --cached --name-status -z -M)
-    }
-
     N_QUARANTINED=0
     while IFS= read -r qfile; do
         [ -z "$qfile" ] && continue
@@ -343,7 +346,7 @@ if [ -n "$QUARANTINE" ]; then
         # pattern happens to hit — silently withholding files we never
         # reported as quarantined.
         # Must run while the rename pairing is still staged.
-        [ "$HAVE_HEAD" -eq 1 ] && _restore_rename_source "$qfile"
+        [ "$HAVE_HEAD" -eq 1 ] && _restore_rename_source "$qfile" "quarantined"
         if [ "$HAVE_HEAD" -eq 1 ]; then
             git reset -q HEAD -- ":(literal)$qfile" 2>>"$LOG_FILE" || true
         else
@@ -384,11 +387,16 @@ fi
 #
 # Comparison is strictly greater-than: a file already synced at exactly
 # the limit must not suddenly start stalling.
+#
+# A renamed-then-grown file's new path is a staged rename destination —
+# see _restore_rename_source above. Must run while the rename pairing is
+# still staged, i.e. before the reset/rm below.
 N_OVERSIZE=0
 while IFS= read -r -d '' f; do
     [ -z "$f" ] && continue
     size="$(wc -c < "$f" | tr -d ' ')"
     if [ "$size" -gt "$SYNC_MAX_FILE_BYTES" ]; then
+        [ "$HAVE_HEAD" -eq 1 ] && _restore_rename_source "$f" "oversize"
         if [ "$HAVE_HEAD" -eq 1 ]; then
             git reset -q HEAD -- ":(literal)$f" 2>>"$LOG_FILE" || true
         else
