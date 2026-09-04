@@ -261,10 +261,14 @@ def _last_run_quarantined(tail_lines: list[str]) -> bool:
     partial sync is invisible. That silence is precisely the failure mode
     that let a month of memories sit unpushed — surface it instead.
     """
-    for line in reversed(tail_lines[:-1]):
+    seen_run_line = False
+    for line in reversed(tail_lines):
+        if _is_health_line(line):
+            continue  # transparent: belongs to no run, ends no run
         low = line.lower()
-        if any(m in low for m in _RUN_TERMINAL_MARKERS):
+        if seen_run_line and any(m in low for m in _RUN_TERMINAL_MARKERS):
             break  # walked back into the previous run
+        seen_run_line = True
         if "sync: held back" in low:
             return True
     return False
@@ -287,27 +291,71 @@ _HEALTH_STALE_HOURS = 26.0
 _SIZE_REJECTION_RE = re.compile(r"file size limit|GH001|large files", re.IGNORECASE)
 
 
+# Git's own failure lines, matched at the START of a log line (after the
+# `date -u` prefix sync.sh adds), ranked by how much they explain. Mirrors
+# `recall.health._GIT_ERROR_PREFIXES`; the two parsers are pinned on one
+# fixture by `tests/test_render_pending.py::...::test_remote_error_parsers_agree`.
+#   0 — GitHub rejected the push and said why.
+#   1 — git gave up; the FIRST `fatal:` names the cause, later ones are
+#       boilerplate ("Could not read from remote repository").
+#   2 — transport/auth failures and git's summary line: no cause of their
+#       own, but better than silence.
+_GIT_ERROR_PREFIXES: tuple[tuple[str, ...], ...] = (
+    ("remote: error:", "! [remote rejected]"),
+    ("fatal:",),
+    ("error:", "ssh:", "permission denied", "could not resolve"),
+)
+
+
+def _is_health_line(line: str) -> bool:
+    """True for sync.sh's own `health: ...` lines.
+
+    The EXIT trap writes one on every exit path, so it always lands AFTER
+    the run's terminal marker. It belongs to no run: it must neither end
+    one nor count as its last line. Dropping these before a backward scan
+    is what lets the scan reach the git stderr sitting above the marker
+    (2026-09-04 smoke test, Defect 1).
+    """
+    return _LOG_TS_RE.sub("", line).strip().lower().startswith("health:")
+
+
 def _last_remote_error(tail_lines: list[str]) -> Optional[str]:
-    """The `remote: error: ...` line git printed during the most recent
-    sync run, or `None` if the tail carries no such line.
+    """The most informative git failure line from the most recent sync run,
+    or `None` if the tail carries none.
 
     Scoped to the last run: the scan walks backwards and stops at the
     PREVIOUS run's terminal marker, so a failure from five days ago is
-    never quoted as if it were today's. `health:` lines are skipped —
-    sync.sh writes them from the same exit trap, so they land after the
-    run's terminal marker and would otherwise shadow the git output.
+    never quoted as if it were today's. Among this run's candidates,
+    GitHub's `remote: error:` / `! [remote rejected]` wins; failing that
+    the first `fatal:`; failing that whatever transport error is left.
+
+    `seen_run_line` — not "is this the physical last line?" — decides
+    whether a terminal marker ends the scan. The EXIT trap's `health:`
+    line always sits below the marker, so the index test broke on the
+    current run's own marker and never reached the git stderr above it.
     """
-    last = len(tail_lines) - 1
-    for idx in range(last, -1, -1):
+    found: list[tuple[int, int, str]] = []
+    seen_run_line = False
+    for idx in range(len(tail_lines) - 1, -1, -1):
         line = tail_lines[idx]
-        low = line.lower()
-        if "health:" in low:
-            continue
-        if "remote: error:" in low:
-            return _LOG_TS_RE.sub("", line).strip()
-        if idx != last and any(m in low for m in _RUN_TERMINAL_MARKERS):
-            break
-    return None
+        if _is_health_line(line):
+            continue  # transparent: belongs to no run, ends no run
+        stripped = _LOG_TS_RE.sub("", line).strip()
+        low = stripped.lower()
+        rank = next(
+            (r for r, prefixes in enumerate(_GIT_ERROR_PREFIXES)
+             if low.startswith(prefixes)),
+            None,
+        )
+        if rank is not None:
+            found.append((rank, idx, stripped))
+        elif seen_run_line and any(m in low for m in _RUN_TERMINAL_MARKERS):
+            break  # walked back into the previous run
+        seen_run_line = True
+    if not found:
+        return None
+    found.sort(key=lambda t: (t[0], t[1]))
+    return found[0][2]
 
 
 def _held_back_paths(tail_lines: list[str]) -> dict[str, list[str]]:
@@ -319,19 +367,25 @@ def _held_back_paths(tail_lines: list[str]) -> dict[str, list[str]]:
     means the banner can give the right advice for each.
     """
     out: dict[str, list[str]] = {"secret": [], "oversize": []}
-    last = len(tail_lines) - 1
-    for idx in range(last, -1, -1):
+    # Same boundary rule as `_last_remote_error`, for the same reason: the
+    # EXIT trap's `health:` line sits below the run's terminal marker, so
+    # an index test made the marker "not the last line" and the scan broke
+    # before reading a single held-back path. That is why the banner said
+    # "see sync.log" instead of naming the 51 MB file (2026-09-04 smoke
+    # test).
+    seen_run_line = False
+    for idx in range(len(tail_lines) - 1, -1, -1):
         line = tail_lines[idx]
+        if _is_health_line(line):
+            continue  # transparent: belongs to no run, ends no run
         if _QUARANTINE_MARKER in line:
             out["secret"].append(line.split(_QUARANTINE_MARKER, 1)[1].strip())
-            continue
-        if _OVERSIZE_MARKER in line:
+        elif _OVERSIZE_MARKER in line:
             raw = line.split(_OVERSIZE_MARKER, 1)[1].strip()
             out["oversize"].append(_OVERSIZE_SUFFIX_RE.sub("", raw).strip())
-            continue
-        low = line.lower()
-        if idx != last and any(m in low for m in _RUN_TERMINAL_MARKERS):
-            break
+        elif seen_run_line and any(m in line.lower() for m in _RUN_TERMINAL_MARKERS):
+            break  # walked back into the previous run
+        seen_run_line = True
     out["secret"].reverse()
     out["oversize"].reverse()
     return out
@@ -441,6 +495,26 @@ def _check_sync_status(brain_root: Path) -> str:
 _ALL_CLEAR_LINE = "✅ all clear\n"
 
 
+def _brain_display(brain_root: Path) -> str:
+    """`~/.agent` when the brain really lives there, else the literal path.
+
+    Every hint below is a command the user pastes into a shell. Hardcoding
+    `~/.agent` told a sandbox user to run `git -C ~/.agent rm --cached`
+    and to read `~/.agent/sync.log` while their brain was at
+    `/tmp/rsd-smoke-oAQ6/agent` — following that advice would have touched
+    the wrong repository (2026-09-04 smoke test, "Read as a human" #8).
+    The tilde is kept for the default install because it is what the user
+    calls it, and it survives a different `$HOME` in the docs.
+    """
+    path = Path(brain_root)
+    try:
+        if path.resolve() == Path("~/.agent").expanduser().resolve():
+            return "~/.agent"
+    except OSError:  # pragma: no cover - resolve() on a broken mount
+        pass
+    return str(path)
+
+
 def compose_summary(
     brain_root: Path,
     drift_report: Optional[dict] = None,
@@ -459,6 +533,8 @@ def compose_summary(
     from `runtime/health.json`. All three are optional, so existing callers
     that don't pass them behave exactly as before.
     """
+    # Every pasteable command below names THIS brain, not the default one.
+    brain = _brain_display(brain_root)
     counts = count_pending_per_namespace(brain_root)
     total = sum(counts.values())
     misplaced = count_misplaced_per_namespace(brain_root)
@@ -558,7 +634,7 @@ def compose_summary(
             "`memory/candidates/` with status != staged. "
             "Likely cause: interrupted lifecycle move OR external write."
         )
-        lines.append("- Inspect: `python ~/.agent/tools/list_candidates.py`")
+        lines.append(f"- Inspect: `python {brain}/tools/list_candidates.py`")
         lines.append("- Move each to its proper subdir based on status field, "
                      "or delete after verifying it's duplicated in graduated/rejected.")
         lines.append("")
@@ -611,13 +687,13 @@ def compose_summary(
             lines.append("- Last sync > 2h ago. Hourly LaunchAgent may be stuck.")
         elif sync_status == "blocked-noscanner":
             lines.append("- No secret scanner (trufflehog or gitleaks) is installed, so sync.sh refuses to push. The brain is NOT syncing.")
-            lines.append("- Install one: `./install.sh --install-scanner` (or `brew install trufflehog`), then re-run `~/.agent/tools/sync.sh`.")
+            lines.append(f"- Install one: `./install.sh --install-scanner` (or `brew install trufflehog`), then re-run `{brain}/tools/sync.sh`.")
         elif sync_status == "blocked-trufflehog":
             lines.append("- TruffleHog blocked the last push (verified secret in the working tree).")
-            lines.append("- Run `~/.agent/tools/sync.sh` and inspect the secret hit; rewrite history if needed.")
+            lines.append(f"- Run `{brain}/tools/sync.sh` and inspect the secret hit; rewrite history if needed.")
         elif sync_status == "blocked-precommit":
             lines.append("- Local pre-commit hook (likely `redact.py`) refused the commit.")
-            lines.append("- Run `~/.agent/tools/sync.sh` to see the offending pattern; adjust `redact-private.txt` or scrub the input.")
+            lines.append(f"- Run `{brain}/tools/sync.sh` to see the offending pattern; adjust `redact-private.txt` or scrub the input.")
         elif sync_status == "blocked-network":
             lines.append("- Commit succeeded locally but the push failed — usually a network/remote-reachability issue, NOT a secret.")
             if sync_error:
@@ -633,28 +709,28 @@ def compose_summary(
                     )
             else:
                 lines.append("- The push failed (no git error captured in sync.log).")
-            lines.append("- The brain repo is committed locally; the next hourly sync will retry. Run `~/.agent/tools/sync.sh` manually to retry now.")
+            lines.append(f"- The brain repo is committed locally; the next hourly sync will retry. Run `{brain}/tools/sync.sh` manually to retry now.")
         elif sync_status == "blocked-scanner":
             lines.append("- The secret scanner could not run, so sync.sh refused to push. This is NOT a secret in your tree — the gate itself is broken.")
-            lines.append("- Usually a half-finished upgrade: re-run `./install.sh` to restore `~/.agent/tools/scan_gate.py`, then `~/.agent/tools/sync.sh`.")
+            lines.append(f"- Usually a half-finished upgrade: re-run `./install.sh` to restore `{brain}/tools/scan_gate.py`, then `{brain}/tools/sync.sh`.")
         elif sync_status == "blocked-unstage":
             lines.append("- A risky file was identified but could not be removed from the commit, so the push was refused rather than risk publishing it.")
-            lines.append("- See the `could not unstage` line in `~/.agent/sync.log` for the path; check for an unusual filename or a locked index (`.git/index.lock`).")
+            lines.append(f"- See the `could not unstage` line in `{brain}/sync.log` for the path; check for an unusual filename or a locked index (`.git/index.lock`).")
         elif sync_status == "quarantined":
             lines.append("- Last sync pushed, but held back one or more files whose contents tripped the secret scanner. **Those memories are NOT on the remote.**")
-            lines.append("- See the `quarantined (not pushed)` lines in `~/.agent/sync.log` for the exact paths.")
-            lines.append("- If a hit is a false positive, add a regex for it to `~/.agent/.secret-scan-allowlist.txt`; if it is a real secret, scrub the file. Either way the next sync picks it up automatically.")
+            lines.append(f"- See the `quarantined (not pushed)` lines in `{brain}/sync.log` for the exact paths.")
+            lines.append(f"- If a hit is a false positive, add a regex for it to `{brain}/.secret-scan-allowlist.txt`; if it is a real secret, scrub the file. Either way the next sync picks it up automatically.")
         elif sync_status == "missing":
             lines.append("- No sync.log yet (sync never ran).")
         if show_oversize:
             n = len(oversize_paths) or 1
-            listed = ", ".join(f"`{p}`" for p in oversize_paths) or "see `~/.agent/sync.log`"
+            listed = ", ".join(f"`{p}`" for p in oversize_paths) or f"see `{brain}/sync.log`"
             lines.append(
                 f"- Last sync held back {n} file(s) larger than 50 MB "
                 f"(GitHub rejects >100 MB): {listed}"
             )
             lines.append(
-                "- Untrack: `git -C ~/.agent rm --cached <path>`; "
+                f"- Untrack: `git -C {brain} rm --cached <path>`; "
                 "`./install.sh --upgrade` adds the ignore rule."
             )
         lines.append("")
@@ -688,7 +764,7 @@ def compose_summary(
     # Triage instructions
     lines.append("## Triage")
     lines.append("- Claude Code: `/dream` skill (interactive review)")
-    lines.append("- CLI: `python ~/.agent/tools/list_candidates.py`")
+    lines.append(f"- CLI: `python {brain}/tools/list_candidates.py`")
     lines.append("- Or: `recall pending --review`")
     lines.append("")
 

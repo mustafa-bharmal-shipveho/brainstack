@@ -64,13 +64,24 @@ _RUN_TERMINAL_MARKERS: tuple = (
     "commit blocked", "push failed", "skipping push",
 )
 
+# Git's own failure lines, matched at the START of a log line (after the
+# `date -u` prefix sync.sh adds), ranked by how much they explain:
+#   0 — GitHub rejected the push and said why.
+#   1 — git itself gave up; the first `fatal:` names the cause, the ones
+#       after it are boilerplate ("Could not read from remote repository").
+#   2 — transport/auth failures and git's summary line, which carry no
+#       cause of their own but still beat saying nothing.
+# Client-side failures (dead remote, bad key, DNS) never print
+# `remote: error:`, so matching that alone left every one of them silent.
+_GIT_ERROR_PREFIXES: tuple = (
+    ("remote: error:", "! [remote rejected]"),
+    ("fatal:",),
+    ("error:", "ssh:", "permission denied", "could not resolve"),
+)
+
 # `date -u +%FT%TZ` — the prefix sync.sh puts on every log line.
 _LOG_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\s+")
 
-_SETUP_CLAUDE_EXTRAS_FIX = (
-    "./install.sh --setup-claude-extras (then wait <=1h or run "
-    "~/.agent/tools/sync_claude_extras.py)"
-)
 _SETUP_LAUNCHD_FIX = "./install.sh --setup-launchd"
 
 _STATUS_RANK = {"PASS": 0, "SKIP": 0, "WARN": 1, "FAIL": 2}
@@ -175,7 +186,7 @@ def check_imports_freshness(env: HealthEnv) -> CheckResult:
             "imports_freshness", "FAIL",
             f"newest {src_label} {_ts(src_mtime)}; "
             f"mirror imports/claude/projects: never mirrored",
-            _SETUP_CLAUDE_EXTRAS_FIX,
+            _setup_claude_extras_fix(env.brain_root),
         )
 
     dst_mtime = _newest_mtime(mirror_files) or 0.0
@@ -185,9 +196,15 @@ def check_imports_freshness(env: HealthEnv) -> CheckResult:
         f"newest mirror {_ts(dst_mtime)}; lag {lag_h:.0f}h"
     )
     if lag_h > IMPORTS_FAIL_HOURS:
-        return CheckResult("imports_freshness", "FAIL", evidence, _SETUP_CLAUDE_EXTRAS_FIX)
+        return CheckResult(
+            "imports_freshness", "FAIL", evidence,
+            _setup_claude_extras_fix(env.brain_root),
+        )
     if lag_h > IMPORTS_WARN_HOURS:
-        return CheckResult("imports_freshness", "WARN", evidence, _SETUP_CLAUDE_EXTRAS_FIX)
+        return CheckResult(
+            "imports_freshness", "WARN", evidence,
+            _setup_claude_extras_fix(env.brain_root),
+        )
     return CheckResult("imports_freshness", "PASS", evidence)
 
 
@@ -234,10 +251,14 @@ def check_launch_agents(env: HealthEnv) -> CheckResult:
         elif short == "claude-extras" and has_claude_sources:
             missing.append(short)
             status = _worse(status, "WARN")
-            _add(fixes, _SETUP_CLAUDE_EXTRAS_FIX)
+            _add(fixes, _setup_claude_extras_fix(env.brain_root))
         # auto-migrate / recall-daemon are optional: never mentioned when absent.
 
-    evidence = "loaded: " + (", ".join(loaded) if loaded else "none")
+    # "user launchd:" because launchd is per-USER, not per-brain: run
+    # against a sandbox brain root this check still describes the agents
+    # loaded for whoever is logged in. Without the prefix the line reads
+    # as a fact about the brain root printed above it.
+    evidence = "user launchd: loaded: " + (", ".join(loaded) if loaded else "none")
     if missing:
         evidence += "; missing: " + ", ".join(missing)
     return CheckResult("launch_agents", status, evidence, "; ".join(fixes))
@@ -291,7 +312,7 @@ def check_brain_push(env: HealthEnv) -> CheckResult:
     if ahead == 0:
         return CheckResult("brain_push", "PASS", _with_push(f"in sync with {upstream}"))
 
-    evidence = _with_push(f"{ahead} commits ahead of {upstream}")
+    evidence = _with_push(f"{ahead} commit{_s(ahead)} ahead of {upstream}")
     age_h = (
         (env.now.timestamp() - last_push_ct) / 3600.0
         if last_push_ct is not None else 0.0
@@ -304,7 +325,7 @@ def check_brain_push(env: HealthEnv) -> CheckResult:
         evidence += f"; last remote error: {remote_error}"
     return CheckResult(
         "brain_push", "FAIL", evidence,
-        "see large_tracked_files; then ~/.agent/tools/sync.sh",
+        f"see large_tracked_files; then {_brain_display(brain)}/tools/sync.sh",
     )
 
 
@@ -341,7 +362,10 @@ def check_large_tracked_files(env: HealthEnv) -> CheckResult:
         )
 
     listed = ", ".join(f"{rel} {size / _MB:.1f} MB" for rel, size in oversize[:3])
-    evidence = f"{listed} exceed {TRACKED_FILE_FAIL_BYTES // _MB} MB"
+    evidence = (
+        f"{listed} exceed{_verb_s(len(oversize))} "
+        f"{TRACKED_FILE_FAIL_BYTES // _MB} MB"
+    )
     if len(oversize) > 3:
         evidence += f" (+{len(oversize) - 3} more)"
     return CheckResult(
@@ -386,7 +410,8 @@ def check_log_sizes(env: HealthEnv) -> CheckResult:
     listed = ", ".join(f"{label} {size / _MB:.1f} MB" for label, size in oversize)
     return CheckResult(
         "log_sizes", "WARN",
-        f"{listed} exceed {limit_mb} MB (rolls on next write after upgrade)",
+        f"{listed} exceed{_verb_s(len(oversize))} {limit_mb} MB "
+        "(rolls on next write after upgrade)",
         "./install.sh --upgrade (adds rotation); rolled files land beside the current one",
     )
 
@@ -497,32 +522,65 @@ def check_auto_recall_config(env: HealthEnv) -> CheckResult:
             "auto_recall_config", "PASS",
             f"auto-recall ON from {env.cwd} (resolved config {resolved})",
         )
+
+    # S1 merges the layers per key, so a cwd `[tool.recall.runtime]` that
+    # simply omits the key no longer shadows anything. The only way to be
+    # OFF with the global set true is a layer that writes
+    # `enable_auto_recall = false` outright. Name that layer, not the
+    # highest one — the old "resolved config X shadows Y" pointed at a file
+    # that may be entirely innocent.
+    layers = [Path(p) for p in (getattr(cfg, "config_layers", None) or [resolved])]
+    culprit = next((p for p in layers if _toml_auto_recall_value(p) is False), None)
+    if culprit is None:
+        return CheckResult(
+            "auto_recall_config", "FAIL",
+            f"auto-recall OFF from {env.cwd}: no config layer sets "
+            f"enable_auto_recall = false, yet the merge of "
+            f"{', '.join(str(p) for p in layers)} resolved it off",
+            f"check {resolved} for a malformed [tool.recall.runtime] section",
+        )
+    via_env = os.environ.get("RECALL_RUNTIME_CONFIG")
+    source = (
+        f"{culprit} (via $RECALL_RUNTIME_CONFIG)"
+        if via_env and Path(via_env) == culprit else str(culprit)
+    )
     return CheckResult(
         "auto_recall_config", "FAIL",
-        f"auto-recall OFF from {env.cwd}: resolved config {resolved} shadows "
-        f"{global_path} (enable_auto_recall=true)",
-        "remove or complete the cwd [tool.recall.runtime] section "
-        "(S1 merges per key once landed)",
+        f"auto-recall OFF from {env.cwd}: {source} sets "
+        f"enable_auto_recall = false, overriding "
+        f"enable_auto_recall = true in {global_path}",
+        f"set enable_auto_recall = true in {culprit} "
+        f"([tool.recall.runtime]), or remove the key so the global value applies",
     )
 
 
 def check_daemon(env: HealthEnv) -> CheckResult:
-    """Whether the recall daemon is configured and reachable."""
-    socket_path = env.brain_root / DAEMON_SOCKET_REL
+    """Whether the recall daemon is configured and reachable.
+
+    Resolves the socket through `recall.config.daemon_socket_path`, the
+    same order the hook, the CLI and the daemon itself use, with this
+    env's brain root as the config tier. Health used to hardcode
+    `<brain>/runtime/recall.sock`, so a daemon started with
+    `$RECALL_DAEMON_SOCKET` pointing elsewhere was reported absent in the
+    same minute `recall doctor` reported it running.
+    """
+    from recall.config import daemon_socket_path
+
+    socket_path = daemon_socket_path(str(env.brain_root / DAEMON_SOCKET_REL))
     plist = (
         env.home / "Library" / "LaunchAgents" / "com.brainstack.recall-daemon.plist"
     )
     if not plist.is_file() and not socket_path.exists():
         return CheckResult(
             "daemon", "SKIP",
-            "recall daemon not configured (no plist, no runtime/recall.sock)",
+            f"recall daemon not configured (no plist, no socket at {socket_path})",
         )
     if env.connect_unix(socket_path, 0.5):
         return CheckResult(
-            "daemon", "PASS", f"socket {DAEMON_SOCKET_REL} accepting connections",
+            "daemon", "PASS", f"socket {socket_path} accepting connections",
         )
     return CheckResult(
-        "daemon", "FAIL", f"socket {DAEMON_SOCKET_REL} refused connection",
+        "daemon", "FAIL", f"socket {socket_path} refused connection",
         "launchctl kickstart -k gui/$UID/com.brainstack.recall-daemon",
     )
 
@@ -709,28 +767,61 @@ def load_report(
 # ---------------------------------------------------------------------------
 
 
+def _is_health_log_line(line: str) -> bool:
+    """True for sync.sh's own `health: ...` lines.
+
+    The EXIT trap writes one on every exit path, so it always lands AFTER
+    the run's terminal marker. Treat it as transparent — it belongs to no
+    run, so it must neither end one nor count as its last line. Skipping
+    it without moving the "last line" boundary is what broke the remote-
+    error quote in production (2026-09-04 smoke test, Defect 1).
+    """
+    return _strip_log_timestamp(line).lower().startswith("health:")
+
+
+def _git_error_rank(line: str) -> Optional[int]:
+    """Which `_GIT_ERROR_PREFIXES` tier `line` belongs to, or `None`."""
+    low = _strip_log_timestamp(line).lower()
+    for rank, prefixes in enumerate(_GIT_ERROR_PREFIXES):
+        if low.startswith(prefixes):
+            return rank
+    return None
+
+
 def _sync_log_remote_error(text: str) -> Optional[str]:
-    """The `remote: error: ...` line from the most recent sync run in
-    `sync.log`, or `None`.
+    """The most informative git failure line from the most recent sync run
+    in `sync.log`, or `None`.
 
     Scoped to the last run: the scan walks backwards and stops at the
-    previous run's terminal marker, so a fixed-days-ago failure is never
-    quoted as if it were current. `health:` lines (written by the same
-    sync.sh trap, after the run's terminal marker) are skipped so they
-    neither shadow the error nor get mistaken for one.
+    PREVIOUS run's terminal marker, so a failure from five days ago is
+    never quoted as if it were current. Among the candidates in that run,
+    GitHub's `remote: error:` / `! [remote rejected]` wins; failing that
+    the FIRST `fatal:` (the one that names the cause); failing that
+    whatever transport error is left.
+
+    `seen_run_line` — not "is this the physical last line?" — is what
+    decides whether a terminal marker ends the scan. The EXIT trap's
+    `health:` line always sits below the marker, so the index test broke
+    on the current run's own marker and never reached the git stderr
+    above it.
     """
     lines = (text or "").splitlines()[-400:]
-    last = len(lines) - 1
-    for idx in range(last, -1, -1):
+    found: list = []
+    seen_run_line = False
+    for idx in range(len(lines) - 1, -1, -1):
         line = lines[idx]
-        low = line.lower()
-        if "health:" in low:
-            continue
-        if "remote: error:" in low:
-            return _strip_log_timestamp(line)
-        if idx != last and any(m in low for m in _RUN_TERMINAL_MARKERS):
-            break
-    return None
+        if _is_health_log_line(line):
+            continue  # transparent: belongs to no run, ends no run
+        rank = _git_error_rank(line)
+        if rank is not None:
+            found.append((rank, idx, line))
+        elif seen_run_line and any(m in line.lower() for m in _RUN_TERMINAL_MARKERS):
+            break  # walked back into the previous run
+        seen_run_line = True
+    if not found:
+        return None
+    found.sort(key=lambda t: (t[0], t[1]))
+    return _strip_log_timestamp(found[0][2])
 
 
 def _parse_launchctl_list(stdout: str) -> dict:
@@ -784,16 +875,6 @@ def _newest_mtime(paths) -> Optional[float]:
     return newest
 
 
-def _rolled_and_current(path: Path) -> list:
-    """`<stem>*<suffix>` siblings of `path` (rolled + current)."""
-    path = Path(path)
-    suffix = path.suffix
-    stem = path.name[: -len(suffix)] if suffix else path.name
-    if not path.parent.is_dir():
-        return []
-    return sorted(p for p in path.parent.glob(f"{stem}*{suffix}") if p.is_file())
-
-
 def _load_runtime_config_at(cwd: Path):
     """`RuntimeConfig.load()` as resolved from `cwd` (chdir guarded by
     try/finally)."""
@@ -839,6 +920,41 @@ def _worse(current: str, candidate: str) -> str:
 def _add(items: list, value: str) -> None:
     if value and value not in items:
         items.append(value)
+
+
+def _brain_display(brain_root: Path) -> str:
+    """`~/.agent` when the brain really lives there, else the literal path.
+
+    Fix hints are shell commands the user pastes. Hardcoding `~/.agent`
+    told a sandbox user to run `git -C ~/.agent rm --cached` against a
+    repository that was not theirs (2026-09-04 smoke test)."""
+    path = Path(brain_root)
+    try:
+        if path.resolve() == Path("~/.agent").expanduser().resolve():
+            return "~/.agent"
+    except OSError:  # pragma: no cover - resolve() on a broken mount
+        pass
+    return str(path)
+
+
+def _setup_claude_extras_fix(brain_root: Path) -> str:
+    return (
+        "./install.sh --setup-claude-extras (then wait <=1h or run "
+        f"{_brain_display(brain_root)}/tools/sync_claude_extras.py)"
+    )
+
+
+def _s(count: int) -> str:
+    """Plural suffix for a NOUN: "1 commit", "2 commits"."""
+    return "" if count == 1 else "s"
+
+
+def _verb_s(count: int) -> str:
+    """Plural suffix for a VERB — the mirror of `_s`: one file "exceeds",
+    two files "exceed". These lines are read by a human in the session
+    banner every day, and "1 commits ahead" / "51 MB exceed" costs the
+    whole check its credibility (2026-09-04 smoke test)."""
+    return "s" if count == 1 else ""
 
 
 def _int_or_none(raw: str) -> Optional[int]:
@@ -945,18 +1061,30 @@ def _log_label(path: Path, brain: Path) -> str:
         return path.name
 
 
-def _toml_auto_recall_enabled(path: Path) -> bool:
+def _toml_auto_recall_value(path: Path) -> Optional[bool]:
+    """`enable_auto_recall` as written in one config layer, or `None` when
+    the layer does not mention the key.
+
+    Tri-state on purpose. S1 merges the layers PER KEY, so "absent" and
+    "false" are different facts: absent falls through to the global value,
+    false overrides it. Only the layer that wrote `false` is worth naming
+    in the FAIL evidence.
+    """
     if not Path(path).is_file():
-        return False
+        return None
     try:
         with Path(path).open("rb") as handle:
             data = tomllib.load(handle)
     except (OSError, tomllib.TOMLDecodeError):
-        return False
+        return None
     section = data.get("tool", {}).get("recall", {}).get("runtime", {})
-    if not isinstance(section, dict):
-        return False
-    return bool(section.get("enable_auto_recall", False))
+    if not isinstance(section, dict) or "enable_auto_recall" not in section:
+        return None
+    return bool(section.get("enable_auto_recall"))
+
+
+def _toml_auto_recall_enabled(path: Path) -> bool:
+    return _toml_auto_recall_value(path) is True
 
 
 def _brainstack_repo(brain_root: Path) -> Optional[Path]:
