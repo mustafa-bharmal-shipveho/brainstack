@@ -24,7 +24,10 @@ import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT / "agent" / "tools"))
+# Same pattern as tests/test_digest_render.py, guarded against duplicates.
+_AGENT_TOOLS = str(REPO_ROOT / "agent" / "tools")
+if _AGENT_TOOLS not in sys.path:
+    sys.path.insert(0, _AGENT_TOOLS)
 
 
 @pytest.fixture

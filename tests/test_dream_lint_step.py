@@ -35,7 +35,20 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT / "agent" / "memory"))
+
+# auto_dream imports archive / cluster / decay / promote / review_state by
+# bare top-level name, so agent/memory has to be ON sys.path — a
+# spec_from_file_location load of auto_dream alone dies on
+# `No module named 'archive'`.
+#
+# It must also be AHEAD of agent/tools, which 17 other test modules prepend
+# and which contains a DIFFERENT `promote.py`. Resolve to that one and
+# auto_dream fails to import `_env_bool`. Hence move-to-front rather than
+# skip-if-present: the entry has to win, not merely exist.
+_AGENT_MEMORY = str(REPO_ROOT / "agent" / "memory")
+while _AGENT_MEMORY in sys.path:
+    sys.path.remove(_AGENT_MEMORY)
+sys.path.insert(0, _AGENT_MEMORY)
 
 import auto_dream  # noqa: E402
 
