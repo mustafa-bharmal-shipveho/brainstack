@@ -253,7 +253,7 @@ def render_markdown(
     if chosen is None:
         lines += [
             f"**No viable threshold**: no point on the curve reaches the required "
-            f"relevance-2 recall. Leave `auto_recall_min_rerank = 0.0` (gate off) "
+            f"relevance-2 recall. Leave `auto_recall_min_rerank` unset (`None`, gate off) "
             f"until the labelled set grows or the model changes.",
             "",
         ]

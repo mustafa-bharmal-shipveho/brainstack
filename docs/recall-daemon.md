@@ -34,7 +34,7 @@ honours your values, and the two flags above beat both. `recall serve
 plus `warmup_ms`, so a health check can compare what is running against
 what was calibrated.
 
-The relevance **gate** (`auto_recall_min_rerank`) stays at 0.0. Reranking is
+The relevance **gate** (`auto_recall_min_rerank`) stays unset (`None`, gate off). Reranking is
 for ordering only for now.
 
 ## The one thing to know first
