@@ -28,6 +28,7 @@ import argparse
 import datetime
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Optional
@@ -269,32 +270,116 @@ def _last_run_quarantined(tail_lines: list[str]) -> bool:
     return False
 
 
+# sync.sh prefixes every log line with `date -u +%FT%TZ`. Stripping it
+# lets us quote git's own output verbatim.
+_LOG_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\s+")
+
+_QUARANTINE_MARKER = "sync: quarantined (not pushed):"
+_OVERSIZE_MARKER = "sync: oversize (not pushed):"
+# `<path> (114294784 bytes > 52428800-byte limit)` -> `<path>`
+_OVERSIZE_SUFFIX_RE = re.compile(r"\s*\(\d+\s+bytes\s*>.*\)\s*$")
+
+# A health report older than this is evidence the hourly agent died, not
+# evidence that the brain is fine. Matches recall.health.HEALTH_STALE_HOURS.
+_HEALTH_STALE_HOURS = 26.0
+
+# Remote errors that no amount of hourly retrying will fix.
+_SIZE_REJECTION_RE = re.compile(r"file size limit|GH001|large files", re.IGNORECASE)
+
+
 def _last_remote_error(tail_lines: list[str]) -> Optional[str]:
     """The `remote: error: ...` line git printed during the most recent
     sync run, or `None` if the tail carries no such line.
 
-    Scaffold: signature only. See tests/test_render_pending.py::
-    TestSyncErrorAndHealthSections.
+    Scoped to the last run: the scan walks backwards and stops at the
+    PREVIOUS run's terminal marker, so a failure from five days ago is
+    never quoted as if it were today's. `health:` lines are skipped —
+    sync.sh writes them from the same exit trap, so they land after the
+    run's terminal marker and would otherwise shadow the git output.
     """
-    raise NotImplementedError("scaffold")
+    last = len(tail_lines) - 1
+    for idx in range(last, -1, -1):
+        line = tail_lines[idx]
+        low = line.lower()
+        if "health:" in low:
+            continue
+        if "remote: error:" in low:
+            return _LOG_TS_RE.sub("", line).strip()
+        if idx != last and any(m in low for m in _RUN_TERMINAL_MARKERS):
+            break
+    return None
 
 
 def _held_back_paths(tail_lines: list[str]) -> dict[str, list[str]]:
     """Paths a sync run quarantined (secret hit) or held back (oversize),
-    keyed `"secret"` / `"oversize"`. Scaffold: signature only."""
-    raise NotImplementedError("scaffold")
+    keyed `"secret"` / `"oversize"`.
+
+    Two markers, two remedies: a quarantined file needs an allowlist entry
+    or a scrub, an oversize file needs untracking. Returning them apart
+    means the banner can give the right advice for each.
+    """
+    out: dict[str, list[str]] = {"secret": [], "oversize": []}
+    last = len(tail_lines) - 1
+    for idx in range(last, -1, -1):
+        line = tail_lines[idx]
+        if _QUARANTINE_MARKER in line:
+            out["secret"].append(line.split(_QUARANTINE_MARKER, 1)[1].strip())
+            continue
+        if _OVERSIZE_MARKER in line:
+            raw = line.split(_OVERSIZE_MARKER, 1)[1].strip()
+            out["oversize"].append(_OVERSIZE_SUFFIX_RE.sub("", raw).strip())
+            continue
+        low = line.lower()
+        if idx != last and any(m in low for m in _RUN_TERMINAL_MARKERS):
+            break
+    out["secret"].reverse()
+    out["oversize"].reverse()
+    return out
 
 
 def _last_run_oversize(tail_lines: list[str]) -> bool:
-    """True if the most recent sync run held back an oversize file.
-    Scaffold: signature only."""
-    raise NotImplementedError("scaffold")
+    """True if the most recent sync run held back an oversize file."""
+    return bool(_held_back_paths(tail_lines)["oversize"])
+
+
+def _sync_log_tail(brain_root: Path, limit: int = 400) -> list[str]:
+    """The last `limit` raw lines of `<brain>/sync.log` (git output
+    included — unlike `_check_sync_status`, which keeps `sync:` lines
+    only, the remote-error parser needs the untouched tail)."""
+    log = brain_root / "sync.log"
+    try:
+        return log.read_text().splitlines()[-limit:]
+    except OSError:
+        return []
 
 
 def _load_health(brain_root: Path) -> Optional[dict]:
     """Load `<brain>/runtime/health.json`, adding a `"stale"` bool (> 26h
-    old). `None` if missing or unreadable. Scaffold: signature only."""
-    raise NotImplementedError("scaffold")
+    old). `None` if missing or unreadable."""
+    path = brain_root / "runtime" / "health.json"
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    data["stale"] = _health_age_hours(data) > _HEALTH_STALE_HOURS
+    return data
+
+
+def _health_age_hours(health: dict) -> float:
+    """Hours since the report was generated. An unparseable timestamp is
+    treated as infinitely old — we cannot vouch for a report we cannot
+    date."""
+    raw = str(health.get("generated_at") or "").strip()
+    try:
+        generated = datetime.datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc
+        )
+    except ValueError:
+        return float("inf")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return max(0.0, (now - generated).total_seconds() / 3600.0)
 
 
 def _check_sync_status(brain_root: Path) -> str:
@@ -310,6 +395,7 @@ def _check_sync_status(brain_root: Path) -> str:
       - 'blocked-network'     — commit succeeded but push failed (remote unreachable)
       - 'blocked-scanner'     — the secret gate could not run (not a secret hit)
       - 'blocked-unstage'     — a risky file could not be removed from the commit
+      - 'oversize'            — push succeeded but a >50 MB file was held back
       - 'quarantined'         — push succeeded but some file(s) were held back
       - 'stale'               — last sync line is > 2 hours old
       - 'ok'                  — last line is a successful push or no-op
@@ -332,6 +418,11 @@ def _check_sync_status(brain_root: Path) -> str:
             if marker in last:
                 return reason
         # Pushed, but not everything went. Never let this pass as 'ok'.
+        # Oversize first: a size hold-back also logs a "held back" line, so
+        # the quarantine check below would otherwise claim a secret hit and
+        # send the user hunting for a credential that does not exist.
+        if _last_run_oversize(tail_lines):
+            return "oversize"
         if _last_run_quarantined(tail_lines):
             return "quarantined"
     try:
@@ -364,12 +455,9 @@ def compose_summary(
 
     `sync_error`, `held_back`, and `health` are S5 additions (requirements
     2 and 3): quoting the actual git error behind a blocked-network sync,
-    naming oversize-held-back paths, and rendering the `## Health`
-    section from `runtime/health.json`. Scaffold: the parameters are
-    accepted so callers can pass them, but the rendering they drive is
-    not yet wired — see tests/test_render_pending.py::
-    TestSyncErrorAndHealthSections for the target behaviour. Existing
-    callers (none of which pass these) are unaffected.
+    naming oversize-held-back paths, and rendering the `## Health` section
+    from `runtime/health.json`. All three are optional, so existing callers
+    that don't pass them behave exactly as before.
     """
     counts = count_pending_per_namespace(brain_root)
     total = sum(counts.values())
@@ -379,8 +467,20 @@ def compose_summary(
     if drift_report is None:
         drift_in_sync = True
 
+    health_checks = (health or {}).get("checks") or []
+    health_fail = [c for c in health_checks if c.get("status") == "FAIL"]
+    health_warn = [c for c in health_checks if c.get("status") == "WARN"]
+    health_stale = bool((health or {}).get("stale"))
+    # A WARN has to break the one-liner or the section it belongs to would
+    # never be read; a stale report is not evidence that anything is fine.
+    health_dirty = bool(health_fail or health_warn or health_stale)
+
+    oversize_paths = list((held_back or {}).get("oversize") or [])
+    show_oversize = sync_status == "oversize" or bool(oversize_paths)
+
     if (total == 0 and drift_in_sync
-            and sync_status == "ok" and misplaced_total == 0):
+            and sync_status == "ok" and misplaced_total == 0
+            and not health_dirty):
         return _ALL_CLEAR_LINE
 
     now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
@@ -436,6 +536,12 @@ def compose_summary(
         parts.append(f"⚠️ sync {headline_status}")
     if misplaced_total > 0:
         parts.append(f"⚠️ {misplaced_total} misplaced")
+    if health_stale:
+        parts.append("⚠️ health stale")
+    if health_fail:
+        parts.append(f"⚠️ health {len(health_fail)} fail")
+    elif health_warn:
+        parts.append(f"⚠️ health {len(health_warn)} warn")
     lines.append(" | ".join(parts))
     lines.append("")
 
@@ -499,7 +605,7 @@ def compose_summary(
     # Sync section — message matches the actual sync.log marker so a
     # transient network failure doesn't trigger "verified secret in tree"
     # panic, and a real trufflehog hit isn't masked as "push failed".
-    if sync_status != "ok":
+    if sync_status != "ok" or show_oversize:
         lines.append("## Sync")
         if sync_status == "stale":
             lines.append("- Last sync > 2h ago. Hourly LaunchAgent may be stuck.")
@@ -514,6 +620,19 @@ def compose_summary(
             lines.append("- Run `~/.agent/tools/sync.sh` to see the offending pattern; adjust `redact-private.txt` or scrub the input.")
         elif sync_status == "blocked-network":
             lines.append("- Commit succeeded locally but the push failed — usually a network/remote-reachability issue, NOT a secret.")
+            if sync_error:
+                # Quote git verbatim. "push failed" alone kept a 107 MB
+                # rejection looking like patience for five days (2026-09-04).
+                lines.append("- Last remote error:")
+                lines.append(f"  `{sync_error}`")
+                if _SIZE_REJECTION_RE.search(sync_error):
+                    lines.append(
+                        "- A tracked file exceeds GitHub's limit; see "
+                        "`recall health` (large_tracked_files). Retrying hourly "
+                        "will never clear this."
+                    )
+            else:
+                lines.append("- The push failed (no git error captured in sync.log).")
             lines.append("- The brain repo is committed locally; the next hourly sync will retry. Run `~/.agent/tools/sync.sh` manually to retry now.")
         elif sync_status == "blocked-scanner":
             lines.append("- The secret scanner could not run, so sync.sh refused to push. This is NOT a secret in your tree — the gate itself is broken.")
@@ -527,6 +646,43 @@ def compose_summary(
             lines.append("- If a hit is a false positive, add a regex for it to `~/.agent/.secret-scan-allowlist.txt`; if it is a real secret, scrub the file. Either way the next sync picks it up automatically.")
         elif sync_status == "missing":
             lines.append("- No sync.log yet (sync never ran).")
+        if show_oversize:
+            n = len(oversize_paths) or 1
+            listed = ", ".join(f"`{p}`" for p in oversize_paths) or "see `~/.agent/sync.log`"
+            lines.append(
+                f"- Last sync held back {n} file(s) larger than 50 MB "
+                f"(GitHub rejects >100 MB): {listed}"
+            )
+            lines.append(
+                "- Untrack: `git -C ~/.agent rm --cached <path>`; "
+                "`./install.sh --upgrade` adds the ignore rule."
+            )
+        lines.append("")
+
+    # Health section — FAIL and WARN only. PASS/SKIP checks belong in the
+    # full `recall health` report, not in a banner the user reads at the
+    # start of every session.
+    if health_dirty:
+        lines.append("## Health")
+        if health_stale:
+            age = _health_age_hours(health or {})
+            age_text = f"{int(age)}h" if age != float("inf") else "an unknown number of hours"
+            lines.append(
+                f"- health report is {age_text} old; the hourly sync LaunchAgent "
+                "may be stuck (`launchctl list | grep agent-sync`)"
+            )
+        else:
+            generated = str((health or {}).get("generated_at") or "unknown")
+            lines.append(f"_from runtime/health.json generated {generated}_")
+        for check in health_fail + health_warn:
+            lines.append(
+                f"- {check.get('status')} `{check.get('id')}` — "
+                f"{check.get('evidence', '')}"
+            )
+            fix = str(check.get("fix") or "").strip()
+            if fix:
+                lines.append(f"  - fix: {fix}")
+        lines.append("- Full report: `recall health`")
         lines.append("")
 
     # Triage instructions
@@ -537,6 +693,23 @@ def compose_summary(
     lines.append("")
 
     return "\n".join(lines)
+
+
+def _status_inputs(brain_root: Path) -> dict:
+    """Everything `compose_summary` needs from sync.log + health.json.
+
+    One helper so `render()` and `--print-only` cannot drift apart: the
+    two used to duplicate the sync-status call, and every new signal
+    (sync_error, held_back, health) doubled the chance of one of them
+    silently rendering a stale banner.
+    """
+    tail = _sync_log_tail(brain_root)
+    return {
+        "sync_status": _check_sync_status(brain_root),
+        "sync_error": _last_remote_error(tail) if tail else None,
+        "held_back": _held_back_paths(tail) if tail else None,
+        "health": _load_health(brain_root),
+    }
 
 
 def render(brain_root: Path) -> Path:
@@ -554,9 +727,9 @@ def render(brain_root: Path) -> Path:
     except Exception:
         drift_report = None  # silently skip drift check on failure
 
-    sync_status = _check_sync_status(brain_root)
-
-    body = compose_summary(brain_root, drift_report=drift_report, sync_status=sync_status)
+    body = compose_summary(
+        brain_root, drift_report=drift_report, **_status_inputs(brain_root)
+    )
     out = brain_root / "PENDING_REVIEW.md"
     atomic_write_text(out, body)
     return out
@@ -592,9 +765,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 drift_report = check_freshness.detect_drift(repo, brain_root)
         except Exception:
             pass
-        sync_status = _check_sync_status(brain_root)
         sys.stdout.write(compose_summary(
-            brain_root, drift_report=drift_report, sync_status=sync_status
+            brain_root, drift_report=drift_report, **_status_inputs(brain_root)
         ))
         return 0
 
