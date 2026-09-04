@@ -359,18 +359,20 @@ class TestAggregateEvents:
         assert aggregate_events(same).repeat_injection_rate == pytest.approx(0.5)
 
     def test_rerank_histogram_buckets(self, tmp_path: Path):
-        """Cross-encoder scores bucket at the (0.1, 0.3, 0.5, 0.7) edges,
-        each bucket half-open on the left (a score exactly at an edge
-        belongs to the bucket that starts there)."""
+        """Cross-encoder scores are raw logits (S4 calibration 2026-09-04:
+        jina turbo ranges about -4.3..0.9, MiniLM about -11.4..2.5), so the
+        buckets sit at the RERANK_BUCKET_EDGES (-2.5, -1.5, -0.75, 0.0),
+        each half-open on the left (a score exactly at an edge belongs to
+        the bucket that starts there)."""
         from recall.stats import aggregate_events
         log = tmp_path / "events.log.jsonl"
         _v12(log, x_outcome="hit", x_k_returned=1,
-             x_rerank_scores=[0.0, 0.1, 0.3])
+             x_rerank_scores=[-3.0, -2.5, -1.5])
         _v12(log, x_outcome="hit", x_k_returned=1,
-             x_rerank_scores=[0.5, 0.7, 0.95])
+             x_rerank_scores=[-0.75, 0.0, 0.9])
         report = aggregate_events(log)
         assert report.rerank_distribution == {
-            "<0.1": 1, "0.1-0.3": 1, "0.3-0.5": 1, "0.5-0.7": 1, "0.7+": 2,
+            "<-2.5": 1, "-2.5..-1.5": 1, "-1.5..-0.75": 1, "-0.75..0": 1, "0+": 2,
         }
 
     def test_rrf_score_histogram_unchanged(self, tmp_path: Path):
