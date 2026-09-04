@@ -65,4 +65,5 @@ runtime/logs/injected/
 runtime/logs/*.json
 runtime/health.json
 runtime/dream_status.json
+runtime/digest_status.json
 runtime/recall.sock
