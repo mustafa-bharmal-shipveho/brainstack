@@ -320,16 +320,31 @@ def daemon_socket_path(raw: "str | None" = None) -> Path:
     with `$BRAIN_ROOT`/`~` expansion) > `$BRAIN_ROOT/runtime/recall.sock` >
     `$BRAIN_HOME`'s parent > `~/.agent/runtime/recall.sock`.
 
-    The last three tiers deliberately check the raw env vars directly
-    (not `resolve_brain_home()`'s fuller fallback chain, which also probes
-    `~/.agent/memory` on disk and an XDG default) — the daemon socket has
-    its own, simpler default of `~/.agent/runtime/recall.sock` regardless
-    of whether a brain happens to exist on disk yet.
+    `raw`'s `$BRAIN_ROOT` / `${BRAIN_ROOT}` placeholder is expanded via
+    `brain_root()` rather than the raw `BRAIN_ROOT` env var directly. The
+    runtime config's own default literal is `"$BRAIN_ROOT/runtime/recall.sock"`,
+    but the normal Claude Code hook environment does NOT export
+    `$BRAIN_ROOT` — hooks never set it. Expanding through the raw env alone
+    would leave the literal text `"$BRAIN_ROOT"` in the returned path.
+    `brain_root()` carries the same "env > $BRAIN_HOME's parent > ~/.agent
+    convention" fallback that a bare `BRAIN_ROOT` env lookup would want, so
+    the default resolves to a real path (typically `~/.agent/runtime/recall.sock`)
+    even with `BRAIN_ROOT` unset.
+
+    The last three tiers (no `raw` at all) deliberately check the raw env
+    vars directly (not `resolve_brain_home()`'s fuller fallback chain, which
+    also probes `~/.agent/memory` on disk and an XDG default) — the daemon
+    socket has its own, simpler default of `~/.agent/runtime/recall.sock`
+    regardless of whether a brain happens to exist on disk yet.
     """
     env = os.environ.get("RECALL_DAEMON_SOCKET")
     if env:
         return _expand(env)
     if raw:
+        if "$BRAIN_ROOT" in raw or "${BRAIN_ROOT}" in raw:
+            brain_root_value = str(brain_root())
+            raw = raw.replace("${BRAIN_ROOT}", brain_root_value)
+            raw = raw.replace("$BRAIN_ROOT", brain_root_value)
         return _expand(raw)
     brain_root_env = os.environ.get("BRAIN_ROOT")
     if brain_root_env:
