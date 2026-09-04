@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -47,6 +48,28 @@ _KNOWN_HOOK_EVENTS = frozenset({
     "Stop", "SubagentStop", "Notification", "PostCompact",
     "PostToolUseFailure",
 })
+
+# Daemon failure reasons that mean the daemon is DOWN, so nothing holds the
+# embedded-Qdrant process lock and the in-process fallback can actually run.
+#
+# The complement (`timeout`, `server_error`, `protocol_error`) means the
+# daemon is ALIVE and owns the store: an in-process fallback would only
+# block on fcntl until the hook's own deadline fires, turning an 800 ms
+# degradation into a 1500 ms one and still returning nothing. Those report
+# `unavailable` instead. Documented deviation from SPEC's "always fall
+# back" — see plans/hook-path.md, "Client budget (hook)".
+_DAEMON_DOWN_REASONS = frozenset({
+    "no_socket", "connection_refused", "import_error",
+})
+
+# `x_daemon_error` is a diagnostic, not a payload. events.py caps every x_*
+# value at 1024 bytes and drops the WHOLE record on breach.
+_DAEMON_ERROR_MAX_CHARS = 200
+
+# One health FAIL must not be able to flood the SessionStart banner.
+_HEALTH_EVIDENCE_MAX_CHARS = 220
+_HEALTH_STALE_HOURS_DEFAULT = 26.0
+_HEALTH_FOOTER = "brainstack health: run 'recall health' for details and fixes"
 
 
 def _now_ms() -> int:
@@ -155,6 +178,13 @@ def handle_hook(event_name: str, *, config: RuntimeConfig | None = None) -> int:
     )
     append_event(config.event_log_path, record)
 
+    # SessionStart is the only surface where a health regression reaches the
+    # user without them running a command. Strictly best-effort: the banner
+    # is printed after the event is written, so a broken report costs a
+    # banner, never telemetry.
+    if event_name == "SessionStart":
+        _print_health_banner(config, payload)
+
     # Re-injection: on UserPromptSubmit, when enabled, emit a small text
     # block to stdout that Claude Code may append to the prompt. This is
     # the v0.3 inject-loop closure — the runtime stops being purely
@@ -179,10 +209,23 @@ def _handle_auto_recall(payload: dict[str, Any], config: RuntimeConfig,
                         session_id: str) -> None:
     """Run the auto-recall flow + emit the injection block + AutoRecall
     telemetry event. Catches all exceptions; never raises to the hook
-    entrypoint. Failure modes (skip / timeout / unavailable / error) are
-    distinguished in telemetry so `recall stats` can report them."""
+    entrypoint.
+
+    Retrieval is DAEMON-FIRST. The hook is a fresh Python subprocess on
+    every prompt, and loading qdrant + an embedder there costs ~1.5 s cold,
+    which is why auto-recall used to time out on real machines. The warm
+    daemon answers over a Unix socket in ~60-130 ms.
+
+    Whether a failed daemon call may fall back in-process depends on WHY it
+    failed — see `_DAEMON_DOWN_REASONS`.
+
+    Every outcome (skip / hit / miss / dedup / timeout / unavailable /
+    error) carries `x_latency_ms`, so the latency distribution is computed
+    over all fires rather than over the survivors.
+    """
     from runtime.adapters.claude_code import auto_recall
 
+    started = time.perf_counter()
     prompt = str(
         payload.get("prompt") or payload.get("user_prompt")
         or payload.get("text") or ""
@@ -194,9 +237,23 @@ def _handle_auto_recall(payload: dict[str, Any], config: RuntimeConfig,
     if skip:
         _append_auto_recall_event(
             config, session_id,
-            extensions={"x_outcome": "skip", "x_skip_reason": reason or "unknown"},
+            extensions={
+                "x_outcome": "skip",
+                "x_skip_reason": reason or "unknown",
+                "x_latency_ms": _elapsed_ms(started),
+            },
         )
         return
+
+    dedup_store = _build_dedup_store(config, session_id)
+    socket_path = _resolve_daemon_socket(config)
+    # The socket budget can never exceed the worker's own deadline: an
+    # 800 ms budget under a 300 ms timeout would guarantee the thread is
+    # abandoned mid-recv and every fire logged as `timeout` instead of the
+    # honest reason.
+    budget_ms = min(config.auto_recall_daemon_budget_ms,
+                    config.auto_recall_timeout_ms)
+    brain_root = _brain_root()
 
     # Build block under a hard timeout. CRITICAL: a `ThreadPoolExecutor`
     # spawns *non-daemon* workers, which keep the interpreter alive on
@@ -205,68 +262,170 @@ def _handle_auto_recall(payload: dict[str, Any], config: RuntimeConfig,
     # subprocess to actually exit). Use a daemon thread instead so the
     # abandoned worker dies with the hook process. Codex 2026-05-05 HIGH.
     #
-    # Retriever construction (embedder + qdrant cold-start) happens INSIDE
-    # the worker so it's bounded by the same timeout. Otherwise a 2-second
-    # embedder load would block the hook before the timer started, breaking
-    # the latency contract on first-fire. Codex 2026-05-05 P2.
+    # Both the socket call and the fallback's retriever construction happen
+    # INSIDE the worker so they're bounded by the same timeout. Otherwise a
+    # 2-second embedder load would block the hook before the timer started,
+    # breaking the latency contract on first-fire. Codex 2026-05-05 P2.
     import queue
     import threading
 
     timeout_s = max(0.05, config.auto_recall_timeout_ms / 1000.0)
-    result_q: "queue.Queue[tuple[str, dict]]" = queue.Queue(maxsize=1)
-    error_q: "queue.Queue[BaseException]" = queue.Queue(maxsize=1)
-    unavailable_q: "queue.Queue[BaseException]" = queue.Queue(maxsize=1)
+    out_q: "queue.Queue[tuple[str, Any]]" = queue.Queue(maxsize=1)
+    # Written by the worker, read by this thread after the join. On a
+    # timeout it names the phase that was in flight, which is the only way
+    # to tell "the daemon never answered" from "the embedder never loaded".
+    state: dict[str, Any] = {"path": "daemon", "daemon_error": None}
 
     def _worker() -> None:
         try:
-            try:
-                retriever = auto_recall._load_retriever()
-            except Exception as load_exc:
-                # ImportError / qdrant missing / cold-start crash — fail open
-                unavailable_q.put(load_exc)
-                return
-            result_q.put(auto_recall.build_recall_block(
+            response, fail_reason = _daemon_query(
+                prompt,
+                k=config.auto_recall_k,
+                session_id=session_id,
+                socket_path=socket_path,
+                budget_ms=budget_ms,
+            )
+            if response is None:
+                state["daemon_error"] = fail_reason or "unknown"
+                if _reason_tag(fail_reason) not in _DAEMON_DOWN_REASONS:
+                    # The daemon is alive and owns the Qdrant store lock.
+                    out_q.put(("unavailable", None))
+                    return
+                state["path"] = "inproc"
+                try:
+                    retriever: Any = auto_recall._load_retriever()
+                except BaseException as load_exc:  # noqa: BLE001
+                    # ImportError / qdrant missing / cold-start crash.
+                    out_q.put(("unavailable", load_exc))
+                    return
+            else:
+                retriever = auto_recall.DaemonResults(response)
+
+            out_q.put(("ok", auto_recall.build_recall_block(
                 prompt, retriever,
                 k=config.auto_recall_k,
                 budget_tokens=config.auto_recall_budget_tokens,
                 min_score=config.auto_recall_min_score,
-            ))
+                min_rerank=config.auto_recall_min_rerank,
+                dedup_store=dedup_store,
+                brain_root=brain_root,
+            )))
         except BaseException as exc:  # noqa: BLE001 — pass to main thread
-            error_q.put(exc)
+            out_q.put(("error", exc))
 
     t = threading.Thread(target=_worker, daemon=True, name="auto-recall")
     t.start()
     t.join(timeout=timeout_s)
+
+    # Hook-level fields, merged onto whatever outcome we end up recording.
+    # A 900 ms p50 means one thing on "daemon" and another on "inproc", so
+    # neither number is readable without the other.
+    hook_ext: dict[str, Any] = {"x_path": state["path"]}
+    if state["daemon_error"]:
+        hook_ext["x_daemon_error"] = (
+            str(state["daemon_error"])[:_DAEMON_ERROR_MAX_CHARS]
+        )
 
     if t.is_alive():
         # Worker still running. It's a daemon thread, so it'll be killed
         # when this process exits. Don't wait.
         _append_auto_recall_event(
             config, session_id,
-            extensions={"x_outcome": "timeout"},
-        )
-        return
-    if not unavailable_q.empty():
-        exc = unavailable_q.get_nowait()
-        print(f"[runtime] auto-recall unavailable: {exc!r}", file=sys.stderr)
-        _append_auto_recall_event(
-            config, session_id,
-            extensions={"x_outcome": "unavailable"},
-        )
-        return
-    if not error_q.empty():
-        exc = error_q.get_nowait()
-        print(f"[runtime] auto-recall error: {exc!r}", file=sys.stderr)
-        _append_auto_recall_event(
-            config, session_id,
-            extensions={"x_outcome": "error"},
+            extensions={"x_outcome": "timeout",
+                        "x_latency_ms": _elapsed_ms(started), **hook_ext},
         )
         return
 
-    block, telemetry = result_q.get_nowait()
+    try:
+        kind, value = out_q.get_nowait()
+    except Exception:  # pragma: no cover - the worker always puts exactly one
+        kind, value = "error", RuntimeError("auto-recall worker produced nothing")
+
+    if kind == "unavailable":
+        if value is not None:
+            print(f"[runtime] auto-recall unavailable: {value!r}", file=sys.stderr)
+        _append_auto_recall_event(
+            config, session_id,
+            extensions={"x_outcome": "unavailable",
+                        "x_latency_ms": _elapsed_ms(started), **hook_ext},
+        )
+        return
+    if kind == "error":
+        print(f"[runtime] auto-recall error: {value!r}", file=sys.stderr)
+        _append_auto_recall_event(
+            config, session_id,
+            extensions={"x_outcome": "error",
+                        "x_latency_ms": _elapsed_ms(started), **hook_ext},
+        )
+        return
+
+    block, telemetry = value
     if block:
         print(block)
-    _append_auto_recall_event(config, session_id, extensions=telemetry)
+
+    extensions = dict(telemetry)
+    extensions.update(hook_ext)
+    # Full worker wall. Floored by the retrieval time the backend reported
+    # so the invariant `x_latency_ms >= x_query_ms` holds even when the
+    # daemon's own clock ran ahead of ours; in production the socket call
+    # is a component of the wall, so the floor never binds.
+    extensions["x_latency_ms"] = max(
+        _elapsed_ms(started), int(extensions.get("x_query_ms") or 0),
+    )
+    _append_auto_recall_event(config, session_id, extensions=extensions)
+
+    # Nothing else ever cleans the injected dir, so every fire pays this
+    # one cheap pass. After `record`, so the store we just wrote survives.
+    if dedup_store is not None:
+        try:
+            type(dedup_store).prune(config.injected_dir)
+        except Exception as e:  # pragma: no cover - defensive
+            print(f"[runtime] auto-recall dedup prune failed: {e!r}",
+                  file=sys.stderr)
+
+
+def _elapsed_ms(started: float) -> int:
+    return int((time.perf_counter() - started) * 1000)
+
+
+def _reason_tag(reason: "str | None") -> str:
+    """The bare reason from a `DaemonUnavailable`-style string, which may
+    carry a `"<reason>: <detail>"` message."""
+    return str(reason or "unknown").split(":", 1)[0].strip()
+
+
+def _build_dedup_store(config: RuntimeConfig, session_id: str) -> Any:
+    """The per-session injected-doc store, or None when disabled.
+
+    `auto_recall_dedup = false` is the kill switch: no store is
+    constructed, so nothing is written and every fire re-injects.
+    """
+    if not getattr(config, "auto_recall_dedup", True):
+        return None
+    try:
+        from runtime.adapters.claude_code.dedup import SessionDedupStore
+
+        return SessionDedupStore(config.injected_dir, session_id)
+    except Exception as e:  # pragma: no cover - defensive
+        print(f"[runtime] auto-recall dedup disabled: {e!r}", file=sys.stderr)
+        return None
+
+
+def _brain_root() -> "Path | None":
+    """The brain root used to relativize `x_paths`, or None.
+
+    None means telemetry keeps absolute paths — honest but machine-bound.
+    Never raises: a path helper that is missing or unimplemented must not
+    cost the user their prompt.
+    """
+    try:
+        from recall.config import brain_root
+
+        return Path(brain_root())
+    except Exception:
+        pass
+    env = os.environ.get("BRAIN_ROOT")
+    return Path(env).expanduser() if env else None
 
 
 def _append_auto_recall_event(config: RuntimeConfig, session_id: str,
@@ -294,10 +453,35 @@ def _append_auto_recall_event(config: RuntimeConfig, session_id: str,
 def _resolve_daemon_socket(config: RuntimeConfig) -> Path:
     """Resolve the warm recall daemon's socket path for this hook fire.
 
-    Scaffold: signature + docstring only (S3). See
-    tests/runtime/test_hook_daemon_path.py.
+    Precedence is `$RECALL_DAEMON_SOCKET` > the configured path > the
+    brain-root default. The env var is an OVERRIDE and therefore outranks
+    an explicitly configured path: the test suite's root conftest sets it
+    for every test so nothing can reach the developer's live socket at
+    `~/.agent/runtime/recall.sock`, and a config value that could outrank
+    it would defeat that guard. Orchestrator decision, 2026-09-04.
+
+    `recall.config.daemon_socket_path` is the single source of truth once
+    it lands; the local resolution below is the same order, inlined so the
+    hook keeps working while that helper is still a scaffold.
     """
-    raise NotImplementedError("scaffold")
+    try:
+        return Path(config.daemon_socket_path)
+    except Exception:
+        pass
+
+    env = os.environ.get("RECALL_DAEMON_SOCKET")
+    if env:
+        return Path(env).expanduser()
+    raw = str(getattr(config, "auto_recall_daemon_socket", "") or "")
+    if raw:
+        expanded = os.path.expandvars(raw)
+        # An unexpanded `$VAR` means the variable is unset; fall through to
+        # the brain-root default rather than creating a literal `$BRAIN_ROOT`
+        # directory on disk.
+        if "$" not in expanded:
+            return Path(expanded).expanduser()
+    root = _brain_root() or Path("~/.agent").expanduser()
+    return root / "runtime" / "recall.sock"
 
 
 def _daemon_query(
@@ -314,26 +498,139 @@ def _daemon_query(
     where `reason` is one of the `recall.daemon_client.DaemonUnavailable`
     reasons (`no_socket`, `connection_refused`, `timeout`,
     `protocol_error`, `server_error`) or `import_error` when
-    `recall.daemon_client` itself is unavailable.
+    `recall.daemon_client` itself is unavailable (an older install or a
+    partial upgrade must degrade to the in-process path, not disable
+    auto-recall).
 
-    Scaffold stub (S3): always reports the daemon as absent so every
-    caller falls back to the in-process path unchanged. See
-    tests/runtime/test_hook_daemon_path.py.
+    The import is lazy and the client is stdlib-only by design — the hook
+    must never pull `recall.core`/qdrant just to ask a question over a
+    socket.
     """
-    return (None, "no_socket")
+    def _fail(reason: str, exc: BaseException) -> "tuple[None, str]":
+        return (None, f"{reason}: {exc}"[:_DAEMON_ERROR_MAX_CHARS])
+
+    try:
+        from recall import daemon_client
+    except Exception as exc:
+        return _fail("import_error", exc)
+
+    try:
+        response = daemon_client.query(
+            prompt, k=k, socket_path=socket_path,
+            budget_ms=budget_ms, session_id=session_id,
+        )
+    except (NotImplementedError, AttributeError, ImportError) as exc:
+        # The client exists but cannot perform the call — an unfinished or
+        # partially upgraded install. No daemon is holding anything on our
+        # behalf, so this is the same situation as the module being
+        # missing: fall back rather than go silent.
+        return _fail("import_error", exc)
+    except Exception as exc:
+        # `DaemonUnavailable` carries the reason the fallback policy keys
+        # on. Anything else is an unexpected client fault while a daemon
+        # may well be alive and holding the store lock, so it takes the
+        # conservative no-fallback branch.
+        return _fail(str(getattr(exc, "reason", "") or "server_error"), exc)
+    return (response, None)
 
 
 def _print_health_banner(config: RuntimeConfig, payload: dict[str, Any]) -> None:
     """Print one line per FAIL check from the cached `runtime/health.json`
-    report on SessionStart, plus a live re-check of this session's
-    auto-recall config (the cached report was written with the brain as
-    cwd, so it cannot see a worktree pyproject.toml shadowing the global
-    config). Never raises; never blocks; prints nothing on any error.
+    report, plus a live re-check of THIS session's auto-recall config.
 
-    Scaffold stub: does nothing (S5 surfacing work, not yet wired into
-    `handle_hook`). See tests/runtime/test_session_start_health.py.
+    The live re-check exists because the cached report is written by the
+    hourly sync agent with the brain as cwd, so it can never see that the
+    directory Claude Code opened shadows the global config and silently
+    disables auto-recall.
+
+    Rules, in order of importance: never raise, never block, always leave
+    the exit code at 0, and stay silent when there is nothing wrong. A
+    missing report is silence too — nagging about a file the user has
+    never heard of, before the first sync tick has written it, is worse
+    than saying nothing.
     """
-    return None
+    try:
+        lines = _health_banner_lines(config, payload)
+    except Exception:
+        # Deliberately silent, including on a bug in the code above: a
+        # broken banner must never cost the user a session.
+        return
+    if not lines:
+        return
+    for line in lines:
+        print(line)
+    print(_HEALTH_FOOTER)
+
+
+def _health_banner_lines(config: RuntimeConfig,
+                         payload: dict[str, Any]) -> list[str]:
+    """The banner body, without the footer. Split out so the printing
+    wrapper can stay a bare try/except."""
+    lines: list[str] = []
+    try:
+        from recall import health as _health
+
+        path = config.log_dir.parent / "health.json"
+        # `load_report` collapses missing, corrupt AND stale into None, but
+        # those want two different banners: silence for the first two (a
+        # fresh install has never had a report, and nagging about a file
+        # the user has never heard of is worse than saying nothing) and a
+        # warning for the third. Two calls tell them apart —
+        # `max_age_hours=0` disables the age check. Contract from the
+        # health slice owner, 2026-09-04.
+        raw = _health.load_report(path, max_age_hours=0)
+        if raw is None:
+            return []
+        stale_hours = float(
+            getattr(_health, "HEALTH_STALE_HOURS", _HEALTH_STALE_HOURS_DEFAULT)
+        )
+        fresh = _health.load_report(path)
+        if fresh is None:
+            # The checks inside a stale report are no longer evidence of
+            # anything, so they are not reported as if they were.
+            lines.append(
+                f"brainstack health: last report "
+                f"{getattr(raw, 'generated_at', '?')} is older than "
+                f"{int(stale_hours)}h; the hourly sync LaunchAgent may be "
+                f"dead. run 'recall health'"
+            )
+        else:
+            lines.extend(
+                _health_fail_line(c.id, c.evidence) for c in fresh.failures()
+            )
+    except Exception:
+        # Missing module, unimplemented helper, unreadable file — all mean
+        # the same thing to the user: no banner.
+        return []
+
+    live = _live_auto_recall_check(payload)
+    if live is not None:
+        lines.append(_health_fail_line(*live))
+    return lines
+
+
+def _health_fail_line(check_id: str, evidence: str) -> str:
+    return (f"brainstack health FAIL: {check_id} — "
+            f"{str(evidence)[:_HEALTH_EVIDENCE_MAX_CHARS]}")
+
+
+def _live_auto_recall_check(payload: dict[str, Any]) -> "tuple[str, str] | None":
+    """Re-run the auto-recall config check against THIS session's cwd.
+
+    Returns `(check_id, evidence)` on FAIL, else None. Silent on any
+    error, including the health module not being importable.
+    """
+    try:
+        from recall.health import build_env, check_auto_recall_config
+
+        cwd = Path(str(payload.get("cwd") or os.getcwd()))
+        result = check_auto_recall_config(build_env(cwd=cwd))
+    except Exception:
+        return None
+    if getattr(result, "status", "") != "FAIL":
+        return None
+    return (getattr(result, "id", "auto_recall_config"),
+            getattr(result, "evidence", ""))
 
 
 def _build_reinjection_for_session(config) -> str:
