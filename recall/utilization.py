@@ -37,7 +37,9 @@ from pathlib import Path, PurePath
 from typing import Optional
 
 # The hook's injection banner, as it appears in the transcript attachment.
-_HEADER_RE = re.compile(r"auto-recall: (\d+) docs surfaced in (\d+)ms")
+# `docs?` because the header pluralizes the noun: "1 doc surfaced" for a
+# single result, "2 docs surfaced" otherwise.
+_HEADER_RE = re.compile(r"auto-recall: (\d+) docs? surfaced in (\d+)ms")
 # One `## <path> (score X) …` section wrapped in start/end markers.
 _DOC_RE = re.compile(
     r"## (\S+\.md) \(score ([0-9.]+)\).*?"

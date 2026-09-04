@@ -681,7 +681,8 @@ def _render_v12(report: StatsReport, total_fires: int,
             # "0 / 0" would read as "the index is fresh" when the truth is
             # "nobody checked".
             path_line += (f" · index stale {report.index_stale_count}"
-                          f" / {report.index_stale_known} daemon fires")
+                          f" / {report.index_stale_known} fires that"
+                          " reported staleness")
         lines.append(_row("Path", path_line))
 
     if total_fires > 0 and (report.latency_p50_ms or report.latency_p95_ms
