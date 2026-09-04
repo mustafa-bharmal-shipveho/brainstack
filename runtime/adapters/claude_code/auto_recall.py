@@ -174,7 +174,7 @@ def build_recall_block(
     k: int,
     budget_tokens: int,
     min_score: float = 0.0,
-    min_rerank: float = 0.0,
+    min_rerank: float | None = None,
     dedup_store: "Any | None" = None,
     brain_root: "Any | None" = None,
 ) -> tuple[str, dict]:
@@ -184,7 +184,8 @@ def build_recall_block(
 
         retriever.query  ->  normalize_results
                          ->  RRF pre-filter   (score >= min_score)
-                         ->  rerank gate      (rerank_score >= min_rerank)
+                         ->  rerank gate      (rerank_score >= min_rerank,
+                                               off iff min_rerank is None)
                          ->  session dedup    (dedup_store.split)
                          ->  budgeted render  ->  dedup_store.record
 
@@ -265,16 +266,25 @@ def build_recall_block(
         if c.rerank_score is not None
     ]
 
-    # --- gate 2: the cross-encoder floor. `None` passes: the in-process
-    # fallback never loads a reranker, and gating everything out there
-    # would make auto-recall go permanently silent whenever the daemon is
-    # down. `x_path` / `x_rerank_scores == []` make that degradation
-    # visible instead of silent.
-    if min_rerank > 0.0:
+    # --- gate 2: the cross-encoder floor.
+    #
+    # `None` is the ONLY off switch. Cross-encoder outputs are raw logits,
+    # not probabilities, so a calibrated floor is routinely NEGATIVE —
+    # eval/RESULTS.md picks -1.9547. An `if min_rerank > 0.0` enable-check
+    # therefore disabled the gate for precisely the values the calibration
+    # exists to produce, and 0.0 is a real threshold (admit >= 0) rather
+    # than a sentinel.
+    #
+    # A `None` rerank_score still passes: the in-process fallback never
+    # loads a reranker, and gating everything out there would make
+    # auto-recall go permanently silent whenever the daemon is down.
+    # `x_path` / `x_rerank_scores == []` make that degradation visible
+    # instead of silent.
+    if min_rerank is None:
+        passed = list(survivors)
+    else:
         passed = [c for c in survivors
                   if c.rerank_score is None or c.rerank_score >= min_rerank]
-    else:
-        passed = list(survivors)
     k_gated_out = k_candidates - len(passed)
 
     # --- gate 3: per-session dedup. Re-showing the same doc on every

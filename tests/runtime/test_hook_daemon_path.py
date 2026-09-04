@@ -220,6 +220,37 @@ class TestDaemonRequest:
         # filesystem concern that belongs to the dedup store alone.
         assert call["session_id"] == "sess-42"
 
+    @pytest.mark.parametrize("threshold", [None, -1.9547, 0.0, 0.5])
+    def test_min_rerank_reaches_the_builder_verbatim(
+        self, tmp_config: RuntimeConfig, stdin_with, monkeypatch, capsys,
+        threshold,
+    ):
+        """The hook is a courier for the rerank floor, not a policy layer.
+
+        `None` is the gate's only off switch, and every float — negative
+        included — turns it on. Coercing `None` to `0.0` here would
+        silently enable the gate at a threshold that rejects every
+        negative cross-encoder logit, which is what the daemon actually
+        returns, and auto-recall would go permanently silent."""
+        import runtime.adapters.claude_code.auto_recall as ar_mod
+        _patch(monkeypatch, daemon_return=(_wire_response(), None),
+               loader=_RecordingLoader())
+
+        seen: list[Any] = []
+        real = ar_mod.build_recall_block
+
+        def spy(*args, **kwargs):
+            seen.append(kwargs.get("min_rerank", "NOT PASSED"))
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(ar_mod, "build_recall_block", spy)
+        monkeypatch.setattr(tmp_config, "auto_recall_min_rerank", threshold)
+
+        stdin_with({"session_id": "s", "prompt": _PROMPT})
+        handle_hook("UserPromptSubmit", config=tmp_config)
+
+        assert seen == [threshold]
+
     def test_daemon_socket_defaults_to_env_override(
         self, tmp_config: RuntimeConfig, stdin_with, monkeypatch, capsys
     ):
