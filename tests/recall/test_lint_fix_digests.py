@@ -449,6 +449,31 @@ class TestApply:
         ld.apply_digest_fixes(second, dry_run=False)
         assert target.read_bytes() == before
 
+    @pytest.mark.parametrize("stem", ["2026-03-24", "123", "1e5", "true"])
+    def test_yaml_ambiguous_stems_are_written_as_strings(
+            self, ld, tmp_path, stem):
+        """`name` and `type` were written unquoted while `description` was
+        quoted. A digest stem like `2026-03-24` then parsed back as a
+        `datetime.date` and `true` as a bool, so the missing-key check saw a
+        non-string, proposed the key again on every run, and the index got a
+        non-string name."""
+        memory = tmp_path / stem / "memory"
+        target = _write(memory / "semantic" / "digests" / f"{stem}.md",
+                        _digest_text(_FM_LINES, _BODY))
+
+        written = ld.apply_digest_fixes(
+            ld.plan_digest_fixes(memory), dry_run=False)
+        assert written == [target]
+
+        fm = parse_path(target).frontmatter
+        assert isinstance(fm["name"], str), \
+            f"{stem!r} parsed back as {type(fm['name']).__name__}"
+        assert fm["name"] == stem
+        assert fm["type"] == "digest"
+
+        # Idempotent: a second plan has nothing left to propose.
+        assert [f for f in ld.plan_digest_fixes(memory) if f.proposed] == []
+
     def test_apply_never_writes_a_skipped_digest(self, ld, digest_brain):
         target = (digest_brain / "semantic" / "digests"
                   / "2026-03-27__unparseable__ee55ff66.md")
@@ -480,9 +505,10 @@ class TestManifest:
         assert out.startswith("== recall lint --fix-digests ==")
         assert "digests under" in out
         assert "semantic/digests/2026-03-24__q2-2026-facilities-roadmap__ff1a201a.md" in out
-        assert "+ name: 2026-03-24__q2-2026-facilities-roadmap__ff1a201a" in out
+        assert ('+ name: "2026-03-24__q2-2026-facilities-roadmap__ff1a201a"'
+                in out), "the manifest previews the exact line that is written"
         assert "+ description:" in out
-        assert "+ type: digest" in out
+        assert '+ type: "digest"' in out
         assert "file(s) would change" in out
         assert "--fix-digests --apply" in out
 

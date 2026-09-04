@@ -17,6 +17,11 @@ Hard constraints:
      dry_run=False)`.
   4. A digest whose frontmatter YAML doesn't parse is SKIPPED with a
      reason, never guessed at — `recall lint --repair` owns that case.
+  5. All three values are written double-quoted. They are strings and
+     must read back as strings: a digest stem like `2026-03-24` or `true`
+     parses as a date or a bool unquoted, which both re-opens the
+     "missing" check on every run and puts a non-string `name` in the
+     index.
 """
 from __future__ import annotations
 
@@ -182,6 +187,16 @@ def plan_digest_fixes(root: Path) -> list[DigestFix]:
     return fixes
 
 
+def _fm_line(key: str, value: str) -> str:
+    """One `key: "value"` frontmatter line, YAML-safe.
+
+    Every backfilled value is a string, so every one is quoted — the
+    writer and the manifest both go through here so the preview can never
+    drift from what lands on disk.
+    """
+    return f"{key}: {lint._double_quote(value)}"
+
+
 def apply_digest_fixes(fixes: list[DigestFix], *, dry_run: bool = True) -> list[Path]:
     """Splice each fix's proposed keys into its file's existing
     frontmatter block. Dry-run by default. Returns the files actually
@@ -201,14 +216,11 @@ def apply_digest_fixes(fixes: list[DigestFix], *, dry_run: bool = True) -> list[
             continue
         raw, newline, body_start, _fm_end = bounds
 
-        insert_lines = []
-        for key in ("name", "description", "type"):
-            if key not in fix.proposed:
-                continue
-            value = fix.proposed[key]
-            if key == "description":
-                value = lint._double_quote(value)
-            insert_lines.append(f"{key}: {value}")
+        insert_lines = [
+            _fm_line(key, fix.proposed[key])
+            for key in ("name", "description", "type")
+            if key in fix.proposed
+        ]
         if not insert_lines:
             continue
 
@@ -260,12 +272,8 @@ def render_digest_manifest(
         changed += 1
         lines.append(f"  {rel}")
         for key in ("name", "description", "type"):
-            if key not in fix.proposed:
-                continue
-            value = fix.proposed[key]
-            if key == "description":
-                value = lint._double_quote(value)
-            lines.append(f"    + {key}: {value}")
+            if key in fix.proposed:
+                lines.append(f"    + {_fm_line(key, fix.proposed[key])}")
 
     lines.append("")
     if applied is not None:
