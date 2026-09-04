@@ -418,6 +418,25 @@ def test_atomic_rolled_name_rotate_and_episodic_files(tmp_path):
     ], "rolled files ascending by name, current last"
 
 
+def test_atomic_episodic_files_excludes_same_prefix_sibling_stream(tmp_path):
+    """A loose `<stem>*<suffix>` glob would also match a sibling stream
+    that merely shares the stem prefix, like `AGENT_LEARNINGS_other.jsonl`.
+    `episodic_files` must require the anchored `<stem>.<date>[.n]<suffix>`
+    shape, so only real rolls of THIS stream come back."""
+    epi = tmp_path / "episodic"
+    epi.mkdir()
+    current = epi / CURRENT
+
+    _seed_jsonl(current, [{"id": "cur"}])
+    (epi / f"AGENT_LEARNINGS.{DAY}.1.jsonl").write_text('{"id": "rolled"}\n')
+    (epi / "AGENT_LEARNINGS_other.jsonl").write_text('{"id": "not-ours"}\n')
+
+    names = [p.name for p in _atomic.episodic_files(current)]
+    assert names == [f"AGENT_LEARNINGS.{DAY}.1.jsonl", CURRENT], (
+        f"AGENT_LEARNINGS_other.jsonl must not be picked up as a rolled sibling: {names}"
+    )
+
+
 def test_atomic_rotate_boundary_rolls_only_past_threshold(tmp_path):
     """The adapters' rotation site follows the same strict-greater rule as
     the two append writers."""
@@ -689,6 +708,9 @@ def test_consolidate_episodic_paths_globs_rolled_sorted(tmp_path):
     _seed_jsonl(epi / "codex" / "AGENT_LEARNINGS.2026-09-01.jsonl", [{"id": "ns-r1"}])
     _seed_jsonl(epi / "snapshots" / "AGENT_LEARNINGS.2026-01-01.jsonl", [{"id": "archived"}])
     (epi / "codex" / "_imported.jsonl").write_text("{}\n")
+    # Shares the stem prefix but is not a dated roll — a loose
+    # `<stem>*<suffix>` glob would wrongly pick this up.
+    (epi / "AGENT_LEARNINGS_other.jsonl").write_text("{}\n")
 
     paths = [Path(p) for p in consolidate._episodic_paths(str(brain), "default")]
     names = [p.name for p in paths]
@@ -697,6 +719,7 @@ def test_consolidate_episodic_paths_globs_rolled_sorted(tmp_path):
         f"archived snapshots must not be consolidated: {paths}"
     )
     assert "_imported.jsonl" not in names
+    assert "AGENT_LEARNINGS_other.jsonl" not in names
 
     top = [p.name for p in paths if p.parent == epi]
     assert top == [

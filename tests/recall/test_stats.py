@@ -628,19 +628,39 @@ class TestRawReader:
         """logrotate leaves `events.log.<date>.jsonl` next to the live
         file. A 7d window that ignored them would silently report a
         fraction of the real traffic — and must not double-count the
-        live file either."""
+        live file either. A sibling that merely shares the "events.log"
+        stem prefix (`events.log-foo.jsonl`) must not be swept in by a
+        loose `<stem>*<suffix>` glob."""
         from recall.stats import aggregate_events
         log = tmp_path / "events.log.jsonl"
         rotated = tmp_path / "events.log.2026-09-01.jsonl"
         unrelated = tmp_path / "other.jsonl"
+        same_prefix = tmp_path / "events.log-foo.jsonl"
         _v12(log, x_outcome="hit", x_k_returned=1)
         _v12(rotated, x_outcome="hit", x_k_returned=1)
         _v12(rotated, x_outcome="hit", x_k_returned=1)
         for _ in range(5):
             _v12(unrelated, x_outcome="hit", x_k_returned=1)
+        for _ in range(5):
+            _v12(same_prefix, x_outcome="hit", x_k_returned=1)
 
         report = aggregate_events(log)
         assert report.fired_count == 3
+
+    def test_log_files_anchors_rolled_shape(self, tmp_path: Path):
+        """`_log_files` must require the exact `<stem>.<date>[.n]<suffix>`
+        shape: `events.log-foo.jsonl` shares the stem prefix but is not a
+        roll and must be excluded; `events.log.2026-09-04.1.jsonl` (the
+        same-day counter suffix) IS a roll and must be included."""
+        from recall.stats import _log_files
+        log = tmp_path / "events.log.jsonl"
+        log.write_text("{}\n")
+        counter_roll = tmp_path / "events.log.2026-09-04.1.jsonl"
+        counter_roll.write_text("{}\n")
+        (tmp_path / "events.log-foo.jsonl").write_text("{}\n")
+
+        names = {p.name for p in _log_files(log)}
+        assert names == {"events.log.jsonl", "events.log.2026-09-04.1.jsonl"}
 
     def test_iter_yields_only_auto_recall_records_as_dicts(self, tmp_path: Path):
         from recall.stats import iter_auto_recall_records

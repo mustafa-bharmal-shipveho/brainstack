@@ -29,7 +29,6 @@ else:  # pragma: no cover - 3.10 fallback, matches runtime.adapters config
 SCHEMA_VERSION = 1
 
 # Paths are relative to `brain_root`.
-HEALTH_JSON_REL = Path("runtime/health.json")
 DREAM_STATUS_REL = Path("runtime/dream_status.json")
 DAEMON_SOCKET_REL = Path("runtime/recall.sock")
 
@@ -152,13 +151,18 @@ def build_env(*, brain_root: Optional[Path] = None, cwd: Optional[Path] = None) 
 
 
 def default_brain_root() -> Path:
-    """`$BRAIN_ROOT` if set, else `resolve_brain_home().parent`."""
-    raw = os.environ.get("BRAIN_ROOT")
-    if raw:
-        return Path(raw).expanduser()
-    from recall.config import resolve_brain_home
+    """Brain root for a `HealthEnv` built with no explicit override.
 
-    return resolve_brain_home().parent
+    Delegates to `recall.config.brain_root()` — the one resolver — rather
+    than keeping a second copy of the `$BRAIN_ROOT` / `resolve_brain_home()`
+    fallback chain here. A prior local copy assumed `resolve_brain_home()`
+    always ends in `memory/` and took `.parent` unconditionally; the XDG
+    fallback (`$XDG_DATA_HOME/brain`) does not, so that copy silently
+    diverged from the real resolver in that case.
+    """
+    from recall.config import brain_root as _resolve_brain_root
+
+    return _resolve_brain_root()
 
 
 # ---------------------------------------------------------------------------
@@ -377,16 +381,32 @@ def check_large_tracked_files(env: HealthEnv) -> CheckResult:
 
 def check_log_sizes(env: HealthEnv) -> CheckResult:
     """Any log/episodic file over `LOG_WARN_BYTES` (rolled or current)."""
+    from recall.stats import _log_files
+
     brain = env.brain_root
     episodic = brain / "memory" / "episodic"
+    logs_dir = brain / "runtime" / "logs"
+
+    # One base path per stream — `_log_files` anchors rolled siblings
+    # against the base's own stem/suffix (`_is_rolled_sibling` in
+    # recall/stats.py), so a directory-wide loose glob that also matched an
+    # unrelated sibling stream sharing a stem prefix (e.g.
+    # `AGENT_LEARNINGS_other.jsonl`) is no longer possible here.
+    bases = [logs_dir / "events.log.jsonl", episodic / "AGENT_LEARNINGS.jsonl"]
+    if episodic.is_dir():
+        try:
+            namespaces = sorted(
+                p for p in episodic.iterdir() if p.is_dir() and p.name != "snapshots"
+            )
+        except OSError:
+            namespaces = []
+        bases.extend(ns / "AGENT_LEARNINGS.jsonl" for ns in namespaces)
+
     candidates: dict = {}
-    for path in (
-        list((brain / "runtime" / "logs").glob("events.log*.jsonl"))
-        + list(episodic.glob("AGENT_LEARNINGS*.jsonl"))
-        + list(episodic.glob("*/AGENT_LEARNINGS*.jsonl"))
-    ):
-        if path.is_file():
-            candidates[str(path)] = path
+    for base in bases:
+        for path in _log_files(base):
+            if path.is_file():
+                candidates[str(path)] = path
 
     sized: list = []
     for path in candidates.values():

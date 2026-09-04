@@ -236,6 +236,9 @@ def test_iter_log_paths_orders_rolled_then_current(tmp_path):
     sentinel_lock_path(tmp_path / LOG).write_text("")
     (tmp_path / "events.log.jsonl.tmp").write_text("partial")
     (tmp_path / "other.log.jsonl").write_text("{}\n")
+    # Shares the "events.log" stem prefix but is not a dated roll — a loose
+    # `<stem>*<suffix>` glob would wrongly pick this up.
+    (tmp_path / "events.log-foo.jsonl").write_text("{}\n")
 
     names = [p.name for p in iter_log_paths(tmp_path / LOG)]
     # Byte order puts ".1" before the bare dated name ('1' < 'j'); the
@@ -246,6 +249,7 @@ def test_iter_log_paths_orders_rolled_then_current(tmp_path):
         "events.log.2026-09-04.jsonl",
         LOG,
     ]
+    assert "events.log-foo.jsonl" not in names
 
 
 # --------------------------------------------------------------------------

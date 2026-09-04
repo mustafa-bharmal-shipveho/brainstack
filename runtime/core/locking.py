@@ -17,9 +17,21 @@ from __future__ import annotations
 
 import fcntl
 import os
+import re
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+
+
+# `<stem>.<YYYY-MM-DD>[.N]<suffix>` — the exact shape `rolled_name` (below)
+# produces. Anchored so a sibling that merely shares the stem prefix
+# (`events.log-foo.jsonl`) is never mistaken for a roll of this stream.
+# Mirrored — same rule, own copy, different deploy tree — in
+# `agent/memory/_atomic._rolled_pattern` and `recall/stats._is_rolled_sibling`.
+def _rolled_pattern(stem: str, suffix: str) -> re.Pattern[str]:
+    return re.compile(
+        rf"^{re.escape(stem)}\.\d{{4}}-\d{{2}}-\d{{2}}(?:\.\d+)?{re.escape(suffix)}$"
+    )
 
 
 def sentinel_lock_path(data_path: Path) -> Path:
@@ -56,19 +68,26 @@ def rolled_name(path: Path, day: str) -> Path:
 def iter_log_paths(path: Path) -> list[Path]:
     """Rolled siblings of `path` (ascending by name), then `path` itself.
 
-    The glob is `<stem>*<suffix>`, which matches every roll of this log and
-    nothing else: sentinel locks are dotfiles (`.events.log.jsonl.lock`),
-    temp files end in `.tmp`, and an unrelated `other.log.jsonl` has a
-    different stem. Order is name-ascending, NOT chronological — byte order
-    puts `events.log.2026-09-04.1.jsonl` (the SECOND roll of that day)
-    before `events.log.2026-09-04.jsonl` (the first). Callers that need a
-    timeline must re-sort by each record's own timestamp; this list is only
-    "every file of the stream, current one last".
+    A candidate must match `_rolled_pattern` (`<stem>.<YYYY-MM-DD>[.N]<suffix>`,
+    anchored) to count as a roll of this log: sentinel locks are dotfiles
+    (`.events.log.jsonl.lock`), temp files end in `.tmp`, an unrelated
+    `other.log.jsonl` has a different stem, and — the case a loose
+    `<stem>*<suffix>` glob would miss — `events.log-foo.jsonl` shares the
+    stem prefix but is not a roll of this stream. Order is name-ascending,
+    NOT chronological — byte order puts `events.log.2026-09-04.1.jsonl`
+    (the SECOND roll of that day) before `events.log.2026-09-04.jsonl`
+    (the first). Callers that need a timeline must re-sort by each record's
+    own timestamp; this list is only "every file of the stream, current
+    one last".
     """
     path = Path(path)
-    pattern = f"{path.stem}*{path.suffix}"
+    stem, suffix = path.stem, path.suffix
+    pattern = _rolled_pattern(stem, suffix)
     try:
-        rolled = sorted(p for p in path.parent.glob(pattern) if p.name != path.name)
+        rolled = sorted(
+            p for p in path.parent.glob(f"{stem}*{suffix}")
+            if p.name != path.name and pattern.match(p.name)
+        )
     except OSError:
         rolled = []
     return [*rolled, path]
