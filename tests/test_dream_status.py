@@ -36,9 +36,17 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 MEMORY_DIR = REPO_ROOT / "agent" / "memory"
 HARNESS_DIR = REPO_ROOT / "agent" / "harness"
 
-for _d in (MEMORY_DIR, HARNESS_DIR):
-    if str(_d) not in sys.path:
-        sys.path.insert(0, str(_d))
+# agent/memory MUST win over agent/tools: both ship a `promote.py`, and
+# auto_dream needs the memory one (`_env_bool`). Other test modules prepend
+# agent/tools, so always move these to the FRONT (not just "insert if absent")
+# and drop a stale tools-side `promote` from sys.modules before importing.
+for _d in (HARNESS_DIR, MEMORY_DIR):
+    while str(_d) in sys.path:
+        sys.path.remove(str(_d))
+    sys.path.insert(0, str(_d))
+_stale = sys.modules.get("promote")
+if _stale is not None and "agent/tools" in (getattr(_stale, "__file__", "") or ""):
+    del sys.modules["promote"]
 
 pytest.importorskip("fcntl")
 
@@ -53,6 +61,10 @@ STATUS_REL = Path("runtime") / "dream_status.json"
 @pytest.fixture
 def auto_dream():
     """The dream module lives in agent/memory/, which is not a package."""
+    stale = sys.modules.get("promote")
+    if stale is not None and "agent/tools" in (getattr(stale, "__file__", "") or ""):
+        del sys.modules["promote"]
+        sys.modules.pop("auto_dream", None)
     return __import__("auto_dream")
 
 
