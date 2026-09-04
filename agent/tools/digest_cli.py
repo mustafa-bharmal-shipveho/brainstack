@@ -11,9 +11,14 @@ Subcommands:
         Walk historical sessions and produce per-session digests. Idempotent
         via content-SHA sidecar — safe to re-run.
 
-    digest_cli.py incremental
+    digest_cli.py incremental [--limit N] [--max-seconds S]
         Same as `backfill` but intended for the hourly LaunchAgent.
-        Always processes BOTH sources, no limit.
+        Always considers BOTH sources, but PROCESSES at most N pending
+        (not-yet-digested) sessions and stops cleanly once S seconds
+        have elapsed, so a busy hour with many new sessions can't blow
+        past the LaunchAgent's own timeout. Prints a machine-readable
+        `digests: processed=P pending=Q elapsed_s=E budget_hit=<bool>`
+        summary line. Defaults: --limit 3, --max-seconds 1500.
 
     digest_cli.py status
         Print sidecar stats + counts of episodic lines + markdown
@@ -168,12 +173,54 @@ def _wrap_limit(adapter_mod, limit: int) -> None:
 
 
 def _cmd_incremental(args) -> int:
-    """Same as backfill --source both, no limit. Designed for the
-    hourly LaunchAgent."""
-    args.source = "both"
-    args.limit = 0
-    args.dry_run = False
-    return _cmd_backfill(args)
+    """Bounded incremental digest run for the hourly LaunchAgent.
+
+    Unlike `backfill --limit N` (which caps total DISCOVERED sessions,
+    including free idempotent skips), this caps the number of sessions
+    actually PROCESSED (LLM calls made) and stops cleanly once
+    `--max-seconds` elapses, rather than running until the LaunchAgent's
+    own timeout kills the process mid-summarize. Progress is
+    sidecar-idempotent either way, so a bounded run never loses work —
+    it just leaves the rest for the next hourly tick, reported via the
+    `digests: processed=... pending=...` summary line below."""
+    brain = _brain_root()
+    try:
+        provider = resolve_provider(args.provider)
+    except (ValueError, ProviderNotAvailable) as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+
+    print(f"using provider: {provider.name} "
+          f"(default_model={provider.default_model})")
+
+    try:
+        stats = adapter.backfill(
+            brain_root=brain,
+            projects_root=_projects_root(),
+            codex_root=_codex_root(),
+            provider=provider,
+            log=print,
+            limit=args.limit,
+            max_seconds=args.max_seconds,
+        )
+    except ProviderNotAvailable as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+
+    print("---")
+    print(f"discovered:    {stats['discovered']}")
+    print(f"written:       {stats['digests_written']}")
+    print(f"skipped (sha): {stats['skipped_idempotent']}")
+    print(f"failed:        {stats['failed']}")
+    # Machine-readable line — sync_claude_extras.py parses this to
+    # decide exit-code semantics and to write runtime/digest_status.json.
+    print(
+        f"digests: processed={stats['processed']} "
+        f"pending={stats['pending']} "
+        f"elapsed_s={stats['elapsed_s']:.1f} "
+        f"budget_hit={stats['budget_hit']}"
+    )
+    return 0
 
 
 def _cmd_status(args) -> int:
@@ -222,6 +269,12 @@ def main(argv: list[str] | None = None) -> int:
 
     si = sub.add_parser("incremental")
     si.add_argument("--provider", default=None)
+    si.add_argument("--limit", type=int, default=3,
+                    help="max sessions to actually digest this run "
+                         "(default: 3)")
+    si.add_argument("--max-seconds", type=float, default=1500,
+                    help="stop starting new sessions once this many "
+                         "seconds have elapsed (default: 1500)")
 
     st = sub.add_parser("status")
 
@@ -235,11 +288,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "backfill":
         return _cmd_backfill(args)
     if args.cmd == "incremental":
-        # incremental shares backfill flags; set defaults
-        args.source = "both"
-        args.limit = 0
-        args.dry_run = False
-        return _cmd_backfill(args)
+        return _cmd_incremental(args)
     if args.cmd == "status":
         return _cmd_status(args)
 
