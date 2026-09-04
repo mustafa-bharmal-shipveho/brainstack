@@ -8,7 +8,13 @@
 #   - run JSONL secret-scrubber over episodic logs (rewrites in place).
 #   - run trufflehog (REQUIRED — fails closed if missing).
 #   - run the redact pre-commit filter (already wired as a git hook).
+#   - hold back any file over ${SYNC_MAX_FILE_BYTES:-50 MiB} (GitHub rejects
+#     blobs over 100 MB server-side; catching it here keeps one oversize
+#     memory from blocking every other memory in the same run).
 #   - commit + push.
+#   - write runtime/health.json (via `recall health --write`) and refresh
+#     PENDING_REVIEW.md from a single EXIT trap, so every exit path —
+#     no-op, push failure, pre-commit rejection — leaves both fresh.
 #
 # Intended to be invoked by launchd hourly. See docs/git-sync.md.
 #
@@ -22,6 +28,7 @@ BRAIN_ROOT="${BRAIN_ROOT:-$HOME/.agent}"
 LOCK_FILE="$BRAIN_ROOT/.brain.lock"
 LOG_FILE="$BRAIN_ROOT/sync.log"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+SYNC_MAX_FILE_BYTES="${SYNC_MAX_FILE_BYTES:-52428800}"
 
 # ---- Resolve a Python that's >= 3.10 ----
 if ! "$PYTHON_BIN" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
@@ -49,6 +56,11 @@ if [ ! -d "$BRAIN_ROOT/.git" ]; then
 fi
 
 # ---- Acquire exclusive lock (Python fallback if flock missing) ----
+# LOCK_PID is only set on the Python-fallback path (the flock(1) path holds
+# its lock on fd 9, released automatically when the shell exits). _finish
+# (below) kills it on every exit path — this replaces the trap that used to
+# be set here, since bash allows only one EXIT trap at a time.
+LOCK_PID=""
 acquire_lock() {
     if command -v flock >/dev/null 2>&1; then
         exec 9> "$LOCK_FILE"
@@ -79,7 +91,6 @@ PY
     if ! kill -0 "$LOCK_PID" 2>/dev/null; then
         return 11
     fi
-    trap 'kill -TERM '"$LOCK_PID"' 2>/dev/null || true' EXIT
     return 0
 }
 
@@ -90,11 +101,11 @@ fi
 
 cd "$BRAIN_ROOT"
 
-# Reusable refresh helper — called both before AND after the sync. The
-# pre-sync call refreshes the candidate count for surfaces; the post-sync
-# call updates the sync-status field after we've written the final log
-# line (so a successful push clears a stale "blocked"/"stale" warning that
-# was true at the start of the run — Codex 2026-05-04 P2).
+# Reusable refresh helper — recomputes PENDING_REVIEW.md's candidate counts
+# and sync-status field. Called once before the sync (so surfaces reflect
+# drift/candidate counts even if everything below is a no-op) and once from
+# _finish on every exit path (see below) — never scattered inline at each
+# individual exit, or a future exit path could forget to call it.
 _refresh_pending_summary() {
     if [ -f "$BRAIN_ROOT/tools/render_pending_summary.py" ]; then
         PYTHON_BIN_FOR_RENDER="${PYTHON_BIN:-python3}"
@@ -104,6 +115,44 @@ _refresh_pending_summary() {
         fi
     fi
 }
+
+# Writes runtime/health.json via `recall health --write`, resolving the
+# `recall` CLI the same way a launchd job with a minimal PATH has to:
+# an explicit RECALL_BIN override, then whatever `recall` is on PATH, then
+# the well-known install location. Every log line here uses the `health:`
+# prefix (never `sync:`) — render_pending_summary._check_sync_status
+# classifies the run's status from the LAST log line containing `sync:`,
+# and a health line with that prefix would be mistaken for the run's own
+# terminal marker.
+_write_health() {
+    local recall_bin
+    recall_bin="${RECALL_BIN:-$(command -v recall 2>/dev/null || true)}"
+    if [ -z "$recall_bin" ] && [ -x "$HOME/.local/bin/recall" ]; then
+        recall_bin="$HOME/.local/bin/recall"
+    fi
+    if [ -z "$recall_bin" ]; then
+        echo "$(date -u +%FT%TZ) health: recall CLI not found; skipped" >> "$LOG_FILE"
+        return 0
+    fi
+    "$recall_bin" health --json --brain-root "$BRAIN_ROOT" --cwd "$BRAIN_ROOT" \
+        --write "$BRAIN_ROOT/runtime/health.json" >/dev/null 2>>"$LOG_FILE" || true
+    echo "$(date -u +%FT%TZ) health: wrote runtime/health.json" >> "$LOG_FILE"
+}
+
+# Single EXIT trap for the whole script — runs on every exit path (success,
+# no-op, push failure, pre-commit rejection, misconfiguration) so
+# runtime/health.json and PENDING_REVIEW.md are never more than one run
+# stale. Bash preserves the pending exit code across an EXIT trap as long
+# as the trap itself never calls `exit`, so none of this changes the
+# script's own exit status.
+_finish() {
+    _write_health
+    _refresh_pending_summary
+    if [ -n "$LOCK_PID" ]; then
+        kill -TERM "$LOCK_PID" 2>/dev/null || true
+    fi
+}
+trap _finish EXIT
 
 # Pre-sync refresh: candidate counts (drift, sync stat) before scrubbing
 _refresh_pending_summary
@@ -212,7 +261,6 @@ if [ -n "$SCANNER" ] && [ -f "$SCAN_GATE" ]; then
     # not a clean brain — fail closed, as before.
     if [ "$gate_rc" -eq 2 ]; then
         echo "$(date -u +%FT%TZ) sync: secret scan could not run; refusing to push" >> "$LOG_FILE"
-        _refresh_pending_summary
         exit 1
     fi
 elif [ -n "$SCANNER" ]; then
@@ -222,22 +270,22 @@ elif [ -n "$SCANNER" ]; then
     # all-or-nothing behaviour this commit replaced. Fail closed.
     echo "$(date -u +%FT%TZ) sync: scan_gate.py missing at $SCAN_GATE; refusing to push" >> "$LOG_FILE"
     echo "$(date -u +%FT%TZ) sync: reinstall with ./install.sh to restore the secret gate" >> "$LOG_FILE"
-    _refresh_pending_summary
     exit 2
 fi
 
 # ---- Stage all changes, minus anything quarantined ----
 git add -A
 
-if [ -n "$QUARANTINE" ]; then
-    # An unborn HEAD (fresh brain, first ever sync) can't be reset against;
-    # `git rm --cached` is the only way to unstage there.
-    if git rev-parse --verify -q HEAD >/dev/null 2>&1; then
-        HAVE_HEAD=1
-    else
-        HAVE_HEAD=0
-    fi
+# An unborn HEAD (fresh brain, first ever sync) can't be reset against;
+# `git rm --cached` is the only way to unstage there. Shared by the
+# quarantine gate below and the size gate that follows it.
+if git rev-parse --verify -q HEAD >/dev/null 2>&1; then
+    HAVE_HEAD=1
+else
+    HAVE_HEAD=0
+fi
 
+if [ -n "$QUARANTINE" ]; then
     # Is exactly this path still in the index? `-z` avoids core.quotepath
     # mangling, and the :(literal) pathspec keeps the query exact.
     _is_staged() {
@@ -309,7 +357,6 @@ if [ -n "$QUARANTINE" ]; then
         if _is_staged "$qfile"; then
             echo "$(date -u +%FT%TZ) sync: could not unstage $qfile; refusing to push" >> "$LOG_FILE"
             git reset -q 2>>"$LOG_FILE" || true
-            _refresh_pending_summary
             exit 1
         fi
         N_QUARANTINED=$((N_QUARANTINED + 1))
@@ -324,14 +371,40 @@ if [ -n "$QUARANTINE" ]; then
     fi
 fi
 
+# ---- Size gate: hold back anything over the limit, push the rest ----
+#
+# GitHub rejects blobs over 100 MB server-side with a hard error; when
+# that happens today, the ENTIRE commit (every memory since the last
+# successful push) sits unpushed until a human notices and untracks the
+# offending file. One 107 MB `AGENT_LEARNINGS.jsonl` held 67 commits
+# hostage for five days. Fail open per file, exactly like the secret
+# quarantine above: unstage only the oversize path(s) and push everything
+# else. The file stays dirty in the working tree, so a later run (after
+# rotation shrinks it, or a human untracks it) re-checks it automatically.
+#
+# Comparison is strictly greater-than: a file already synced at exactly
+# the limit must not suddenly start stalling.
+N_OVERSIZE=0
+while IFS= read -r -d '' f; do
+    [ -z "$f" ] && continue
+    size="$(wc -c < "$f" | tr -d ' ')"
+    if [ "$size" -gt "$SYNC_MAX_FILE_BYTES" ]; then
+        if [ "$HAVE_HEAD" -eq 1 ]; then
+            git reset -q HEAD -- ":(literal)$f" 2>>"$LOG_FILE" || true
+        else
+            git rm --cached -q --force -- ":(literal)$f" 2>>"$LOG_FILE" || true
+        fi
+        N_OVERSIZE=$((N_OVERSIZE + 1))
+        echo "$(date -u +%FT%TZ) sync: oversize (not pushed): $f ($size bytes > ${SYNC_MAX_FILE_BYTES}-byte limit)" >> "$LOG_FILE"
+    fi
+done < <(git diff --cached --name-only --diff-filter=d -z)
+if [ "$N_OVERSIZE" -gt 0 ]; then
+    echo "$(date -u +%FT%TZ) sync: held back $N_OVERSIZE oversize file(s) (>50 MB); syncing the rest" >> "$LOG_FILE"
+fi
+
 # Anything to commit?
 if git diff --cached --quiet; then
     echo "$(date -u +%FT%TZ) sync: no changes" >> "$LOG_FILE"
-    # Refresh after writing the final log line so PENDING_REVIEW.md picks
-    # up the new "ok" sync status — without this, a previous "blocked" /
-    # "stale" warning persists until some other render trigger fires
-    # (Codex 2026-05-05 P2).
-    _refresh_pending_summary
     exit 0
 fi
 
@@ -342,17 +415,9 @@ if git commit -q -m "auto: $TS" 2>>"$LOG_FILE"; then
         echo "$TS sync: pushed" >> "$LOG_FILE"
     else
         echo "$TS sync: commit succeeded but push failed; brain is committed locally" >> "$LOG_FILE"
-        # Refresh after writing the final log line so PENDING_REVIEW.md
-        # reflects the new "blocked" / "stale" state (Codex 2026-05-04 P2).
-        _refresh_pending_summary
         exit 1
     fi
 else
     echo "$TS sync: commit blocked (likely by redact pre-commit hook)" >> "$LOG_FILE"
-    _refresh_pending_summary
     exit 1
 fi
-
-# Post-sync refresh on success — clears any stale "blocked"/"stale"
-# warning from the previous run by re-reading the now-updated sync.log.
-_refresh_pending_summary
