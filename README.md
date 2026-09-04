@@ -167,6 +167,7 @@ Useful commands:
 | `recall reindex` | Rebuild the retrieval cache after large imports/edits. |
 | `recall stats --since 7d` | Inspect auto-recall usage and latency. |
 | `recall doctor` | Diagnose wiring: hook interpreter, model cache, retrieval mode, scanner, install root. Run this FIRST when something looks wrong. |
+| `recall health` | Check the running system: sync backlog, mirror freshness, log sizes, dream cycle, launch agents, drift. Exits 1 on FAIL. See [Health checks](#health-checks). |
 | `recall runtime replay` | Reconstruct what entered the agent's context, from logs. |
 
 Retrieval details and benchmark notes: [`recall/README.md`](recall/README.md).
@@ -253,6 +254,34 @@ recall runtime install-hooks
 ```
 
 Hooks are registered with the repo venv's Python interpreter; `recall doctor` verifies the hook interpreter, model cache, retrieval mode, scanner, and install root. Setup details: [`docs/claude-code-setup.md`](docs/claude-code-setup.md).
+
+### Health checks
+
+`recall doctor` checks that brainstack is wired correctly. `recall health` checks that it is still *working*: the background jobs run unattended, so a failure there is silent until something surfaces it.
+
+```bash
+recall health            # human-readable report; exit 1 on FAIL, 0 on PASS/WARN
+recall health --json     # same report as JSON
+recall doctor --health   # doctor output with the health report appended
+```
+
+Nine checks run against the live brain:
+
+| Check | Fails when |
+|---|---|
+| `imports_freshness` | The `~/.claude/projects/*/memory` mirror lags more than 24 h (over 2 h warns). |
+| `launch_agents` | A LaunchAgent plist is installed but launchd is not running it. A non-zero last exit warns. |
+| `brain_push` | The brain is ahead of its remote and the last successful push is over 3 h old. Quotes the `remote: error:` line from `sync.log`. |
+| `large_tracked_files` | A git-tracked file is over 50 MB, so GitHub will reject the push. |
+| `log_sizes` | An event log or episodic file is over 20 MB (warn). |
+| `dream_cycle` | The last dream cycle is over 36 h old, or the LLM provider was unavailable. |
+| `drift` | The brain no longer matches the brainstack checkout it was installed from (warn). |
+| `auto_recall_config` | A `pyproject.toml` in your working directory silently shadows the global config and turns auto-recall off. |
+| `daemon` | The recall daemon is configured but its socket refuses connections. |
+
+Every failing check carries a `fix:` line with the exact command to run.
+
+The hourly sync agent writes the report to `~/.agent/runtime/health.json`. Two surfaces read that cached file, so a regression reaches you without running anything: the Claude Code `SessionStart` hook prints one line per failure, and `~/.agent/PENDING_REVIEW.md` gains a `## Health` section. A report older than 26 h is reported as stale rather than trusted, because that usually means the hourly agent itself stopped.
 
 ## Bring existing memories
 
