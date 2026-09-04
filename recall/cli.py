@@ -970,7 +970,7 @@ def lint(
                 ],
             }
         else:
-            typer.echo(render_claim_manifest(actions, brain_root, applied=applied_claims))
+            typer.echo(render_claim_manifest(actions, brain_root, applied=applied_claims, stub_min_chars=stub_min_chars))
         pending_claim_actions = (
             plan_claim_dedupe(brain_root, stub_min_chars=stub_min_chars)
             if apply else actions
