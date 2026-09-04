@@ -751,6 +751,7 @@ def stats_cli(world: World, monkeypatch):
     )
     monkeypatch.setenv("RECALL_RUNTIME_CONFIG", str(cfg))
     monkeypatch.setenv("BRAIN_ROOT", str(world.brain))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(world.tmp / "xdg-cache"))
     return CliRunner()
 
 
@@ -779,9 +780,14 @@ class TestUtilizationCli:
         # only the in-window hit counted → the 14d default applied
         assert "1 / 1 schema-1.2 hits" in result.output
         assert "opened later in-session: 1" in result.output
-        # sample lands next to the events log by default
-        default_sample = world.logs / "utilization_sample.json"
+        # The sample holds raw prompt/response text, so by default it lands in
+        # the recall cache dir, never under the brain root (sync.sh would push
+        # anything under runtime/logs to the remote).
+        from recall.config import cache_dir
+        default_sample = cache_dir() / "utilization_sample.json"
         assert default_sample.is_file()
+        assert not default_sample.is_relative_to(world.brain)
+        assert not (world.logs / "utilization_sample.json").exists()
         assert len(json.loads(default_sample.read_text())) == 1
 
     def test_cli_utilization_json(self, world: World, t0: int,

@@ -61,6 +61,8 @@ memory/episodic/**/_imported.jsonl*
 *.preCodexFix.bak
 runtime/logs/*.jsonl
 runtime/logs/injected/
+# Any JSON export under runtime/logs (e.g. an explicit --sample-out) holds raw text.
+runtime/logs/*.json
 runtime/health.json
 runtime/dream_status.json
 runtime/recall.sock

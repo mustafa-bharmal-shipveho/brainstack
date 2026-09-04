@@ -657,3 +657,19 @@ def test_push_failure_leaves_git_error_before_marker(brain_repo):
         "git's push error is not in sync.log; there is nothing for "
         f"`recall health` to quote\n{_debug(res, brain_repo)}"
     )
+
+
+def test_crashing_recall_health_is_logged_not_claimed_written(brain_repo, tmp_path):
+    """`recall health` exiting >=2 (a broken CLI, not a FAIL verdict) must not be
+    logged as `health: wrote runtime/health.json`; the log the health check
+    reads has to say the CLI failed."""
+    crashing = tmp_path / "recall-crash" / "recall"
+    crashing.parent.mkdir()
+    crashing.write_text("#!/bin/sh\necho 'boom' >&2\nexit 3\n")
+    crashing.chmod(0o755)
+    res = _run_sync(brain_repo, env_overrides={"RECALL_BIN": str(crashing)})
+    assert res.returncode in (0, 1), res.stderr
+    lines = _log_lines(brain_repo)
+    assert any("health: recall health exited 3" in ln for ln in lines), lines[-6:]
+    assert not any("health: wrote runtime/health.json" in ln for ln in lines), lines[-6:]
+

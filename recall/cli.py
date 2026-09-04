@@ -1783,7 +1783,8 @@ def stats(
     sample_out: Optional[Path] = typer.Option(
         None, "--sample-out",
         help="Where to write the --utilization LLM-judge sample JSON "
-             "(default: <log_dir>/utilization_sample.json).",
+             "(default: <XDG cache>/recall/utilization_sample.json; never inside the "
+             "brain, because it holds raw prompt and response text).",
     ),
     sample_n: int = typer.Option(
         24, "--sample-n",
@@ -1839,7 +1840,11 @@ def stats(
         effective_brain_root = brain_root or Path(
             os.environ.get("BRAIN_ROOT", str(Path.home() / ".agent"))
         )
-        effective_sample_out = sample_out or (log_path.parent / "utilization_sample.json")
+        # Raw prompt/response text must never land under the brain root: sync.sh
+        # would push it to the remote on the next hourly tick (runtime/core/events.py
+        # data policy). Default to the recall cache dir instead.
+        from recall.config import cache_dir as _cache_dir
+        effective_sample_out = sample_out or (_cache_dir() / "utilization_sample.json")
         util_report = compute_utilization(
             log_path, td,
             brain_root=effective_brain_root,

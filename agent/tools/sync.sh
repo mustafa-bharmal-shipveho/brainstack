@@ -134,9 +134,16 @@ _write_health() {
         echo "$(date -u +%FT%TZ) health: recall CLI not found; skipped" >> "$LOG_FILE"
         return 0
     fi
+    # `recall health` exits 1 when a check FAILs (still a good write); >=2 or a
+    # missing file means the CLI itself broke, which must be visible here.
+    local health_rc=0
     "$recall_bin" health --json --brain-root "$BRAIN_ROOT" --cwd "$BRAIN_ROOT" \
-        --write "$BRAIN_ROOT/runtime/health.json" >/dev/null 2>>"$LOG_FILE" || true
-    echo "$(date -u +%FT%TZ) health: wrote runtime/health.json" >> "$LOG_FILE"
+        --write "$BRAIN_ROOT/runtime/health.json" >/dev/null 2>>"$LOG_FILE" || health_rc=$?
+    if [ "$health_rc" -ge 2 ] || [ ! -s "$BRAIN_ROOT/runtime/health.json" ]; then
+        echo "$(date -u +%FT%TZ) health: recall health exited $health_rc (health.json not refreshed)" >> "$LOG_FILE"
+    else
+        echo "$(date -u +%FT%TZ) health: wrote runtime/health.json" >> "$LOG_FILE"
+    fi
 }
 
 # Single EXIT trap for the whole script — runs on every exit path (success,
@@ -394,7 +401,7 @@ fi
 N_OVERSIZE=0
 while IFS= read -r -d '' f; do
     [ -z "$f" ] && continue
-    size="$(wc -c < "$f" | tr -d ' ')"
+    size="$(wc -c < "$f" 2>/dev/null | tr -d ' ' || echo 0)"; size="${size:-0}"
     if [ "$size" -gt "$SYNC_MAX_FILE_BYTES" ]; then
         [ "$HAVE_HEAD" -eq 1 ] && _restore_rename_source "$f" "oversize"
         if [ "$HAVE_HEAD" -eq 1 ]; then

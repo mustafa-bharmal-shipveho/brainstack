@@ -163,3 +163,5 @@ Keep this distinction explicit in docs and user-facing output.
 Some memory-pipeline files are derived from `codejunkie99/agentic-stack` under
 Apache 2.0. Keep attribution centralized in `NOTICE` and `UPSTREAM.md`, and do
 not remove those files or their file lists when refactoring the README.
+
+`recall stats --utilization` writes its LLM-judge sample (raw prompt and response text) to `$XDG_CACHE_HOME/recall/utilization_sample.json` by default, never under the brain root; pass `--sample-out` to choose another location outside the brain.
