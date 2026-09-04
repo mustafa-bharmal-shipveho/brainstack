@@ -89,6 +89,27 @@ def _rank_key(r: QueryResult) -> tuple[float, str]:
     return (-float(primary), r.document.path)
 
 
+def _demote_rerank_score(value: float, penalty: float) -> float:
+    """Apply `penalty` to a cross-encoder score so it always moves DOWN.
+
+    Cross-encoder outputs are raw logits, and most real ones are NEGATIVE.
+    Plain `value * penalty` with `penalty` < 1 shrinks a negative score
+    toward zero — which under `_rank_key` is a PROMOTION, and also lifts the
+    doc over a negative `auto_recall_min_rerank` threshold. So: multiply
+    positives, divide negatives, and leave zero alone (it has no direction to
+    move). A non-positive `penalty` means "bury it", which for a negative
+    score is `-inf` rather than a division by zero or a sign flip.
+
+    The RRF `score` needs none of this: fused rank reciprocals are always
+    positive, so multiplication is already sign-safe there.
+    """
+    if value > 0.0:
+        return value * penalty
+    if value < 0.0:
+        return value / penalty if penalty > 0.0 else float("-inf")
+    return value
+
+
 def apply_review_policy(
     results: list[QueryResult], policy: str, penalty: float
 ) -> list[QueryResult]:
@@ -97,12 +118,15 @@ def apply_review_policy(
     - "exclude": flagged memories are removed entirely.
     - "demote":  flagged memories keep their place in the candidate set but
                  BOTH their RRF `score` and their `rerank_score` (when they
-                 have one) are multiplied by `penalty`, so fresh memories of
-                 comparable relevance outrank them. Scaling only the RRF
-                 score would let a stale doc with a high cross-encoder score
-                 keep the top slot AND sail through `auto_recall_min_rerank`
-                 at full strength. Results are re-sorted by `_rank_key` so
-                 the caller's top-k truncation reflects the penalty.
+                 have one) are penalised, so fresh memories of comparable
+                 relevance outrank them. Penalising only the RRF score would
+                 let a stale doc with a high cross-encoder score keep the top
+                 slot AND sail through `auto_recall_min_rerank` at full
+                 strength. The RRF score is scaled (`score * penalty`); the
+                 rerank score goes through `_demote_rerank_score`, which is
+                 sign-safe because logits are usually negative. Results are
+                 re-sorted by `_rank_key` so the caller's top-k truncation
+                 reflects the penalty.
     - anything else ("ignore"): returned unchanged.
 
     Pure and order-stable for non-flagged inputs; safe to call on any list.
@@ -117,7 +141,9 @@ def apply_review_policy(
                 document=r.document,
                 score=r.score * penalty,
                 rerank_score=(
-                    r.rerank_score * penalty if r.rerank_score is not None else None
+                    _demote_rerank_score(r.rerank_score, penalty)
+                    if r.rerank_score is not None
+                    else None
                 ),
             )
             if _is_needs_review(r.document)

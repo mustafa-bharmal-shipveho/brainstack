@@ -305,3 +305,126 @@ class TestDenseFallbackActive:
         qdrant_backend._SPARSE_FALLBACK_WARN_ONCE.set()
         qdrant_backend._reset_sparse_fallback_warning_for_tests()
         assert qdrant_backend.dense_fallback_active() is False
+
+
+class TestDemoteIsSignSafeForLogits:
+    """`demote` must move a flagged doc DOWN whatever the score's sign.
+
+    Cross-encoder outputs are raw logits, and in practice most of them are
+    NEGATIVE. Multiplying a negative score by a penalty < 1 moves it TOWARD
+    zero, i.e. UP under `_rank_key` — the exact opposite of a demotion, and
+    it also lifts the doc over `auto_recall_min_rerank`. The penalty has to
+    be applied sign-safely: multiply when positive, divide when negative.
+
+    The RRF `score` is a fused rank reciprocal and always positive, so it
+    keeps the plain `score * penalty` form.
+    """
+
+    def test_negative_rerank_score_is_pushed_further_negative(self):
+        flagged = _qr("stale", score=0.8, rerank_score=-1.0, needs_review=True)
+        out = apply_review_policy([flagged], "demote", 0.5)
+        # -1.0 * 0.5 == -0.5 would be a PROMOTION. -1.0 / 0.5 == -2.0.
+        assert out[0].rerank_score == pytest.approx(-2.0)
+
+    def test_demoted_negative_doc_ranks_below_an_undemoted_worse_one(self):
+        # Pre-penalty the flagged doc is the better match (-1.0 > -1.5).
+        # After a 0.5 penalty it must fall behind the fresh one.
+        flagged = _qr("stale", score=0.8, rerank_score=-1.0, needs_review=True)
+        fresh = _qr("fresh", score=0.4, rerank_score=-1.5)
+        out = apply_review_policy([flagged, fresh], "demote", 0.5)
+        assert _names(out) == ["fresh", "stale"]
+
+    def test_positive_rerank_score_still_scaled_down(self):
+        flagged = _qr("stale", score=0.8, rerank_score=1.0, needs_review=True)
+        out = apply_review_policy([flagged], "demote", 0.5)
+        assert out[0].rerank_score == pytest.approx(0.5)
+
+    def test_zero_rerank_score_stays_zero(self):
+        # 0.0 keeps its sign-free identity; guard against a boundary rewrite
+        # that flips it or divides it into something else.
+        flagged = _qr("stale", score=0.8, rerank_score=0.0, needs_review=True)
+        out = apply_review_policy([flagged], "demote", 0.5)
+        assert out[0].rerank_score == pytest.approx(0.0)
+
+    def test_rrf_score_keeps_plain_multiplication_when_rerank_is_negative(self):
+        # RRF fusion scores are always positive, so multiplying is already
+        # sign-safe there; the negative-logit fix must not touch it.
+        flagged = _qr("stale", score=0.8, rerank_score=-1.0, needs_review=True)
+        out = apply_review_policy([flagged], "demote", 0.5)
+        assert out[0].score == pytest.approx(0.4)
+
+    def test_unflagged_negative_scores_are_untouched(self):
+        fresh = _qr("fresh", score=0.4, rerank_score=-1.5)
+        out = apply_review_policy([fresh], "demote", 0.5)
+        assert out[0].rerank_score == pytest.approx(-1.5)
+        assert out[0].score == pytest.approx(0.4)
+
+    def test_negative_demotion_survives_a_realistic_gate_threshold(self):
+        # With auto_recall_min_rerank calibrated at -1.2, the buggy
+        # multiplication (-1.0 -> -0.5) sails through the gate; the sign-safe
+        # form (-1.0 -> -2.0) is correctly filtered out.
+        min_rerank = -1.2
+        flagged = _qr("stale", score=0.8, rerank_score=-1.0, needs_review=True)
+        out = apply_review_policy([flagged], "demote", 0.5)
+        assert out[0].rerank_score < min_rerank
+
+
+class TestSingleCandidateIsStillScored:
+    """One surviving candidate must still get a `rerank_score`.
+
+    The relevance gate treats `rerank_score is None` as "pass" (there is no
+    score to judge). Short-circuiting the single-candidate case therefore let
+    exactly one off-topic memory bypass a configured `auto_recall_min_rerank`
+    entirely — and the narrowest pool is where the gate matters most.
+
+    The empty pool still short-circuits: there is nothing to score.
+    """
+
+    @pytest.fixture
+    def counting_encoder(self, monkeypatch):
+        seen: dict = {"calls": 0, "pairs": 0}
+
+        class _Encoder:
+            def rerank(self, query, texts):
+                seen["calls"] += 1
+                seen["pairs"] += len(texts)
+                return [-1.75 for _ in texts]
+
+        monkeypatch.setattr(
+            qdrant_backend, "_get_cross_encoder", lambda model: _Encoder()
+        )
+        return seen
+
+    def test_single_candidate_is_scored_with_exactly_one_pair(self, counting_encoder):
+        qdrant_backend.rerank_results("q", [_qr("solo", score=0.5)], limit=10)
+        assert counting_encoder["calls"] == 1
+        assert counting_encoder["pairs"] == 1
+
+    def test_single_candidate_gets_a_float_rerank_score(self, counting_encoder):
+        out = qdrant_backend.rerank_results("q", [_qr("solo", score=0.5)], limit=10)
+        assert len(out) == 1
+        assert isinstance(out[0].rerank_score, float)
+        assert out[0].rerank_score == pytest.approx(-1.75)
+
+    def test_single_candidate_keeps_its_rrf_score_and_document(self, counting_encoder):
+        out = qdrant_backend.rerank_results("q", [_qr("solo", score=0.5)], limit=10)
+        assert out[0].score == pytest.approx(0.5)
+        assert out[0].document.path == "/synth/brain/solo.md"
+
+    def test_limit_of_one_scores_the_single_kept_candidate(self, counting_encoder):
+        # A limit that truncates the pool down to one is the same case.
+        pool = [_qr("a", score=0.9), _qr("b", score=0.5)]
+        out = qdrant_backend.rerank_results("q", pool, limit=1)
+        assert counting_encoder["pairs"] == 1
+        assert _names(out) == ["a"]
+        assert out[0].rerank_score == pytest.approx(-1.75)
+
+    def test_empty_candidates_still_short_circuit_without_the_model(
+        self, counting_encoder
+    ):
+        assert qdrant_backend.rerank_results("q", [], limit=10) == []
+        assert counting_encoder["calls"] == 0
+
+    def test_non_positive_limit_still_short_circuits(self, counting_encoder):
+        assert qdrant_backend.rerank_results("q", [_qr("a", score=0.5)], limit=0) == []
+        assert counting_encoder["calls"] == 0
