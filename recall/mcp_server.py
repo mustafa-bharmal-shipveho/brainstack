@@ -14,7 +14,7 @@ from typing import Optional
 from recall.config import effective_mode, load_config
 from recall.core import HybridRetriever
 from recall.index import build_index, load_index, needs_refresh
-from recall.serialize import serialize_results
+from recall.serialize import serialize_results, wire_to_serialized
 
 # Generous next to the hook's 800 ms budget: an MCP call is an explicit tool
 # invocation the model is already waiting on, and the daemon's first query
@@ -56,25 +56,7 @@ def _query_via_daemon(
         return None
     except Exception:  # noqa: BLE001 - the daemon is a soft dependency
         return None
-    return [_wire_to_serialized(item) for item in (resp.get("results") or [])]
-
-
-def _wire_to_serialized(item: dict) -> dict:
-    """Project a daemon wire result onto `serialize_results`' exact shape,
-    so an MCP client cannot tell whether the daemon was running."""
-    rerank_score = item.get("rerank_score")
-    return {
-        "path": item.get("path"),
-        "source": item.get("source"),
-        "name": item.get("name"),
-        "type": item.get("type"),
-        "description": item.get("description"),
-        "score": round(float(item.get("score") or 0.0), 6),
-        "rerank_score": (
-            None if rerank_score is None else round(float(rerank_score), 6)
-        ),
-        "provenance": item.get("provenance"),
-    }
+    return [wire_to_serialized(item) for item in (resp.get("results") or [])]
 
 
 def recall_query_handler(

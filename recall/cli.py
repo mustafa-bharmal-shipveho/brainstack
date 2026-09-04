@@ -34,7 +34,7 @@ from recall.qdrant_backend import (
     QdrantStoreBusyError,
     close_client_cache,
 )
-from recall.serialize import serialize_results
+from recall.serialize import serialize_results, wire_to_serialized
 from recall.sources import discover_documents
 
 app = typer.Typer(
@@ -148,28 +148,6 @@ def _daemon_cli_budget_ms() -> int:
     return 60_000
 
 
-def _wire_to_serialized(item: dict) -> dict:
-    """Project a daemon wire result onto `serialize_results`' exact shape.
-
-    Every consumer of `recall query` parses that JSON. If routing through
-    the socket dropped or renamed a key, installing the daemon would be a
-    silent breaking change.
-    """
-    rerank_score = item.get("rerank_score")
-    return {
-        "path": item.get("path"),
-        "source": item.get("source"),
-        "name": item.get("name"),
-        "type": item.get("type"),
-        "description": item.get("description"),
-        "score": round(float(item.get("score") or 0.0), 6),
-        "rerank_score": (
-            None if rerank_score is None else round(float(rerank_score), 6)
-        ),
-        "provenance": item.get("provenance"),
-    }
-
-
 def _query_via_daemon(
     prompt: str,
     *,
@@ -190,10 +168,11 @@ def _query_via_daemon(
     sock = _resolve_daemon_socket()
     if sock is None:
         return None
-    try:
-        from recall import daemon_client
-    except ImportError:
-        return None
+    # No ImportError guard: `daemon_client` is stdlib-only by design (see
+    # its module docstring), so it cannot fail to import where `recall`
+    # itself imported.
+    from recall import daemon_client
+
     try:
         resp = daemon_client.query(
             prompt,
@@ -215,7 +194,7 @@ def _query_via_daemon(
             err=True,
         )
         raise typer.Exit(code=1) from exc
-    return [_wire_to_serialized(item) for item in (resp.get("results") or [])]
+    return [wire_to_serialized(item) for item in (resp.get("results") or [])]
 
 
 def _query_results(
@@ -541,12 +520,10 @@ def reindex():
     if not _daemon_disabled():
         sock = _resolve_daemon_socket()
         if sock is not None:
-            try:
-                from recall import daemon_client
+            from recall import daemon_client
 
+            try:
                 resp = daemon_client.reindex(sock)
-            except ImportError:
-                pass
             except daemon_client.DaemonUnavailable as exc:
                 if exc.reason not in {"no_socket", "connection_refused"}:
                     typer.echo(

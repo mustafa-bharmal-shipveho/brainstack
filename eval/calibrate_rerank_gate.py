@@ -159,15 +159,26 @@ def score_pairs(
     pairs: Sequence[LabeledPair],
     scorer: "Callable[[str, list[str]], list[float]]",
     *,
-    text_cap: int = 2000,
+    text_cap: "int | None" = None,
 ) -> list[ScoredPair]:
     """Score every pair with `scorer`, capping `indexed_text_for_file(...)`
-    at `text_cap` chars (mirrors `recall.qdrant_backend.RERANK_TEXT_CAP`).
-    One `ScoredPair` per input, in order.
+    at `text_cap` chars. One `ScoredPair` per input, in order.
+
+    `text_cap` defaults to `recall.qdrant_backend.RERANK_TEXT_CAP` — the
+    cap production actually reranks at. A calibration run against a
+    different cap calibrates a threshold for a system nobody is running,
+    so this reads the real constant rather than repeating the number.
+    (Imported inside the call, like every other `recall` import in this
+    module, so `--help` does not pay for the qdrant import chain.)
 
     Pairs sharing a prompt are batched into one scorer call, which is how
     the daemon calls the encoder too (one query, N candidate texts).
     """
+    if text_cap is None:
+        from recall.qdrant_backend import RERANK_TEXT_CAP
+
+        text_cap = RERANK_TEXT_CAP
+
     by_prompt: dict[str, list[int]] = {}
     for i, pair in enumerate(pairs):
         by_prompt.setdefault(pair.prompt, []).append(i)
@@ -434,43 +445,43 @@ def main(argv: "list[str] | None" = None) -> int:
     print()
     print(md)
 
-    if args.curve_out is not None:
-        Path(args.curve_out).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.curve_out).write_text(
-            json.dumps(
-                {
-                    "model": args.model,
-                    "date": date,
-                    "n_pairs": len(pairs),
-                    "sets": sets,
-                    "min_recall2": args.min_recall2,
-                    "scoring_seconds": round(elapsed, 4),
-                    "chosen": None if chosen is None else vars(chosen),
-                    "curve": [vars(p) for p in curve],
-                    # Deliberately NO prompts and NO paths: labelled prompts
-                    # are the user's real questions and the paths point into
-                    # their brain. This file is meant to be committable, so it
-                    # carries only (score, relevance, set) — enough to re-plot
-                    # or re-sweep, identifying nothing. Use `--scores-cache`
-                    # (never committed) when you need the raw pairs back.
-                    "score_distribution": sorted(
-                        (
-                            {
-                                "score": s.score,
-                                "relevance": s.pair.relevance,
-                                "set": s.pair.set_name,
-                            }
-                            for s in scored
-                        ),
-                        key=lambda d: -d["score"],
+    # `--curve-out` has a real default and `type=Path`, so it is never None.
+    Path(args.curve_out).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.curve_out).write_text(
+        json.dumps(
+            {
+                "model": args.model,
+                "date": date,
+                "n_pairs": len(pairs),
+                "sets": sets,
+                "min_recall2": args.min_recall2,
+                "scoring_seconds": round(elapsed, 4),
+                "chosen": None if chosen is None else vars(chosen),
+                "curve": [vars(p) for p in curve],
+                # Deliberately NO prompts and NO paths: labelled prompts
+                # are the user's real questions and the paths point into
+                # their brain. This file is meant to be committable, so it
+                # carries only (score, relevance, set) — enough to re-plot
+                # or re-sweep, identifying nothing. Use `--scores-cache`
+                # (never committed) when you need the raw pairs back.
+                "score_distribution": sorted(
+                    (
+                        {
+                            "score": s.score,
+                            "relevance": s.pair.relevance,
+                            "set": s.pair.set_name,
+                        }
+                        for s in scored
                     ),
-                },
-                indent=2,
-            )
-            + "\n",
-            encoding="utf-8",
+                    key=lambda d: -d["score"],
+                ),
+            },
+            indent=2,
         )
-        print(f"curve written to {args.curve_out}")
+        + "\n",
+        encoding="utf-8",
+    )
+    print(f"curve written to {args.curve_out}")
 
     if args.write_results:
         results_path = Path(__file__).resolve().parent / "RESULTS.md"

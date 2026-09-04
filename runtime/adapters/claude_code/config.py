@@ -226,18 +226,11 @@ class RuntimeConfig:
         defaults = cls()
 
         def scalar(key: str, kind: str, default):
-            for section in sections:
-                if key in section:
-                    ok, value = _coerce(section[key], kind)
-                    if ok:
-                        return value
-            return default
+            return _first_valid(sections, key, kind, default)
 
-        log_dir = defaults.log_dir
-        for section in sections:
-            if "log_dir" in section:
-                log_dir = Path(str(section["log_dir"])).expanduser()
-                break
+        # `log_dir` is the one key with no failure mode: any TOML scalar
+        # stringifies, so the first layer that sets it wins outright.
+        log_dir = _first_valid(sections, "log_dir", "path", defaults.log_dir)
 
         return dict(
             log_dir=log_dir,
@@ -288,13 +281,11 @@ class RuntimeConfig:
             layer_budgets.append(b)
             keys.update(str(k) for k in b)
         for key in keys:
-            for b in layer_budgets:
-                if key in b:
-                    try:
-                        budgets[key] = int(b[key])
-                        break
-                    except (TypeError, ValueError):
-                        continue
+            # Same per-key rule as the scalars, one layer down: the highest
+            # layer that sets the key AND coerces cleanly wins it.
+            value = _first_valid(layer_budgets, key, "int", None)
+            if value is not None:
+                budgets[key] = value
         return budgets
 
     @staticmethod
@@ -351,6 +342,27 @@ def _read_section(path: Path) -> dict | None:
     return section if isinstance(section, dict) else {}
 
 
+def _first_valid(sections: list[dict], key: str, kind: str, default):
+    """The per-key merge rule, once.
+
+    Walk `sections` high-precedence first and return the first value of
+    `key` that both EXISTS and coerces as `kind`. A layer that lacks the
+    key, or whose value fails to coerce, is skipped FOR THAT KEY ONLY — a
+    typo in one setting must not cost the user every other setting in the
+    same file. Nobody valid set it: `default`.
+
+    Used by the scalar merge and the `[budget]` sub-table alike; they are
+    the same rule at two nesting levels, and letting them drift is how a
+    budget key ends up obeying different precedence than a scalar.
+    """
+    for section in sections:
+        if key in section:
+            ok, value = _coerce(section[key], kind)
+            if ok:
+                return value
+    return default
+
+
 def _coerce(value: object, kind: str) -> tuple[bool, object]:
     """Lenient per-value coercion. Returns `(ok, coerced)`; `ok=False` means
     the caller should fall through to the next layer / the dataclass
@@ -391,6 +403,10 @@ def _coerce(value: object, kind: str) -> tuple[bool, object]:
             return False, None
     if kind == "str":
         return True, str(value)
+    if kind == "path":
+        # No failure mode: every TOML scalar stringifies, so the first
+        # layer that sets a path key wins it outright.
+        return True, Path(str(value)).expanduser()
     raise ValueError(f"unknown coercion kind: {kind!r}")
 
 

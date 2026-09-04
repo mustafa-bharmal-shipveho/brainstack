@@ -706,61 +706,6 @@ def rerank_results(
     ]
 
 
-def query_hybrid_rerank(
-    client: QdrantClient,
-    collection: str,
-    query: str,
-    k: int,
-    type_filter: Optional[str] = None,
-    source_filter: Optional[str] = None,
-    dense_model: str = _DENSE_DEFAULT,
-    sparse_model: str = _SPARSE_DEFAULT,
-    reranker_model: str = _RERANKER_DEFAULT,
-    rerank_n: int = _RERANK_OVERSAMPLE,
-    mode: str = "hybrid",
-) -> list[QueryResult]:
-    """Hybrid query + cross-encoder rerank.
-
-    1. Pull top-`rerank_n` from `query_hybrid` (oversample)
-    2. Score every (query, doc.text[:RERANK_TEXT_CAP]) pair with the
-       cross-encoder
-    3. Sort by rerank score descending, return top-k
-
-    Both scores survive: the cheap Qdrant RRF fusion score stays in
-    `QueryResult.score` and the cross-encoder score lands in
-    `QueryResult.rerank_score`. The S4 relevance gate needs both — the RRF
-    score as a cheap pre-filter, the rerank score as the decision — and the
-    telemetry reports them separately.
-
-    Cross-encoder outputs are RAW model scores, not calibrated probabilities;
-    the range is model-specific (see `eval/RESULTS.md` for the observed range
-    of the calibrated model). Do not assume 0-1.
-    """
-    if k <= 0:
-        return []
-    n = max(rerank_n, k)
-    candidates = query_hybrid(
-        client,
-        collection,
-        query,
-        n,
-        type_filter=type_filter,
-        source_filter=source_filter,
-        dense_model=dense_model,
-        sparse_model=sparse_model,
-        mode=mode,
-    )
-    if not candidates:
-        return []
-    # We deliberately do NOT short-circuit at <=k: callers oversample `k` for
-    # a downstream policy/truncation step, so reranking still determines
-    # which candidates survive — skipping it there silently bypassed the
-    # cross-encoder.
-    return rerank_results(
-        query, candidates, reranker_model=reranker_model, limit=n
-    )[:k]
-
-
 def count(client: QdrantClient, collection: str) -> int:
     if not client.collection_exists(collection):
         return 0

@@ -45,7 +45,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from recall.frontmatter import parse_file_text, parse_path
-from recall.lint import _atomic_write, _double_quote, mark_needs_review
+from recall.lint import (
+    _atomic_write,
+    _double_quote,
+    frontmatter_bounds,
+    mark_needs_review,
+    memory_root as _memory_root,
+)
 
 # Claims are one-liners by construction (median body 65 chars); length
 # alone is not a content-free signal, so this rule ships disabled unless
@@ -106,10 +112,6 @@ _ARCHIVE_NAME_TS_FMT = "%Y%m%dT%H%M%S"
 # How much of a stub body to quote in the manifest.
 _DETAIL_BODY_CHARS = 56
 
-# Only `stub_short_body` details carry the threshold, so the manifest can
-# recover it without the planner passing it through.
-_SHORT_DETAIL_RE = re.compile(r"body \d+ chars < (\d+)$")
-
 
 @dataclass(frozen=True)
 class ClaimAction:
@@ -132,20 +134,6 @@ class _Claim:
     mtime: float
     body: str
     value_normalized: str
-
-
-def _memory_root(root: Path) -> Path:
-    """Accept either the memory root or the brain root.
-
-    `recall lint --brain` defaults to `resolve_brain_home()` (the memory
-    dir), but callers hand us `~/.agent` too.
-    """
-    root = Path(root).expanduser()
-    if (root / "semantic").is_dir():
-        return root
-    if (root / "memory" / "semantic").is_dir():
-        return root / "memory"
-    return root
 
 
 def claims_dir(root: Path) -> Path | None:
@@ -198,14 +186,10 @@ def _string_claim_id_raw(raw: str, claim_id: str) -> str:
     """
     if isinstance(parse_file_text(raw).frontmatter.get("claim_id"), str):
         return raw
-    open_m = re.match(r"---(\r\n|\r|\n)", raw)
-    if not open_m:
+    bounds = frontmatter_bounds(raw)
+    if bounds is None:
         return raw
-    body_start = open_m.end()
-    close_m = re.search(r"(?:\r\n|\r|\n)---[ \t]*(?=\r\n|\r|\n|$)", raw[body_start:])
-    if not close_m:
-        return raw
-    fm_end = body_start + close_m.start()
+    _newline, body_start, fm_end = bounds
     quoted = _double_quote(claim_id)
     fm_region, n = re.subn(
         r"(?m)^claim_id:[ \t]*\S.*$",
@@ -478,37 +462,21 @@ def apply_claim_dedupe(
     return applied
 
 
-def _infer_stub_min_chars(actions: list[ClaimAction]) -> int:
-    """Recover the threshold the plan ran with from its own actions.
-
-    Fallback only, for callers that render a manifest without knowing the
-    flag value. Only `stub_short_body` details carry it, so with the rule
-    off (the default) there is nothing to recover and nothing to report — 0.
-    Callers that DO know the value pass it as
-    `render_claim_manifest(..., stub_min_chars=N)`.
-    """
-    for action in actions:
-        if action.reason != REASON_SHORT_BODY:
-            continue
-        m = _SHORT_DETAIL_RE.search(action.detail)
-        if m:
-            return int(m.group(1))
-    return STUB_MIN_CHARS
-
-
 def render_claim_manifest(
     actions: list[ClaimAction],
     root: Path,
     *,
     applied: list[Path] | None = None,
-    stub_min_chars: int | None = None,
+    stub_min_chars: int = STUB_MIN_CHARS,
 ) -> str:
     """Human-readable `== recall lint --dedupe-claims ==` manifest, or
     the post-apply summary line when `applied` is given.
 
-    `stub_min_chars` is the threshold the plan ran with. Omit it and the
-    header falls back to inferring it from the actions' own detail
-    strings, which only works when the short-body rule actually fired."""
+    `stub_min_chars` is the threshold the plan ran with; the caller that
+    ran it knows the value and passes it. (A previous fallback regexed the
+    threshold back out of the plan's own detail strings — which only
+    worked when the short-body rule had actually fired, so the one
+    production caller passed it explicitly anyway.)"""
     memory_root = _memory_root(root)
     lines: list[str] = []
 
@@ -516,14 +484,10 @@ def render_claim_manifest(
         cdir = claims_dir(root)
         claims = _scan_claims(cdir) if cdir is not None else []
         n_events = len({c.source_event_id for c in claims})
-        threshold = (
-            stub_min_chars if stub_min_chars is not None
-            else _infer_stub_min_chars(actions)
-        )
         lines.append(
             f"== recall lint --dedupe-claims ==  ({len(claims)} claims, "
             f"{n_events} distinct source events; "
-            f"stub_min_chars={threshold})"
+            f"stub_min_chars={stub_min_chars})"
         )
     else:
         lines.append("== recall lint --dedupe-claims ==")

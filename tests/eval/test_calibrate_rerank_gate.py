@@ -17,7 +17,8 @@ Planned contract (not implemented yet), from the S4 plan:
     load_labels(path) -> list[LabeledPair]
     indexed_text_for_file(path) -> str
     make_scorer(model) -> Callable[[str, list[str]], list[float]]
-    score_pairs(pairs, scorer, *, text_cap=2000) -> list[ScoredPair]
+    score_pairs(pairs, scorer, *, text_cap=None) -> list[ScoredPair]
+        (text_cap=None means recall.qdrant_backend.RERANK_TEXT_CAP)
     sweep(scored) -> list[CurvePoint]
     choose(curve, *, min_recall2=0.7) -> CurvePoint | None
     render_markdown(curve, chosen, *, model, n_pairs, sets, date) -> str

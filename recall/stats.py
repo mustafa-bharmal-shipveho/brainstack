@@ -32,6 +32,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Iterator
 
+from recall._coerce import as_float as _as_float
+from recall._coerce import as_int as _as_int
+from recall._coerce import as_list as _as_list
+from recall._coerce import as_mapping as _as_mapping
+from recall._coerce import format_window as _format_window
+
 # Cross-encoder score histogram bucket edges for `rerank_distribution`.
 #
 # These are RAW LOGITS, not probabilities. The S4 calibration measured
@@ -179,53 +185,87 @@ def _build_report(records: list[dict],
     # Chronological order is load-bearing for `repeat_injection_rate`: a
     # path is only a repeat relative to what the session already saw.
     records = sorted(records, key=lambda r: _as_int(r.get("ts_ms")))
-    v12 = [r for r in records if is_v12(r)]
-    legacy = [r for r in records if not is_v12(r)]
 
-    hits = [r for r in v12 if r.get("x_outcome") == "hit"]
-    misses = [r for r in v12 if r.get("x_outcome") == "miss"]
-    dedups = [r for r in v12 if r.get("x_outcome") == "dedup"]
-    skips = [r for r in v12 if r.get("x_outcome") == "skip"]
-    others = [r for r in v12
-              if r.get("x_outcome") not in ("hit", "miss", "dedup", "skip")]
+    # One pass to partition. Every list stays in the sorted order it was
+    # built in — `repeat_injection_rate` reads `hits` chronologically.
+    legacy: list[dict] = []
+    hits: list[dict] = []
+    misses: list[dict] = []
+    dedups: list[dict] = []
+    skips: list[dict] = []
+    others: list[dict] = []
     # A worker ran for everything except a skip, so `x_latency_ms`,
     # `x_path` and the k-counters are read over exactly this population.
-    non_skip = [r for r in v12 if r.get("x_outcome") != "skip"]
+    non_skip: list[dict] = []
+    skip_reasons: Counter[str] = Counter()
+    other_outcomes: Counter[str] = Counter()
 
-    skip_reasons: Counter[str] = Counter(
-        str(r.get("x_skip_reason") or "unknown") for r in skips
-    )
-    other_outcomes: Counter[str] = Counter(
-        str(r.get("x_outcome") or "unknown") for r in others
-    )
+    for r in records:
+        if not is_v12(r):
+            legacy.append(r)
+            continue
+        outcome = r.get("x_outcome")
+        if outcome == "skip":
+            skips.append(r)
+            skip_reasons[str(r.get("x_skip_reason") or "unknown")] += 1
+            continue
+        non_skip.append(r)
+        if outcome == "hit":
+            hits.append(r)
+        elif outcome == "miss":
+            misses.append(r)
+        elif outcome == "dedup":
+            dedups.append(r)
+        else:
+            others.append(r)
+            other_outcomes[str(outcome or "unknown")] += 1
 
-    total_fires = len(hits) + len(misses) + len(dedups) + len(others)
+    total_fires = len(non_skip)
     total_prompts = total_fires + len(skips)
 
-    latencies = [_as_int(r["x_latency_ms"]) for r in non_skip
-                 if r.get("x_latency_ms") is not None]
-    query_ms = [_as_int(r["x_query_ms"]) for r in non_skip
-                if r.get("x_query_ms") is not None]
+    # One pass over the worker population for every field it feeds.
+    latencies: list[int] = []
+    query_ms: list[int] = []
+    path_split: Counter[str] = Counter()
+    daemon_errors: Counter[str] = Counter()
+    degraded_count = 0
+    index_stale_count = 0
+    index_stale_known = 0
+    k_candidates_total = 0
+    k_gated_out_total = 0
+    k_dedup_total = 0
+    for r in non_skip:
+        latency = r.get("x_latency_ms")
+        if latency is not None:
+            latencies.append(_as_int(latency))
+        query = r.get("x_query_ms")
+        if query is not None:
+            query_ms.append(_as_int(query))
+        path_split[str(r.get("x_path") or "unknown")] += 1
+        daemon_error = r.get("x_daemon_error")
+        if daemon_error is not None:
+            daemon_errors[_daemon_error_reason(daemon_error)] += 1
+        if r.get("x_degraded") is True:
+            degraded_count += 1
+        # An absent flag is UNKNOWN, never False: the in-process path has
+        # no way to vouch for index freshness, and counting silence as
+        # "fresh" hides exactly the failure the flag exists to catch.
+        stale = r.get("x_index_stale")
+        if isinstance(stale, bool):
+            index_stale_known += 1
+            index_stale_count += 1 if stale else 0
+        k_candidates_total += _as_int(r.get("x_k_candidates"))
+        k_gated_out_total += _as_int(r.get("x_k_gated_out"))
+        k_dedup_total += _as_int(r.get("x_k_dedup"))
 
-    path_split: Counter[str] = Counter(
-        str(r.get("x_path") or "unknown") for r in non_skip
-    )
-    daemon_errors: Counter[str] = Counter(
-        _daemon_error_reason(r["x_daemon_error"]) for r in non_skip
-        if r.get("x_daemon_error") is not None
-    )
-    degraded_count = sum(1 for r in non_skip if r.get("x_degraded") is True)
-    # An absent flag is UNKNOWN, never False: the in-process path has no
-    # way to vouch for index freshness, and counting silence as "fresh"
-    # hides exactly the failure the flag exists to catch.
-    stale_known = [r for r in non_skip
-                   if isinstance(r.get("x_index_stale"), bool)]
-
+    # One pass over the hits for everything read off an injected doc.
+    surfaced_count = 0
     source_counts: Counter[str] = Counter()
     score_buckets: Counter[str] = Counter()
     rerank_buckets: Counter[str] = Counter()
     path_counts: Counter[str] = Counter()
     for r in hits:
+        surfaced_count += _as_int(r.get("x_k_returned"))
         for src, count in _as_mapping(r.get("x_sources")).items():
             source_counts[str(src)] += _as_int(count)
         for s in _as_list(r.get("x_top_scores")):
@@ -234,6 +274,9 @@ def _build_report(records: list[dict],
             rerank_buckets[_bucket_rerank(_as_float(s))] += 1
         for p in _as_list(r.get("x_paths")):
             path_counts[str(p)] += 1
+
+    latency_p50, latency_p95 = _percentiles(latencies, 50, 95)
+    query_p50, query_p95 = _percentiles(query_ms, 50, 95)
 
     return StatsReport(
         fired_count=len(hits),
@@ -252,16 +295,16 @@ def _build_report(records: list[dict],
         daemon_error_count=sum(daemon_errors.values()),
         daemon_error_by_reason=dict(daemon_errors),
         degraded_count=degraded_count,
-        index_stale_count=sum(1 for r in stale_known if r["x_index_stale"]),
-        index_stale_known=len(stale_known),
-        latency_p50_ms=_percentile(latencies, 50),
-        latency_p95_ms=_percentile(latencies, 95),
-        query_p50_ms=_percentile(query_ms, 50),
-        query_p95_ms=_percentile(query_ms, 95),
-        surfaced_count=sum(_as_int(r.get("x_k_returned")) for r in hits),
-        k_candidates_total=sum(_as_int(r.get("x_k_candidates")) for r in non_skip),
-        k_gated_out_total=sum(_as_int(r.get("x_k_gated_out")) for r in non_skip),
-        k_dedup_total=sum(_as_int(r.get("x_k_dedup")) for r in non_skip),
+        index_stale_count=index_stale_count,
+        index_stale_known=index_stale_known,
+        latency_p50_ms=latency_p50,
+        latency_p95_ms=latency_p95,
+        query_p50_ms=query_p50,
+        query_p95_ms=query_p95,
+        surfaced_count=surfaced_count,
+        k_candidates_total=k_candidates_total,
+        k_gated_out_total=k_gated_out_total,
+        k_dedup_total=k_dedup_total,
         repeat_injection_rate=_repeat_injection_rate(hits),
         top_sources=source_counts.most_common(),
         top_paths=path_counts.most_common(10),
@@ -269,8 +312,10 @@ def _build_report(records: list[dict],
         rerank_distribution=dict(rerank_buckets),
         legacy=_build_legacy(legacy),
         window_start_ts_ms=since_ts_ms,
-        window_end_ts_ms=max((_as_int(r.get("ts_ms")) for r in records),
-                             default=None),
+        # `records` is sorted by exactly this key, so the last one holds
+        # the max — no second pass to find it.
+        window_end_ts_ms=(_as_int(records[-1].get("ts_ms")) if records
+                          else None),
     )
 
 
@@ -495,6 +540,7 @@ def _build_legacy(records: list[dict]) -> dict:
     for r in hits:
         for src, count in _as_mapping(r.get("x_sources")).items():
             sources[str(src)] += _as_int(count)
+    p50, p95 = _percentiles(latencies, 50, 95)
     return {
         "events": len(records),
         "hit_logged": len(hits),
@@ -504,39 +550,17 @@ def _build_legacy(records: list[dict]) -> dict:
         "timeout": outcomes.get("timeout", 0),
         "unavailable": outcomes.get("unavailable", 0),
         "error": outcomes.get("error", 0),
-        "query_p50_ms": _percentile(latencies, 50),
-        "query_p95_ms": _percentile(latencies, 95),
+        "query_p50_ms": p50,
+        "query_p95_ms": p95,
         "surfaced_count": sum(_as_int(r.get("x_k_returned")) for r in hits),
         "top_sources": sources.most_common(),
     }
 
 
 # ---------------------------------------------------------------------------
-# Coercion helpers — every value here came off a disk line written by some
-# older version of the hook, so nothing about its type is guaranteed.
+# Arithmetic helpers. (The value coercions every field goes through first
+# live in `recall._coerce`, shared with the utilization report.)
 # ---------------------------------------------------------------------------
-
-
-def _as_int(value: object, default: int = 0) -> int:
-    try:
-        return int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return default
-
-
-def _as_float(value: object, default: float = 0.0) -> float:
-    try:
-        return float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return default
-
-
-def _as_list(value: object) -> list:
-    return value if isinstance(value, list) else []
-
-
-def _as_mapping(value: object) -> dict:
-    return value if isinstance(value, dict) else {}
 
 
 def _pct(numerator: int, denominator: int) -> float:
@@ -546,7 +570,21 @@ def _pct(numerator: int, denominator: int) -> float:
 def _percentile(values: Iterable[int], p: int) -> int:
     """Approximate p-th percentile. statistics.quantiles needs >= 2 values
     so we fall back to `min`/`max`/single-value for tiny samples."""
+    return _percentile_of_sorted(sorted(values), p)
+
+
+def _percentiles(values: Iterable[int], *ps: int) -> tuple[int, ...]:
+    """`_percentile` for several `p`s over ONE sort of `values`.
+
+    Every caller wants p50 AND p95 of the same list; sorting it twice is
+    the whole cost of the calculation paid twice.
+    """
     vals = sorted(values)
+    return tuple(_percentile_of_sorted(vals, p) for p in ps)
+
+
+def _percentile_of_sorted(vals: list[int], p: int) -> int:
+    """The percentile body, given an ALREADY sorted list."""
     if not vals:
         return 0
     if len(vals) == 1:
@@ -688,7 +726,7 @@ def render_human(report: StatsReport) -> str:
             "  Or check the runtime log directory for events.log.jsonl"
         )
 
-    lines: list[str] = [f"brainstack: auto-recall{_format_window(report)}\n"]
+    lines: list[str] = [f"brainstack: auto-recall{_format_window(report.window_start_ts_ms)}\n"]
     if total_prompts > 0:
         lines.extend(_render_v12(report, total_fires, total_prompts))
     elif legacy_events:
@@ -848,15 +886,6 @@ def _render_histogram(distribution: dict[str, int],
     known = [b for b in order if b in distribution]
     rest = [b for b in distribution if b not in set(known)]
     return ", ".join(f"{distribution[b]} in {b}" for b in known + rest)
-
-
-def _format_window(report: StatsReport) -> str:
-    if report.window_start_ts_ms is None:
-        return " (all time)"
-    start = datetime.datetime.fromtimestamp(
-        report.window_start_ts_ms / 1000, tz=datetime.timezone.utc
-    ).date().isoformat()
-    return f" (since {start})"
 
 
 # ---------------------------------------------------------------------------

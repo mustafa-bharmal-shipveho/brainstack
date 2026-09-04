@@ -53,14 +53,7 @@ def digests_dir(root: Path) -> Path | None:
     """`<memory_root>/semantic/digests`, resolving `root` whether it is
     the memory root or the brain root (mirrors lint's `--brain` default
     of `resolve_brain_home()` == `~/.agent/memory`). None if absent."""
-    root = Path(root)
-    if (root / "semantic").is_dir():
-        memory_root = root
-    elif (root / "memory" / "semantic").is_dir():
-        memory_root = root / "memory"
-    else:
-        memory_root = root
-    candidate = memory_root / "semantic" / "digests"
+    candidate = lint.memory_root(root) / "semantic" / "digests"
     return candidate if candidate.is_dir() else None
 
 

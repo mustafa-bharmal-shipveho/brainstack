@@ -44,6 +44,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from recall.frontmatter import parse_path
+from recall.fsutil import atomic_write_text
 
 # Staleness checks (gated behind --stale) vs integrity checks.
 STALE_KINDS = frozenset({"dead_path", "broken_wikilink", "broken_local_link"})
@@ -562,40 +563,26 @@ def lint_dirs(
 def _atomic_write(file: Path, new_raw: str) -> bool:
     """Write ``new_raw`` to ``file`` atomically and symlink-safely.
 
-    mkstemp creates a fresh O_EXCL file in the same dir (so it never
-    follows a planted temp symlink), which we then rename over the
-    original. Returns True on success.
+    Delegates to `recall.fsutil.atomic_write_text` (mkstemp in the same
+    dir, then rename) and converts its exception into the False this
+    module's callers expect: a file we could not rewrite is skipped, not a
+    lint run that dies partway through the brain.
     """
-    import tempfile
-
-    tmpname = None
     try:
-        fd, tmpname = tempfile.mkstemp(dir=str(file.parent), prefix=f".{file.name}.", suffix=".tmp")
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
-            fh.write(new_raw)
-        os.replace(tmpname, file)
+        atomic_write_text(file, new_raw)
         return True
     except (OSError, ValueError):
-        if tmpname is not None:
-            try:
-                os.unlink(tmpname)
-            except OSError:
-                pass
         return False
 
 
-def _read_frontmatter_bounds(file: Path) -> tuple[str, str, int, int] | None:
-    """Return (raw, newline, body_start, fm_end) for a file with a real
-    frontmatter block, or None. fm_end is the index of the newline before
-    the closing ``---``. Reads bytes (not read_text) to preserve newline
-    style; skips symlinks and non-UTF-8 files.
+def frontmatter_bounds(raw: str) -> tuple[str, int, int] | None:
+    """Return `(newline, body_start, fm_end)` for `raw`'s frontmatter block,
+    or None when it has no real one.
+
+    `fm_end` is the index of the newline before the closing ``---``, and
+    `newline` is the style the file actually uses, so a caller can rewrite
+    the frontmatter region without normalising CRLF out of the file.
     """
-    try:
-        if file.is_symlink():
-            return None
-        raw = file.read_bytes().decode("utf-8")
-    except (OSError, ValueError, UnicodeDecodeError):
-        return None
     open_m = re.match(r"---(\r\n|\r|\n)", raw)
     if not open_m:
         return None
@@ -603,7 +590,44 @@ def _read_frontmatter_bounds(file: Path) -> tuple[str, str, int, int] | None:
     close_m = re.search(r"(?:\r\n|\r|\n)---[ \t]*(?=\r\n|\r|\n|$)", raw[body_start:])
     if not close_m:
         return None
-    return raw, open_m.group(1), body_start, body_start + close_m.start()
+    return open_m.group(1), body_start, body_start + close_m.start()
+
+
+def _read_frontmatter_bounds(file: Path) -> tuple[str, str, int, int] | None:
+    """`frontmatter_bounds` for a file on disk: `(raw, newline, body_start,
+    fm_end)`, or None.
+
+    Reads bytes (not read_text) to preserve newline style; skips symlinks
+    and non-UTF-8 files.
+    """
+    try:
+        if file.is_symlink():
+            return None
+        raw = file.read_bytes().decode("utf-8")
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    bounds = frontmatter_bounds(raw)
+    if bounds is None:
+        return None
+    newline, body_start, fm_end = bounds
+    return raw, newline, body_start, fm_end
+
+
+def memory_root(root: Path) -> Path:
+    """Accept either the memory root or the brain root.
+
+    `recall lint --brain` defaults to `resolve_brain_home()` (the memory
+    dir), but callers hand us `~/.agent` too. Every lint module that
+    resolves a `semantic/<kind>` directory needs exactly this rule; two
+    copies of it is two chances for `<brain>/semantic` and
+    `<brain>/memory/semantic` to be treated differently.
+    """
+    root = Path(root).expanduser()
+    if (root / "semantic").is_dir():
+        return root
+    if (root / "memory" / "semantic").is_dir():
+        return root / "memory"
+    return root
 
 
 _NEEDS_REVIEW_TRUE_RE = re.compile(
