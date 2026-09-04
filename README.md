@@ -16,7 +16,7 @@ Your coding agents already learn things every session, then forget them by the n
 
 ![brainstack: a prompt is auto-enriched with a past lesson, the lesson is traced to its source, and an agent's durable write is refused](demo/demo.gif)
 
-Four beats: the per-prompt hook injects a past lesson before you ask; `recall trace` walks that lesson back to its provenance and originating session; a piped (non-human) `recall remember --reviewed` is refused while the default write lands staged for your review; `recall stats` shows the week's auto-recall ROI. Generated from [`demo/demo.tape`](demo/demo.tape) against a fully synthetic brain built by [`demo/make_demo_brain.py`](demo/make_demo_brain.py) (placeholder names only, safe to publish). Regenerate with `make demo` (requires [vhs](https://github.com/charmbracelet/vhs)).
+Four beats: the per-prompt hook injects a past lesson before you ask; `recall trace` walks that lesson back to its provenance and originating session; a piped (non-human) `recall remember --reviewed` is refused while the default write lands staged for your review; `recall stats` shows the week's auto-recall coverage and latency. Generated from [`demo/demo.tape`](demo/demo.tape) against a fully synthetic brain built by [`demo/make_demo_brain.py`](demo/make_demo_brain.py) (placeholder names only, safe to publish). Regenerate with `make demo` (requires [vhs](https://github.com/charmbracelet/vhs)).
 
 ## Why you can trust it
 
@@ -359,7 +359,7 @@ recall remember "always run the exact CI command from the repo config"
 recall query "what should I remember before changing CI?"
 recall forget ci-command
 recall pending --review                  # review staged candidates
-recall stats --since 24h                 # see auto-recall ROI
+recall stats --since 24h                 # coverage, miss/dedup/timeout rates, latency
 recall doctor                            # diagnose missing wiring
 ```
 
