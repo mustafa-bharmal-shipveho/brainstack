@@ -539,11 +539,24 @@ def lint_dirs(
     one subdir at a time would falsely report every cross-tree link as
     broken. Missing subdirs are tolerated. Findings sorted like
     ``lint_brain``.
-
-    Scaffold: signature + docstring only. See
-    tests/recall/test_lint.py::test_lint_dirs_resolves_wikilinks_across_memory_and_imports.
     """
-    raise NotImplementedError("scaffold")
+    kinds = kinds or ALL_KINDS
+    # Computed ONCE, over the whole brain: a plan under imports/ linking a
+    # lesson in memory/ must resolve, so the key set can never be scoped to
+    # the subdir being walked.
+    known_keys = _known_memory_keys(brain_root) if "broken_wikilink" in kinds else set()
+
+    findings: list[Finding] = []
+    for sub in subdirs:
+        subdir = brain_root / sub
+        if not subdir.is_dir():
+            continue  # a brain with no imports/ yet is the first-run shape
+        for md in sorted(subdir.rglob("*.md")):
+            findings.extend(
+                lint_file(md, known_keys=known_keys, kinds=kinds, brain_root=brain_root)
+            )
+    findings.sort(key=lambda f: (str(f.file), f.line, f.kind))
+    return findings
 
 
 def _atomic_write(file: Path, new_raw: str) -> bool:
