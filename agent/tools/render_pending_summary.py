@@ -277,10 +277,10 @@ def _in_last_run(tail_lines: list[str], claims=None):
         line = tail_lines[idx]
         if _is_health_line(line):
             continue  # transparent: belongs to no run, ends no run
-        if not (claims is not None and claims(line)):
-            if seen_run_line and any(m in line.lower()
-                                     for m in _RUN_TERMINAL_MARKERS):
-                return  # walked back into the previous run
+        claimed = claims is not None and claims(line)
+        if seen_run_line and not claimed and any(
+                m in line.lower() for m in _RUN_TERMINAL_MARKERS):
+            return  # walked back into the previous run
         seen_run_line = True
         yield idx, line
 
