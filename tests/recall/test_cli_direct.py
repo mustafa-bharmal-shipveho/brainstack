@@ -506,6 +506,80 @@ def test_serve_status_exit_1_when_absent(runner, isolated_xdg, monkeypatch):
     assert "not running" in result.output.lower(), result.output
 
 
+def test_serve_status_works_without_the_daemon_module(
+    runner, isolated_xdg, monkeypatch
+):
+    """`--status` and `doctor`'s daemon note resolve the socket through
+    `recall.config`, never `recall.daemon`.
+
+    Importing the daemon module pulls `recall.index` -> `qdrant_client`, so
+    a probe whose whole job is "is anything listening on this path?" either
+    pays ~0.9 s for a path join or, on an install where qdrant is not
+    importable, fails outright instead of answering "not running".
+    `sys.modules[name] = None` is exactly how Python reports an
+    unimportable module, so this simulates that install.
+    """
+    import sys
+
+    monkeypatch.setitem(sys.modules, "recall.daemon", None)
+    with _short_sock_dir() as sock_dir:
+        monkeypatch.setenv("RECALL_DAEMON_SOCKET", str(sock_dir / "absent.sock"))
+
+        status = runner.invoke(app, ["serve", "--status"])
+        notes: list[str] = []
+        from recall.cli import _check_daemon, _resolve_daemon_socket
+
+        resolved = _resolve_daemon_socket()
+        _check_daemon(notes)
+
+    assert status.exit_code == 1, (
+        f"--status must still answer when recall.daemon cannot be imported:\n"
+        f"{status.output}\n{status.exception!r}"
+    )
+    assert "not running" in status.output.lower(), status.output
+    assert resolved is not None and resolved.name == "absent.sock", resolved
+    assert notes and "Daemon: not running" in notes[0], notes
+
+
+def test_daemon_probes_do_not_import_the_daemon_module(isolated_xdg, tmp_path):
+    """The laziness itself, checked in a clean interpreter.
+
+    An in-process assertion would be meaningless: any earlier test in the
+    session may already have imported `recall.daemon`.
+    """
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    probe = textwrap.dedent(
+        """
+        import sys
+        from recall.cli import _check_daemon, _resolve_daemon_socket
+
+        _resolve_daemon_socket()
+        _check_daemon([])
+        assert "recall.daemon" not in sys.modules, (
+            "resolving the daemon socket imported recall.daemon (and with it "
+            "recall.index -> qdrant_client) just to join a few path components"
+        )
+        print("ok")
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        # Pinned at a path nothing listens on: the probe must never reach a
+        # daemon the developer actually has running.
+        env={**os.environ, "RECALL_DAEMON_SOCKET": str(tmp_path / "absent.sock")},
+    )
+    assert result.returncode == 0, (
+        f"stdout={result.stdout}\nstderr={result.stderr}"
+    )
+
+
 def test_query_no_daemon_flag_accepted(
     runner, isolated_xdg, write_config, empty_brain
 ):

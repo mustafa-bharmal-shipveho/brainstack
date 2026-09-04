@@ -101,11 +101,18 @@ def _exit_qdrant_store_error(
 
 
 def _resolve_daemon_socket() -> Optional[Path]:
-    """The socket the CLI should talk to, or None if it cannot be resolved."""
-    try:
-        from recall.daemon import resolve_daemon_socket
+    """The socket the CLI should talk to, or None if it cannot be resolved.
 
-        return resolve_daemon_socket()
+    Resolves through `recall.config`, NOT `recall.daemon`: importing the
+    daemon module pulls `recall.index` -> `qdrant_client` (~0.9 s) just to
+    join a few path components, and `recall doctor` / `recall serve
+    --status` pay that on every call. Resolution is a config concern; the
+    daemon module is the server.
+    """
+    try:
+        from recall.config import daemon_socket_path
+
+        return Path(daemon_socket_path())
     except Exception:  # noqa: BLE001 - the daemon is a soft dependency
         return None
 
@@ -633,10 +640,13 @@ def serve(
     """
     import json as _json
 
+    # `recall.config`, not `recall.daemon`: `--status` and `--stop` are
+    # probes, and must not pay the ~0.9 s qdrant import chain (nor fail
+    # outright when qdrant is not importable) to find a socket path.
     from recall import daemon_client
-    from recall.daemon import resolve_daemon_socket
+    from recall.config import daemon_socket_path
 
-    sock = Path(socket) if socket else resolve_daemon_socket()
+    sock = Path(socket) if socket else Path(daemon_socket_path())
 
     if status:
         result = daemon_client.status(sock)
@@ -1345,9 +1355,9 @@ def _check_daemon(notes: list[str]) -> None:
     rest of doctor's report."""
     try:
         from recall import daemon_client
-        from recall.daemon import resolve_daemon_socket
+        from recall.config import daemon_socket_path
 
-        sock = resolve_daemon_socket()
+        sock = Path(daemon_socket_path())
         result = daemon_client.status(sock)
     except Exception:
         return

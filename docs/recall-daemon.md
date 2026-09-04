@@ -131,29 +131,44 @@ and is retried on the next interval. The daemon keeps serving throughout:
 serving a known-stale brain loudly beats dying, and beats serving a stale
 brain silently.
 
+Passes are **mutually exclusive**. A `reindex` op that arrives while the
+background loop is mid-pass does not start a second one — it waits for the
+running pass and returns its counts. Two concurrent passes would embed the
+whole brain twice, and the one that finished first would clear
+`refresh_pending` while the other was still upserting, so `index_stale`
+would read false in the middle of a refresh.
+
 Adding a new source to `config.json` still needs a restart.
 
 ## Protocol
 
 AF_UNIX, `SOCK_STREAM`, socket mode `0600` (owner only — any local user
-could otherwise read your brain). One NDJSON request per connection.
-Connections are handled on threads so a burst of hook fires is all answered;
-retrieval itself is serialized under one lock because embedded Qdrant is not
-thread-safe.
+could otherwise read your brain). The `bind()` runs under a `0o077` umask,
+so the socket is never world-connectable even for the instant between
+creation and `chmod`; the process umask is restored straight afterwards.
+One NDJSON request per connection. Connections are handled on threads so a
+burst of hook fires is all answered; retrieval itself is serialized under
+one lock because embedded Qdrant is not thread-safe.
 
 Limits: 64 KB per request line (inclusive), 20000 chars per prompt, 2 s to
-receive a complete request line.
+receive a complete request line, and a bounded server-side queue wait (see
+`busy` under Errors).
 
 ### Requests
 
 ```json
-{"v":1,"op":"query","prompt":"atomic writes","k":5,"session_id":"","source":null,"type":null,"rerank":null}
+{"v":1,"op":"query","prompt":"atomic writes","k":5,"session_id":"","source":null,"type":null,"rerank":null,"budget_ms":800}
 {"v":1,"op":"status"}
 {"v":1,"op":"reindex"}
 {"v":1,"op":"shutdown"}
 ```
 
-`rerank: null` means "use the daemon's own setting".
+`rerank: null` means "use the daemon's own setting". `budget_ms` is
+optional: it tells the daemon how long the client itself will wait, so a
+client with a long budget can queue longer than the default bound instead of
+being answered `busy`. Unknown fields are ignored, so omitting it is safe —
+and `recall.daemon_client` does omit it today, so every client currently
+gets the default bound.
 
 ### Query response
 
@@ -212,7 +227,23 @@ before the first), `last_refresh_ok`, `last_refresh_error`,
 |---|---|
 | `bad_request` | malformed JSON, `v` ≠ 1, unknown op, missing/oversized prompt, oversized request |
 | `internal` | retrieval raised |
-| `busy` | a refresh held the retrieval lock for more than 2 s |
+| `busy` | the retrieval lock was not free in time — see below |
+
+`busy` says which wait was actually in the way, and the `message`
+distinguishes them:
+
+- **a refresh held the lock** for more than `QUERY_LOCK_TIMEOUT_S` (2 s).
+  Retrying shortly genuinely helps: the chunk finishes and the index is
+  fresher. This is reported only while the pass really holds the lock, never
+  during its lock-free discovery phase — otherwise every slow query during a
+  long walk would blame a refresh that was blocking nothing.
+- **another query held it** past the queue bound (2 s by default, ~2x the
+  hook's 800 ms budget; `RECALL_DAEMON_QUEUE_TIMEOUT_S`, or 2x the request's
+  `budget_ms` up to 60 s). Retrieval is serialized on purpose, so queueing is
+  normal — but finishing a query whose client has already given up just holds
+  the lock against clients that are still waiting.
+- **the client hung up** while queued. The request is dropped without
+  running.
 
 ## Client failure reasons
 
@@ -241,11 +272,22 @@ hook reports `unavailable` instead and records `x_daemon_error`.
 | `RECALL_DAEMON_SOCKET` | override the socket path everywhere (daemon, CLI, hook, doctor) |
 | `RECALL_NO_DAEMON=1` | CLI, MCP and hook skip the socket and go in-process |
 | `RECALL_CLI_DAEMON_BUDGET_MS` | how long `recall query` waits on the daemon (default 60000) |
+| `RECALL_DAEMON_QUEUE_TIMEOUT_S` | how long the daemon queues a request behind another query before answering `busy` (default 2) |
+| `RECALL_DAEMON_BUSY_BACKOFF_S` | how long `recall serve` sleeps before exiting 1 when another daemon owns the socket (default 30) |
 | `BRAIN_ROOT` | socket defaults to `$BRAIN_ROOT/runtime/recall.sock` |
 
 Resolution order for the socket: `$RECALL_DAEMON_SOCKET` → the config
 literal → `$BRAIN_ROOT/runtime/recall.sock` → `$BRAIN_HOME`'s parent →
-`~/.agent/runtime/recall.sock`.
+`~/.agent/runtime/recall.sock`. It lives in `recall.config.daemon_socket_path`,
+and every probe (`recall doctor`, `recall serve --status`, `recall-mcp`)
+resolves it from there rather than importing `recall.daemon`, which would
+drag in `qdrant_client` for a path join.
+
+`RECALL_DAEMON_BUSY_BACKOFF_S` exists for launchd: with `KeepAlive`, a
+daemon that exits 1 because a manual `recall serve` owns the socket is
+respawned every `ThrottleInterval` (10 s), so it would repeat the same
+refusal in `recall-daemon.stderr.log` six times a minute forever. The
+message names the pid holding the socket.
 
 ## Troubleshooting
 
