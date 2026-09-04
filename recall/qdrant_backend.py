@@ -678,13 +678,18 @@ def rerank_results(
 
     Returns the scored subset, rerank score descending, path breaking ties.
     Each result keeps its RRF `score` and gains a `rerank_score`.
+
+    A pool of exactly one is still scored, even though there is nothing to
+    reorder. The relevance gate reads `rerank_score is None` as "no opinion,
+    let it through", so skipping the single pair to save a model load let one
+    off-topic memory bypass `auto_recall_min_rerank` outright — and a pool of
+    one is precisely where the gate is the only thing standing between the
+    user and an irrelevant memory. An EMPTY pool still short-circuits: there
+    is no pair to score.
     """
     if limit <= 0 or not candidates:
         return []
     pool = list(candidates[:limit])
-    if len(pool) <= 1:
-        # Nothing to reorder; don't pay for a model load.
-        return pool
 
     encoder = _get_cross_encoder(reranker_model)
     # Cap the encoder input: rerank cost grows roughly linearly in token
