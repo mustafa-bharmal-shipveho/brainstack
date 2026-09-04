@@ -96,6 +96,7 @@ The full install enables everything. Skip any subset by passing flags to `./inst
 | `--no-launchd` | Hourly sync + nightly dream scheduler (launchd agents on macOS, systemd user timers on Linux) | You want to script the schedule yourself |
 | `--no-recall-first` | Recall-first directive in `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.cursor/.cursorrules` | You don't use those agents, or wire elsewhere |
 | `--no-auto-recall` | Claude Code UserPromptSubmit hook firing recall on every prompt | Want only agent-driven recall, not the unconditional sweep |
+| `--no-daemon` | Warm recall daemon LaunchAgent that keeps the retriever and reranker resident (macOS; `--setup-daemon` / `--remove-daemon` manage it directly, see [docs/recall-daemon.md](docs/recall-daemon.md)) | Every query then pays a cold model load; only worth it if you cannot spare a resident process |
 | `--setup-systemd` | (Adds systemd user timers explicitly; `--remove-systemd` tears them down) | Wire Linux scheduling without re-running the full install |
 | `--yes` | (Accepts the install plan and migrate-discovery prompts non-interactively) | CI / scripted installs |
 | `--no-prompt` | (Decline all migrate prompts; still runs the other defaults) | CI / scripted installs |
