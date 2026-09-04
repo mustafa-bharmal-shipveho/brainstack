@@ -33,9 +33,16 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 # Cross-encoder score histogram bucket edges for `rerank_distribution`.
-# One constant so retuning against the observed score range (see
-# eval/RESULTS.md) is a one-line change rather than a code change.
-RERANK_BUCKET_EDGES: tuple[float, float, float, float] = (0.1, 0.3, 0.5, 0.7)
+#
+# These are RAW LOGITS, not probabilities. The S4 calibration measured
+# jina turbo at −4.3 … +0.9 and MiniLM at −11.4 … +2.5 on real pairs, so
+# the earlier 0–1 edges put every score in one bucket and read as if the
+# reranker emitted confidences. Labels below render the numeric range
+# (`<-2.5`, `-2.5..-1.5`, …) for the same reason.
+#
+# One constant, one label builder: retuning against a new observed range
+# (see eval/RESULTS.md) is a one-line change.
+RERANK_BUCKET_EDGES: tuple[float, float, float, float] = (-2.5, -1.5, -0.75, 0.0)
 
 # Outcomes that mean retrieval actually ran. `skip` is the only outcome
 # that never starts a worker, so it is the only one outside this set.
@@ -367,10 +374,14 @@ def is_v12(rec: dict) -> bool:
 
 def _rerank_labels() -> list[str]:
     """Bucket labels derived from `RERANK_BUCKET_EDGES`, low to high, so
-    retuning the edges renames the buckets without touching the renderer."""
+    retuning the edges renames the buckets without touching the renderer.
+
+    Ranges join on `..` rather than `-`: the edges are signed logits, and
+    `-2.5--1.5` is unreadable.
+    """
     edges = RERANK_BUCKET_EDGES
     labels = [f"<{edges[0]:g}"]
-    labels += [f"{lo:g}-{hi:g}" for lo, hi in zip(edges, edges[1:])]
+    labels += [f"{lo:g}..{hi:g}" for lo, hi in zip(edges, edges[1:])]
     labels.append(f"{edges[-1]:g}+")
     return labels
 
@@ -695,13 +706,11 @@ def _render_v12(report: StatsReport, total_fires: int,
         lines.append(_row("Sources", ", ".join(
             f"{name} ({n})" for name, n in report.top_sources[:5])))
     if report.score_distribution:
-        lines.append(_row("RRF scores", ", ".join(
-            f"{report.score_distribution[b]} in {b}"
-            for b in _SCORE_BUCKET_ORDER if b in report.score_distribution)))
+        lines.append(_row("RRF scores", _render_histogram(
+            report.score_distribution, _SCORE_BUCKET_ORDER)))
     if report.rerank_distribution:
-        lines.append(_row("Rerank", ", ".join(
-            f"{report.rerank_distribution[b]} in {b}"
-            for b in _rerank_labels() if b in report.rerank_distribution)))
+        lines.append(_row("Rerank", _render_histogram(
+            report.rerank_distribution, _rerank_labels())))
     if report.top_paths:
         lines.append(_row("Top docs", ", ".join(
             f"{path} ({n})" for path, n in report.top_paths[:10])))
@@ -735,6 +744,20 @@ def _render_legacy(legacy: dict, events: int) -> list[str]:
 
 def _round_pct(numerator: int, denominator: int) -> int:
     return round(_pct(numerator, denominator))
+
+
+def _render_histogram(distribution: dict[str, int],
+                      order: Iterable[str]) -> str:
+    """`N in <bucket>` pairs, known buckets in bucket order first.
+
+    Anything the current bucket edges don't name still prints, after the
+    known ones: a report can arrive from `--json` written by a build with
+    different `RERANK_BUCKET_EDGES`, and silently dropping those counts
+    would understate the histogram instead of showing it is stale.
+    """
+    known = [b for b in order if b in distribution]
+    rest = [b for b in distribution if b not in set(known)]
+    return ", ".join(f"{distribution[b]} in {b}" for b in known + rest)
 
 
 def _format_window(report: StatsReport) -> str:
