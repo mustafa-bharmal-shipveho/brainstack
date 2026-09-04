@@ -521,8 +521,7 @@ def _archive_rolls_all_namespaces(episodic_root, now=None) -> int:
     return total
 
 
-# Counters the health check reads out of the summary line. Parsed rather
-# than passed through so the log and the status file can never disagree.
+# Counters the health check reads out of the status file.
 _SUMMARY_INT_FIELDS = {
     "staged": "staged",
     "kept": "kept",
@@ -533,8 +532,53 @@ _SUMMARY_INT_FIELDS = {
 _LLM_ERRORS_RE = __import__("re").compile(r"llm_errors=([\w=,]+)")
 
 
+def _cycle_counters(*, staged=0, kept=0, archived=0, consolidate_claims=0,
+                    llm_calls=0, llm_errors=None):
+    """The status file's counter block, built from numbers the cycle
+    already holds. Both entry points tally these as they go, so nothing
+    has to be recovered from the text of the line they printed."""
+    return {
+        "staged": int(staged),
+        "kept": int(kept),
+        "archived": int(archived),
+        "consolidate_claims": int(consolidate_claims),
+        "llm_calls": int(llm_calls),
+        "llm_errors": {str(k): int(v) for k, v in (llm_errors or {}).items()},
+    }
+
+
+def _collect_llm_counters(extractors):
+    """Sum `llm_calls` / `llm_errors` across every extractor in play.
+
+    Walks the same chain as the summary-line rendering below (Hybrid →
+    its `primary` / `fallback`) and asks each for `error_counters()` —
+    the structured twin of `error_summary()`. An extractor that predates
+    the accessor simply contributes nothing.
+    """
+    calls = 0
+    errors = {}
+    for ex in extractors:
+        for candidate in (ex, getattr(ex, "fallback", None),
+                          getattr(ex, "primary", None)):
+            if candidate is None:
+                continue
+            fn = getattr(candidate, "error_counters", None)
+            if not callable(fn):
+                continue
+            data = fn() or {}
+            calls += int(data.get("llm_calls") or 0)
+            for tag, count in (data.get("llm_errors") or {}).items():
+                errors[tag] = errors.get(tag, 0) + int(count)
+    return calls, errors
+
+
 def _parse_summary_counters(summary_line):
-    """Pull the status file's numeric fields out of the `dream cycle:` line."""
+    """Recover the counter block from a printed `dream cycle:` line.
+
+    Fallback only: the live cycle passes its own tally to
+    `_write_cycle_status`. This exists for the one caller that has
+    nothing but the text — a `dream.log` line read back after the fact.
+    """
     import re as _re
 
     out = {key: 0 for key in _SUMMARY_INT_FIELDS.values()}
@@ -557,7 +601,8 @@ def _parse_summary_counters(summary_line):
     return out
 
 
-def _write_cycle_status(brain_root, namespace, summary_line, *, ok=True, error=None) -> None:
+def _write_cycle_status(brain_root, namespace, summary_line, *,
+                        ok=True, error=None, counters=None) -> None:
     """Write `runtime/dream_status.json` — the cycle's machine-readable
     receipt (schema in plans/guards.md).
 
@@ -567,9 +612,12 @@ def _write_cycle_status(brain_root, namespace, summary_line, *, ok=True, error=N
     "ran an hour ago, clean" from "last ran in July". The health check
     reads this file for both freshness and LLM-error state.
 
-    Counters are parsed out of the summary line the cycle already printed,
-    so the log and the status file can never disagree. Never raises — a
-    status-write failure must not fail the cycle it is reporting on.
+    `counters` is the cycle's own tally (see `_cycle_counters`). Both
+    entry points hold those numbers already, so they hand them over
+    rather than round-tripping them through the printed line; only a
+    caller that has nothing but `dream.log` text leaves it None and gets
+    the regex fallback. Never raises — a status-write failure must not
+    fail the cycle it is reporting on.
     """
     try:
         from _atomic import atomic_write_json  # local import — module-init cycle
@@ -583,7 +631,10 @@ def _write_cycle_status(brain_root, namespace, summary_line, *, ok=True, error=N
             "summary": summary_line or "",
             "error": error,
         }
-        payload.update(_parse_summary_counters(summary_line))
+        payload.update(
+            _cycle_counters(**counters) if counters is not None
+            else _parse_summary_counters(summary_line)
+        )
         root = _resolve_brain_root(brain_root)
         atomic_write_json(os.path.join(root, "runtime", "dream_status.json"), payload)
     except Exception:  # pragma: no cover — best-effort receipt
@@ -736,7 +787,7 @@ def run_dream_cycle():
             pending = write_review_queue_summary(CANDIDATES, REVIEW_QUEUE)
             summary = f"dream cycle: no entries (queue has {pending} pending)"
             print(summary)
-            _write_cycle_status(None, "default", summary)
+            _write_cycle_status(None, "default", summary, counters={})
             _refresh_pending_summary()
             return
 
@@ -773,6 +824,9 @@ def run_dream_cycle():
     # consolidator acquires its own claims-log sentinel lock independently
     # of the episodic lock.
     consolidate_summary = ""
+    claims_asserted = 0
+    llm_calls = 0
+    llm_errors = {}
     try:
         import consolidate  # local import — avoids cycles at module init
         import topic_keys
@@ -785,6 +839,7 @@ def run_dream_cycle():
             namespace="default",
             extractors=extractors,
         )
+        claims_asserted = cresult.claims_asserted
         consolidate_summary = (
             f" consolidate_events={cresult.events_conforming} "
             f"consolidate_claims={cresult.claims_asserted} "
@@ -806,6 +861,7 @@ def run_dream_cycle():
                     s = summary_fn()
                     if s:
                         consolidate_summary += " " + s
+        llm_calls, llm_errors = _collect_llm_counters(extractors)
     except Exception as exc:  # pragma: no cover — best-effort
         consolidate_summary = f" consolidate_error={exc!r}"
 
@@ -822,7 +878,14 @@ def run_dream_cycle():
         f"{lint_summary}"
     )
     print(summary)
-    _write_cycle_status(None, "default", summary)
+    _write_cycle_status(None, "default", summary, counters={
+        "staged": staged,
+        "kept": len(kept),
+        "archived": len(archived),
+        "consolidate_claims": claims_asserted,
+        "llm_calls": llm_calls,
+        "llm_errors": llm_errors,
+    })
     _refresh_pending_summary()
 
 
@@ -875,7 +938,8 @@ def run(brain_root=None, namespace="default", dry_run=False):
             # next hourly sync (Codex 2026-05-04 P2).
             if not dry_run:
                 _write_cycle_status(
-                    brain_root, namespace, "dream cycle: no entries")
+                    brain_root, namespace, "dream cycle: no entries",
+                    counters={})
                 _refresh_pending_summary(brain_root)
             return result
 
@@ -945,14 +1009,20 @@ def run(brain_root=None, namespace="default", dry_run=False):
     result["lint_summary"] = _lint_step(_resolve_brain_root(brain_root))
 
     # Same shape as the `dream cycle:` line run_dream_cycle() prints, so
-    # the health check parses one format regardless of which entry point
-    # ran. Not printed — run() returns its result instead of logging.
+    # a human reading either surface sees one format regardless of which
+    # entry point ran. Not printed — run() returns its result instead of
+    # logging. The counters come from `result`, not from this text.
     _write_cycle_status(brain_root, namespace, (
         f"dream cycle: staged={result['candidates_written']} "
         f"kept={len(kept)} archived={len(archived)} "
         f"consolidate_claims={result.get('consolidate_claims', 0)}"
         f"{result['lint_summary']}"
-    ))
+    ), counters={
+        "staged": result["candidates_written"],
+        "kept": len(kept),
+        "archived": len(archived),
+        "consolidate_claims": result.get("consolidate_claims", 0),
+    })
     _refresh_pending_summary(brain_root)
     return result
 

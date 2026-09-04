@@ -16,16 +16,18 @@ This file pins three contracts:
      once either is exceeded — reporting `processed` / `pending` /
      `elapsed_s` / `budget_hit` instead of just stopping quietly.
   2. `digest_cli.py incremental` exposes `--limit` (default 3) /
-     `--max-seconds` (default 1500) and prints the machine-readable
+     `--max-seconds` (default 1500), prints the
      `digests: processed=P pending=Q elapsed_s=E budget_hit=<bool>`
-     line sync_claude_extras.py depends on.
+     line for the log, and writes the same numbers to
+     `runtime/digest_status.json` — it owns that receipt, because it is
+     where the numbers live.
   3. `sync_claude_extras.py` gives the digest step its OWN timeout
      (`BRAINSTACK_DIGEST_TIMEOUT_S`, default 1800s) separate from the
      600s adapter timeout, forwards `BRAINSTACK_DIGEST_LIMIT` /
-     `BRAINSTACK_DIGEST_MAX_SECONDS` as `--limit`/`--max-seconds`, logs
-     the summary line, writes `runtime/digest_status.json`, and exits 0
-     when the digest step completed (even with pending > 0) — 1 only
-     on a real failure (non-zero rc or a genuine timeout kill).
+     `BRAINSTACK_DIGEST_MAX_SECONDS` as `--limit`/`--max-seconds`, quotes
+     the summary line into its log, and exits 0 when the digest step
+     completed (even with pending > 0) — 1 only on a real failure
+     (non-zero rc or a genuine timeout kill).
 
 No real LLM is ever called: a fake in-process provider stands in for
 digest_cli/adapter-level tests, and a fake `digest_cli.py` STUB script
@@ -300,6 +302,37 @@ class TestIncrementalCLI:
         m = re.search(r"digests: processed=(\d+) pending=(\d+)", out)
         assert m and int(m.group(1)) == 2 and int(m.group(2)) == 3
 
+    def test_incremental_writes_digest_status_json(
+            self, cli_mod, tmp_path, monkeypatch, capsys):
+        """The CLI owns `runtime/digest_status.json`: it has the stats
+        dict and the brain root, so the receipt is written from the same
+        numbers it prints rather than scraped back out of them by the
+        hourly wrapper."""
+        brain = tmp_path / "brain"
+        projects = tmp_path / "projects"
+        codex = tmp_path / "no-codex"
+        _make_pending_sessions(projects, 3)
+        self._patch_roots(monkeypatch, cli_mod, brain=brain,
+                          projects=projects, codex=codex)
+        monkeypatch.setattr(cli_mod, "resolve_provider",
+                            lambda *a, **k: _FakeProvider())
+
+        assert cli_mod.main(["incremental", "--limit", "2"]) == 0
+        out = capsys.readouterr().out
+
+        payload = json.loads(
+            (brain / "runtime" / "digest_status.json").read_text()
+        )
+        assert payload["processed"] == 2
+        assert payload["pending"] == 1
+        assert payload["budget_hit"] is True
+        assert "ts" in payload
+        # The receipt and the printed line are the same numbers.
+        assert (f"digests: processed={payload['processed']} "
+                f"pending={payload['pending']} "
+                f"elapsed_s={payload['elapsed_s']:.1f} "
+                f"budget_hit={payload['budget_hit']}") in out
+
     def test_second_run_only_digests_new_pending_sessions(
             self, cli_mod, tmp_path, monkeypatch, capsys):
         """Two consecutive `incremental` runs with limit=2 against 3
@@ -342,8 +375,13 @@ print("fake adapter ok", *sys.argv[1:])
 sys.exit(0)
 '''
 
+# Stands in for digest_cli.py at sync_claude_extras' subprocess
+# boundary. Mirrors the real CLI on both surfaces the wrapper cares
+# about: the printed summary line AND `runtime/digest_status.json`,
+# which the CLI (not the wrapper) owns.
 _FAKE_DIGEST_CLI = '''#!/usr/bin/env python3
 import argparse
+import json
 import os
 import sys
 import time
@@ -369,6 +407,15 @@ elapsed = os.environ.get("FAKE_DIGEST_ELAPSED", "0.0")
 budget_hit = os.environ.get("FAKE_DIGEST_BUDGET_HIT", "False")
 print(f"digests: processed={processed} pending={pending} "
       f"elapsed_s={elapsed} budget_hit={budget_hit}")
+brain = os.environ.get("BRAIN_ROOT")
+if brain:
+    runtime = os.path.join(brain, "runtime")
+    os.makedirs(runtime, exist_ok=True)
+    with open(os.path.join(runtime, "digest_status.json"), "w") as f:
+        json.dump({"ts": "2026-05-01T00:00:00Z",
+                   "processed": int(processed), "pending": int(pending),
+                   "elapsed_s": float(elapsed),
+                   "budget_hit": budget_hit == "True"}, f)
 sys.exit(int(os.environ.get("FAKE_DIGEST_EXIT", "0")))
 '''
 
@@ -466,6 +513,11 @@ class TestSyncClaudeExtrasDigestBudget:
 
     def test_summary_line_logged_and_status_file_written(self, monkeypatch,
                                                           brain):
+        """The wrapper quotes the summary line into its log verbatim,
+        and the digest step it ran leaves the receipt behind. The
+        wrapper does not write that file — it must not have to re-derive
+        numbers the CLI already holds — but the receipt must exist once
+        the step has run, or a growing backlog stays invisible."""
         monkeypatch.setenv("FAKE_DIGEST_PROCESSED", "2")
         monkeypatch.setenv("FAKE_DIGEST_PENDING", "5")
         monkeypatch.setenv("FAKE_DIGEST_ELAPSED", "12.3")
@@ -482,13 +534,33 @@ class TestSyncClaudeExtrasDigestBudget:
                 "elapsed_s=12.3 budget_hit=True") in log
 
         status_path = brain / "runtime" / "digest_status.json"
-        assert status_path.is_file()
+        assert status_path.is_file(), (
+            "no runtime/digest_status.json after the digest step ran"
+        )
         payload = json.loads(status_path.read_text())
         assert payload["processed"] == 2
         assert payload["pending"] == 5
         assert payload["elapsed_s"] == 12.3
         assert payload["budget_hit"] is True
         assert "ts" in payload
+
+    def test_wrapper_does_not_write_the_status_file_itself(self, monkeypatch,
+                                                            brain):
+        """A digest step that prints a summary but leaves no receipt
+        must not have one invented for it — a status file the wrapper
+        scraped out of stdout can disagree with the run it describes."""
+        (brain / "tools" / "digest_cli.py").write_text(
+            "#!/usr/bin/env python3\n"
+            "print('digests: processed=1 pending=0 elapsed_s=0.5 "
+            "budget_hit=False')\n"
+        )
+        mod = _reload_sync(monkeypatch, brain)
+
+        assert mod.main() == 0
+        assert not (brain / "runtime" / "digest_status.json").exists()
+        assert ("[digest_cli_incremental] digests: processed=1 pending=0 "
+                "elapsed_s=0.5 budget_hit=False") in (
+            brain / "claude-extras.log").read_text()
 
     def test_real_digest_failure_exits_1(self, monkeypatch, brain):
         """A genuine failure (e.g. provider unavailable, rc=2) must
