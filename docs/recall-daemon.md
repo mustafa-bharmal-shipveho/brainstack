@@ -166,9 +166,7 @@ receive a complete request line, and a bounded server-side queue wait (see
 `rerank: null` means "use the daemon's own setting". `budget_ms` is
 optional: it tells the daemon how long the client itself will wait, so a
 client with a long budget can queue longer than the default bound instead of
-being answered `busy`. Unknown fields are ignored, so omitting it is safe —
-and `recall.daemon_client` does omit it today, so every client currently
-gets the default bound.
+being answered `busy`. Unknown fields are ignored, so omitting it is safe. `recall.daemon_client.query()` always sends it (the hook passes its own `auto_recall_daemon_budget_ms`, the CLI its longer budget), so each caller gets a queue bound of about twice what it will actually wait, capped at 60 s.
 
 ### Query response
 
