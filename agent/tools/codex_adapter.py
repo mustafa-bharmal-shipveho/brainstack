@@ -42,7 +42,7 @@ _BASE = _HERE.parent
 sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_BASE / "memory"))
 
-from _atomic import atomic_write_text  # noqa: E402
+from _atomic import atomic_write_text, rotate_if_oversize  # noqa: E402
 from _redact_common import redact_for_write  # noqa: E402
 from migrate_dispatcher import (  # noqa: E402
     AdapterRegistrationError,
@@ -461,8 +461,13 @@ class CodexCliAdapter:
         if all_episodes:
             all_episodes = [_redact_episode(e, dst) for e in all_episodes]
             episodic_path.parent.mkdir(parents=True, exist_ok=True)
+            # This is a full-file rewrite, so an oversize file must roll
+            # BEFORE we read it — otherwise every import re-reads and
+            # re-writes 100+ MB and the file never shrinks. If it rolled,
+            # the rolled file holds the history and we start a fresh one.
+            rolled = rotate_if_oversize(episodic_path)
             existing_text = ""
-            if episodic_path.is_file():
+            if rolled is None and episodic_path.is_file():
                 try:
                     existing_text = episodic_path.read_text()
                 except OSError:
