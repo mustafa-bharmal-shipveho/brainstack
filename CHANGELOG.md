@@ -1,5 +1,54 @@
 # Changelog
 
+## v0.7.0 (2026-09-04)
+
+**Reliability overhaul: every memory captured, every injection honest, failures visible within a day.**
+Driven by the 2026-09-04 audit (`recall` was helping in ~8% of the turns it fired on; 171 Claude
+memories never reached the brain; the brain remote had been blocked for 5 days by a 115 MB log;
+dream had failed nightly for ~80 cycles; none of it surfaced anywhere a person looks).
+
+- Warm daemon (`recall serve`): a launchd-managed process (`--setup-daemon`, on by default in the
+  full install, `--no-daemon` to opt out) holds the retriever warm and owns the embedded Qdrant
+  store; the Claude Code hook, `recall query`, `recall reindex` and `recall-mcp` route through it
+  over a 0600 unix socket and fall back in-process only when it is not running. The daemon also
+  owns index freshness (chunked refresh every 5 min), so files mirrored into the brain become
+  injectable without anyone running the CLI. Hook timeout drops 3000 → 1500 ms.
+- Honest telemetry (event schema 1.2): `hit` now means "≥1 doc injected"; new `miss` and `dedup`
+  outcomes replace phantom hits; full-worker latency is recorded on every outcome including
+  timeouts; injected paths are logged per doc; legacy 1.1 events stay readable and are reported
+  separately. `recall stats` reports real coverage, miss/dedup/timeout rates, daemon vs in-process
+  path, worker vs query latency, and repeat-injection rate; the ROI copy is gone.
+  `recall stats --utilization` joins injections to Claude transcripts and exports an LLM-judge sample.
+- Session dedup: a doc already injected in the same session is not injected again unless its
+  content changed (`auto_recall_dedup`, 7-day pruning of the per-session store).
+- Config precedence fixed: `[tool.recall.runtime]` merges per key across `$RECALL_RUNTIME_CONFIG`,
+  the project `pyproject.toml` and `~/.agent/runtime/pyproject.toml`, so a project file can no
+  longer silently disable auto-recall. The repo's own example section moved to `docs/runtime.md`.
+- Health (`recall health`, `recall doctor --health`): nine checks (imports freshness, LaunchAgents
+  loaded, brain push age quoting the real git error, tracked files > 50 MB, log sizes, dream cycle
+  age + LLM errors, drift, auto-recall enabled from this cwd, daemon alive). Written hourly by
+  sync to `runtime/health.json`, rendered into `PENDING_REVIEW.md`, and printed as one line per
+  FAIL in the Claude Code session banner.
+- Growth control: sync refuses to stage any file > 50 MB and keeps syncing the rest; raw episodic
+  and telemetry JSONL are untracked via `templates/brain.gitignore` (appended idempotently on
+  `--upgrade`); episodic and event logs roll at 20 MiB into dated files that every reader globs;
+  expired rolled files archive per namespace so the Codex/Claude-session logs stop growing forever.
+  `runtime/dream_status.json` records each cycle; the dream cycle runs `recall lint --mark` and
+  reports `lint_findings=`.
+- LLM providers find `claude`/`codex` in the usual user-local dirs (`~/.local/bin`, nvm, bun, npm)
+  even under launchd's minimal PATH, and every LaunchAgent/systemd template includes `~/.local/bin`.
+- Corpus hygiene: `recall lint --fix-digests` backfills name/description/type on digests (and the
+  renderer emits them going forward); `recall lint --dedupe-claims` archives duplicate and
+  content-free Slack-stub claims with a retraction row so the nightly projection does not
+  resurrect them; `semantic/archived/**` is excluded from retrieval.
+- Reranker plumbing + calibration (`eval/calibrate_rerank_gate.py`): RRF `score` and
+  `rerank_score` are both kept, `query(rerank=)` overrides per call. Calibrated on 76 labeled
+  real pairs: no cross-encoder threshold met the precision bar and reranking showed no measurable
+  ordering gain at 4–13x the latency, so reranking stays OFF by default and `auto_recall_min_rerank`
+  defaults to 0.0; the numbers are in `eval/RESULTS.md`. `rerank_n` is now a true cap across
+  collections.
+- Demo brain emits schema-1.2 telemetry; `demo/demo.gif` re-recorded.
+
 ## v0.5.1 (2026-06-12)
 
 Next release after v0.5.0 (the last tagged release). Supersedes the unreleased
