@@ -653,3 +653,63 @@ class TestBrainRootResolution:
         assert _resolved(recall_config.brain_root()) == _resolved(
             runtime_home.home / ".agent"
         )
+
+
+# ---------------------------------------------------------------------------
+# layer discovery parses each file once
+# ---------------------------------------------------------------------------
+
+
+class TestLayerParsingIsNotRepeated:
+    """`load()` runs on the UserPromptSubmit hook path, i.e. once per prompt.
+    Discovery used to parse ./pyproject.toml to decide whether it carried a
+    `[tool.recall.runtime]` table, then `load()` parsed the very same file
+    again to read it. A project pyproject.toml is not small; paying for it
+    twice per keystroke-adjacent hook fire is pure waste."""
+
+    def test_each_layer_is_parsed_exactly_once_per_load(self, runtime_home):
+        from runtime.adapters.claude_code import config as config_mod
+
+        runtime_home.write_global("[tool.recall.runtime]\nauto_recall_k = 9\n")
+        runtime_home.write_cwd("[tool.recall.runtime]\nauto_recall_k = 3\n")
+        runtime_home.write_env_config(
+            "[tool.recall.runtime]\nauto_recall_budget_tokens = 111\n")
+
+        reads: list[str] = []
+        real = config_mod._read_section
+
+        def counting_read(path):
+            reads.append(str(Path(path).resolve()))
+            return real(path)
+
+        runtime_home.monkeypatch.setattr(config_mod, "_read_section", counting_read)
+
+        cfg = config_mod.RuntimeConfig.load()
+
+        # Behaviour is unchanged: the merge still resolves per key.
+        assert cfg.auto_recall_k == 3
+        assert cfg.auto_recall_budget_tokens == 111
+        assert len(cfg.config_layers) == 3
+        assert len(reads) == len(set(reads)) == 3, reads
+
+    def test_cwd_without_a_runtime_section_is_still_parsed_once(self, runtime_home):
+        """The "does this file even have our table?" check IS the parse; a
+        cwd pyproject.toml we then reject must not be read a second time."""
+        from runtime.adapters.claude_code import config as config_mod
+
+        runtime_home.write_cwd("[build-system]\nrequires = []\n")
+
+        reads: list[str] = []
+        real = config_mod._read_section
+
+        def counting_read(path):
+            reads.append(str(Path(path).resolve()))
+            return real(path)
+
+        runtime_home.monkeypatch.setattr(config_mod, "_read_section", counting_read)
+
+        cfg = config_mod.RuntimeConfig.load()
+
+        cwd = str(runtime_home.cwd_path.resolve())
+        assert cwd not in [str(Path(p).resolve()) for p in cfg.config_layers]
+        assert reads.count(cwd) == 1, reads

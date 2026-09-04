@@ -188,15 +188,20 @@ class RuntimeConfig:
         """
         if config_path is not None:
             return cls._load_one(config_path, layers=[config_path])
-        layers = cls._discover_layers()
-        if not layers:
+        discovered = cls._discover_layers()
+        if not discovered:
             return cls()
+        # Discovery already parsed every layer (deciding whether ./pyproject
+        # .toml even carries our table IS a parse), so the sections come back
+        # with the paths — this runs once per hook fire and a project's
+        # pyproject.toml is not cheap to parse twice.
+        #
         # A layer that exists but fails to parse contributes nothing rather
         # than crashing the merge (`_read_section` returns `None` for that
         # case) — it still occupies its slot in `config_layers`.
-        sections = [(_read_section(p) or {}) for p in layers]
-        kwargs = cls._merge_sections(sections)
-        return cls(**kwargs, config_path=layers[0], config_layers=list(layers))
+        paths = [p for p, _ in discovered]
+        kwargs = cls._merge_sections([(s or {}) for _, s in discovered])
+        return cls(**kwargs, config_path=paths[0], config_layers=paths)
 
     @classmethod
     def _load_one(cls, path: Path, *, layers: list[Path]) -> "RuntimeConfig":
@@ -293,8 +298,12 @@ class RuntimeConfig:
         return budgets
 
     @staticmethod
-    def _discover_layers() -> list[Path]:
-        """The ordered (high to low) list of file layers `load()` merges.
+    def _discover_layers() -> "list[tuple[Path, dict | None]]":
+        """The ordered (high to low) file layers `load()` merges, each paired
+        with its already-parsed `[tool.recall.runtime]` section (`None` when
+        the file could not be read or parsed at all). Discovery has to parse
+        to decide inclusion anyway, so it hands the result to `load()` rather
+        than making it re-read the same files.
 
         - `$RECALL_RUNTIME_CONFIG`: included if set AND the path exists
           (content is not inspected — an explicit override is trusted as-is,
@@ -308,25 +317,22 @@ class RuntimeConfig:
           this file is install.sh's dedicated home for the section, so mere
           existence is enough to treat it as "the" config layer.
         """
-        layers: list[Path] = []
+        layers: "list[tuple[Path, dict | None]]" = []
         env = os.environ.get("RECALL_RUNTIME_CONFIG")
         if env:
             p = Path(env).expanduser()
             if p.exists():
-                layers.append(p)
+                layers.append((p, _read_section(p)))
         cwd_pyproject = Path.cwd() / "pyproject.toml"
-        if cwd_pyproject.exists() and _has_runtime_section(cwd_pyproject):
-            layers.append(cwd_pyproject)
+        if cwd_pyproject.exists():
+            cwd_section = _read_section(cwd_pyproject)
+            # Non-empty table required (unparseable -> `None` -> falsy).
+            if cwd_section:
+                layers.append((cwd_pyproject, cwd_section))
         global_pyproject = RuntimeConfig.global_config_path()
         if global_pyproject.exists():
-            layers.append(global_pyproject)
+            layers.append((global_pyproject, _read_section(global_pyproject)))
         return layers
-
-
-def _has_runtime_section(path: Path) -> bool:
-    """True iff `path` is a TOML file with a non-empty `[tool.recall.runtime]` table."""
-    section = _read_section(path)
-    return bool(section)
 
 
 def _read_section(path: Path) -> dict | None:
