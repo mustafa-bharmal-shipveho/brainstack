@@ -60,7 +60,10 @@ def iter_log_paths(path: Path) -> list[Path]:
     nothing else: sentinel locks are dotfiles (`.events.log.jsonl.lock`),
     temp files end in `.tmp`, and an unrelated `other.log.jsonl` has a
     different stem. Order is name-ascending, NOT chronological — byte order
-    puts `events.log.2026-09-04.1.jsonl` before `events.log.2026-09-04.jsonl`.
+    puts `events.log.2026-09-04.1.jsonl` (the SECOND roll of that day)
+    before `events.log.2026-09-04.jsonl` (the first). Callers that need a
+    timeline must re-sort by each record's own timestamp; this list is only
+    "every file of the stream, current one last".
     """
     path = Path(path)
     pattern = f"{path.stem}*{path.suffix}"

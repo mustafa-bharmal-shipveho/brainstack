@@ -613,6 +613,63 @@ def test_auto_dream_archives_rolls_in_unregistered_namespaces(
     )
 
 
+def test_archive_sweep_takes_each_namespaces_own_sentinel(
+    tmp_path, isolated_home, monkeypatch
+):
+    """The sweep moves rolled files belonging to OTHER namespaces, and the
+    adapters read exactly those rolls under `<path>.lock` (the codex and
+    claude-session dedup preloads glob `AGENT_LEARNINGS*.jsonl`). Running
+    the whole sweep under the DEFAULT namespace's sentinel serialises
+    nothing for codex: a roll can vanish mid-preload, the dedup set
+    silently shrinks, and the next import duplicates that history.
+
+    The default namespace is swept WITHOUT re-acquiring its sentinel on
+    purpose — `run_dream_cycle` already holds it, and flock is per open
+    file description, so a second acquire from the same process on the
+    same sentinel deadlocks.
+    """
+    import contextlib
+
+    auto_dream = _import_memory("auto_dream")
+    brain = _make_brain(tmp_path / ".agent")
+    _patch_dream_globals(monkeypatch, auto_dream, brain)
+    epi = brain / "memory" / "episodic"
+
+    ns_dir = epi / "codex"
+    expired = ns_dir / f"AGENT_LEARNINGS.{DAY}.jsonl"
+    _seed_jsonl(expired, [
+        {"id": "codex-old", "timestamp": _iso_days_ago(150), "action": "ancient"},
+    ])
+    _seed_jsonl(ns_dir / CURRENT, [
+        {"id": "codex-live", "timestamp": _iso_days_ago(1), "action": "live"},
+    ])
+    _seed_jsonl(epi / CURRENT, [
+        {"id": "live-1", "timestamp": _iso_days_ago(0), "action": "live"},
+    ])
+
+    held: list[str] = []
+    real_locked = auto_dream._episodic_locked_path
+
+    @contextlib.contextmanager
+    def recorder(episodic_path):
+        held.append(str(episodic_path))
+        with real_locked(episodic_path) as fd:
+            yield fd
+
+    monkeypatch.setattr(auto_dream, "_episodic_locked_path", recorder)
+    auto_dream._archive_rolls_all_namespaces(str(epi))
+
+    assert not expired.exists(), "expired namespace roll left in the live tree"
+    assert str(ns_dir / CURRENT) in held, (
+        f"codex's roll was archived without holding {ns_dir / CURRENT}.lock; "
+        f"sentinels taken: {held}"
+    )
+    assert str(epi / CURRENT) not in held, (
+        "the default namespace's sentinel was re-acquired inside the sweep; "
+        "run_dream_cycle already holds it and flock would deadlock"
+    )
+
+
 # --------------------------------------------------------------------------
 # consolidate — the claim-store reader
 # --------------------------------------------------------------------------

@@ -12,7 +12,11 @@ must reach the model again.
 
 Failure policy is fail-open everywhere: a corrupt file behaves as empty
 (the worst case is one redundant injection, never a lost prompt), and the
-write is atomic so a hook killed mid-write cannot leave a half file behind.
+write is atomic per write (`os.replace` of a sibling tmp), so a hook killed
+mid-write cannot leave a half file behind. The read-merge-write in `record`
+is NOT locked: two hook processes for the same session would be needed to
+race it (Claude Code serialises prompts within a session), and a lost merge
+costs one duplicate re-injection — never a lost prompt.
 
 See tests/runtime/test_dedup_store.py for the pinned contract.
 """

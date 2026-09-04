@@ -359,9 +359,21 @@ def _handle_auto_recall(payload: dict[str, Any], config: RuntimeConfig,
         )
         return
 
-    block, telemetry = value
+    block, telemetry, injected = value
     if block:
         print(block)
+        # COMMIT POINT. `record` marks these docs "already shown this
+        # session", which suppresses them on every later prompt — so it
+        # may only run once the block has actually reached the user. The
+        # worker thread cannot know that: it is abandoned on timeout, and
+        # recording there marked docs as shown for a block nobody saw.
+        if dedup_store is not None and injected:
+            try:
+                dedup_store.record(injected)
+            except Exception as e:  # pragma: no cover - defensive
+                # Fail-open: a dedup we do not get, not a prompt lost.
+                print(f"[runtime] auto-recall dedup record failed: {e!r}",
+                      file=sys.stderr)
 
     extensions = dict(telemetry)
     extensions.update(hook_ext)
@@ -375,7 +387,8 @@ def _handle_auto_recall(payload: dict[str, Any], config: RuntimeConfig,
     _append_auto_recall_event(config, session_id, extensions=extensions)
 
     # Nothing else ever cleans the injected dir, so every fire pays this
-    # one cheap pass. After `record`, so the store we just wrote survives.
+    # one cheap pass. After the `record` above, so the store we just wrote
+    # survives (its mtime is fresh, well inside the prune window).
     if dedup_store is not None:
         try:
             type(dedup_store).prune(config.injected_dir)
@@ -460,28 +473,14 @@ def _resolve_daemon_socket(config: RuntimeConfig) -> Path:
     `~/.agent/runtime/recall.sock`, and a config value that could outrank
     it would defeat that guard. Orchestrator decision, 2026-09-04.
 
-    `recall.config.daemon_socket_path` is the single source of truth once
-    it lands; the local resolution below is the same order, inlined so the
-    hook keeps working while that helper is still a scaffold.
+    `recall.config.daemon_socket_path` (reached through the config
+    property) is the single source of truth, and this function is a bare
+    pass-through to it. It must stay that way: the hook, the CLI and the
+    daemon all have to agree on one path, and a second copy of the
+    precedence here is how they end up on different sockets. The
+    `$`-literal guard for an unexpandable placeholder lives there too.
     """
-    try:
-        return Path(config.daemon_socket_path)
-    except Exception:
-        pass
-
-    env = os.environ.get("RECALL_DAEMON_SOCKET")
-    if env:
-        return Path(env).expanduser()
-    raw = str(getattr(config, "auto_recall_daemon_socket", "") or "")
-    if raw:
-        expanded = os.path.expandvars(raw)
-        # An unexpanded `$VAR` means the variable is unset; fall through to
-        # the brain-root default rather than creating a literal `$BRAIN_ROOT`
-        # directory on disk.
-        if "$" not in expanded:
-            return Path(expanded).expanduser()
-    root = _brain_root() or Path("~/.agent").expanduser()
-    return root / "runtime" / "recall.sock"
+    return Path(config.daemon_socket_path)
 
 
 def _daemon_query(
@@ -570,7 +569,7 @@ def _health_banner_lines(config: RuntimeConfig,
     try:
         from recall import health as _health
 
-        path = config.log_dir.parent / "health.json"
+        path = _health_report_path(config)
         # `load_report` collapses missing, corrupt AND stale into None, but
         # those want two different banners: silence for the first two (a
         # fresh install has never had a report, and nagging about a file
@@ -609,9 +608,48 @@ def _health_banner_lines(config: RuntimeConfig,
     return lines
 
 
+def _health_report_path(config: RuntimeConfig) -> Path:
+    """Where `sync.sh` writes the cached health report.
+
+    `<brain>/runtime/health.json`, resolved from `recall.config.brain_root()`
+    — NOT from `config.log_dir.parent`. `log_dir` is user-configurable (the
+    demo points it elsewhere), and deriving the report path from it made the
+    banner silently unreachable for anyone who had moved their logs, which
+    is exactly the population most likely to have a health problem.
+
+    The import is lazy and guarded because this module must stay importable
+    without `recall` installed; the `log_dir.parent` guess is kept only as
+    the no-`recall` fallback.
+    """
+    try:
+        from recall.config import brain_root as _brain_root_fn
+
+        return _brain_root_fn() / "runtime" / "health.json"
+    except Exception:
+        return config.log_dir.parent / "health.json"
+
+
 def _health_fail_line(check_id: str, evidence: str) -> str:
-    return (f"brainstack health FAIL: {check_id} — "
-            f"{str(evidence)[:_HEALTH_EVIDENCE_MAX_CHARS]}")
+    """One FAIL, one line — always.
+
+    Evidence is UNTRUSTED: it carries verbatim `remote: error:` git output
+    and `check_freshness` summaries, which contain newlines and ANSI
+    colour. A raw newline here would let a single check forge extra
+    `brainstack health FAIL:` lines in the banner or scroll the real ones
+    out of view, so it is flattened before the cap.
+    """
+    try:
+        from recall.sanitize import sanitize_untrusted
+
+        text = sanitize_untrusted(
+            str(evidence),
+            max_len=_HEALTH_EVIDENCE_MAX_CHARS,
+            keep_newlines=False,
+        )
+    except Exception:
+        # No `recall` on the path. Still never emit a second line.
+        text = " ".join(str(evidence).split())[:_HEALTH_EVIDENCE_MAX_CHARS]
+    return f"brainstack health FAIL: {check_id} — {text}"
 
 
 def _live_auto_recall_check(payload: dict[str, Any]) -> "tuple[str, str] | None":

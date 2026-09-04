@@ -462,6 +462,22 @@ class TestRuntimeConfigProperties:
             runtime_home.home / "env.sock"
         )
 
+    def test_global_config_path_is_defined_exactly_once(self):
+        """`global_config_path` was declared twice in the class body; the
+        second silently shadowed the first. They happened to be identical,
+        so nothing broke — but Python takes the last one, which means a fix
+        applied to the visible copy near `load()`'s docstring would have had
+        no effect at all. A source-level assertion is the only thing that
+        can see a shadowed duplicate."""
+        import inspect
+
+        src = inspect.getsource(RuntimeConfig)
+
+        assert src.count("def global_config_path(") == 1, (
+            "RuntimeConfig declares global_config_path more than once; the "
+            "later definition silently shadows the earlier one"
+        )
+
 
 # ---------------------------------------------------------------------------
 # recall.config.daemon_socket_path — one resolution order for hook, CLI, daemon
