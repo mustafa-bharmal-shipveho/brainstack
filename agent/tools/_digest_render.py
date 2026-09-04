@@ -102,6 +102,51 @@ def _slugify(s: str, max_len: int = 60) -> str:
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
+# ---------------------------------------------------------------------------
+# name / description / type backfill (kept in sync with
+# recall/lint_digests.py's derive_description — agent/tools can't import
+# recall, so the sentence-splitting logic is duplicated here in miniature:
+# unlike the lint backfill (which parses an existing rendered body), this
+# runs at render time straight off the digest dict, so it only needs the
+# title + first sentence of what_user_did, not full-body paragraph
+# scanning.)
+# ---------------------------------------------------------------------------
+
+_DESC_MAX = 200
+_DESC_SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def _first_sentence(text: str) -> str:
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not text:
+        return ""
+    return _DESC_SENTENCE_RE.split(text, 1)[0].strip()
+
+
+def _truncate_description(text: str, limit: int = _DESC_MAX) -> str:
+    if len(text) <= limit:
+        return text
+    cut = text[: limit - 1]
+    if " " in cut:
+        cut = cut[: cut.rfind(" ")]
+    cut = cut.rstrip()
+    return cut + "…"
+
+
+def _default_description(digest: dict) -> str:
+    title = str(digest.get("title") or "").strip()
+    sentence = _first_sentence(digest.get("what_user_did"))
+    if title and sentence:
+        result = f"{title} — {sentence}"
+    elif title:
+        result = title
+    elif sentence:
+        result = sentence
+    else:
+        result = "digest"
+    return _truncate_description(result)
+
+
 def markdown_path_for(digest: dict, meta: dict, *,
                       base_dir: Path) -> Path:
     """Compute the path for the markdown digest. Format:
@@ -193,10 +238,12 @@ def render_markdown(
 ) -> str:
     """Build the markdown body with YAML front matter.
 
-    ``name``/``description``/``type`` are accepted for the upcoming
-    identity-fields backfill (see recall/lint_digests.py and
-    tests/test_digest_render_frontmatter.py) but are not yet emitted —
-    scaffold only, no behavior change.
+    ``name`` / ``description`` / ``type`` are the identity fields
+    `recall lint --fix-digests` backfills onto existing digests (see
+    recall/lint_digests.py). Emitting them here too means a re-digest
+    (which overwrites the file at its deterministic path — see
+    `write_dual`) never undoes that backfill: each defaults to the same
+    shape the backfill derives when the caller doesn't override it.
     """
     domain_tags = digest.get("domain_tags") or []
     if not isinstance(domain_tags, list):
@@ -204,8 +251,15 @@ def render_markdown(
     decisions = digest.get("decisions") or []
     files_touched = digest.get("files_touched") or []
 
+    resolved_name = name if name else _slugify(str(digest.get("title") or "untitled"))
+    resolved_description = description if description else _default_description(digest)
+    resolved_type = type if type else "digest"
+
     front = [
         "---",
+        f"name: {_yaml_safe(resolved_name)}",
+        f"description: {_yaml_safe(resolved_description)}",
+        f"type: {_yaml_safe(resolved_type)}",
         f"session_id: {_yaml_safe(str(meta.get('session_id') or ''))}",
         f"source: {meta.get('source', 'claude')}",
         # Provenance attribution (self-reported, feeds recall's per-doc
@@ -313,7 +367,9 @@ def write_dual(digest: dict, meta: dict, *,
 
     # Markdown — atomic via temp file + replace
     md_path = markdown_path_for(digest, meta, base_dir=markdown_dir)
-    md_body = render_markdown(digest, meta)
+    # name=md_path.stem: the digest's `name` frontmatter field must match
+    # the file it lives in, so a wikilink built off either resolves.
+    md_body = render_markdown(digest, meta, name=md_path.stem)
     # Preserve a review flag a human/lint added to a prior render of this
     # exact digest, so re-rendering never silently un-flags a stale memory.
     if _existing_needs_review(md_path):
