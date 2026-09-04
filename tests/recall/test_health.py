@@ -1222,6 +1222,69 @@ def test_load_report_stale_returns_none(tmp_path: Path):
     assert health.load_report(path, now=NOW, max_age_hours=48.0) is not None
 
 
+def _report_at(tmp_path: Path, hours_old: float) -> health.HealthReport:
+    return health.HealthReport(
+        generated_at=(NOW - timedelta(hours=hours_old)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        brain_root=str(tmp_path),
+        cwd=str(tmp_path),
+        checks=[health.CheckResult("daemon", "FAIL", "socket refused")],
+    )
+
+
+def test_read_report_separates_missing_from_stale(tmp_path: Path):
+    """`load_report` collapses missing, corrupt and stale into one `None`,
+    so the SessionStart banner — which must stay silent for the first two
+    and warn for the third — had to read and parse the file twice.
+    `read_report` answers both off one parse."""
+    path = tmp_path / "health.json"
+
+    assert health.read_report(path, now=NOW) == (None, False)
+
+    path.write_text("{ not json", encoding="utf-8")
+    assert health.read_report(path, now=NOW) == (None, False)
+
+    path.write_text(json.dumps(_report_at(tmp_path, 2).to_dict()), encoding="utf-8")
+    report, stale = health.read_report(path, now=NOW)
+    assert report is not None and stale is False
+    # The parsed report comes back whole, not just a freshness verdict.
+    assert [c.id for c in report.failures()] == ["daemon"]
+
+    path.write_text(json.dumps(_report_at(tmp_path, 40).to_dict()), encoding="utf-8")
+    report, stale = health.read_report(path, now=NOW)
+    assert stale is True
+    # Stale still hands the report back: the banner quotes `generated_at`.
+    assert report is not None
+    assert report.generated_at.startswith("20")
+
+
+def test_read_report_uses_the_module_stale_window(tmp_path: Path):
+    """One window, `HEALTH_STALE_HOURS`, not a second copy of the number."""
+    path = tmp_path / "health.json"
+    just_inside = health.HEALTH_STALE_HOURS - 1
+    just_outside = health.HEALTH_STALE_HOURS + 1
+
+    path.write_text(
+        json.dumps(_report_at(tmp_path, just_inside).to_dict()), encoding="utf-8")
+    assert health.read_report(path, now=NOW)[1] is False
+
+    path.write_text(
+        json.dumps(_report_at(tmp_path, just_outside).to_dict()), encoding="utf-8")
+    assert health.read_report(path, now=NOW)[1] is True
+
+
+def test_read_report_unparseable_timestamp_is_stale(tmp_path: Path):
+    """An unreadable `generated_at` is not evidence of freshness."""
+    path = tmp_path / "health.json"
+    report = _report_at(tmp_path, 1)
+    data = report.to_dict()
+    data["generated_at"] = "whenever"
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    got, stale = health.read_report(path, now=NOW)
+    assert got is not None
+    assert stale is True
+
+
 def test_write_report_atomic_replaces(tmp_path: Path):
     path = tmp_path / "runtime" / "health.json"
     first = health.HealthReport(

@@ -185,3 +185,100 @@ class TestPrune:
     def test_prune_on_missing_dir_is_a_noop(self, tmp_path: Path):
         from runtime.adapters.claude_code.dedup import SessionDedupStore
         assert SessionDedupStore.prune(tmp_path / "nope", now=time.time()) == 0
+
+    def test_prune_throttled_to_once_per_interval(self, store_root: Path, monkeypatch):
+        """`prune` runs on EVERY auto-recall fire, and it globs + stats the
+        whole shared injected dir. On a busy machine with hundreds of stale
+        stores that is real syscall cost paid per prompt for a job that only
+        needs doing occasionally. A marker file caps it at once an hour."""
+        from runtime.adapters.claude_code.dedup import SessionDedupStore
+
+        now = time.time()
+        _store(store_root, "old").record([_candidate("/brain/memory/a.md", "A")])
+        old_path = _store(store_root, "old").path
+        eight_days = now - 8 * 86400
+        os.utime(old_path, (eight_days, eight_days))
+
+        globs: list[str] = []
+        real_glob = Path.glob
+
+        def counting_glob(self, pattern, *a, **kw):
+            globs.append(pattern)
+            return real_glob(self, pattern, *a, **kw)
+
+        monkeypatch.setattr(Path, "glob", counting_glob)
+
+        assert SessionDedupStore.prune(store_root, now=now) == 1
+        assert not old_path.exists()
+        assert len(globs) == 1, globs
+
+        # Second fire seconds later: no glob, no stat storm, no work.
+        assert SessionDedupStore.prune(store_root, now=now + 60) == 0
+        assert len(globs) == 1, f"pruned again inside the interval: {globs}"
+
+    def test_prune_runs_again_after_the_interval(self, store_root: Path, monkeypatch):
+        """Throttling must not turn into never-pruning: once the interval
+        has passed the next fire does the full pass again."""
+        from runtime.adapters.claude_code.dedup import SessionDedupStore
+
+        store_root.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        SessionDedupStore.prune(store_root, now=now)
+
+        globs: list[str] = []
+        real_glob = Path.glob
+
+        def counting_glob(self, pattern, *a, **kw):
+            globs.append(pattern)
+            return real_glob(self, pattern, *a, **kw)
+
+        monkeypatch.setattr(Path, "glob", counting_glob)
+
+        # Inside the interval: skipped.
+        SessionDedupStore.prune(store_root, now=now + 3599)
+        assert globs == []
+
+        # A stale store written after the first prune must still be caught.
+        _store(store_root, "old").record([_candidate("/brain/memory/a.md", "A")])
+        old_path = _store(store_root, "old").path
+        eight_days = now - 8 * 86400
+        os.utime(old_path, (eight_days, eight_days))
+
+        assert SessionDedupStore.prune(store_root, now=now + 3601) == 1
+        assert len(globs) == 1, globs
+        assert not old_path.exists()
+
+    def test_prune_marker_is_not_itself_a_store(self, store_root: Path):
+        """The marker must not be mistaken for a session store: it is not
+        matched by the `*.json` sweep, and it is never counted as removed."""
+        from runtime.adapters.claude_code.dedup import SessionDedupStore
+
+        store_root.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        assert SessionDedupStore.prune(store_root, now=now) == 0
+        marker = store_root / ".last_prune"
+        assert marker.exists()
+
+        # Ancient marker, ancient dir: the marker survives its own prune.
+        ancient = now - 900 * 86400
+        os.utime(marker, (ancient, ancient))
+        assert SessionDedupStore.prune(store_root, now=now) == 0
+        assert marker.exists()
+        assert _store(store_root, "x").load() == {}
+
+    def test_prune_interval_can_be_disabled(self, store_root: Path):
+        """`min_interval_s=0` is the escape hatch for callers that want the
+        old unconditional behaviour (and for the pinned 7-day tests)."""
+        from runtime.adapters.claude_code.dedup import SessionDedupStore
+
+        store_root.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        SessionDedupStore.prune(store_root, now=now)
+        _store(store_root, "old").record([_candidate("/brain/memory/a.md", "A")])
+        old_path = _store(store_root, "old").path
+        eight_days = now - 8 * 86400
+        os.utime(old_path, (eight_days, eight_days))
+
+        assert SessionDedupStore.prune(
+            store_root, now=now, min_interval_s=0) == 1
+        assert not old_path.exists()

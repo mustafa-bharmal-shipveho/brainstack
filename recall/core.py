@@ -308,8 +308,11 @@ class HybridRetriever:
                 reranker_model=self._reranker_model,
                 limit=max(self._rerank_n, k),
             )
-        # Stable sort: rerank score when present, else RRF score; path breaks ties.
-        merged.sort(key=_rank_key)
+            # Re-sort: rerank score when present, else RRF score; path breaks
+            # ties. Only reranking can change the order — without it `merged`
+            # is still in the `_rank_key` order it was sorted into above, and
+            # re-sorting it was a full sort to reach the same list.
+            merged.sort(key=_rank_key)
         # Down-rank / drop needs_review memories, then truncate to k.
         merged = apply_review_policy(
             merged, self._needs_review_policy, self._needs_review_penalty

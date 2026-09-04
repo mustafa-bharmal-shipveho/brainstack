@@ -318,3 +318,86 @@ def test_fail_evidence_is_flattened_to_one_line(
     assert "remote: error: File big.jsonl is 107 MB" in fail_lines[0]
     assert "failed to push some refs" in fail_lines[0]
     assert "\x1b" not in out and "[31m" not in out
+
+
+# ---------- the banner reads each source once ---------------------------
+
+
+def test_live_check_reuses_the_hooks_config_when_cwd_matches(
+    brain: Path, stdin_with, session_cwd, isolated_home, monkeypatch, capsys
+):
+    """SessionStart already loads `RuntimeConfig` for the process cwd, and
+    `RuntimeConfig.load()` parses up to three TOML files. Re-running the
+    live auto-recall check against that same directory used to load it all
+    over again — two full parses on the session-open path for one answer.
+    The banner must be identical either way."""
+    global_cfg = isolated_home / ".agent" / "runtime" / "pyproject.toml"
+    global_cfg.parent.mkdir(parents=True, exist_ok=True)
+    global_cfg.write_text(
+        "[tool.recall.runtime]\nenable_auto_recall = true\n", encoding="utf-8"
+    )
+    (session_cwd / "pyproject.toml").write_text(
+        "[tool.recall.runtime]\nenable_auto_recall = false\n", encoding="utf-8"
+    )
+    _write_health(brain, [_check("drift", "PASS", "in sync")])
+    monkeypatch.chdir(session_cwd)
+    stdin_with({"session_id": "s-1", "cwd": str(session_cwd)})
+
+    loads: list[dict] = []
+    real_load = RuntimeConfig.load
+
+    def counting_load(**kwargs):
+        loads.append(kwargs)
+        return real_load(**kwargs)
+
+    monkeypatch.setattr(RuntimeConfig, "load", staticmethod(counting_load))
+
+    rc = handle_hook("SessionStart")
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "brainstack health FAIL: auto_recall_config" in out
+    assert str(session_cwd) in out
+    assert len(loads) == 1, f"config loaded {len(loads)}x for one cwd: {loads}"
+
+
+def test_live_check_still_loads_for_a_different_cwd(
+    brain: Path, tmp_config, stdin_with, session_cwd, isolated_home,
+    monkeypatch, capsys, tmp_path,
+):
+    """Reuse is only valid when the session's cwd IS the process cwd. A
+    session opened elsewhere must still get the chdir-guarded load, or the
+    check reports on the wrong directory's config."""
+    global_cfg = isolated_home / ".agent" / "runtime" / "pyproject.toml"
+    global_cfg.parent.mkdir(parents=True, exist_ok=True)
+    global_cfg.write_text(
+        "[tool.recall.runtime]\nenable_auto_recall = true\n", encoding="utf-8"
+    )
+    (session_cwd / "pyproject.toml").write_text(
+        "[tool.recall.runtime]\nenable_auto_recall = false\n", encoding="utf-8"
+    )
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    _write_health(brain, [_check("drift", "PASS", "in sync")])
+    stdin_with({"session_id": "s-1", "cwd": str(session_cwd)})
+
+    loads: list[dict] = []
+    real_load = RuntimeConfig.load
+
+    def counting_load(**kwargs):
+        loads.append(kwargs)
+        return real_load(**kwargs)
+
+    monkeypatch.setattr(RuntimeConfig, "load", staticmethod(counting_load))
+
+    # `config=` means the hook itself does not load, so every load counted
+    # here belongs to the live check.
+    rc = handle_hook("SessionStart", config=tmp_config)
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "brainstack health FAIL: auto_recall_config" in out
+    assert str(session_cwd) in out
+    assert len(loads) == 1, (
+        "the live check reused a config resolved from the wrong directory")

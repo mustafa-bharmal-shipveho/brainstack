@@ -188,15 +188,20 @@ class RuntimeConfig:
         """
         if config_path is not None:
             return cls._load_one(config_path, layers=[config_path])
-        layers = cls._discover_layers()
-        if not layers:
+        discovered = cls._discover_layers()
+        if not discovered:
             return cls()
+        # Discovery already parsed every layer (deciding whether ./pyproject
+        # .toml even carries our table IS a parse), so the sections come back
+        # with the paths — this runs once per hook fire and a project's
+        # pyproject.toml is not cheap to parse twice.
+        #
         # A layer that exists but fails to parse contributes nothing rather
         # than crashing the merge (`_read_section` returns `None` for that
         # case) — it still occupies its slot in `config_layers`.
-        sections = [(_read_section(p) or {}) for p in layers]
-        kwargs = cls._merge_sections(sections)
-        return cls(**kwargs, config_path=layers[0], config_layers=list(layers))
+        paths = [p for p, _ in discovered]
+        kwargs = cls._merge_sections([(s or {}) for _, s in discovered])
+        return cls(**kwargs, config_path=paths[0], config_layers=paths)
 
     @classmethod
     def _load_one(cls, path: Path, *, layers: list[Path]) -> "RuntimeConfig":
@@ -221,18 +226,11 @@ class RuntimeConfig:
         defaults = cls()
 
         def scalar(key: str, kind: str, default):
-            for section in sections:
-                if key in section:
-                    ok, value = _coerce(section[key], kind)
-                    if ok:
-                        return value
-            return default
+            return _first_valid(sections, key, kind, default)
 
-        log_dir = defaults.log_dir
-        for section in sections:
-            if "log_dir" in section:
-                log_dir = Path(str(section["log_dir"])).expanduser()
-                break
+        # `log_dir` is the one key with no failure mode: any TOML scalar
+        # stringifies, so the first layer that sets it wins outright.
+        log_dir = _first_valid(sections, "log_dir", "path", defaults.log_dir)
 
         return dict(
             log_dir=log_dir,
@@ -283,18 +281,20 @@ class RuntimeConfig:
             layer_budgets.append(b)
             keys.update(str(k) for k in b)
         for key in keys:
-            for b in layer_budgets:
-                if key in b:
-                    try:
-                        budgets[key] = int(b[key])
-                        break
-                    except (TypeError, ValueError):
-                        continue
+            # Same per-key rule as the scalars, one layer down: the highest
+            # layer that sets the key AND coerces cleanly wins it.
+            value = _first_valid(layer_budgets, key, "int", None)
+            if value is not None:
+                budgets[key] = value
         return budgets
 
     @staticmethod
-    def _discover_layers() -> list[Path]:
-        """The ordered (high to low) list of file layers `load()` merges.
+    def _discover_layers() -> "list[tuple[Path, dict | None]]":
+        """The ordered (high to low) file layers `load()` merges, each paired
+        with its already-parsed `[tool.recall.runtime]` section (`None` when
+        the file could not be read or parsed at all). Discovery has to parse
+        to decide inclusion anyway, so it hands the result to `load()` rather
+        than making it re-read the same files.
 
         - `$RECALL_RUNTIME_CONFIG`: included if set AND the path exists
           (content is not inspected — an explicit override is trusted as-is,
@@ -308,25 +308,22 @@ class RuntimeConfig:
           this file is install.sh's dedicated home for the section, so mere
           existence is enough to treat it as "the" config layer.
         """
-        layers: list[Path] = []
+        layers: "list[tuple[Path, dict | None]]" = []
         env = os.environ.get("RECALL_RUNTIME_CONFIG")
         if env:
             p = Path(env).expanduser()
             if p.exists():
-                layers.append(p)
+                layers.append((p, _read_section(p)))
         cwd_pyproject = Path.cwd() / "pyproject.toml"
-        if cwd_pyproject.exists() and _has_runtime_section(cwd_pyproject):
-            layers.append(cwd_pyproject)
+        if cwd_pyproject.exists():
+            cwd_section = _read_section(cwd_pyproject)
+            # Non-empty table required (unparseable -> `None` -> falsy).
+            if cwd_section:
+                layers.append((cwd_pyproject, cwd_section))
         global_pyproject = RuntimeConfig.global_config_path()
         if global_pyproject.exists():
-            layers.append(global_pyproject)
+            layers.append((global_pyproject, _read_section(global_pyproject)))
         return layers
-
-
-def _has_runtime_section(path: Path) -> bool:
-    """True iff `path` is a TOML file with a non-empty `[tool.recall.runtime]` table."""
-    section = _read_section(path)
-    return bool(section)
 
 
 def _read_section(path: Path) -> dict | None:
@@ -343,6 +340,27 @@ def _read_section(path: Path) -> dict | None:
         return None
     section = data.get("tool", {}).get("recall", {}).get("runtime", {})
     return section if isinstance(section, dict) else {}
+
+
+def _first_valid(sections: list[dict], key: str, kind: str, default):
+    """The per-key merge rule, once.
+
+    Walk `sections` high-precedence first and return the first value of
+    `key` that both EXISTS and coerces as `kind`. A layer that lacks the
+    key, or whose value fails to coerce, is skipped FOR THAT KEY ONLY — a
+    typo in one setting must not cost the user every other setting in the
+    same file. Nobody valid set it: `default`.
+
+    Used by the scalar merge and the `[budget]` sub-table alike; they are
+    the same rule at two nesting levels, and letting them drift is how a
+    budget key ends up obeying different precedence than a scalar.
+    """
+    for section in sections:
+        if key in section:
+            ok, value = _coerce(section[key], kind)
+            if ok:
+                return value
+    return default
 
 
 def _coerce(value: object, kind: str) -> tuple[bool, object]:
@@ -385,6 +403,10 @@ def _coerce(value: object, kind: str) -> tuple[bool, object]:
             return False, None
     if kind == "str":
         return True, str(value)
+    if kind == "path":
+        # No failure mode: every TOML scalar stringifies, so the first
+        # layer that sets a path key wins it outright.
+        return True, Path(str(value)).expanduser()
     raise ValueError(f"unknown coercion kind: {kind!r}")
 
 

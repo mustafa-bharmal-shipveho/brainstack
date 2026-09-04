@@ -27,6 +27,7 @@ import json
 import os
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -424,21 +425,32 @@ def _build_dedup_store(config: RuntimeConfig, session_id: str) -> Any:
         return None
 
 
-def _brain_root() -> "Path | None":
-    """The brain root used to relativize `x_paths`, or None.
+def _brain_root_or(fallback: "Callable[[], Path | None]") -> "Path | None":
+    """`recall.config.brain_root()` as a `Path`, or `fallback()`.
 
-    None means telemetry keeps absolute paths — honest but machine-bound.
-    Never raises: a path helper that is missing or unimplemented must not
-    cost the user their prompt.
+    This module must stay importable and usable without `recall` on the
+    path, so every brain-root consumer needs this exact guard — and never
+    raises, because a path helper that is missing or unimplemented must not
+    cost the user their prompt. They differ only in what they fall back to.
     """
     try:
         from recall.config import brain_root
 
         return Path(brain_root())
     except Exception:
-        pass
-    env = os.environ.get("BRAIN_ROOT")
-    return Path(env).expanduser() if env else None
+        return fallback()
+
+
+def _brain_root() -> "Path | None":
+    """The brain root used to relativize `x_paths`, or None.
+
+    None means telemetry keeps absolute paths — honest but machine-bound.
+    """
+    def _from_env() -> "Path | None":
+        env = os.environ.get("BRAIN_ROOT")
+        return Path(env).expanduser() if env else None
+
+    return _brain_root_or(_from_env)
 
 
 def _append_auto_recall_event(config: RuntimeConfig, session_id: str,
@@ -570,39 +582,38 @@ def _health_banner_lines(config: RuntimeConfig,
         from recall import health as _health
 
         path = _health_report_path(config)
-        # `load_report` collapses missing, corrupt AND stale into None, but
-        # those want two different banners: silence for the first two (a
-        # fresh install has never had a report, and nagging about a file
-        # the user has never heard of is worse than saying nothing) and a
-        # warning for the third. Two calls tell them apart —
-        # `max_age_hours=0` disables the age check. Contract from the
-        # health slice owner, 2026-09-04.
-        raw = _health.load_report(path, max_age_hours=0)
-        if raw is None:
+        # Missing/corrupt and stale want two different banners: silence for
+        # the first (a fresh install has never had a report, and nagging
+        # about a file the user has never heard of is worse than saying
+        # nothing) and a warning for the second. `read_report` returns both
+        # answers off ONE parse; `load_report` collapses them into a single
+        # None, which used to cost this session-open path two reads of the
+        # same file. Contract from the health slice owner, 2026-09-04.
+        report, stale = _health.read_report(path)
+        if report is None:
             return []
-        stale_hours = float(
-            getattr(_health, "HEALTH_STALE_HOURS", _HEALTH_STALE_HOURS_DEFAULT)
-        )
-        fresh = _health.load_report(path)
-        if fresh is None:
+        if stale:
             # The checks inside a stale report are no longer evidence of
             # anything, so they are not reported as if they were.
+            stale_hours = float(
+                getattr(_health, "HEALTH_STALE_HOURS", _HEALTH_STALE_HOURS_DEFAULT)
+            )
             lines.append(
                 f"brainstack health: last report "
-                f"{getattr(raw, 'generated_at', '?')} is older than "
+                f"{getattr(report, 'generated_at', '?')} is older than "
                 f"{int(stale_hours)}h; the hourly sync LaunchAgent may be "
                 f"dead. run 'recall health'"
             )
         else:
             lines.extend(
-                _health_fail_line(c.id, c.evidence) for c in fresh.failures()
+                _health_fail_line(c.id, c.evidence) for c in report.failures()
             )
     except Exception:
         # Missing module, unimplemented helper, unreadable file — all mean
         # the same thing to the user: no banner.
         return []
 
-    live = _live_auto_recall_check(payload)
+    live = _live_auto_recall_check(payload, config)
     if live is not None:
         lines.append(_health_fail_line(*live))
     return lines
@@ -617,16 +628,14 @@ def _health_report_path(config: RuntimeConfig) -> Path:
     banner silently unreachable for anyone who had moved their logs, which
     is exactly the population most likely to have a health problem.
 
-    The import is lazy and guarded because this module must stay importable
-    without `recall` installed; the `log_dir.parent` guess is kept only as
-    the no-`recall` fallback.
+    The lookup is guarded (see `_brain_root_or`) because this module must
+    stay importable without `recall` installed; the `log_dir.parent` guess
+    is kept only as the no-`recall` fallback.
     """
-    try:
-        from recall.config import brain_root as _brain_root_fn
-
-        return _brain_root_fn() / "runtime" / "health.json"
-    except Exception:
+    root = _brain_root_or(lambda: None)
+    if root is None:
         return config.log_dir.parent / "health.json"
+    return root / "runtime" / "health.json"
 
 
 def _health_fail_line(check_id: str, evidence: str) -> str:
@@ -652,23 +661,46 @@ def _health_fail_line(check_id: str, evidence: str) -> str:
     return f"brainstack health FAIL: {check_id} — {text}"
 
 
-def _live_auto_recall_check(payload: dict[str, Any]) -> "tuple[str, str] | None":
+def _live_auto_recall_check(
+    payload: dict[str, Any], config: "RuntimeConfig | None" = None,
+) -> "tuple[str, str] | None":
     """Re-run the auto-recall config check against THIS session's cwd.
 
     Returns `(check_id, evidence)` on FAIL, else None. Silent on any
     error, including the health module not being importable.
+
+    `config` is the config the hook already loaded, from the process cwd.
+    When the session's cwd IS that directory — the normal case, since
+    Claude Code runs hooks in the project directory — reuse it instead of
+    making the check parse the same TOML layers again. Any other cwd falls
+    back to the chdir-guarded load, which is the only correct answer there.
     """
     try:
         from recall.health import build_env, check_auto_recall_config
 
         cwd = Path(str(payload.get("cwd") or os.getcwd()))
-        result = check_auto_recall_config(build_env(cwd=cwd))
+        reuse = config if _is_process_cwd(cwd) else None
+        result = check_auto_recall_config(build_env(cwd=cwd), config=reuse)
     except Exception:
         return None
     if getattr(result, "status", "") != "FAIL":
         return None
     return (getattr(result, "id", "auto_recall_config"),
             getattr(result, "evidence", ""))
+
+
+def _is_process_cwd(path: Path) -> bool:
+    """True iff `path` is the directory this process is running in.
+
+    Compared through `realpath` so a symlinked worktree or a /private
+    prefix on macOS does not read as a different directory and cost a
+    redundant config load. False on any error: the caller's fallback is
+    only slower, never wrong.
+    """
+    try:
+        return os.path.realpath(path) == os.path.realpath(os.getcwd())
+    except OSError:
+        return False
 
 
 def _build_reinjection_for_session(config) -> str:

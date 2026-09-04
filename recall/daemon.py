@@ -22,6 +22,7 @@ Protocol (pinned; see docs/recall-daemon.md):
 
 from __future__ import annotations
 
+import datetime as _dt
 import hashlib
 import json
 import os
@@ -34,6 +35,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from recall import __version__
+from recall.sanitize import provenance_label, sanitize_untrusted
 
 # Imported (not called until refresh_once runs) so
 # `monkeypatch.setattr("recall.daemon.refresh_index_chunked", ...)` has a
@@ -148,8 +150,6 @@ def _json_safe(value: Any) -> Any:
     unquoted `created:` fields, which would raise inside the response
     encoder and take the whole request down.
     """
-    import datetime as _dt
-
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     if isinstance(value, (_dt.datetime, _dt.date, _dt.time)):
@@ -172,8 +172,6 @@ def result_to_wire(result: Any) -> dict:
     was last injected; hashing the truncated body would make every edit past
     char `BODY_WIRE_CAP` invisible.
     """
-    from recall.sanitize import provenance_label, sanitize_untrusted
-
     doc = result.document
     frontmatter = dict(getattr(doc, "frontmatter", None) or {})
     body = getattr(doc, "body", "") or ""
@@ -226,17 +224,30 @@ def _env_seconds(name: str, default: float) -> float:
     return value if value >= 0 else default
 
 
+def _first_of_type(kind: type, *candidates):
+    """The first candidate that really is a `kind`, else `None`.
+
+    `_model_info` reports what is LOADED, falling back through
+    progressively weaker sources; each step is the same "did this source
+    actually give me a str/int?" test, and a source that gave back
+    something else has to be skipped rather than reported.
+    """
+    for candidate in candidates:
+        if isinstance(candidate, kind):
+            return candidate
+    return None
+
+
 class DaemonAlreadyRunning(RuntimeError):
     """Another daemon already answers on this socket.
 
     A `RuntimeError` subclass so existing callers that catch `RuntimeError`
     keep working; distinct so `run_daemon` can back off before exiting,
     instead of letting launchd respawn into the same refusal every 10 s.
-    """
 
-    def __init__(self, message: str, *, pid: "int | None" = None):
-        super().__init__(message)
-        self.pid = pid
+    The offending pid is carried in the MESSAGE, which is the only thing
+    any caller does with it (print it, then back off).
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -477,7 +488,6 @@ class RecallDaemon:
         queue_timeout_s: "float | None" = None,
     ):
         self.socket_path = Path(socket_path)
-        self.cfg = cfg
         self.retriever = retriever
         self.rerank = rerank
         self.reranker_model = reranker_model
@@ -498,6 +508,10 @@ class RecallDaemon:
         self.effective_reranker_model: "str | None" = reranker_model
         self.effective_rerank_n: "int | None" = rerank_n
         self.warmup_ms: "int | None" = None
+        # `_model_info`'s answer, memoised once a retriever exists. Nothing
+        # rebuilds the retriever or renames its models after that, so the
+        # dict cannot go stale — see `_model_info`.
+        self._model_info_cache: "dict | None" = None
 
         # Freshness state (S3).
         self.last_refresh_ts: "float | None" = None
@@ -560,13 +574,10 @@ class RecallDaemon:
         violation, so an untouched config field falls through to the
         calibrated daemon default instead.
         """
-        try:
-            from recall.config import RankingConfig
+        from recall.config import RankingConfig
 
-            if configured != getattr(RankingConfig(), field):
-                return configured
-        except Exception:  # noqa: BLE001 - defaults are best-effort
-            return configured if configured is not None else daemon_default
+        if configured != getattr(RankingConfig(), field):
+            return configured
         return daemon_default
 
     def _ensure_retriever(self):
@@ -602,6 +613,17 @@ class RecallDaemon:
         return self.retriever
 
     def _model_info(self) -> dict:
+        """What is actually loaded, for `status()` and every query response.
+
+        Memoised once a retriever exists: it is read on the hot response
+        path, and nothing rebuilds the retriever or renames its models for
+        the life of the process. Before the retriever is built the answer
+        is still a guess from config, so THAT is not cached — `status()`
+        on a daemon that has not served a query yet must not pin it.
+        """
+        if self._model_info_cache is not None:
+            return self._model_info_cache
+
         retriever = self.retriever
         cfg = self._cfg_cache
         # `HybridRetriever` stores the resolved model names as `_dense_model`
@@ -609,35 +631,36 @@ class RecallDaemon:
         # Reading the real attributes matters: `status()` is what a health
         # check compares against the calibrated model, so falling back to the
         # config value would report what was ASKED for, not what is loaded.
-        embedder = getattr(retriever, "_dense_model", None)
-        if not isinstance(embedder, str):
-            embedder = cfg.ranking.embedder if cfg is not None else None
-        reranker = getattr(retriever, "_reranker", None)
-        if not isinstance(reranker, str):
+        embedder = _first_of_type(str, getattr(retriever, "_dense_model", None))
+        if embedder is None and cfg is not None:
+            embedder = cfg.ranking.embedder
+        reranker = _first_of_type(str, getattr(retriever, "_reranker", None))
+        if reranker is None:
             reranker = "cross_encoder" if self.rerank else "none"
 
         # Prefer what the daemon actually resolved, then whatever the
         # injected retriever reports, then the calibrated default. A health
         # check compares this against the calibrated model, so a guess from
         # the config would be worse than useless.
-        reranker_model = self.effective_reranker_model
-        if not isinstance(reranker_model, str):
-            reranker_model = getattr(retriever, "_reranker_model", None)
-        if not isinstance(reranker_model, str):
-            reranker_model = DAEMON_RERANKER_MODEL
-
-        rerank_n = self.effective_rerank_n
-        if not isinstance(rerank_n, int):
-            rerank_n = getattr(retriever, "_rerank_n", None)
-        if not isinstance(rerank_n, int):
-            rerank_n = DAEMON_RERANK_N
-
-        return {
+        info = {
             "embedder": embedder,
             "reranker": reranker,
-            "reranker_model": reranker_model,
-            "rerank_n": int(rerank_n),
+            "reranker_model": _first_of_type(
+                str,
+                self.effective_reranker_model,
+                getattr(retriever, "_reranker_model", None),
+                DAEMON_RERANKER_MODEL,
+            ),
+            "rerank_n": int(_first_of_type(
+                int,
+                self.effective_rerank_n,
+                getattr(retriever, "_rerank_n", None),
+                DAEMON_RERANK_N,
+            )),
         }
+        if retriever is not None:
+            self._model_info_cache = info
+        return info
 
     def note_activity(self) -> None:
         self._last_activity = time.monotonic()
@@ -1065,8 +1088,7 @@ class RecallDaemon:
             raise DaemonAlreadyRunning(
                 f"recall serve: already running (pid {pid}) at {path}. "
                 f"Use 'recall serve --stop' to stop it, or "
-                f"'kill {pid}' if it is a manual daemon you forgot about.",
-                pid=pid if isinstance(pid, int) else None,
+                f"'kill {pid}' if it is a manual daemon you forgot about."
             )
 
         # Only reachable via no_socket / connection_refused: the file is a

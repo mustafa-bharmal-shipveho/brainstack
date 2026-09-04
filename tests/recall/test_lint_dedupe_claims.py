@@ -670,7 +670,8 @@ def test_projection_does_not_recreate_after_retraction(lc, tmp_path):
 class TestManifest:
     def test_dry_run_manifest_text(self, lc, claims_brain):
         actions = lc.plan_claim_dedupe(claims_brain["root"], stub_min_chars=200)
-        out = lc.render_claim_manifest(actions, claims_brain["root"])
+        out = lc.render_claim_manifest(
+            actions, claims_brain["root"], stub_min_chars=200)
 
         assert out.startswith("== recall lint --dedupe-claims ==")
         assert "stub_min_chars=200" in out
@@ -698,22 +699,25 @@ class TestManifest:
         assert ("Archived 5 claim(s) to semantic/archived/ and appended "
                 "5 retraction(s) to semantic/claim_overrides.jsonl.") in out
 
-    def test_manifest_uses_the_given_threshold_over_inference(
+    def test_manifest_reports_the_threshold_it_was_given(
             self, lc, claims_brain):
-        """The caller knows the flag value it ran the plan with. Recovering
-        it by regexing the plan's own detail strings is a fallback for
-        callers that don't, not the source of truth."""
+        """The header states the threshold the CALLER ran the plan with, not
+        one guessed from the plan's own output. The two can disagree — a
+        plan run at 200 that archived nothing for short bodies leaves no
+        trace of the 200 anywhere in its actions."""
         actions = lc.plan_claim_dedupe(claims_brain["root"], stub_min_chars=200)
         out = lc.render_claim_manifest(
             actions, claims_brain["root"], stub_min_chars=0)
         assert "stub_min_chars=0" in out
         assert "stub_min_chars=200" not in out
 
-    def test_manifest_infers_the_threshold_when_none_is_given(
+    def test_manifest_threshold_defaults_to_the_rule_being_off(
             self, lc, claims_brain):
-        actions = lc.plan_claim_dedupe(claims_brain["root"], stub_min_chars=200)
+        """`STUB_MIN_CHARS` is 0 — the short-body rule is opt-in, and a
+        caller that says nothing gets a header that says so."""
+        actions = lc.plan_claim_dedupe(claims_brain["root"])
         out = lc.render_claim_manifest(actions, claims_brain["root"])
-        assert "stub_min_chars=200" in out
+        assert f"stub_min_chars={lc.STUB_MIN_CHARS}" in out
 
     def test_empty_plan_manifest(self, lc, tmp_path):
         out = lc.render_claim_manifest([], tmp_path)

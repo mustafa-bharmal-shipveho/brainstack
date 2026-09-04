@@ -350,13 +350,7 @@ def load_events_all(log_path: Path | str) -> list[EventRecord]:
 
     out: list[EventRecord] = []
     for p in locking.iter_log_paths(Path(log_path)):
-        if not p.exists():
-            continue
-        for line in p.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            out.append(load_event(line))
+        out.extend(load_events(p))
     return out
 
 

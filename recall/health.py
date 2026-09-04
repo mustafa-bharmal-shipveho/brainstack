@@ -16,10 +16,12 @@ import json
 import os
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
+
+from recall.fsutil import atomic_write_text
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -39,6 +41,12 @@ TRACKED_FILE_FAIL_BYTES = 50 * 1024 * 1024
 LOG_WARN_BYTES = 20 * 1024 * 1024
 DREAM_FAIL_HOURS = 36.0
 HEALTH_STALE_HOURS = 26.0
+# A local AF_UNIX connect either completes in microseconds or the socket is
+# not being served. 0.5 s only bought a longer stall on the failure path.
+DAEMON_CONNECT_TIMEOUT_S = 0.15
+# How much of the (unbounded, append-only) sync.log the remote-error scan
+# looks at. Matches the `[-400:]` slice `_sync_log_remote_error` applies.
+_SYNC_LOG_TAIL_LINES = 400
 
 # LaunchAgent label -> short name used in `launch_agents` evidence lines.
 LAUNCH_AGENT_LABELS = {
@@ -107,6 +115,11 @@ class HealthEnv:
     platform: str
     run: Runner
     connect_unix: Callable[[Path, float], bool]
+    # Per-run memo for `_memory_sources`; see there for why. Not part of
+    # the injected surface — callers build an env and never set it.
+    _memory_sources_memo: Optional[list] = field(
+        default=None, repr=False, compare=False
+    )
 
 
 def build_env(*, brain_root: Optional[Path] = None, cwd: Optional[Path] = None) -> HealthEnv:
@@ -172,7 +185,7 @@ def default_brain_root() -> Path:
 
 def check_imports_freshness(env: HealthEnv) -> CheckResult:
     """PASS/WARN/FAIL/SKIP on how stale the Claude-project memory mirror is."""
-    sources = _claude_project_memory_files(env.home)
+    sources = _memory_sources(env)
     if not sources:
         return CheckResult(
             "imports_freshness", "SKIP",
@@ -224,7 +237,7 @@ def check_launch_agents(env: HealthEnv) -> CheckResult:
     rc, stdout, _stderr = env.run(["launchctl", "list"])
     listed = _parse_launchctl_list(stdout) if rc == 0 else {}
     agents_dir = env.home / "Library" / "LaunchAgents"
-    has_claude_sources = bool(_claude_project_memory_files(env.home))
+    has_claude_sources = bool(_memory_sources(env))
 
     loaded: list = []
     missing: list = []
@@ -307,24 +320,25 @@ def check_brain_push(env: HealthEnv) -> CheckResult:
     if rc == 0 and stdout.strip().isdigit():
         last_push_ct = int(stdout.strip())
 
+    age_h = (
+        (env.now.timestamp() - last_push_ct) / 3600.0
+        if last_push_ct is not None else 0.0
+    )
+
     def _with_push(text: str) -> str:
         if last_push_ct is None:
             return text
-        age_h = (env.now.timestamp() - last_push_ct) / 3600.0
         return f"{text}; last push {_ts(last_push_ct)} ({_human_age(age_h)})"
 
     if ahead == 0:
         return CheckResult("brain_push", "PASS", _with_push(f"in sync with {upstream}"))
 
     evidence = _with_push(f"{ahead} commit{_s(ahead)} ahead of {upstream}")
-    age_h = (
-        (env.now.timestamp() - last_push_ct) / 3600.0
-        if last_push_ct is not None else 0.0
-    )
     if last_push_ct is None or age_h <= PUSH_FAIL_HOURS:
         return CheckResult("brain_push", "PASS", evidence)
 
-    remote_error = _sync_log_remote_error(_read_text(brain / "sync.log"))
+    remote_error = _sync_log_remote_error(
+        "\n".join(_tail_lines(brain / "sync.log", _SYNC_LOG_TAIL_LINES)))
     if remote_error:
         evidence += f"; last remote error: {remote_error}"
     return CheckResult(
@@ -353,29 +367,14 @@ def check_large_tracked_files(env: HealthEnv) -> CheckResult:
             continue
         sized.append((rel, size))
 
-    oversize = sorted(
-        (t for t in sized if t[1] > TRACKED_FILE_FAIL_BYTES),
-        key=lambda t: t[1], reverse=True,
-    )
-    if not oversize:
-        largest = max((s for _r, s in sized), default=0)
-        return CheckResult(
-            "large_tracked_files", "PASS",
-            f"{len(sized)} tracked files, largest {largest / _MB:.1f} MB "
-            f"(limit {TRACKED_FILE_FAIL_BYTES // _MB} MB)",
-        )
-
-    listed = ", ".join(f"{rel} {size / _MB:.1f} MB" for rel, size in oversize[:3])
-    evidence = (
-        f"{listed} exceed{_verb_s(len(oversize))} "
-        f"{TRACKED_FILE_FAIL_BYTES // _MB} MB"
-    )
-    if len(oversize) > 3:
-        evidence += f" (+{len(oversize) - 3} more)"
-    return CheckResult(
-        "large_tracked_files", "FAIL", evidence,
-        f"git -C {brain} rm --cached <path>; "
-        "./install.sh --upgrade adds the ignore rule",
+    return _size_threshold_result(
+        "large_tracked_files", sized,
+        limit_bytes=TRACKED_FILE_FAIL_BYTES,
+        noun="tracked files",
+        over_status="FAIL",
+        max_listed=3,
+        fix=f"git -C {brain} rm --cached <path>; "
+            "./install.sh --upgrade adds the ignore rule",
     )
 
 
@@ -415,25 +414,55 @@ def check_log_sizes(env: HealthEnv) -> CheckResult:
         except OSError:
             continue
 
-    oversize = sorted(
-        (t for t in sized if t[1] > LOG_WARN_BYTES), key=lambda t: t[1], reverse=True
+    return _size_threshold_result(
+        "log_sizes", sized,
+        limit_bytes=LOG_WARN_BYTES,
+        noun="log file(s)",
+        over_status="WARN",
+        over_suffix=" (rolls on next write after upgrade)",
+        fix="./install.sh --upgrade (adds rotation); "
+            "rolled files land beside the current one",
     )
-    limit_mb = LOG_WARN_BYTES // _MB
+
+
+def _size_threshold_result(
+    check_id: str,
+    sized: list,
+    *,
+    limit_bytes: int,
+    noun: str,
+    over_status: str,
+    fix: str,
+    max_listed: "int | None" = None,
+    over_suffix: str = "",
+) -> CheckResult:
+    """The shared shape of both size checks, over `[(label, bytes), ...]`.
+
+    PASS quotes the count and the largest file; anything over `limit_bytes`
+    flips to `over_status` and names the offenders largest-first, capped at
+    `max_listed` with a `(+N more)` tail. The two checks differ only in the
+    noun, the status they escalate to, the cap, and the fix — not in how
+    they say any of it.
+    """
+    limit_mb = limit_bytes // _MB
+    oversize = sorted(
+        (t for t in sized if t[1] > limit_bytes), key=lambda t: t[1], reverse=True
+    )
     if not oversize:
-        largest = max((s for _label, s in sized), default=0)
+        largest = max((size for _label, size in sized), default=0)
         return CheckResult(
-            "log_sizes", "PASS",
-            f"{len(sized)} log file(s), largest {largest / _MB:.1f} MB "
+            check_id, "PASS",
+            f"{len(sized)} {noun}, largest {largest / _MB:.1f} MB "
             f"(limit {limit_mb} MB)",
         )
 
-    listed = ", ".join(f"{label} {size / _MB:.1f} MB" for label, size in oversize)
-    return CheckResult(
-        "log_sizes", "WARN",
-        f"{listed} exceed{_verb_s(len(oversize))} {limit_mb} MB "
-        "(rolls on next write after upgrade)",
-        "./install.sh --upgrade (adds rotation); rolled files land beside the current one",
-    )
+    shown = oversize if max_listed is None else oversize[:max_listed]
+    listed = ", ".join(f"{label} {size / _MB:.1f} MB" for label, size in shown)
+    evidence = f"{listed} exceed{_verb_s(len(oversize))} {limit_mb} MB"
+    hidden = len(oversize) - len(shown)
+    if hidden > 0:
+        evidence += f" (+{hidden} more)"
+    return CheckResult(check_id, over_status, evidence + over_suffix, fix)
 
 
 def check_dream_cycle(env: HealthEnv) -> CheckResult:
@@ -519,8 +548,13 @@ def check_drift(env: HealthEnv) -> CheckResult:
     )
 
 
-def check_auto_recall_config(env: HealthEnv) -> CheckResult:
-    """Whether `env.cwd`'s resolved runtime config leaves auto-recall on."""
+def check_auto_recall_config(env: HealthEnv, *, config=None) -> CheckResult:
+    """Whether `env.cwd`'s resolved runtime config leaves auto-recall on.
+
+    `config=` lets a caller that has ALREADY loaded the runtime config for
+    `env.cwd` (the SessionStart hook) hand it over instead of paying for a
+    second three-file TOML parse. Omit it and the config is loaded here.
+    """
     global_path = env.brain_root / "runtime" / "pyproject.toml"
     if not global_path.is_file():
         global_path = env.home / ".agent" / "runtime" / "pyproject.toml"
@@ -530,14 +564,17 @@ def check_auto_recall_config(env: HealthEnv) -> CheckResult:
             f"auto-recall not enabled globally (no enable_auto_recall = true in {global_path})",
         )
 
-    cfg = _load_runtime_config_at(env.cwd)
+    cfg = _load_runtime_config_at(env.cwd, config=config)
     if cfg is None:
         return CheckResult(
             "auto_recall_config", "SKIP",
             "runtime adapter not importable; cannot resolve the effective config",
         )
-    resolved = getattr(cfg, "config_path", None) or global_path
-    if getattr(cfg, "enable_auto_recall", False):
+    # `cfg` is a `RuntimeConfig` — `_load_runtime_config_at` returns that or
+    # `None`, never a duck type — so these are plain attributes. `getattr`
+    # with a default here only hid a rename until someone read the evidence.
+    resolved = cfg.config_path or global_path
+    if cfg.enable_auto_recall:
         return CheckResult(
             "auto_recall_config", "PASS",
             f"auto-recall ON from {env.cwd} (resolved config {resolved})",
@@ -549,7 +586,7 @@ def check_auto_recall_config(env: HealthEnv) -> CheckResult:
     # `enable_auto_recall = false` outright. Name that layer, not the
     # highest one — the old "resolved config X shadows Y" pointed at a file
     # that may be entirely innocent.
-    layers = [Path(p) for p in (getattr(cfg, "config_layers", None) or [resolved])]
+    layers = [Path(p) for p in (cfg.config_layers or [resolved])]
     culprit = next((p for p in layers if _toml_auto_recall_value(p) is False), None)
     if culprit is None:
         return CheckResult(
@@ -595,7 +632,7 @@ def check_daemon(env: HealthEnv) -> CheckResult:
             "daemon", "SKIP",
             f"recall daemon not configured (no plist, no socket at {socket_path})",
         )
-    if env.connect_unix(socket_path, 0.5):
+    if env.connect_unix(socket_path, DAEMON_CONNECT_TIMEOUT_S):
         return CheckResult(
             "daemon", "PASS", f"socket {socket_path} accepting connections",
         )
@@ -740,16 +777,7 @@ def write_report(report: HealthReport, path: Path) -> None:
     """Atomic write (tmp + `os.replace`), creating `path.parent` if missing."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        tmp.write_text(json.dumps(report.to_dict(), indent=2) + "\n", encoding="utf-8")
-        os.replace(tmp, path)
-    finally:
-        if tmp.exists():
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
+    atomic_write_text(path, json.dumps(report.to_dict(), indent=2) + "\n")
 
 
 def load_report(
@@ -770,16 +798,50 @@ def load_report(
         report = HealthReport.from_dict(data)
     except Exception:  # noqa: BLE001 - unusable payload is the same as no payload
         return None
-    if max_age_hours and max_age_hours > 0:
-        ts = _parse_iso_z(report.generated_at)
-        if ts is None:
-            return None
-        moment = now or datetime.now(timezone.utc)
-        if moment.tzinfo is None:
-            moment = moment.replace(tzinfo=timezone.utc)
-        if (moment - ts).total_seconds() / 3600.0 > max_age_hours:
-            return None
+    if _is_stale(report, now=now, max_age_hours=max_age_hours):
+        return None
     return report
+
+
+def read_report(
+    path: Path, *, now: Optional[datetime] = None
+) -> "tuple[Optional[HealthReport], bool]":
+    """Parse `path` ONCE and return `(report, stale)`.
+
+    `report` is `None` when the file is missing, unreadable, or unusable —
+    three cases that mean the same thing to every caller: there is no
+    report. `stale` is True when the report parsed but its `generated_at`
+    is older than `HEALTH_STALE_HOURS` (an unparseable timestamp counts as
+    stale: it is not evidence of freshness).
+
+    `load_report` collapses missing, corrupt AND stale into a single
+    `None`, which forced the SessionStart banner — a hook on the session
+    open path — to read and parse health.json twice just to tell "say
+    nothing" apart from "the hourly agent looks dead".
+    """
+    report = load_report(path, now=now, max_age_hours=0)
+    if report is None:
+        return None, False
+    return report, _is_stale(report, now=now, max_age_hours=HEALTH_STALE_HOURS)
+
+
+def _is_stale(
+    report: HealthReport, *, now: Optional[datetime], max_age_hours: float
+) -> bool:
+    """True when `report.generated_at` is more than `max_age_hours` old.
+
+    `max_age_hours` of 0 (or less) disables the check entirely; an
+    unparseable `generated_at` is treated as stale rather than fresh.
+    """
+    if not max_age_hours or max_age_hours <= 0:
+        return False
+    ts = _parse_iso_z(report.generated_at)
+    if ts is None:
+        return True
+    moment = now or datetime.now(timezone.utc)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return (moment - ts).total_seconds() / 3600.0 > max_age_hours
 
 
 # ---------------------------------------------------------------------------
@@ -862,6 +924,52 @@ def _parse_launchctl_list(stdout: str) -> dict:
     return out
 
 
+def _memory_sources(env: HealthEnv) -> list:
+    """`_claude_project_memory_files(env.home)`, computed once per env.
+
+    Two checks need it, and it stats every file under every project
+    directory the user has ever opened in Claude Code — the single most
+    expensive thing `run_health` does. Memoised on the env, which lives
+    exactly one health run, so the answer cannot go stale within a report.
+    """
+    if env._memory_sources_memo is None:
+        env._memory_sources_memo = _claude_project_memory_files(env.home)
+    return env._memory_sources_memo
+
+
+def _tail_lines(path: Path, limit: int) -> list[str]:
+    """The last `limit` lines of `path`, read from the END of the file.
+
+    `sync.log` is append-only and unbounded; reading all of it to keep the
+    final 400 lines meant every `recall health` paid for every byte the
+    agent had ever logged. Seeking back in blocks costs the tail only.
+
+    `[]` for a missing or unreadable file — the caller treats an absent log
+    exactly like an empty one.
+    """
+    block = 65536
+    chunks: list[bytes] = []
+    try:
+        with Path(path).open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            pos = fh.tell()
+            newlines = 0
+            # `> limit`, not `>= limit`: a file whose tail starts mid-line
+            # needs one extra newline before the first WHOLE line is in
+            # hand, and the final slice discards the partial one anyway.
+            while pos > 0 and newlines <= limit:
+                step = min(block, pos)
+                pos -= step
+                fh.seek(pos)
+                chunk = fh.read(step)
+                newlines += chunk.count(b"\n")
+                chunks.append(chunk)
+    except OSError:
+        return []
+    text = b"".join(reversed(chunks)).decode("utf-8", errors="replace")
+    return text.splitlines()[-limit:]
+
+
 def _claude_project_memory_files(home: Path) -> list:
     """Every `~/.claude/projects/<slug>/memory/*` file, skipping projects
     whose `memory/` is a symlink into the brain itself.
@@ -895,9 +1003,18 @@ def _newest_mtime(paths) -> Optional[float]:
     return newest
 
 
-def _load_runtime_config_at(cwd: Path):
+def _load_runtime_config_at(cwd: Path, *, config=None):
     """`RuntimeConfig.load()` as resolved from `cwd` (chdir guarded by
-    try/finally)."""
+    try/finally).
+
+    `config=` short-circuits the load. `RuntimeConfig.load()` parses up to
+    three TOML files, and the SessionStart hook has already done exactly
+    that for exactly this directory; passing it back in is the difference
+    between one parse per session open and two. The CALLER owns the
+    precondition that `config` was resolved from `cwd`.
+    """
+    if config is not None:
+        return config
     try:
         from runtime.adapters.claude_code.config import RuntimeConfig
     except ImportError:

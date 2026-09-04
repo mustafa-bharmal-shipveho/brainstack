@@ -31,11 +31,15 @@ import json
 import os
 import random
 import re
-import tempfile
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path, PurePath
 from typing import Optional
+
+from recall._coerce import as_int as _as_int
+from recall._coerce import as_list as _as_list
+from recall._coerce import format_window as _format_window
+from recall.fsutil import atomic_write_text
 
 # The hook's injection banner, as it appears in the transcript attachment.
 # `docs?` because the header pluralizes the noun: "1 doc surfaced" for a
@@ -586,17 +590,6 @@ def _iso_to_ms(iso: object) -> int | None:
         return None
 
 
-def _as_int(value: object, default: int = 0) -> int:
-    try:
-        return int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return default
-
-
-def _as_list(value: object) -> list:
-    return value if isinstance(value, list) else []
-
-
 # ---------------------------------------------------------------------------
 # LLM-judge sample
 # ---------------------------------------------------------------------------
@@ -638,15 +631,7 @@ def write_sample(cases: list[dict], path: Path) -> int:
     replace). Returns the number of cases written."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent),
-                               prefix=f".{path.name}.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(cases, fh, indent=1)
-        os.replace(tmp, path)
-    except BaseException:
-        Path(tmp).unlink(missing_ok=True)
-        raise
+    atomic_write_text(path, json.dumps(cases, indent=1))
     return len(cases)
 
 
@@ -685,12 +670,3 @@ def render_utilization(r: UtilizationReport) -> str:
 
 def _row(label: str, value: str) -> str:
     return f"  {label + ':':<{_LABEL_WIDTH}}{value}"
-
-
-def _format_window(since_ts_ms: int | None) -> str:
-    if since_ts_ms is None:
-        return " (all time)"
-    start = datetime.datetime.fromtimestamp(
-        since_ts_ms / 1000, tz=datetime.timezone.utc
-    ).date().isoformat()
-    return f" (since {start})"

@@ -50,6 +50,20 @@ def _remaining_s(deadline: float) -> float:
     return deadline - time.monotonic()
 
 
+def _arm_timeout(sock, deadline: float, message: str) -> None:
+    """Give `sock` whatever is left of `deadline`, or give up.
+
+    `budget_ms` is a hard wall on the WHOLE exchange, not on each syscall,
+    so every step that can block re-checks the clock before it blocks and
+    arms the socket with only the remainder. Raises
+    `DaemonUnavailable("timeout", message)` when nothing is left.
+    """
+    remaining = _remaining_s(deadline)
+    if remaining <= 0:
+        raise DaemonUnavailable("timeout", message)
+    sock.settimeout(remaining)
+
+
 def request(socket_path: Path | str, payload: dict, *, budget_ms: int) -> dict:
     """Send one NDJSON request, return the parsed response dict, or raise
     `DaemonUnavailable` with the appropriate reason. Deadline-aware: never
@@ -66,10 +80,7 @@ def request(socket_path: Path | str, payload: dict, *, budget_ms: int) -> dict:
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        remaining = _remaining_s(deadline)
-        if remaining <= 0:
-            raise DaemonUnavailable("timeout", f"budget exhausted before connect to {path}")
-        sock.settimeout(remaining)
+        _arm_timeout(sock, deadline, f"budget exhausted before connect to {path}")
 
         try:
             sock.connect(path)
@@ -94,10 +105,7 @@ def request(socket_path: Path | str, payload: dict, *, budget_ms: int) -> dict:
 
         line = (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
         try:
-            remaining = _remaining_s(deadline)
-            if remaining <= 0:
-                raise DaemonUnavailable("timeout", "budget exhausted before send")
-            sock.settimeout(remaining)
+            _arm_timeout(sock, deadline, "budget exhausted before send")
             sock.sendall(line)
         except TimeoutError as exc:
             raise DaemonUnavailable("timeout", "send timed out") from exc
@@ -106,12 +114,10 @@ def request(socket_path: Path | str, payload: dict, *, budget_ms: int) -> dict:
 
         buf = b""
         while b"\n" not in buf:
-            remaining = _remaining_s(deadline)
-            if remaining <= 0:
-                raise DaemonUnavailable(
-                    "timeout", f"daemon at {path} did not answer within {budget_ms} ms"
-                )
-            sock.settimeout(remaining)
+            _arm_timeout(
+                sock, deadline,
+                f"daemon at {path} did not answer within {budget_ms} ms",
+            )
             try:
                 chunk = sock.recv(_RECV_CHUNK)
             except TimeoutError as exc:

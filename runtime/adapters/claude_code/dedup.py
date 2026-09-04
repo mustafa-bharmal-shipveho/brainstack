@@ -37,6 +37,11 @@ if TYPE_CHECKING:
 # schema is treated like a corrupt one: ignored, then overwritten.
 STORE_SCHEMA = 1
 
+# Throttle marker for `prune`. Deliberately not a `.json` name so the
+# pruner's own sweep never sees it.
+PRUNE_MARKER_NAME = ".last_prune"
+PRUNE_INTERVAL_S = 3600.0
+
 
 def _safe_id(session_id: str) -> str:
     """Sanitize a (possibly attacker-influenced) session id into a safe
@@ -139,16 +144,41 @@ class SessionDedupStore:
             return
 
     @staticmethod
-    def prune(root: Path, *, max_age_days: int = 7, now: "float | None" = None) -> int:
+    def prune(
+        root: Path,
+        *,
+        max_age_days: int = 7,
+        now: "float | None" = None,
+        min_interval_s: float = PRUNE_INTERVAL_S,
+    ) -> int:
         """Remove session store files whose mtime is older than
         `max_age_days`. Returns the count removed. A no-op (returns 0) when
-        `root` does not exist.
+        `root` does not exist — and it never creates `root`.
 
-        Nothing else ever cleans this directory, so the hook calls this
-        once per fire. Seven days is far past any live session, so a store
-        for a session that could still be running is never touched."""
+        Nothing else ever cleans this directory, so the hook calls this on
+        every fire; but a glob + one stat per file in a shared directory is
+        real per-prompt syscall cost for a job that only needs doing
+        occasionally. `min_interval_s` (default one hour) throttles it via
+        the mtime of a `.last_prune` marker written after each real pass;
+        `min_interval_s=0` restores the unconditional sweep. The marker is
+        not matched by the `*.json` sweep, so it never prunes itself.
+
+        Seven days is far past any live session, so a store for a session
+        that could still be running is never touched."""
         root = Path(root)
-        cutoff = (time.time() if now is None else now) - max_age_days * 86400
+        now_ts = time.time() if now is None else now
+        marker = root / PRUNE_MARKER_NAME
+        if min_interval_s > 0:
+            try:
+                last = marker.stat().st_mtime
+            except OSError:
+                last = None
+            # `>= 0` so a marker stamped in the future (clock skew, a
+            # restored backup) cannot disable pruning until that time
+            # arrives — we prune, then rewrite the marker to now.
+            if last is not None and 0 <= now_ts - last < min_interval_s:
+                return 0
+        cutoff = now_ts - max_age_days * 86400
         removed = 0
         try:
             entries = list(root.glob("*.json"))
@@ -163,6 +193,14 @@ class SessionDedupStore:
                 # Raced with another hook process, or unreadable. Skip it:
                 # a file we failed to prune costs bytes, not correctness.
                 continue
+        try:
+            marker.touch()
+            os.utime(marker, (now_ts, now_ts))
+        except OSError:
+            # No marker means the next fire prunes again: wasted work, never
+            # a wrong answer. Notably this is the `root`-does-not-exist case,
+            # which must stay a pure no-op.
+            pass
         return removed
 
 
