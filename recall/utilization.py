@@ -25,6 +25,7 @@ copy says "opened later in-session" for that reason.
 """
 from __future__ import annotations
 
+import bisect
 import datetime
 import json
 import os
@@ -79,6 +80,86 @@ class UtilizationReport:
     used_docs_top: list[tuple[str, int]] = field(default_factory=list)
     sample_written: int = 0
     sample_path: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Per-session transcript index
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TranscriptIndex:
+    """The three lookups the join needs, built once per transcript.
+
+    Every hit in a session used to rescan the whole transcript three
+    times — once to find its injection attachment, once to collect the
+    tool calls after it, once to rebuild the `uuid` map that walks back
+    to the human prompt. A 207-hour session with 248 injections paid that
+    O(hits x lines) three times over. The scan is the same; only the
+    number of passes changes.
+
+    ``attachments`` and ``tool_refs`` are in line order, which is what
+    the readers below rely on: the attachment search reproduces the
+    original first-wins tie-break, and ``tool_ref_positions`` is
+    non-decreasing so a suffix can be sliced with `bisect`.
+    """
+
+    attachments: list[tuple[int, int, str]] = field(default_factory=list)
+    by_uuid: dict[object, dict] = field(default_factory=dict)
+    tool_ref_positions: list[int] = field(default_factory=list)
+    tool_refs: list[tuple[str, str]] = field(default_factory=list)
+
+
+def build_transcript_index(lines: list[dict]) -> TranscriptIndex:
+    """One pass over `lines` producing every lookup the join needs."""
+    index = TranscriptIndex()
+    for i, rec in enumerate(lines):
+        if not isinstance(rec, dict):
+            continue
+        uuid = rec.get("uuid")
+        if uuid:
+            # Last write wins on a duplicate uuid, as the dict
+            # comprehension this replaced did.
+            index.by_uuid[uuid] = rec
+        content = _attachment_content(rec)
+        if content is not None:
+            ts = _iso_to_ms(rec.get("timestamp"))
+            # An attachment with no parseable timestamp can't be joined
+            # to an event, so it never enters the search.
+            if ts is not None:
+                index.attachments.append((i, ts, content))
+        message = rec.get("message")
+        blocks = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(blocks, list):
+            continue
+        for block in blocks:
+            ref = _tool_ref(block)
+            if ref is not None:
+                index.tool_ref_positions.append(i)
+                index.tool_refs.append(ref)
+    return index
+
+
+def _tool_ref(block: object) -> tuple[str, str] | None:
+    """`(tool_name, path_or_command)` for a tool_use block that names a
+    file we can compare against `x_paths`, else None.
+
+    A `Grep` without a path searches the cwd: no evidence about any
+    particular doc, and not a reason to crash the join.
+    """
+    if not isinstance(block, dict) or block.get("type") != "tool_use":
+        return None
+    name = block.get("name")
+    inputs = block.get("input")
+    if not isinstance(name, str) or not isinstance(inputs, dict):
+        return None
+    if name in _PATH_INPUT:
+        value = inputs.get(_PATH_INPUT[name])
+    elif name == "Bash":
+        value = inputs.get("command")
+    else:
+        return None
+    return (name, value) if isinstance(value, str) and value else None
 
 
 # ---------------------------------------------------------------------------
@@ -139,26 +220,31 @@ def compute_utilization(
             unjoined += len(recs)
             continue
         lines = load_transcript(transcript)
+        # Built once, reused by every hit in this session. See
+        # `TranscriptIndex` — the per-hit rescans were the cost that made
+        # a long session quadratic.
+        index = build_transcript_index(lines)
         for rec in recs:
             doc_paths = [str(p) for p in _as_list(rec.get("x_paths"))]
             idx = find_injection_attachment(
                 lines, _as_int(rec.get("ts_ms")),
                 prefer_paths={norm_brain_path(p, brain) for p in doc_paths},
                 brain_root=brain,
+                index=index,
             )
             if idx is None:
                 unjoined += 1
                 continue
             joined += 1
             injected_docs += len(doc_paths)
-            refs = tool_refs_after(lines, idx)
+            refs = tool_refs_after(lines, idx, index=index)
             for doc in doc_paths:
                 tool = doc_use(doc, refs, brain)
                 if tool:
                     used_docs += 1
                     used_by_tool[tool] += 1
                     used_docs_top[doc] += 1
-            case = _build_case(lines, idx, session_id, transcript)
+            case = _build_case(lines, idx, session_id, transcript, index=index)
             if case is not None:
                 cases.append(case)
 
@@ -233,6 +319,7 @@ def find_injection_attachment(
     window_ms: int = 120_000,
     prefer_paths: set[str] | None = None,
     brain_root: Path | None = None,
+    index: TranscriptIndex | None = None,
 ) -> int | None:
     """Index of the `UserPromptSubmit` attachment record nearest `ts_ms`
     within `window_ms`, or None if none qualifies.
@@ -240,26 +327,25 @@ def find_injection_attachment(
     A chatty session can hold dozens of injections, so nearest-in-time is
     the join key. `prefer_paths` breaks an exact tie in favour of the
     attachment that actually rendered the event's docs.
+
+    Pass `index` to reuse a `TranscriptIndex` across the hits of one
+    session; without it, one is built for this call alone.
     """
+    if index is None:
+        index = build_transcript_index(lines)
     best: int | None = None
     best_delta: int | None = None
-    for i, rec in enumerate(lines):
-        content = _attachment_content(rec)
-        if content is None:
-            continue
-        ts = _iso_to_ms(rec.get("timestamp"))
-        if ts is None:
-            continue
+    best_content = ""
+    for i, ts, content in index.attachments:
         delta = abs(ts - ts_ms)
         if delta > window_ms:
             continue
         if best_delta is None or delta < best_delta:
-            best, best_delta = i, delta
+            best, best_delta, best_content = i, delta, content
         elif delta == best_delta and prefer_paths and brain_root is not None:
             if (_covers(content, prefer_paths, brain_root)
-                    and not _covers(_attachment_content(lines[best]) or "",
-                                    prefer_paths, brain_root)):
-                best = i
+                    and not _covers(best_content, prefer_paths, brain_root)):
+                best, best_content = i, content
     return best
 
 
@@ -304,34 +390,21 @@ def parse_injection_block(content: str) -> list[dict]:
     return docs
 
 
-def tool_refs_after(lines: list[dict], start_idx: int) -> list[tuple[str, str]]:
+def tool_refs_after(lines: list[dict], start_idx: int, *,
+                    index: TranscriptIndex | None = None
+                    ) -> list[tuple[str, str]]:
     """Every `(tool_name, path_or_command)` tool_use reference after
-    `start_idx`, including sidechain (subagent) records — a subagent
-    reading the injected doc is still the injection paying off."""
-    refs: list[tuple[str, str]] = []
-    for rec in lines[start_idx + 1:]:
-        message = rec.get("message")
-        content = message.get("content") if isinstance(message, dict) else None
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if not isinstance(block, dict) or block.get("type") != "tool_use":
-                continue
-            name = block.get("name")
-            inputs = block.get("input")
-            if not isinstance(name, str) or not isinstance(inputs, dict):
-                continue
-            if name in _PATH_INPUT:
-                value = inputs.get(_PATH_INPUT[name])
-            elif name == "Bash":
-                value = inputs.get("command")
-            else:
-                continue
-            # `Grep` without a path searches the cwd: no evidence about
-            # this doc, and not a reason to crash the join.
-            if isinstance(value, str) and value:
-                refs.append((name, value))
-    return refs
+    `start_idx`, in line order, including sidechain (subagent) records —
+    a subagent reading the injected doc is still the injection paying off.
+
+    With an `index` this is a suffix slice: the positions are
+    non-decreasing, so `bisect_right` lands past every ref on
+    `start_idx` itself, which the scan it replaced also excluded.
+    """
+    if index is None:
+        index = build_transcript_index(lines)
+    start = bisect.bisect_right(index.tool_ref_positions, start_idx)
+    return index.tool_refs[start:]
 
 
 def doc_use(doc_rel: str, refs: list[tuple[str, str]], brain_root: Path) -> str | None:
@@ -348,11 +421,17 @@ def doc_use(doc_rel: str, refs: list[tuple[str, str]], brain_root: Path) -> str 
     return None
 
 
-def extract_prompt(lines: list[dict], idx: int) -> str | None:
+def extract_prompt(lines: list[dict], idx: int, *,
+                   index: TranscriptIndex | None = None) -> str | None:
     """Walk `parentUuid` back from `idx` to the human prompt that
     triggered this injection (forward-scan fallback when the chain is
-    broken); None for slash/hash commands or when nothing qualifies."""
-    by_uuid = {r.get("uuid"): r for r in lines if r.get("uuid")}
+    broken); None for slash/hash commands or when nothing qualifies.
+
+    Pass `index` to reuse a session's uuid map instead of rebuilding it
+    for every hit."""
+    if index is None:
+        index = build_transcript_index(lines)
+    by_uuid = index.by_uuid
     prompt: str | None = None
     current: dict | None = lines[idx]
     hops = 0
@@ -425,7 +504,8 @@ def norm_brain_path(p: str, brain_root: Path) -> str:
 
 
 def _build_case(lines: list[dict], idx: int, session_id: str,
-                transcript: Path) -> dict | None:
+                transcript: Path, *,
+                index: TranscriptIndex | None = None) -> dict | None:
     """One LLM-judge case, in the exact shape of the ad-hoc
     `tools/sample_utilization.py` script. None when the turn can't be
     judged (no docs rendered, no human prompt, or no response)."""
@@ -434,7 +514,7 @@ def _build_case(lines: list[dict], idx: int, session_id: str,
     docs = parse_injection_block(content)
     if not docs:
         return None
-    prompt = extract_prompt(lines, idx)
+    prompt = extract_prompt(lines, idx, index=index)
     if not prompt:
         return None
     response = extract_response(lines, idx, prompt)

@@ -44,9 +44,22 @@ from typing import Iterable, Iterator
 # (see eval/RESULTS.md) is a one-line change.
 RERANK_BUCKET_EDGES: tuple[float, float, float, float] = (-2.5, -1.5, -0.75, 0.0)
 
-# Outcomes that mean retrieval actually ran. `skip` is the only outcome
-# that never starts a worker, so it is the only one outside this set.
-_FIRE_OUTCOMES = ("hit", "miss", "dedup")
+# The reasons the hook can put in front of an `x_daemon_error` string —
+# `recall.daemon_client.DaemonUnavailable` reasons plus `import_error`,
+# which the hook synthesizes when the client module itself won't load.
+# See `runtime/adapters/claude_code/hooks.py::_daemon_query`.
+#
+# A prefix outside this set (including the hook's `"unknown"` fallback and
+# any reason a newer hook invents) buckets as `other` rather than being
+# dropped, so the breakdown always sums to `daemon_error_count`.
+DAEMON_ERROR_REASONS: frozenset[str] = frozenset({
+    "no_socket", "connection_refused", "timeout",
+    "server_error", "protocol_error", "import_error",
+})
+
+# The two ways a JSON writer spells the event key, checked as a raw
+# substring before `json.loads`. See `iter_auto_recall_records`.
+_AUTO_RECALL_PROBES = ('"event": "AutoRecall"', '"event":"AutoRecall"')
 
 # `<stem>.<YYYY-MM-DD>[.<n>]<suffix>` — the name logrotate leaves behind.
 _ROLLED_DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})(?:\.\d+)?$")
@@ -115,6 +128,12 @@ class StatsReport:
     timeout_pct: float = 0.0
     path_split: dict[str, int] = field(default_factory=dict)
     daemon_error_count: int = 0
+    # The same errors bucketed by their `<reason>` prefix — the only
+    # signal that separates "the daemon was never installed"
+    # (`no_socket`) from "the daemon is alive but slow" (`timeout`),
+    # which need opposite fixes. Always a partition of
+    # `daemon_error_count`; empty when there were no errors.
+    daemon_error_by_reason: dict[str, int] = field(default_factory=dict)
     degraded_count: int = 0
     index_stale_count: int = 0
     index_stale_known: int = 0
@@ -185,8 +204,9 @@ def _build_report(records: list[dict],
     path_split: Counter[str] = Counter(
         str(r.get("x_path") or "unknown") for r in non_skip
     )
-    daemon_error_count = sum(
-        1 for r in non_skip if r.get("x_daemon_error") is not None
+    daemon_errors: Counter[str] = Counter(
+        _daemon_error_reason(r["x_daemon_error"]) for r in non_skip
+        if r.get("x_daemon_error") is not None
     )
     degraded_count = sum(1 for r in non_skip if r.get("x_degraded") is True)
     # An absent flag is UNKNOWN, never False: the in-process path has no
@@ -223,7 +243,8 @@ def _build_report(records: list[dict],
         dedup_pct=_pct(len(dedups), total_fires),
         timeout_pct=_pct(other_outcomes.get("timeout", 0), total_fires),
         path_split=dict(path_split),
-        daemon_error_count=daemon_error_count,
+        daemon_error_count=sum(daemon_errors.values()),
+        daemon_error_by_reason=dict(daemon_errors),
         degraded_count=degraded_count,
         index_stale_count=sum(1 for r in stale_known if r["x_index_stale"]),
         index_stale_known=len(stale_known),
@@ -245,6 +266,20 @@ def _build_report(records: list[dict],
         window_end_ts_ms=max((_as_int(r.get("ts_ms")) for r in records),
                              default=None),
     )
+
+
+def _daemon_error_reason(raw: object) -> str:
+    """Bucket one `x_daemon_error` value by its `<reason>` prefix.
+
+    The hook writes `"<reason>: <detail>"` (see `_daemon_query`'s `_fail`),
+    where the detail is an exception message and carries no bounded
+    vocabulary. Only the reason is aggregatable, so the detail is dropped.
+    Anything the reason set doesn't know becomes `other` — dropping it
+    would make the breakdown disagree with `daemon_error_count`, and a
+    reason a newer hook invented is still worth seeing as a bucket.
+    """
+    reason = str(raw).split(":", 1)[0].strip()
+    return reason if reason in DAEMON_ERROR_REASONS else "other"
 
 
 def _repeat_injection_rate(hits: list[dict]) -> float:
@@ -287,6 +322,12 @@ def iter_auto_recall_records(
     entirely before the window — the date is the day the file was closed,
     so `date + 1 day < since` means every record inside predates it and
     the file never has to be opened.
+
+    Lines are screened against `_AUTO_RECALL_PROBES` before parsing. That
+    covers both separator styles `json.dumps` can emit (spaced and
+    compact), which is every writer that touches this log; a hand-rolled
+    writer that spaces the key differently (`"event" : ...`) would be
+    filtered out here, so keep the probes in step with the writers.
     """
     for path in _log_files(Path(log_path), since_ts_ms=since_ts_ms):
         try:
@@ -299,6 +340,14 @@ def iter_auto_recall_records(
                 # Cheap prefix check first: the log is tens of MB and most
                 # non-record lines are truncated writes, not objects.
                 if not line.startswith("{"):
+                    continue
+                # Only a slice of a multi-megabyte log is AutoRecall, and
+                # `json.loads` on the rest is the bulk of the runtime (5x
+                # on a 63 MB log). A substring probe cannot decide
+                # acceptance on its own — a record can name AutoRecall in
+                # some other field — so the parsed `event` is still
+                # checked below; this only rejects early.
+                if not any(probe in line for probe in _AUTO_RECALL_PROBES):
                     continue
                 try:
                     rec = json.loads(line)
@@ -556,6 +605,23 @@ _LABEL_WIDTH = 14
 _SCORE_BUCKET_ORDER = ("0.85+", "0.70-0.85", "0.50-0.70", "<0.50")
 
 
+def _daemon_error_segment(report: StatsReport) -> str:
+    """`"9 (no_socket 6, timeout 3)"`, or just `"9"` with no breakdown.
+
+    Ordered by count so the dominant reason reads first, ties broken
+    alphabetically so the line is stable between runs. An empty `()` on a
+    clean window would read as a truncated report, so it is omitted.
+    """
+    if not report.daemon_error_by_reason:
+        return str(report.daemon_error_count)
+    breakdown = ", ".join(
+        f"{reason} {n}" for reason, n in sorted(
+            report.daemon_error_by_reason.items(), key=lambda kv: (-kv[1], kv[0])
+        )
+    )
+    return f"{report.daemon_error_count} ({breakdown})"
+
+
 def render_human(report: StatsReport) -> str:
     """Format `report` as the user-facing block.
 
@@ -674,7 +740,7 @@ def _render_v12(report: StatsReport, total_fires: int,
         known = [n for n in ("daemon", "inproc") if n in report.path_split]
         extra = sorted(k for k in report.path_split if k not in ("daemon", "inproc"))
         split = ", ".join(f"{n} {report.path_split[n]}" for n in known + extra)
-        path_line = (f"{split} (daemon_error {report.daemon_error_count},"
+        path_line = (f"{split} (daemon_error {_daemon_error_segment(report)},"
                      f" degraded {report.degraded_count})")
         if report.index_stale_known:
             # Denominator is what actually reported, not the daemon count:
