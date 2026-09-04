@@ -659,14 +659,43 @@ class TestCli:
         assert not claims_brain["archived_dir"].exists()
 
     def test_dedupe_claims_json(self, runner, isolated_xdg, claims_brain):
+        """`--json --dedupe-claims` is ONE JSON document: findings and the
+        manifest live under keys of a single object, not two concatenated
+        top-level documents."""
         result = runner.invoke(
             app, ["lint", "--brain", str(claims_brain["root"]),
                   "--dedupe-claims", "--json"])
         assert result.exit_code == 1, result.output
-        for key in ('"file"', '"claim_id"', '"source_event_id"', '"reason"',
-                    '"keep"', '"detail"'):
-            assert key in result.output
-        assert '"duplicate_source_event"' in result.output
+
+        doc = json.loads(result.stdout)  # single top-level document
+
+        assert isinstance(doc, dict)
+        assert isinstance(doc["findings"], list)
+        assert doc["fix_digests"] is None, "unrequested surface is null"
+        assert doc["stub_min_chars"] == 0
+
+        manifest = doc["dedupe_claims"]
+        assert manifest["applied"] is False, "dry run by default"
+        actions = manifest["actions"]
+        assert actions
+        for action in actions:
+            assert set(action) == {"file", "claim_id", "source_event_id",
+                                   "reason", "keep", "detail"}
+        assert any(a["reason"] == "duplicate_source_event" for a in actions)
+
+    def test_json_with_both_manifests_is_still_one_document(
+            self, runner, isolated_xdg, claims_brain):
+        result = runner.invoke(
+            app, ["lint", "--brain", str(claims_brain["root"]),
+                  "--fix-digests", "--dedupe-claims", "--json",
+                  "--stub-min-chars", "200"])
+        assert result.exit_code == 1, result.output
+        doc = json.loads(result.stdout)
+        assert set(doc) == {"findings", "fix_digests", "dedupe_claims",
+                            "stub_min_chars"}
+        assert doc["stub_min_chars"] == 200
+        assert doc["fix_digests"] is not None
+        assert doc["dedupe_claims"] is not None
 
     def test_dedupe_claims_apply_with_stub_min_chars(
             self, runner, isolated_xdg, claims_brain):

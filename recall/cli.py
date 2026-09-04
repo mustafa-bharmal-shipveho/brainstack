@@ -774,7 +774,14 @@ def lint(
     ),
     json_out: bool = typer.Option(
         False, "--json",
-        help="Emit findings as JSON instead of the human-readable report.",
+        help="Emit findings as JSON instead of the human-readable report. "
+             "On its own this is a bare array of findings. Combined with "
+             "--fix-digests and/or --dedupe-claims it is a single object: "
+             '{"findings": [...], "fix_digests": {...}|null, '
+             '"dedupe_claims": {...}|null, "stub_min_chars": N} — every key '
+             "is always present, and a surface you did not ask for is null. "
+             "Either way stdout is exactly ONE JSON document, so it pipes "
+             "straight into jq.",
     ),
     brain: Optional[Path] = typer.Option(
         None, "--brain",
@@ -837,8 +844,15 @@ def lint(
     kinds = STALE_KINDS if stale else ALL_KINDS
     findings = lint_brain(brain_root, kinds=kinds)
 
+    # stdout must be ONE JSON document. When a manifest surface is also
+    # requested, the findings array becomes a key of a single object emitted
+    # once, after every manifest is computed — echoing it here as well would
+    # put two top-level documents on stdout and break `| jq`.
+    single_json = json_out and (fix_digests or dedupe_claims)
+
     if json_out:
-        typer.echo(_json.dumps([f.to_dict() for f in findings], indent=2))
+        if not single_json:
+            typer.echo(_json.dumps([f.to_dict() for f in findings], indent=2))
     else:
         from collections import Counter
 
@@ -894,8 +908,11 @@ def lint(
 
     # --fix-digests / --dedupe-claims: independent surfaces from the
     # dead-path/wikilink checks above. Both dry-run by default (--apply
-    # required to write); both print their own manifest instead of the
-    # findings list above when --json is set.
+    # required to write). Under --json each folds its manifest into the
+    # single object emitted below rather than echoing its own document.
+    digest_manifest: Optional[dict] = None
+    claim_manifest: Optional[dict] = None
+
     pending_digest_fixes: list = []
     if fix_digests:
         from recall.lint_digests import (
@@ -907,8 +924,9 @@ def lint(
         fixes = plan_digest_fixes(brain_root)
         applied_digests = apply_digest_fixes(fixes, dry_run=False) if apply else None
         if json_out:
-            typer.echo(_json.dumps(
-                [
+            digest_manifest = {
+                "applied": applied_digests is not None,
+                "fixes": [
                     {
                         "file": str(f.file),
                         "missing": list(f.missing),
@@ -917,8 +935,7 @@ def lint(
                     }
                     for f in fixes
                 ],
-                indent=2,
-            ))
+            }
         else:
             typer.echo(render_digest_manifest(fixes, brain_root, applied=applied_digests))
         pending_digest_fixes = (
@@ -938,8 +955,9 @@ def lint(
             apply_claim_dedupe(actions, brain_root, dry_run=False) if apply else None
         )
         if json_out:
-            typer.echo(_json.dumps(
-                [
+            claim_manifest = {
+                "applied": applied_claims is not None,
+                "actions": [
                     {
                         "file": str(a.file),
                         "claim_id": a.claim_id,
@@ -950,14 +968,24 @@ def lint(
                     }
                     for a in actions
                 ],
-                indent=2,
-            ))
+            }
         else:
             typer.echo(render_claim_manifest(actions, brain_root, applied=applied_claims))
         pending_claim_actions = (
             plan_claim_dedupe(brain_root, stub_min_chars=stub_min_chars)
             if apply else actions
         )
+
+    if single_json:
+        typer.echo(_json.dumps(
+            {
+                "findings": [f.to_dict() for f in findings],
+                "fix_digests": digest_manifest,
+                "dedupe_claims": claim_manifest,
+                "stub_min_chars": stub_min_chars,
+            },
+            indent=2,
+        ))
 
     if mark:
         # Reconcile flags against the FULL check suite, independent of the

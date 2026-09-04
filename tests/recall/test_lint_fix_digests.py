@@ -27,6 +27,7 @@ implementation shows up as failing tests, not a collection error).
 from __future__ import annotations
 
 import dataclasses
+import json
 import re
 from pathlib import Path
 
@@ -548,13 +549,48 @@ class TestCli:
         assert "0 file(s) would change" in third.output
 
     def test_fix_digests_json_manifest(self, runner, isolated_xdg, clean_digest_brain):
+        """`--json --fix-digests` is ONE JSON document, not two concatenated
+        ones. Piping to `jq` used to fail because the findings array and the
+        manifest were each echoed as a separate top-level document."""
         result = runner.invoke(
             app, ["lint", "--brain", str(clean_digest_brain),
                   "--fix-digests", "--json"])
         assert result.exit_code == 1, result.output
-        for key in ('"file"', '"missing"', '"proposed"', '"skipped_reason"'):
-            assert key in result.output
-        assert '"digest"' in result.output
+
+        doc = json.loads(result.stdout)  # single top-level document
+
+        assert isinstance(doc, dict)
+        assert doc["findings"] == []
+        assert doc["dedupe_claims"] is None, "unrequested surface is null"
+        assert doc["stub_min_chars"] == 0
+
+        manifest = doc["fix_digests"]
+        assert manifest["applied"] is False, "dry run by default"
+        fixes = manifest["fixes"]
+        assert fixes, "the clean brain has two backfillable digests"
+        for fix in fixes:
+            assert set(fix) == {"file", "missing", "proposed", "skipped_reason"}
+        assert any(f["proposed"].get("type") == "digest" for f in fixes
+                   if f["proposed"])
+
+    def test_json_without_manifest_flags_stays_a_bare_findings_array(
+            self, runner, isolated_xdg, clean_digest_brain):
+        """Backward compatibility: plain `--json` keeps emitting the bare
+        findings list that `agent/memory/auto_dream.py` and any `jq` caller
+        already parse."""
+        result = runner.invoke(
+            app, ["lint", "--brain", str(clean_digest_brain), "--json"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout) == []
+
+    def test_json_applied_manifest_reports_applied_true(
+            self, runner, isolated_xdg, clean_digest_brain):
+        result = runner.invoke(
+            app, ["lint", "--brain", str(clean_digest_brain),
+                  "--fix-digests", "--json", "--apply"])
+        assert result.exit_code == 0, result.output
+        doc = json.loads(result.stdout)
+        assert doc["fix_digests"]["applied"] is True
 
     def test_lint_without_the_flag_does_not_touch_digests(
             self, runner, isolated_xdg, clean_digest_brain):
