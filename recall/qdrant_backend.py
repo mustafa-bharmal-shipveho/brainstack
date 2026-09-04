@@ -655,6 +655,52 @@ def query_hybrid(
     return out
 
 
+def rerank_results(
+    query: str,
+    candidates: Sequence[QueryResult],
+    *,
+    reranker_model: str = _RERANKER_DEFAULT,
+    limit: int = _RERANK_OVERSAMPLE,
+) -> list[QueryResult]:
+    """Cross-encode a MERGED candidate pool once, and only `limit` deep.
+
+    `candidates` must already be in the caller's preferred pre-rerank order
+    (RRF score descending); the first `limit` are scored and the rest are
+    dropped. Dropping rather than keeping them un-scored is deliberate: the
+    two scales are not comparable (RRF fusion scores are small positives,
+    cross-encoder outputs are raw logits that are usually negative), so a
+    mixed list cannot be sorted meaningfully.
+
+    `limit` is a TOTAL budget. Callers that query several collections must
+    merge first and call this once — reranking per collection multiplies the
+    cost by the number of sources, which is the single most expensive thing
+    the retrieval path can do.
+
+    Returns the scored subset, rerank score descending, path breaking ties.
+    Each result keeps its RRF `score` and gains a `rerank_score`.
+    """
+    if limit <= 0 or not candidates:
+        return []
+    pool = list(candidates[:limit])
+    if len(pool) <= 1:
+        # Nothing to reorder; don't pay for a model load.
+        return pool
+
+    encoder = _get_cross_encoder(reranker_model)
+    # Cap the encoder input: rerank cost grows roughly linearly in token
+    # count, so a burst of long memories would otherwise blow the daemon's
+    # per-query budget. `eval/calibrate_rerank_gate.py` scores the same
+    # capped text, so the calibrated threshold matches what runs here.
+    texts = [c.document.text[:RERANK_TEXT_CAP] for c in pool]
+    scores = list(encoder.rerank(query, texts))
+    paired = list(zip(pool, scores))
+    paired.sort(key=lambda x: (-float(x[1]), x[0].document.path))
+    return [
+        QueryResult(document=c.document, score=c.score, rerank_score=float(s))
+        for c, s in paired
+    ]
+
+
 def query_hybrid_rerank(
     client: QdrantClient,
     collection: str,
@@ -701,26 +747,13 @@ def query_hybrid_rerank(
     )
     if not candidates:
         return []
-    if len(candidates) <= 1:
-        # Nothing to reorder. (We deliberately do NOT short-circuit at <=k:
-        # callers oversample `k` for a downstream policy/truncation step, so
-        # reranking still determines which candidates survive — skipping it
-        # there silently bypassed the cross-encoder.)
-        return candidates
-
-    encoder = _get_cross_encoder(reranker_model)
-    # Cap the encoder input: rerank cost grows roughly linearly in token
-    # count, so a burst of long memories would otherwise blow the daemon's
-    # per-query budget. `eval/calibrate_rerank_gate.py` scores the same
-    # capped text, so the calibrated threshold matches what runs here.
-    texts = [c.document.text[:RERANK_TEXT_CAP] for c in candidates]
-    rerank_scores = list(encoder.rerank(query, texts))
-    paired = list(zip(candidates, rerank_scores))
-    paired.sort(key=lambda x: (-float(x[1]), x[0].document.path))
-    return [
-        QueryResult(document=c.document, score=c.score, rerank_score=float(s))
-        for c, s in paired[:k]
-    ]
+    # We deliberately do NOT short-circuit at <=k: callers oversample `k` for
+    # a downstream policy/truncation step, so reranking still determines
+    # which candidates survive — skipping it there silently bypassed the
+    # cross-encoder.
+    return rerank_results(
+        query, candidates, reranker_model=reranker_model, limit=n
+    )[:k]
 
 
 def count(client: QdrantClient, collection: str) -> int:
