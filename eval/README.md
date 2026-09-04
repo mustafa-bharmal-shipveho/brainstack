@@ -33,6 +33,45 @@ is not a trivial 1.000. The credible public benchmark is **LongMemEval**
 `--dataset`, but running the full public set is tracked in `ROADMAP.md`, not
 done here.
 
+## `calibrate_rerank_gate.py`: what should `auto_recall_min_rerank` be?
+
+Auto-recall can refuse to inject a memory whose cross-encoder score is below
+`auto_recall_min_rerank`. That threshold is **model-specific** — cross-encoder
+outputs are raw logits, not probabilities — so it has to be measured, not
+guessed. This script sweeps every distinct score in a labelled set and reports
+precision, strict precision, relevance-2 recall and harmful (irrelevant)
+injections at each candidate threshold.
+
+```bash
+# Heavy: loads a real cross-encoder. Never runs in `make test-ci`.
+.venv/bin/python3 eval/calibrate_rerank_gate.py \
+    --labels eval/labels/rerank_gate_labels.jsonl \
+    --model jinaai/jina-reranker-v1-turbo-en \
+    --min-recall2 0.7 --write-results \
+    --curve-out eval/rerank_gate_curve.json
+
+# Compare a second model (omit --write-results so it doesn't clobber the report)
+.venv/bin/python3 eval/calibrate_rerank_gate.py \
+    --labels eval/labels/rerank_gate_labels.jsonl \
+    --model Xenova/ms-marco-MiniLM-L-6-v2 --min-recall2 0.7
+```
+
+Labels are JSONL, one `{"prompt", "path", "relevance", "set"}` per line, with
+`relevance` in `{0: irrelevant, 1: tangential, 2: directly relevant}`. Each
+pair is scored on the same text the daemon reranks:
+`_build_indexed_text(name, description, body)` truncated to
+`recall.qdrant_backend.RERANK_TEXT_CAP` (2000) chars. The chosen point is the
+highest-precision threshold that still recalls at least `--min-recall2` of the
+relevance-2 pairs; ties prefer the tighter threshold. `--write-results`
+replaces the block between `<!-- rerank-gate:start -->` and
+`<!-- rerank-gate:end -->` in [`RESULTS.md`](RESULTS.md); `--scores-cache PATH`
+reuses scores so you can re-sweep without reloading the model.
+
+Exit code: 0 when a viable threshold exists, 1 when none does, 2 on bad input.
+Re-run it whenever `ranking.reranker_model` changes — an old threshold on a new
+model is worse than no gate. Latest numbers, the model comparison and the
+measured rerank latency are in [`RESULTS.md`](RESULTS.md).
+
 ## `auto_recall_harness.py`: manual side-by-side grading
 
 Generates prompt pairs (with/without injected context) for human grading. See

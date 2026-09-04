@@ -82,11 +82,10 @@ def dense_fallback_active() -> bool:
     """True when this process has warned (and is running on) BM25-only
     fallback because the dense embedder was unavailable.
 
-    Scaffold stub: always False. Real behavior mirrors
-    `_SPARSE_FALLBACK_WARN_ONCE.is_set()` so the hook can report
-    `x_degraded` honestly once wired up.
+    Mirrors `_SPARSE_FALLBACK_WARN_ONCE.is_set()` so the hook can report
+    `x_degraded` honestly instead of guessing.
     """
-    return False
+    return _SPARSE_FALLBACK_WARN_ONCE.is_set()
 
 
 # FastEmbed types are imported lazily so unit tests that monkeypatch the
@@ -150,7 +149,9 @@ def _qdrant_busy_message(cache_dir: Path) -> str:
     return (
         f"embedded Qdrant index is busy at {qdrant_path}; another recall process "
         "is using it. Retry shortly, use a separate XDG_CACHE_HOME, or run a "
-        "shared recall/Qdrant service for heavy concurrent agents."
+        "shared recall/Qdrant service for heavy concurrent agents. "
+        "If `recall serve --status` shows a running daemon, use the CLI (it "
+        "routes through the daemon) or stop it with `recall serve --stop`."
     )
 
 
@@ -670,11 +671,19 @@ def query_hybrid_rerank(
     """Hybrid query + cross-encoder rerank.
 
     1. Pull top-`rerank_n` from `query_hybrid` (oversample)
-    2. Score every (query, doc.text) pair with the cross-encoder
+    2. Score every (query, doc.text[:RERANK_TEXT_CAP]) pair with the
+       cross-encoder
     3. Sort by rerank score descending, return top-k
 
-    The cross-encoder scores are 0-1 floats from FastEmbed and replace the
-    Qdrant fusion score in the returned `QueryResult.score` for transparency.
+    Both scores survive: the cheap Qdrant RRF fusion score stays in
+    `QueryResult.score` and the cross-encoder score lands in
+    `QueryResult.rerank_score`. The S4 relevance gate needs both — the RRF
+    score as a cheap pre-filter, the rerank score as the decision — and the
+    telemetry reports them separately.
+
+    Cross-encoder outputs are RAW model scores, not calibrated probabilities;
+    the range is model-specific (see `eval/RESULTS.md` for the observed range
+    of the calibrated model). Do not assume 0-1.
     """
     if k <= 0:
         return []
@@ -700,12 +709,16 @@ def query_hybrid_rerank(
         return candidates
 
     encoder = _get_cross_encoder(reranker_model)
-    texts = [c.document.text for c in candidates]
+    # Cap the encoder input: rerank cost grows roughly linearly in token
+    # count, so a burst of long memories would otherwise blow the daemon's
+    # per-query budget. `eval/calibrate_rerank_gate.py` scores the same
+    # capped text, so the calibrated threshold matches what runs here.
+    texts = [c.document.text[:RERANK_TEXT_CAP] for c in candidates]
     rerank_scores = list(encoder.rerank(query, texts))
     paired = list(zip(candidates, rerank_scores))
-    paired.sort(key=lambda x: -float(x[1]))
+    paired.sort(key=lambda x: (-float(x[1]), x[0].document.path))
     return [
-        QueryResult(document=c.document, score=float(s))
+        QueryResult(document=c.document, score=c.score, rerank_score=float(s))
         for c, s in paired[:k]
     ]
 
