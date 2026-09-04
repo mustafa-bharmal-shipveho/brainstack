@@ -71,6 +71,16 @@ SIZE_LIMIT_BYTES = 50 * 1024 * 1024
 # 51 MB: comfortably over the limit, for the plain "held back" cases.
 OVERSIZE_BYTES = 51 * 1024 * 1024
 
+# 40 MB: the "before" size for the rename+oversize test. Git only reports a
+# staged delete+add pair as a rename (`R<NNN>` in --name-status -M) when the
+# two blobs clear its similarity threshold (50% by default) — an all-zero
+# sparse file compared against a longer all-zero sparse file scores on
+# shared length, so this must be a large enough fraction of OVERSIZE_BYTES
+# to clear that bar (40 / 51 MB ≈ 78%, well above 50%). A byte-tiny "before"
+# file would make git report a plain delete + add instead of a rename, which
+# would not exercise the code path this test targets.
+RENAME_BASE_BYTES = 40 * 1024 * 1024
+
 _COPY_IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", ".pytest_cache")
 
 # Stand-in for the `recall` CLI. Implements only the contract sync.sh
@@ -404,6 +414,94 @@ def test_size_gate_boundary_at_50mib_and_one_byte_over(brain_repo):
     assert any(summary in ln for ln in lines), (
         f"expected a count of exactly 1 held-back file (the at-limit file "
         f"must not be counted)\n{_debug(res, brain_repo)}"
+    )
+
+
+def test_rename_plus_oversize_restores_rename_source(brain_repo):
+    """A tracked file that is renamed AND grown past the size limit in the
+    same run must not lose its old path off the remote.
+
+    `git diff --cached --name-only` for a staged rename reports only the
+    new path (the paired deletion of the old path is a separate index
+    entry). Resetting just the new (oversize) path out of this commit
+    leaves that old-path deletion staged — so the commit would delete the
+    memory from its old location on the remote while ALSO withholding the
+    new, oversized content: the memory is lost outright, not just delayed.
+    The fix mirrors the secret-quarantine gate above it: restore the
+    rename's source alongside the oversize destination, so a rename+
+    oversize is a clean no-op and the old path stays on the remote,
+    unchanged.
+    """
+    old_path = brain_repo.brain / "memory" / "notes" / "renamed.md"
+    _write_sparse(old_path, RENAME_BASE_BYTES)
+
+    # Commit + push the tracked file on its own first, so it has a history
+    # on the remote to lose.
+    res = _run_sync(brain_repo)
+    assert res.returncode == 0, _debug(res, brain_repo)
+    pushed_before = _git(
+        brain_repo.env, brain_repo.remote,
+        "ls-tree", "-r", "--name-only", "HEAD",
+    ).stdout.split()
+    assert "memory/notes/renamed.md" in pushed_before, _debug(res, brain_repo)
+
+    # Rename it, then grow the new path past the size limit. Growing it in
+    # place (rather than appending) still leaves it a large all-zero sparse
+    # file like the "before" one, which is what keeps git's own rename
+    # detection (see RENAME_BASE_BYTES) recognising the pair.
+    _git(brain_repo.env, brain_repo.brain, "mv",
+         "memory/notes/renamed.md", "memory/notes/renamed_big.md")
+    new_path = brain_repo.brain / "memory" / "notes" / "renamed_big.md"
+    _write_sparse(new_path, OVERSIZE_BYTES)
+
+    res = _run_sync(brain_repo)
+    assert res.returncode == 0, _debug(res, brain_repo)
+
+    lines = _log_lines(brain_repo)
+    per_file = (f"sync: oversize (not pushed): memory/notes/renamed_big.md "
+                f"({OVERSIZE_BYTES} bytes > {SIZE_LIMIT_BYTES}-byte limit)")
+    assert any(per_file in ln for ln in lines), (
+        f"missing oversize marker for the renamed destination\n"
+        f"{_debug(res, brain_repo)}"
+    )
+
+    pushed_after = _git(
+        brain_repo.env, brain_repo.remote,
+        "ls-tree", "-r", "--name-only", "HEAD",
+    ).stdout.split()
+    assert "memory/notes/renamed.md" in pushed_after, (
+        "the rename source was not restored: the old path was deleted from "
+        "the remote while the oversized new path was withheld, so the "
+        f"memory was lost outright; remote tree:\n{pushed_after}\n\n"
+        f"{_debug(res, brain_repo)}"
+    )
+    assert "memory/notes/renamed_big.md" not in pushed_after, (
+        "the 51 MB renamed destination was pushed despite the size gate; "
+        f"remote tree:\n{pushed_after}\n\n{_debug(res, brain_repo)}"
+    )
+
+    # The old path on the remote is exactly the blob that was pushed
+    # before the rename — untouched, not a truncated or empty stand-in.
+    old_size = _git(
+        brain_repo.env, brain_repo.remote,
+        "cat-file", "-s", "HEAD:memory/notes/renamed.md",
+    ).stdout.strip()
+    assert old_size == str(RENAME_BASE_BYTES), (
+        f"remote old-path size changed unexpectedly: {old_size!r}\n"
+        f"{_debug(res, brain_repo)}"
+    )
+
+    # The new path stays dirty/untracked so a later run (once it shrinks,
+    # or a human untracks it) re-checks the rename automatically — same
+    # contract as the plain oversize case and the secret-quarantine path.
+    tracked_new = subprocess.run(
+        ["git", "ls-files", "--", "memory/notes/renamed_big.md"],
+        cwd=str(brain_repo.brain), env=brain_repo.env,
+        capture_output=True, text=True, timeout=60,
+    ).stdout.strip()
+    assert tracked_new == "", (
+        f"memory/notes/renamed_big.md is still tracked in the index: "
+        f"{tracked_new!r}"
     )
 
 
