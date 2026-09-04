@@ -77,6 +77,18 @@ def _is_needs_review(doc: Document) -> bool:
     return False
 
 
+def _rank_key(r: QueryResult) -> tuple[float, str]:
+    """Sort key: best signal first, path as the deterministic tie-break.
+
+    The cross-encoder score is the more accurate signal and the one the S4
+    relevance gate thresholds on, so it wins whenever it is present. Results
+    from a no-reranker path carry `rerank_score is None` and fall back to the
+    cheap RRF `score`, which is today's behaviour unchanged.
+    """
+    primary = r.rerank_score if r.rerank_score is not None else r.score
+    return (-float(primary), r.document.path)
+
+
 def apply_review_policy(
     results: list[QueryResult], policy: str, penalty: float
 ) -> list[QueryResult]:
@@ -84,10 +96,13 @@ def apply_review_policy(
 
     - "exclude": flagged memories are removed entirely.
     - "demote":  flagged memories keep their place in the candidate set but
-                 their score is multiplied by `penalty`, so fresh memories of
-                 comparable relevance outrank them. Results are re-sorted
-                 (score desc, then path) so the caller's top-k truncation
-                 reflects the penalty.
+                 BOTH their RRF `score` and their `rerank_score` (when they
+                 have one) are multiplied by `penalty`, so fresh memories of
+                 comparable relevance outrank them. Scaling only the RRF
+                 score would let a stale doc with a high cross-encoder score
+                 keep the top slot AND sail through `auto_recall_min_rerank`
+                 at full strength. Results are re-sorted by `_rank_key` so
+                 the caller's top-k truncation reflects the penalty.
     - anything else ("ignore"): returned unchanged.
 
     Pure and order-stable for non-flagged inputs; safe to call on any list.
@@ -98,12 +113,18 @@ def apply_review_policy(
         return [r for r in results if not _is_needs_review(r.document)]
     if policy == "demote":
         adjusted = [
-            QueryResult(document=r.document, score=r.score * penalty)
+            QueryResult(
+                document=r.document,
+                score=r.score * penalty,
+                rerank_score=(
+                    r.rerank_score * penalty if r.rerank_score is not None else None
+                ),
+            )
             if _is_needs_review(r.document)
             else r
             for r in results
         ]
-        adjusted.sort(key=lambda r: (-r.score, r.document.path))
+        adjusted.sort(key=_rank_key)
         return adjusted
     return results
 
@@ -200,8 +221,8 @@ class HybridRetriever:
         source_filter: Optional[str] = None,
         # S4: explicit override for whether to rerank. `None` (default)
         # preserves today's behavior (driven by `self._reranker`); a caller
-        # (the daemon) may force True/False. Scaffold: accepted, not yet
-        # wired into `use_rerank` below.
+        # (the daemon holds ONE retriever and flips reranking per request)
+        # may force True/False.
         rerank: Optional[bool] = None,
     ) -> list[QueryResult]:
         from recall import qdrant_backend as qb
@@ -226,7 +247,7 @@ class HybridRetriever:
             fetch_n = max(2 * k, self._rerank_n, k + 10)
 
         merged: list[QueryResult] = []
-        use_rerank = self._reranker == "cross_encoder"
+        use_rerank = self._reranker == "cross_encoder" if rerank is None else bool(rerank)
         for coll in targets:
             if use_rerank:
                 # Return fetch_n reranked results (headroom for the
@@ -264,8 +285,8 @@ class HybridRetriever:
                         mode=self._mode,
                     )
                 )
-        # Stable sort by score desc, then path for determinism
-        merged.sort(key=lambda r: (-r.score, r.document.path))
+        # Stable sort: rerank score when present, else RRF score; path breaks ties.
+        merged.sort(key=_rank_key)
         # Down-rank / drop needs_review memories, then truncate to k.
         merged = apply_review_policy(
             merged, self._needs_review_policy, self._needs_review_penalty
