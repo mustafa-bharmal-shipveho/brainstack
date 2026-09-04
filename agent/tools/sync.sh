@@ -414,7 +414,7 @@ while IFS= read -r -d '' f; do
     fi
 done < <(git diff --cached --name-only --diff-filter=d -z)
 if [ "$N_OVERSIZE" -gt 0 ]; then
-    echo "$(date -u +%FT%TZ) sync: held back $N_OVERSIZE oversize file(s) (>50 MB); syncing the rest" >> "$LOG_FILE"
+    echo "$(date -u +%FT%TZ) sync: held back $N_OVERSIZE oversize file(s) (>$(( ${SYNC_MAX_FILE_BYTES:-52428800} / 1048576 )) MB); syncing the rest" >> "$LOG_FILE"
 fi
 
 # Anything to commit?
