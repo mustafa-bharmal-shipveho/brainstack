@@ -32,20 +32,22 @@ $RECALL_RUNTIME_CONFIG.)
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import random
 import sys
 from pathlib import Path
 
-# Must match runtime/core/events.py EVENT_LOG_SCHEMA_VERSION. Hardcoded so
-# this script stays standalone (runnable without PYTHONPATH=repo-root); the
-# import below picks up the live value when the repo is importable.
-EVENT_SCHEMA_VERSION = "1.1"
-try:  # pragma: no cover - best effort, fallback is fine
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from runtime.core.events import EVENT_LOG_SCHEMA_VERSION as EVENT_SCHEMA_VERSION  # noqa: F401
-except Exception:
-    pass
+# Telemetry contract version this demo's events.log.jsonl emits. Hardcoded
+# to "1.2" (NOT imported from runtime.core.events.EVENT_LOG_SCHEMA_VERSION):
+# that constant deliberately still reads "1.1" on-disk today — the runtime
+# writer hasn't caught up to the v1.2 extension semantics yet, per the
+# comment at runtime/core/events.py:31 — so importing it would silently
+# regress this demo back to schema 1.1 the moment the repo is importable.
+# The demo targets the CONTRACT `recall/stats.py` (`is_v12`) and
+# `tests/recall/test_stats.py`'s `_v12` helper already understand, which is
+# "1.2" unconditionally. Bump this only if that contract's version changes.
+EVENT_SCHEMA_VERSION = "1.2"
 
 
 # The synthetic session the hero lesson traces back to. Appears in the
@@ -268,8 +270,144 @@ def _candidates(now: datetime.datetime) -> list[dict]:
 
 # ---------------------------------------------------------------------------
 # Synthetic AutoRecall telemetry so `recall stats --since 7d` has data.
-# Line shape matches runtime/core/events.py (required keys + x_* extensions).
+#
+# Telemetry contract v1.2 (recall/stats.py `is_v12` + `_build_report`, and
+# tests/recall/test_stats.py's `_v12` helper):
+#
+#   x_outcome      hit | miss | dedup | skip | timeout | unavailable | error
+#   x_path         daemon | inproc                (every non-skip outcome)
+#   x_daemon_error str | None       x_degraded  bool
+#   x_index_stale  bool             (daemon-path fires only)
+#   x_latency_ms   full worker wall     x_query_ms  retrieval-only wall
+#   x_k_requested / x_k_candidates / x_k_gated_out / x_k_dedup / x_k_returned
+#   x_paths        brain-relative injected paths (hit only; x_k_returned ==
+#                  len(x_paths)) + x_paths_truncated + x_paths_hash
+#   x_top_scores   RRF scores (0..1)     x_rerank_scores  raw cross-encoder
+#                  logits (roughly -3..1 per the S4 calibration — see
+#                  RERANK_BUCKET_EDGES in recall/stats.py)
+#   x_sources      per-source counts of the injected docs
+#
+# A "hit" missing `x_paths` is demoted to legacy by `is_v12` — the whole
+# point of the v1.2 contract is that a hit can be joined back to the docs
+# it actually injected, not just a claimed count. So every hit below
+# carries real x_paths pulled from _HIT_DOC_POOL (the lessons + import note
+# this same script writes to disk), and `recall stats`' "Top docs" line
+# ends up naming files that exist in the demo brain.
 # ---------------------------------------------------------------------------
+
+# (path, source) for every synthetic doc a hit is allowed to "inject".
+# Brain-relative (relative to BRAIN_ROOT), matching what the real hook
+# reports. Mirrors LESSONS (the `brain` source) plus the one `imports` doc
+# written near the end of `main()`.
+_HIT_DOC_POOL: list[tuple[str, str]] = [
+    (f"memory/semantic/lessons/{lesson['file']}", "brain") for lesson in LESSONS
+] + [
+    ("imports/acme_oncall_handoff_notes.md", "imports"),
+]
+
+
+def _paths_hash(paths: list[str]) -> str:
+    """Same recipe as runtime/adapters/claude_code/auto_recall.py: a stable
+    hash of the sorted, newline-joined path list, truncated to 16 hex chars.
+    """
+    blob = "\n".join(sorted(paths)).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()[:16]
+
+
+def _daemon_fields() -> dict:
+    """Shared flags on every daemon-path, non-skip fire. `x_index_stale` is
+    only ever reported on the daemon path — the in-process path has no
+    freshness signal of its own — so a demo hit/miss/timeout that claims
+    `x_path="daemon"` always sets it, here `False` (the demo's index is
+    freshly built by `recall reindex` moments earlier).
+    """
+    return {
+        "x_path": "daemon",
+        "x_daemon_error": None,
+        "x_degraded": False,
+        "x_index_stale": False,
+    }
+
+
+def _hit_event(rng: random.Random, base: dict, *, k_requested: int = 3) -> dict:
+    """A prompt where retrieval ran and at least one doc cleared the gate."""
+    docs = rng.sample(_HIT_DOC_POOL, rng.choice([1, 2]))
+    paths = [path for path, _ in docs]
+    sources: dict[str, int] = {}
+    for _, source in docs:
+        sources[source] = sources.get(source, 0) + 1
+    latency = rng.randint(180, 420)
+    e = dict(base)
+    e.update(_daemon_fields())
+    e.update(
+        {
+            "x_outcome": "hit",
+            "x_latency_ms": latency,
+            "x_query_ms": max(20, latency - rng.randint(60, 140)),
+            "x_k_requested": k_requested,
+            "x_k_candidates": len(docs) + rng.randint(1, 3),
+            "x_k_gated_out": rng.randint(0, 1),
+            "x_k_dedup": 0,
+            "x_k_returned": len(docs),
+            "x_paths": paths,
+            "x_paths_truncated": False,
+            "x_paths_hash": _paths_hash(paths),
+            "x_top_scores": sorted(
+                (round(rng.uniform(0.5, 0.95), 2) for _ in docs), reverse=True
+            ),
+            "x_rerank_scores": [round(rng.uniform(-3.0, 1.0), 2) for _ in docs],
+            "x_sources": sources,
+        }
+    )
+    return e
+
+
+def _miss_event(rng: random.Random, base: dict, *, k_requested: int = 3) -> dict:
+    """Retrieval ran; every candidate was gated out before injection."""
+    candidates = rng.randint(2, 5)
+    latency = rng.randint(140, 340)
+    e = dict(base)
+    e.update(_daemon_fields())
+    e.update(
+        {
+            "x_outcome": "miss",
+            "x_latency_ms": latency,
+            "x_query_ms": max(15, latency - rng.randint(50, 110)),
+            "x_k_requested": k_requested,
+            "x_k_candidates": candidates,
+            "x_k_gated_out": candidates,
+            "x_k_dedup": 0,
+            "x_k_returned": 0,
+        }
+    )
+    return e
+
+
+def _skip_event(base: dict, *, reason: str = "too_short") -> dict:
+    """No retriever call at all — filtered before the worker ever starts."""
+    e = dict(base)
+    e.update({"x_outcome": "skip", "x_skip_reason": reason})
+    return e
+
+
+def _timeout_event(rng: random.Random, base: dict, *, k_requested: int = 3) -> dict:
+    """Retrieval started but blew past the worker budget before returning."""
+    e = dict(base)
+    e.update(_daemon_fields())
+    e.update(
+        {
+            "x_outcome": "timeout",
+            "x_latency_ms": rng.randint(3000, 5000),
+            "x_query_ms": rng.randint(2800, 4800),
+            "x_k_requested": k_requested,
+            "x_k_candidates": 0,
+            "x_k_gated_out": 0,
+            "x_k_dedup": 0,
+            "x_k_returned": 0,
+        }
+    )
+    return e
+
 
 def _auto_recall_events(now_ms: int) -> list[dict]:
     rng = random.Random(42)  # deterministic demo data
@@ -285,29 +423,20 @@ def _auto_recall_events(now_ms: int) -> list[dict]:
             "turn": 0,
         }
 
-    # 9 hits spread over the past ~5 days
-    for i in range(9):
-        e = base(now_ms - (6 + i * 13) * hour)
-        k = rng.choice([2, 3, 3])
-        e.update(
-            {
-                "x_outcome": "hit",
-                "x_latency_ms": rng.randint(180, 420),
-                "x_k_returned": k,
-                "x_sources": {"brain": k},
-                "x_top_scores": [round(rng.uniform(0.55, 0.93), 2) for _ in range(k)],
-            }
-        )
-        events.append(e)
+    # 6 hits spread over the past ~5 days — the pool includes the hero
+    # lesson this demo's beat 1 injects live, so `recall stats`' "Top docs"
+    # line names a file the recording actually shows on camera.
+    for i in range(6):
+        events.append(_hit_event(rng, base(now_ms - (6 + i * 15) * hour)))
 
-    # 3 skips (prompt too short) + 1 timeout for realistic diagnostics
+    # 3 misses: retrieval ran but nothing cleared the relevance gate.
     for i in range(3):
-        e = base(now_ms - (9 + i * 17) * hour)
-        e.update({"x_outcome": "skip", "x_skip_reason": "too-short"})
-        events.append(e)
-    e = base(now_ms - 50 * hour)
-    e.update({"x_outcome": "timeout"})
-    events.append(e)
+        events.append(_miss_event(rng, base(now_ms - (11 + i * 19) * hour)))
+
+    # 1 skip (prompt too short to bother the retriever) + 1 timeout, for
+    # realistic diagnostics.
+    events.append(_skip_event(base(now_ms - 70 * hour), reason="too_short"))
+    events.append(_timeout_event(rng, base(now_ms - 90 * hour)))
 
     events.sort(key=lambda ev: ev["ts_ms"])
     return events
