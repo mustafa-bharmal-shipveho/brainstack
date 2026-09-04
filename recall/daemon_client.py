@@ -171,6 +171,8 @@ def query(
         "source": source_filter,
         "type": type_filter,
         "rerank": rerank,
+        # Queue-wait hint: the daemon bounds its server-side wait by ~2x this.
+        "budget_ms": int(budget_ms),
     }
     return request(socket_path, payload, budget_ms=budget_ms)
 

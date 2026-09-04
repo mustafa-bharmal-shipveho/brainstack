@@ -219,3 +219,5 @@ def test_query_happy_path_returns_payload(fake_server):
     assert seen[0]["v"] == 1
     assert seen[0]["prompt"] == "atomic writes"
     assert seen[0]["k"] == 3
+    # the server bounds its queue wait by ~2x this hint, so it must be forwarded
+    assert seen[0]["budget_ms"] == 1000
