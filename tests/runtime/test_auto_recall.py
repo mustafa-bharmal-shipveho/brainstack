@@ -188,6 +188,24 @@ class TestBuildRecallBlock:
         # a list of zeros (a miss must stay distinguishable from a 0.0 score).
         assert telemetry["x_rerank_scores"] == []
 
+    def test_singular_doc_count_uses_singular_noun(self):
+        """`1 docs surfaced` reads as a typo. With exactly one result the
+        header must say `1 doc surfaced`, not `1 docs surfaced`."""
+        from runtime.adapters.claude_code.auto_recall import build_recall_block
+        retr = _FakeRetriever(results=[
+            _FakeQueryResult(
+                path="/brain/imports/kb/key-contacts.md",
+                source="imports", name="key-contacts", score=0.84,
+                body="Mike: head of platform.",
+            ),
+        ])
+        block, telemetry = build_recall_block(
+            "who is the head of platform?", retr, k=5, budget_tokens=1500,
+        )
+        assert "auto-recall: 1 doc surfaced" in block
+        assert "auto-recall: 1 docs surfaced" not in block
+        assert telemetry["x_k_returned"] == 1
+
     def test_empty_results_emit_no_block(self):
         """Retrieval ran and returned nothing. That is a MISS, not a hit:
         `recall stats` cannot compute a real hit rate while every fire is
@@ -544,8 +562,9 @@ class TestTelemetryContractV12:
             budget_tokens=1500, dedup_store=store,
         )
 
-        # Regex 1 — the sampler's docs+latency counter.
-        header = re.search(r"auto-recall: (\d+) docs surfaced in (\d+)ms", block)
+        # Regex 1 — the sampler's docs+latency counter. `docs?` because the
+        # header pluralizes the noun: "1 doc surfaced" / "2 docs surfaced".
+        header = re.search(r"auto-recall: (\d+) docs? surfaced in (\d+)ms", block)
         assert header is not None, f"header regex did not match:\n{block}"
         assert header.group(1) == "1"
 
@@ -1021,3 +1040,35 @@ class TestInjectionHardening:
         assert len(non_none) == 1, (
             f"expected exactly one attributed doc, got labels {labels!r}"
         )
+
+    def test_truncated_excerpt_carries_a_marker(self):
+        """A body longer than the 500-char excerpt cap is cut mid-sentence
+        with nothing to signal that it continues. Append a marker inside
+        the fence, after the excerpt, so a reading model can tell a
+        truncated excerpt from a complete one."""
+        from recall.sanitize import close_fence
+        from runtime.adapters.claude_code.auto_recall import build_recall_block
+        long_body = "word " * 200  # 1000 chars, well over the 500-char cap
+        retr = _FakeRetriever(results=[
+            _FakeQueryResult(path="/brain/long.md", source="brain",
+                             name="long", score=0.9, body=long_body),
+        ])
+        block, _ = build_recall_block("q", retr, k=5, budget_tokens=1500)
+        assert " … [excerpt truncated]" in block
+        # Marker sits inside the fence, after the excerpt — before the
+        # closing fence line, not after it.
+        marker_idx = block.index("[excerpt truncated]")
+        close_idx = block.index(close_fence(1))
+        assert marker_idx < close_idx
+
+    def test_untruncated_excerpt_has_no_marker(self):
+        """A body that fits within the cap is rendered whole — no marker,
+        since nothing was cut."""
+        from runtime.adapters.claude_code.auto_recall import build_recall_block
+        retr = _FakeRetriever(results=[
+            _FakeQueryResult(path="/brain/short.md", source="brain",
+                             name="short", score=0.9,
+                             body="a short body well under the cap"),
+        ])
+        block, _ = build_recall_block("q", retr, k=5, budget_tokens=1500)
+        assert "[excerpt truncated]" not in block

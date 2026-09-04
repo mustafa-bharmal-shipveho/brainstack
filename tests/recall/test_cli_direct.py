@@ -163,6 +163,59 @@ def test_doctor_reports_missing_path(runner, isolated_xdg, write_config):
     assert "ghost" in result.stdout or "/nonexistent" in result.stdout
 
 
+def test_doctor_missing_path_printed_once_when_configured_equals_resolved(
+    runner, isolated_xdg, write_config
+):
+    """The configured path here is already a literal absolute path, so
+    `resolved_path` is byte-identical to it. Printing an arrow between two
+    copies of the same string ("<p> -> <p>") would falsely imply a mapping
+    happened; print the path once instead."""
+    write_config(
+        sources=[
+            {
+                "name": "ghost",
+                "path": "/nonexistent/path/should/not/exist",
+                "glob": "**/*.md",
+                "frontmatter": "optional",
+                "exclude": [],
+            }
+        ]
+    )
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 1
+    assert (
+        "Source 'ghost' path missing: /nonexistent/path/should/not/exist"
+        in result.stdout
+    )
+    assert "→" not in result.stdout
+
+
+def test_doctor_missing_path_shows_arrow_when_configured_path_differs(
+    runner, isolated_xdg, write_config
+):
+    """When the configured path uses a `$VAR` that expands to something
+    else, the resolved path genuinely differs from what's in config.json —
+    show both, joined by an arrow, so the user can see what expanded to
+    what."""
+    write_config(
+        sources=[
+            {
+                "name": "imports",
+                "path": "$BRAIN_HOME/imports-ghost",
+                "glob": "**/*.md",
+                "frontmatter": "optional",
+                "exclude": [],
+            }
+        ]
+    )
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 1
+    assert (
+        "Source 'imports' path missing: $BRAIN_HOME/imports-ghost → "
+        in result.stdout
+    )
+
+
 # ---------------------------------------------------------------------------
 # Doctor adoption-audit checks (red phase: behavior not implemented yet)
 #

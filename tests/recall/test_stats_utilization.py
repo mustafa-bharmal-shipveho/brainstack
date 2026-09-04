@@ -512,6 +512,32 @@ class TestParseInjectionBlock:
         assert parse_injection_block("auto-recall: 0 docs surfaced in 12ms") == []
 
 
+class TestHeaderRegexAcceptsSingularDocCount:
+    """auto_recall.py pluralizes the header noun: "1 doc surfaced" for a
+    single result, "2 docs surfaced" otherwise. The join's own header
+    regex gates whether an attachment record is even considered an
+    auto-recall injection — it must recognize both spellings, or a
+    single-doc hit silently stops joining the moment the header wording
+    changes."""
+
+    def test_singular_and_plural_headers_both_recognized(self):
+        from recall.utilization import _attachment_content
+
+        def _rec(content: str) -> dict:
+            return {
+                "type": "attachment",
+                "attachment": {
+                    "hookName": "UserPromptSubmit",
+                    "content": content,
+                },
+            }
+
+        singular = _rec("auto-recall: 1 doc surfaced in 42ms · brainstack")
+        plural = _rec("auto-recall: 2 docs surfaced in 42ms · brainstack")
+        assert _attachment_content(singular) == singular["attachment"]["content"]
+        assert _attachment_content(plural) == plural["attachment"]["content"]
+
+
 # ---------------------------------------------------------------------------
 # (b) LLM-judge sample
 # ---------------------------------------------------------------------------

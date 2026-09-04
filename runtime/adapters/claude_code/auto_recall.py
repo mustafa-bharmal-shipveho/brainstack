@@ -45,6 +45,12 @@ _ACKS = frozenset({
 # keep individual docs from dominating the block.
 _EXCERPT_CHAR_CAP = 500
 
+# Appended after an excerpt that got cut at _EXCERPT_CHAR_CAP, inside the
+# fence, so the reading model can tell a truncated excerpt from a complete
+# one instead of silently hitting a mid-sentence cutoff. No marker when the
+# body fit whole.
+_TRUNCATION_MARKER = " … [excerpt truncated]"
+
 # Telemetry payload size constraint (events.py:122 enforces 1024 bytes per
 # x_* value). We cap arrays at 3 entries and round floats so a single x_*
 # field never serializes anywhere near that limit.
@@ -320,7 +326,14 @@ def build_recall_block(
         rerank_part = (
             "" if c.rerank_score is None else f" · rerank {c.rerank_score:.2f}"
         )
+        # Truncation is decided against the fully neutralized, uncapped
+        # length — the same quantity sanitize_untrusted's own max_len branch
+        # compares against — so the marker appears iff the body actually got
+        # cut, never for a body that just happens to end near the cap.
+        was_truncated = len(sanitize_untrusted(c.body)) > _EXCERPT_CHAR_CAP
         excerpt = sanitize_untrusted(c.body, max_len=_EXCERPT_CHAR_CAP)
+        if was_truncated:
+            excerpt = f"{excerpt}{_TRUNCATION_MARKER}"
         section = (
             f"## {c.path} (score {c.score:.2f}){rerank_part}"
             f" · provenance: {provenance_label(c.frontmatter)}\n"
@@ -400,9 +413,10 @@ def _render_header(*, n_docs: int, n_dedup: int, query_ms: int,
     """
     score_str = "/".join(f"{s:.2f}" for s in top_scores) if top_scores else "n/a"
     sources_str = ", ".join(f"{s}={n}" for s, n in source_counts.most_common())
+    doc_noun = "doc" if n_docs == 1 else "docs"
     lines = [
         "<system-reminder>",
-        f"auto-recall: {n_docs} docs surfaced in {query_ms}ms · top scores {score_str}",
+        f"auto-recall: {n_docs} {doc_noun} surfaced in {query_ms}ms · top scores {score_str}",
     ]
     if n_dedup > 0:
         lines.append(f"dedup: {n_dedup} already shown this session")

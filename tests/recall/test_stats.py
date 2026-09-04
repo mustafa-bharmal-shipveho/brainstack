@@ -721,7 +721,7 @@ class TestRenderHuman:
         assert "  Dedup:        14 (8%) every passing doc was already shown this session" in out
         assert "  Timeout:      5 (3%) · unavailable 2 · error 1" in out
         assert ("  Path:         daemon 171, inproc 9 (daemon_error 9, degraded 0)"
-                " · index stale 3 / 160 daemon fires") in out
+                " · index stale 3 / 160 fires that reported staleness") in out
         assert "  Latency:      worker p50 240ms, p95 810ms · query p50 95ms, p95 400ms" in out
         assert ("  Docs:         301 injected (avg 3.1 per hit) · repeat-injection 0.0%"
                 " · candidates 900, gated out 540, dedup 59") in out
@@ -735,15 +735,17 @@ class TestRenderHuman:
         assert "recall stats --utilization" in out
 
     def test_render_path_line_reports_index_staleness(self):
-        """The staleness segment reads "N / M daemon fires" where M is
-        `index_stale_known`, not the daemon count — the two differ
-        whenever a daemon call timed out before reporting. With nothing
-        known the segment is omitted; printing "0 / 0" would read as
-        "the index is fresh" when the truth is "nobody checked"."""
+        """The staleness segment reads "N / M fires that reported staleness"
+        where M is `index_stale_known`, not the daemon count — the two
+        differ whenever a daemon call timed out before reporting, and
+        "daemon fires" as the denominator label reads as an arithmetic
+        error against the "daemon 171" segment earlier on the same line.
+        With nothing known the segment is omitted; printing "0 / 0" would
+        read as "the index is fresh" when the truth is "nobody checked"."""
         from recall.stats import render_human
         out = render_human(_sample_report())
         assert ("  Path:         daemon 171, inproc 9 (daemon_error 9, degraded 0)"
-                " · index stale 3 / 160 daemon fires") in out
+                " · index stale 3 / 160 fires that reported staleness") in out
 
         unknown = render_human(_sample_report(index_stale_count=0,
                                               index_stale_known=0))

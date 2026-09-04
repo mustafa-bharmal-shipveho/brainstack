@@ -211,6 +211,17 @@ class TestUntrustedPreamble:
         assert "instruction" in low
         assert "untrusted" in low
 
+    def test_preamble_points_at_the_fence_markers_not_a_code_fence(self):
+        """The block wraps excerpts in `[recall-doc-N-start]` /
+        `[recall-doc-N-end]` lines, not a markdown code fence. The old
+        wording ("the fenced excerpts below") pointed at something that
+        isn't on the page; it must instead name the actual delimiters."""
+        from recall.sanitize import UNTRUSTED_PREAMBLE
+        assert "the delimited excerpts below" in UNTRUSTED_PREAMBLE
+        assert "[recall-doc-N-start]" in UNTRUSTED_PREAMBLE
+        assert "[recall-doc-N-end]" in UNTRUSTED_PREAMBLE
+        assert "the fenced excerpts below" not in UNTRUSTED_PREAMBLE
+
 
 class TestProvenanceLabel:
     def test_empty_frontmatter_is_none(self):

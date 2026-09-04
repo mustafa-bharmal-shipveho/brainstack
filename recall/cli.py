@@ -1457,9 +1457,15 @@ def doctor(
         cfg = load_config()
         for s in cfg.sources:
             if not Path(s.resolved_path).exists():
-                issues.append(
-                    f"Source '{s.name}' path missing: {s.path} → {s.resolved_path}"
-                )
+                if s.path == s.resolved_path:
+                    # No $VAR expansion happened — the configured path IS
+                    # the resolved path. An arrow between two copies of the
+                    # same string would falsely imply a mapping.
+                    issues.append(f"Source '{s.name}' path missing: {s.path}")
+                else:
+                    issues.append(
+                        f"Source '{s.name}' path missing: {s.path} → {s.resolved_path}"
+                    )
     except Exception as e:
         issues.append(f"Failed to load config: {e}")
 
