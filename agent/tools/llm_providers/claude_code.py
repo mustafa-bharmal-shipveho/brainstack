@@ -23,26 +23,36 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import time
 
-from .base import LLMProvider, LLMResult, LLMError
+from .base import LLMProvider, LLMResult, LLMError, find_cli
 
 
 class ClaudeCodeProvider(LLMProvider):
     name = "claude-code"
     # Haiku 4.5 is the cost-optimal default for summarization.
     default_model = "claude-haiku-4-5"
+    # Resolved absolute path once is_available() finds the CLI outside
+    # PATH (S5 R6) — argv[0] uses this instead of the bare name so a
+    # scheduled job with a minimal PATH can still exec it.
+    _bin: str | None = None
 
     def is_available(self) -> tuple[bool, str]:
-        if not shutil.which("claude"):
-            return (False, "claude CLI not on PATH — install Claude Code")
+        path, searched = find_cli("claude")
+        if path is None:
+            return (
+                False,
+                f"claude CLI not on PATH (PATH={os.environ.get('PATH', '')}) "
+                f"nor in {', '.join(searched)} — install Claude Code or add "
+                f"its bin dir to PATH",
+            )
         # When the CLI is present, treat the provider as available even
         # without ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN in env.
         # The framework promise is subscription-billed via existing
         # login. If the user truly isn't authed, the first invoke()
         # will surface a clear non-zero exit + auth-failure message.
+        self._bin = path
         return (True, "")
 
     # -- internal helpers ----------------------------------------------------
@@ -89,11 +99,10 @@ class ClaudeCodeProvider(LLMProvider):
                 return False
         return True
 
-    @staticmethod
-    def _build_cmd(model: str, json_schema: dict | None,
+    def _build_cmd(self, model: str, json_schema: dict | None,
                    max_budget_usd: float) -> list[str]:
         cmd = [
-            "claude", "-p", "--print",
+            self._bin or "claude", "-p", "--print",
             "--output-format", "json",
             "--model", model,
             "--max-budget-usd", str(max_budget_usd),
