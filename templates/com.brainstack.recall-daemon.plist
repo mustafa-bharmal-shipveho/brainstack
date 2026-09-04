@@ -3,26 +3,31 @@
 <!--
   Warm recall daemon launchd job (S3).
 
-  Holds one HybridRetriever (reranker loaded) and owns the embedded Qdrant
-  store, so the Claude Code auto-recall hook, `recall query`, `recall
-  reindex`, and recall-mcp all answer in tens of milliseconds instead of
-  paying a cold embedder/Qdrant load on every fire.
+  Holds one HybridRetriever and owns the embedded Qdrant store, so the
+  Claude Code auto-recall hook, `recall query`, `recall reindex`, and
+  recall-mcp all answer in tens of milliseconds instead of paying a cold
+  embedder/Qdrant load on every fire. The cross-encoder reranker is opt-in
+  (add the `rerank` flag to ProgramArguments); it is off by default because
+  it measured no ordering gain for several times the latency.
 
-  Install (normally done by install.sh --setup-daemon, not by hand):
-    cp com.brainstack.recall-daemon.plist ~/Library/LaunchAgents/
-    <substitute every __PLACEHOLDER__ below first>
-    launchctl load ~/Library/LaunchAgents/com.brainstack.recall-daemon.plist
+  Install with `install.sh` and its `setup-daemon` flag, not by hand. That
+  path renders the placeholders, lints the result, and loads it.
 
-  Placeholders (all must be substituted — an unreplaced __PLACEHOLDER__
-  produces a unit launchd silently refuses to run):
-    __PYTHON_ABS__   absolute path to the venv's python3 (e.g.
-                     /Users/you/orca/.../.venv/bin/python3)
-    __REPO_DIR__     absolute path to the brainstack checkout (PYTHONPATH)
-    __BRAIN_ROOT__   absolute path to the brain root (usually ~/.agent)
-    __HOME__         the user's home directory
+  Placeholders. All four must be substituted; install.sh refuses to load a
+  rendered plist that still contains a double underscore, because launchd
+  silently refuses such a unit and the user just never gets a daemon:
+    PYTHON_ABS   absolute path to the venv's python3 (e.g.
+                 /Users/you/brainstack/.venv/bin/python3)
+    REPO_DIR     absolute path to the brainstack checkout (PYTHONPATH)
+    BRAIN_ROOT   absolute path to the brain root (usually ~/.agent)
+    HOME         the user's home directory
+  Each appears below wrapped in double underscores.
 
-  Remove: ./install.sh --remove-daemon (unloads, deletes this file, then
-  best-effort `recall serve --stop`).
+  Tear down with install.sh's `remove-daemon` flag: it unloads the job,
+  deletes this file, and stops any resident daemon.
+
+  NOTE: this is an XML comment, so it must not contain two consecutive
+  hyphens. Write flags as `setup-daemon`, never with their leading dashes.
 -->
 <plist version="1.0">
 <dict>

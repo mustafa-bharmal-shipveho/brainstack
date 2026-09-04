@@ -94,13 +94,14 @@ DRY_RUN=0
 # the automatic fallback for non-interactive default installs without --yes.
 MINIMAL=0
 
-# Default-on setup modes (v0.6.0+): fresh install runs all five automatically.
+# Default-on setup modes (v0.6.0+): fresh install runs all six automatically.
 # Each --no-X flag disables exactly one. Only takes effect in fresh-install
 # mode; ignored when explicit --setup-X / --upgrade is passed.
 NO_AUTO_MIGRATE=0
 NO_LAUNCHD=0
 NO_RECALL_FIRST=0
 NO_AUTO_RECALL=0
+NO_DAEMON=0
 SKIP_MIGRATE=0
 # --yes accepts all interactive migrate-discovery prompts non-interactively.
 # --no-prompt declines all of them (silent skip). Either makes the install
@@ -372,11 +373,8 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         --no-daemon)
-            # Fresh-install only opt-out; the daemon MODE itself is not
-            # yet wired into the default install (see the setup-daemon
-            # MODE block below). Kept for --help discoverability and so
-            # a wrapper script that already passes this flag doesn't hit
-            # "unknown argument".
+            # Fresh-install only opt-out (Default 6). Explicit
+            # --setup-daemon ignores it, same as the other --no-X flags.
             NO_DAEMON=1
             shift
             ;;
@@ -484,12 +482,42 @@ maybe_install_scanner() {
 # under a header naming this upgrade. Never removes a line the user wrote
 # by hand; running twice against the same template is a no-op.
 #
-# Scaffold: not yet implemented, and NOT called from --upgrade or the
-# fresh-install path yet (still the three ad-hoc grep/append blocks below).
+# The template is the single source of ignore rules: adding one there is
+# all a future change needs to do, and every existing brain picks it up on
+# the next --upgrade. Replaces the ad-hoc per-rule grep/append blocks this
+# file used to carry, which drifted from the template every time.
+#
 # See tests/test_brain_gitignore_upgrade.py.
 append_missing_gitignore_rules() {
-    echo "install: append_missing_gitignore_rules: not implemented" >&2
-    return 1
+    local template="$1"
+    local live="$2"
+    if [ ! -f "$template" ] || [ ! -f "$live" ]; then
+        return 0
+    fi
+
+    local missing=()
+    local rule
+    while IFS= read -r rule || [ -n "$rule" ]; do
+        # Comments are documentation, not rules; blanks are layout. Neither
+        # is copied, so a re-run never re-appends them.
+        case "$rule" in
+            ''|\#*) continue ;;
+        esac
+        if ! grep -qxF -- "$rule" "$live"; then
+            missing+=("$rule")
+        fi
+    done < "$template"
+
+    if [ "${#missing[@]}" -eq 0 ]; then
+        return 0
+    fi
+
+    {
+        printf '\n# Added by brainstack --upgrade from templates/brain.gitignore.\n'
+        printf '# Append-only: nothing you wrote above was removed.\n'
+        printf '%s\n' "${missing[@]}"
+    } >> "$live"
+    echo "==> .gitignore: appended ${#missing[@]} rule(s) from the brainstack template"
 }
 
 # ----- Helper: print the install plan -----
@@ -541,6 +569,18 @@ print_install_plan() {
     else
         echo "      NONE: no launchd or systemd on this platform ($plan_platform);"
         echo "      set up cron manually or run ./install.sh --setup-systemd where available"
+    fi
+
+    echo ""
+    echo "    Warm recall daemon (keeps the retriever and index resident):"
+    if [ "$NO_DAEMON" = "1" ]; then
+        echo "      skipped (--no-daemon)"
+    elif [ "$plan_platform" = "Darwin" ]; then
+        echo "      $HOME/Library/LaunchAgents/com.brainstack.recall-daemon.plist"
+        echo "      socket at $BRAIN_ROOT/runtime/recall.sock"
+    else
+        echo "      NONE: launchd-only today ($plan_platform); run 'recall serve'"
+        echo "      under your own supervisor instead"
     fi
 
     echo ""
@@ -1072,26 +1112,14 @@ if [ "$MODE" = "upgrade" ]; then
     # dream_runner.py, etc.) can later detect drift relative to the
     # exact repo this upgrade came from.
     echo "$REPO_DIR" > "$BRAIN_ROOT/.brainstack-repo-path"
-    if [ -f "$BRAIN_ROOT/.gitignore" ] && \
-       ! grep -qE "^\.brainstack-repo-path\s*$" "$BRAIN_ROOT/.gitignore"; then
-        printf "\n# Repo path pin — machine-local, do not sync\n.brainstack-repo-path\n" \
-            >> "$BRAIN_ROOT/.gitignore"
-    fi
-    # PENDING_REVIEW.md is regenerated locally on every dream/sync tick;
-    # cross-machine sync would cause churn.
-    if [ -f "$BRAIN_ROOT/.gitignore" ] && \
-       ! grep -qE "^PENDING_REVIEW\.md\s*$" "$BRAIN_ROOT/.gitignore"; then
-        printf "\n# Pending-review summary — regenerated locally\nPENDING_REVIEW.md\n" \
-            >> "$BRAIN_ROOT/.gitignore"
-    fi
-    # .obsidian/ contains per-machine workspace state (layout, plugins, hotkeys, graph).
-    # Syncing causes noisy conflicts. Append on upgrade so existing brains don't
-    # stage workspace files on the next sync (Codex 2026-05-05 P3).
-    if [ -f "$BRAIN_ROOT/.gitignore" ] && \
-       ! grep -qE "^\.obsidian/\s*$" "$BRAIN_ROOT/.gitignore"; then
-        printf "\n# Obsidian per-machine config — workspace state, plugins, hotkeys\n.obsidian/\n" \
-            >> "$BRAIN_ROOT/.gitignore"
-    fi
+    # Bring the brain's .gitignore up to the current template. This
+    # replaces the per-rule grep/append blocks that used to live here (repo
+    # path pin, PENDING_REVIEW.md, .obsidian/) — those rules are all in the
+    # template now, alongside the rotation and machine-local runtime rules
+    # that keep a 100 MB blob out of the next push. Append-only and
+    # idempotent, so a hand-written user rule survives every upgrade.
+    append_missing_gitignore_rules \
+        "$REPO_DIR/templates/brain.gitignore" "$BRAIN_ROOT/.gitignore"
     # Refresh the recall CLI symlink (idempotent; pip-installs into the venv
     # if the venv exists, otherwise creates it).
     # BRAINSTACK_SKIP_CLI_INSTALL=1 lets fast/hermetic tests skip the
@@ -1104,6 +1132,23 @@ if [ "$MODE" = "upgrade" ]; then
     # Refresh the pre-commit hook. rsync covers tools/, but the hook
     # lives in .git/hooks/ and would otherwise never be updated.
     install_precommit_hook "$BRAIN_ROOT"
+
+    # Restart the warm recall daemon so it picks up the code just synced.
+    # KeepAlive brings it straight back; without the kickstart it keeps
+    # serving the pre-upgrade retriever until the next reboot. Skipped
+    # under BRAINSTACK_SKIP_LAUNCHCTL=1 (hermetic tests, tmp-HOME smokes).
+    daemon_plist="$HOME/Library/LaunchAgents/com.brainstack.recall-daemon.plist"
+    if [ -f "$daemon_plist" ] \
+       && [ "${BRAINSTACK_SKIP_LAUNCHCTL:-0}" != "1" ] \
+       && command -v launchctl >/dev/null 2>&1; then
+        if launchctl kickstart -k "gui/$(id -u)/com.brainstack.recall-daemon" \
+             >/dev/null 2>&1; then
+            echo "==> Restarted the recall daemon (com.brainstack.recall-daemon)."
+        else
+            echo "==> WARN: could not restart the recall daemon; it may still be" >&2
+            echo "    running the pre-upgrade code. Try: ./install.sh --setup-daemon" >&2
+        fi
+    fi
 
     # Record what version this brain was upgraded TO so the NEXT
     # `--upgrade` can compute and surface the transition.
@@ -2178,23 +2223,126 @@ PYEOF
 fi
 
 # ----- Mode: setup-daemon / remove-daemon -----
-# Installs/removes the recall query daemon LaunchAgent
-# (com.brainstack.recall-daemon), modeled on the setup-claude-extras
-# block above. S3 owns the daemon itself (recall/daemon.py, the socket
-# protocol, recall serve); this scaffold only wires the installer's flag
-# surface + uninstall inventory (see plans/hook-path.md's install.sh
-# row) so those land independently without touching this file twice.
-#
-# Scaffold: not yet implemented. --dry-run still prints the plan and
-# exits 0 (the global contract every mode honors); the real render/load
-# path is a `not implemented` exit 1 until S3 lands it.
+# Installs/removes the warm recall daemon LaunchAgent
+# (com.brainstack.recall-daemon), modeled on the setup-claude-extras block
+# above. The daemon holds one HybridRetriever and owns the embedded Qdrant
+# store, so auto-recall answers in tens of milliseconds instead of paying a
+# cold embedder + store open on every prompt. The cross-encoder reranker is
+# opt-in (`recall serve --rerank`) and off by default.
 if [ "$MODE" = "setup-daemon" ] || [ "$MODE" = "remove-daemon" ]; then
     if [ "$DRY_RUN" = "1" ]; then
-        echo "==> DRY RUN (setup-daemon): would install com.brainstack.recall-daemon.plist. Nothing was changed."
+        echo "==> DRY RUN ($MODE): would install/remove $HOME/Library/LaunchAgents/com.brainstack.recall-daemon.plist. Nothing was changed."
         exit 0
     fi
-    echo "recall-daemon: not implemented" >&2
-    exit 1
+
+    daemon_plist_path="$HOME/Library/LaunchAgents/com.brainstack.recall-daemon.plist"
+
+    if [ "$MODE" = "remove-daemon" ]; then
+        if [ -f "$daemon_plist_path" ]; then
+            if [ "${BRAINSTACK_SKIP_LAUNCHCTL:-0}" != "1" ] \
+               && command -v launchctl >/dev/null 2>&1; then
+                launchctl unload "$daemon_plist_path" 2>/dev/null || true
+            fi
+            rm -f "$daemon_plist_path"
+            echo "==> com.brainstack.recall-daemon LaunchAgent removed."
+        else
+            echo "==> Nothing to remove (no LaunchAgent at $daemon_plist_path)."
+        fi
+        # Best effort: stop a daemon that is still resident. A leftover
+        # process keeps the exclusive Qdrant lock, so a later `recall
+        # reindex` reports "index is busy" with nothing installed to
+        # explain it. Gated with launchctl: it is host-side activation,
+        # and hermetic tests must not signal a real daemon.
+        if [ "${BRAINSTACK_SKIP_LAUNCHCTL:-0}" != "1" ] \
+           && command -v recall >/dev/null 2>&1; then
+            recall serve --stop >/dev/null 2>&1 || true
+        fi
+        exit 0
+    fi
+
+    # ---- setup-daemon ----
+    if [ "$(uname -s)" != "Darwin" ]; then
+        echo "==> The recall daemon is launchd-only today; no systemd unit ships yet."
+        echo "    Run it under your own supervisor instead, e.g.:"
+        echo "      BRAIN_ROOT=$BRAIN_ROOT $PYTHON_ABS -m recall.cli serve"
+        echo "    A systemd user service wrapping 'recall serve' works the same way."
+        exit 0
+    fi
+
+    if [ ! -d "$BRAIN_ROOT" ]; then
+        echo "install: $BRAIN_ROOT does not exist; run ./install.sh first." >&2
+        exit 2
+    fi
+    daemon_template="$REPO_DIR/templates/com.brainstack.recall-daemon.plist"
+    if [ ! -f "$daemon_template" ]; then
+        echo "install: template missing: $daemon_template" >&2
+        exit 2
+    fi
+    if [ -z "${PYTHON_ABS:-}" ]; then
+        echo "install: PYTHON_ABS not resolved — re-run plain ./install.sh first to bootstrap the venv." >&2
+        exit 2
+    fi
+
+    # launchd ignores PATH, so ProgramArguments[0] must be absolute AND
+    # must be an interpreter that can import qdrant_client/fastembed. That
+    # is the repo venv, not the bare system python3 PYTHON_ABS points at.
+    daemon_python="$PYTHON_ABS"
+    if [ -x "$REPO_DIR/.venv/bin/python3" ]; then
+        daemon_python="$REPO_DIR/.venv/bin/python3"
+    fi
+
+    mkdir -p "$BRAIN_ROOT/runtime/logs"
+    mkdir -p "$HOME/Library/LaunchAgents"
+    sed -e "s|__BRAIN_ROOT__|$BRAIN_ROOT|g" \
+        -e "s|__PYTHON_ABS__|$daemon_python|g" \
+        -e "s|__REPO_DIR__|$REPO_DIR|g" \
+        -e "s|__HOME__|$HOME|g" \
+        "$daemon_template" > "$daemon_plist_path"
+
+    # An unsubstituted placeholder yields a unit launchd refuses at load,
+    # and the refusal is silent — the user simply never gets a daemon.
+    # This is the claude-extras 2026-05 failure; catch it here instead.
+    if grep -q '__' "$daemon_plist_path"; then
+        echo "install: unsubstituted placeholder left in $daemon_plist_path; not loading." >&2
+        grep -n '__' "$daemon_plist_path" >&2
+        rm -f "$daemon_plist_path"
+        exit 2
+    fi
+    if command -v plutil >/dev/null 2>&1 \
+       && ! plutil -lint "$daemon_plist_path" >/dev/null 2>&1; then
+        echo "install: rendered plist failed plutil -lint; not loading. See $daemon_plist_path" >&2
+        exit 2
+    fi
+    # plutil is lenient about malformed XML comments (two consecutive
+    # hyphens); a strict parser is not, and neither is launchd. Parse it
+    # for real before handing it over.
+    if ! "$PYTHON_BIN" -c 'import plistlib,sys; plistlib.load(open(sys.argv[1],"rb"))' \
+         "$daemon_plist_path" 2>/dev/null; then
+        echo "install: rendered plist is not valid XML; not loading. See $daemon_plist_path" >&2
+        exit 2
+    fi
+
+    if [ "${BRAINSTACK_SKIP_LAUNCHCTL:-0}" = "1" ]; then
+        echo "  wrote $daemon_plist_path (skipped launchctl load: BRAINSTACK_SKIP_LAUNCHCTL=1)"
+    else
+        launchctl unload "$daemon_plist_path" 2>/dev/null || true
+        if launchctl load "$daemon_plist_path" 2>/dev/null; then
+            echo "  loaded launchd agent: com.brainstack.recall-daemon"
+        else
+            echo "  WARN: launchctl load failed for $daemon_plist_path — try manually:" >&2
+            echo "    launchctl load $daemon_plist_path" >&2
+        fi
+    fi
+
+    echo "==> com.brainstack.recall-daemon LaunchAgent installed."
+    echo "    plist:     $daemon_plist_path"
+    echo "    python:    $daemon_python"
+    echo "    socket:    $BRAIN_ROOT/runtime/recall.sock"
+    echo "    logs:      $BRAIN_ROOT/runtime/logs/recall-daemon.stdout.log"
+    echo "               $BRAIN_ROOT/runtime/logs/recall-daemon.stderr.log"
+    echo "    health:    recall serve --status"
+    echo "    tear down: ./install.sh --remove-daemon"
+    exit 0
 fi
 
 # ----- Mode: uninstall -----
@@ -2890,19 +3038,9 @@ chmod +x "$BRAIN_ROOT/harness/hooks/"*.py 2>/dev/null || true
 # auto-migrate dispatcher) can later detect drift if the user `git pull`s
 # the brainstack repo without re-running `./install.sh --upgrade`.
 echo "$REPO_DIR" > "$BRAIN_ROOT/.brainstack-repo-path"
-# Ensure the pin is gitignored even if the brain's .gitignore was created
-# before this template line shipped. Idempotent. Codex 2026-05-04 P2.
-if [ -f "$BRAIN_ROOT/.gitignore" ] && \
-   ! grep -qE "^\.brainstack-repo-path\s*$" "$BRAIN_ROOT/.gitignore"; then
-    printf "\n# Repo path pin — machine-local, do not sync\n.brainstack-repo-path\n" \
-        >> "$BRAIN_ROOT/.gitignore"
-fi
-# PENDING_REVIEW.md is regenerated locally on every dream/sync tick.
-if [ -f "$BRAIN_ROOT/.gitignore" ] && \
-   ! grep -qE "^PENDING_REVIEW\.md\s*$" "$BRAIN_ROOT/.gitignore"; then
-    printf "\n# Pending-review summary — regenerated locally\nPENDING_REVIEW.md\n" \
-        >> "$BRAIN_ROOT/.gitignore"
-fi
+# The pin and PENDING_REVIEW.md both live in templates/brain.gitignore now;
+# `append_missing_gitignore_rules` below tops up an existing brain's file
+# from that single source instead of re-listing individual rules here.
 
 # Default .gitignore so the brain doesn't accidentally commit logs / lock
 # files / temp files / dashboard exports. Mirrors the contents documented in
@@ -2910,6 +3048,11 @@ fi
 if [ ! -f "$BRAIN_ROOT/.gitignore" ] && [ -f "$REPO_DIR/templates/brain.gitignore" ]; then
     cp "$REPO_DIR/templates/brain.gitignore" "$BRAIN_ROOT/.gitignore"
 fi
+# Re-running install over an existing brain (the common "reinstall from a
+# newer clone" path) reaches the copy above with .gitignore already there,
+# so top up any rules the template has gained since. Append-only.
+append_missing_gitignore_rules \
+    "$REPO_DIR/templates/brain.gitignore" "$BRAIN_ROOT/.gitignore"
 
 # Default trufflehog exclude so sync.sh's local scan skips .git/objects/
 # (historical commits — already covered by server-side workflow + pre-commit).
@@ -3025,6 +3168,7 @@ DEFAULT_AUTO_MIGRATE_STATUS="pending"
 DEFAULT_LAUNCHD_STATUS="pending"
 DEFAULT_RECALL_FIRST_STATUS="pending"
 DEFAULT_AUTO_RECALL_STATUS="pending"
+DEFAULT_DAEMON_STATUS="pending"
 
 echo ""
 echo "==> Applying default setup (opt out per-mode with --no-X)"
@@ -3210,6 +3354,23 @@ else
     fi
 fi
 
+# --- Default 6: --setup-daemon (warm recall daemon) ---
+# Default 5 wires auto-recall into every prompt; without this one, each of
+# those fires pays a cold embedder load plus an embedded-Qdrant open, which
+# is the entire cost the daemon exists to remove. launchd-only today, so a
+# non-Darwin box is a skip, not a failure.
+if [ "$NO_DAEMON" = "1" ]; then
+    DEFAULT_DAEMON_STATUS="skipped"
+elif [ "$PLATFORM" != "Darwin" ]; then
+    DEFAULT_DAEMON_STATUS="skipped"
+else
+    if PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-daemon >/dev/null 2>&1; then
+        DEFAULT_DAEMON_STATUS="done"
+    else
+        DEFAULT_DAEMON_STATUS="failed"
+    fi
+fi
+
 # ----- Summary -----
 # Print a single block listing each default with its opt-out flag. The
 # (--no-X) markers are how `recall doctor` and the tests verify what fired.
@@ -3249,6 +3410,7 @@ Defaults applied (skip on next install with the flag in parens):
 $SCHEDULER_SUMMARY
   $(_mark_for "$DEFAULT_RECALL_FIRST_STATUS") Recall-first directive: $DEFAULT_RECALL_FIRST_STATUS                                                   (--no-recall-first)
   $(_mark_for "$DEFAULT_AUTO_RECALL_STATUS") Claude Code auto-recall: $DEFAULT_AUTO_RECALL_STATUS                                                 (--no-auto-recall)
+  $(_mark_for "$DEFAULT_DAEMON_STATUS") Warm recall daemon: $DEFAULT_DAEMON_STATUS                                                      (--no-daemon)
 
 Next: open Claude Code / Codex CLI / Cursor and ask a question.
       Your brain context will surface in their replies automatically.

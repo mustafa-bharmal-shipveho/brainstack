@@ -26,6 +26,7 @@ from recall.config import (
     load_config,
     resolve_brain_home,
 )
+from recall.config import effective_mode as _effective_mode
 from recall.core import HybridRetriever
 from recall.index import build_index, load_index, needs_refresh
 from recall.qdrant_backend import (
@@ -75,8 +76,139 @@ _serialize = serialize_results  # backwards-compat alias inside the module
 def _exit_qdrant_store_error(
     exc: QdrantStoreAccessError | QdrantStoreBusyError,
 ) -> NoReturn:
-    typer.echo(str(exc), err=True)
+    message = str(exc)
+    # "index is busy" is almost always the warm daemon holding the store's
+    # exclusive process lock. Without naming it, the user has nothing
+    # visibly installed to explain the failure.
+    sock = _daemon_status_socket()
+    if sock is not None:
+        message += (
+            f"\nA recall daemon is running at {sock} and owns this store. "
+            "`recall query` and `recall reindex` route through it "
+            "automatically; stop it with `recall serve --stop` if you need "
+            "direct access."
+        )
+    typer.echo(message, err=True)
     raise typer.Exit(code=1)
+
+
+# ---------------------------------------------------------------------------
+# Warm daemon routing (S3)
+#
+# While `recall serve` runs it OWNS the embedded Qdrant store, so the CLI
+# talks to the socket instead of racing it for the exclusive process lock.
+# ---------------------------------------------------------------------------
+
+
+def _resolve_daemon_socket() -> Optional[Path]:
+    """The socket the CLI should talk to, or None if it cannot be resolved."""
+    try:
+        from recall.daemon import resolve_daemon_socket
+
+        return resolve_daemon_socket()
+    except Exception:  # noqa: BLE001 - the daemon is a soft dependency
+        return None
+
+
+def _daemon_disabled() -> bool:
+    return os.environ.get("RECALL_NO_DAEMON") == "1"
+
+
+def _daemon_status_socket() -> Optional[Path]:
+    """Return the socket path IF a daemon is answering on it, else None."""
+    sock = _resolve_daemon_socket()
+    if sock is None:
+        return None
+    try:
+        from recall import daemon_client
+
+        return sock if daemon_client.status(sock, timeout_s=0.5) is not None else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _daemon_cli_budget_ms() -> int:
+    """How long the CLI waits on the daemon. Generous compared with the
+    hook's 800 ms: a cold daemon's first query pays the embedder load (and
+    the cross-encoder too, under `--rerank`), and an interactive command can
+    afford to wait for that instead of silently producing worse results."""
+    raw = os.environ.get("RECALL_CLI_DAEMON_BUDGET_MS")
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return 60_000
+
+
+def _wire_to_serialized(item: dict) -> dict:
+    """Project a daemon wire result onto `serialize_results`' exact shape.
+
+    Every consumer of `recall query` parses that JSON. If routing through
+    the socket dropped or renamed a key, installing the daemon would be a
+    silent breaking change.
+    """
+    rerank_score = item.get("rerank_score")
+    return {
+        "path": item.get("path"),
+        "source": item.get("source"),
+        "name": item.get("name"),
+        "type": item.get("type"),
+        "description": item.get("description"),
+        "score": round(float(item.get("score") or 0.0), 6),
+        "rerank_score": (
+            None if rerank_score is None else round(float(rerank_score), 6)
+        ),
+        "provenance": item.get("provenance"),
+    }
+
+
+def _query_via_daemon(
+    prompt: str,
+    *,
+    k: int,
+    source_filter: Optional[str],
+    type_filter: Optional[str],
+    rerank: Optional[bool],
+) -> Optional[list[dict]]:
+    """Answer a query through the daemon.
+
+    Returns the projected rows, or None when the daemon is DOWN (nothing
+    holds the store lock, so the direct path is safe). When the daemon is
+    UP but unhealthy the direct path would only block on fcntl until it
+    timed out, so that case exits with an actionable message instead.
+    """
+    if _daemon_disabled():
+        return None
+    sock = _resolve_daemon_socket()
+    if sock is None:
+        return None
+    try:
+        from recall import daemon_client
+    except ImportError:
+        return None
+    try:
+        resp = daemon_client.query(
+            prompt,
+            k=k,
+            socket_path=sock,
+            budget_ms=_daemon_cli_budget_ms(),
+            source_filter=source_filter,
+            type_filter=type_filter,
+            rerank=rerank,
+        )
+    except daemon_client.DaemonUnavailable as exc:
+        if exc.reason in {"no_socket", "connection_refused"}:
+            return None
+        typer.echo(
+            f"recall query: the daemon at {sock} is running but did not answer "
+            f"({exc.reason}: {exc}). It owns the index, so the direct path "
+            f"would just block on the store lock. Check `recall serve "
+            f"--status`, retry, or stop it with `recall serve --stop`.",
+            err=True,
+        )
+        raise typer.Exit(code=1) from exc
+    return [_wire_to_serialized(item) for item in (resp.get("results") or [])]
 
 
 def _query_results(
@@ -293,9 +425,9 @@ def query(
         False,
         "--no-daemon",
         help="Force the in-process retrieval path even if a `recall serve` "
-             "daemon is running (debugging, or a wedged daemon). This is "
-             "today's default behavior either way; daemon-first routing is "
-             "not wired up yet.",
+             "daemon is running (debugging, or a wedged daemon). Note the "
+             "daemon owns the index while it runs, so the direct path can "
+             "report 'index is busy'.",
     ),
 ):
     """Search the brain for memories relevant to QUERY. Outputs JSON."""
@@ -305,7 +437,7 @@ def query(
             raise typer.Exit(code=2)
         cfg = load_config()
         # Mode precedence: flag > RECALL_MODE env > config.
-        effective_mode = mode or os.environ.get("RECALL_MODE") or cfg.ranking.mode
+        effective_mode = _effective_mode(cfg, mode)
         if effective_mode not in {"hybrid", "dense", "sparse"}:
             typer.echo(
                 'recall query: mode must be "hybrid", "dense", or "sparse" '
@@ -313,6 +445,39 @@ def query(
                 err=True,
             )
             raise typer.Exit(code=2)
+
+        query_str = " ".join(text)
+        effective_k = k if k is not None else cfg.default_k
+        # Tri-state expand flag: explicit --expand/--no-expand wins; when
+        # neither is passed, fall back to the config default (off unless
+        # the user opted in via ranking.expand_default).
+        effective_expand = expand if expand is not None else cfg.ranking.expand_default
+
+        # Daemon-first, BEFORE `_load_or_build` — opening the store here
+        # while a daemon holds its exclusive lock is exactly the "index is
+        # busy" failure the routing exists to avoid. Only the plain ranked
+        # path is routable: query expansion, a per-call rerank model, and an
+        # explicit --mode all need retriever state the daemon does not have.
+        routable = (
+            not no_daemon
+            and mode is None
+            and strategy == "ranked"
+            and not effective_expand
+            and rerank_model is None
+            and rerank in (None, "cross_encoder", "none")
+        )
+        if routable:
+            routed = _query_via_daemon(
+                query_str,
+                k=effective_k,
+                source_filter=source,
+                type_filter=type,
+                rerank=None if rerank is None else (rerank == "cross_encoder"),
+            )
+            if routed is not None:
+                typer.echo(json.dumps(routed, indent=2))
+                raise typer.Exit(code=0)
+
         cache, fresh = _load_or_build(cfg, mode=effective_mode)
         if cache is None or not cache.documents:
             typer.echo("[]")
@@ -332,13 +497,6 @@ def query(
             needs_review_penalty=cfg.ranking.needs_review_penalty,
             mode=effective_mode,
         )
-
-        query_str = " ".join(text)
-        effective_k = k if k is not None else cfg.default_k
-        # Tri-state expand flag: explicit --expand/--no-expand wins; when
-        # neither is passed, fall back to the config default (off unless
-        # the user opted in via ranking.expand_default).
-        effective_expand = expand if expand is not None else cfg.ranking.expand_default
 
         if effective_expand:
             results = _expanded_query(
@@ -370,6 +528,37 @@ def query(
 @app.command()
 def reindex():
     """Rebuild the index cache from scratch."""
+    # Daemon-first: while `recall serve` runs it holds the store's exclusive
+    # process lock, so building here would just fail with "index is busy".
+    # The daemon's `reindex` op runs the same chunked pass synchronously.
+    if not _daemon_disabled():
+        sock = _resolve_daemon_socket()
+        if sock is not None:
+            try:
+                from recall import daemon_client
+
+                resp = daemon_client.reindex(sock)
+            except ImportError:
+                pass
+            except daemon_client.DaemonUnavailable as exc:
+                if exc.reason not in {"no_socket", "connection_refused"}:
+                    typer.echo(
+                        f"recall reindex: the daemon at {sock} is running but "
+                        f"the refresh failed ({exc.reason}: {exc}). It owns the "
+                        f"index; check `recall serve --status` or stop it with "
+                        f"`recall serve --stop`.",
+                        err=True,
+                    )
+                    raise typer.Exit(code=1) from exc
+            else:
+                typer.echo(
+                    f"Reindexed via the daemon at {sock}: "
+                    f"{resp.get('changed', 0)} document(s) re-embedded, "
+                    f"{resp.get('deleted', 0)} stale point(s) removed "
+                    f"({resp.get('ms', 0)} ms)."
+                )
+                return
+
     try:
         cfg = load_config()
         cache = build_index(cfg.sources)
@@ -389,8 +578,24 @@ def serve(
         help="AF_UNIX socket path (default: recall.config.daemon_socket_path()).",
     ),
     rerank: bool = typer.Option(
-        True, "--rerank/--no-rerank",
-        help="Load the cross-encoder reranker in the daemon process.",
+        False, "--rerank/--no-rerank",
+        help="Load the cross-encoder reranker in the daemon process. OFF by "
+             "default: on the calibrated set it produced no measurable "
+             "ordering gain for 4-13x the latency (0.47-1.4 s vs a "
+             "60-130 ms retrieval-only warm path), which does not fit the "
+             "auto-recall hook's budget.",
+    ),
+    reranker_model: Optional[str] = typer.Option(
+        None, "--reranker-model",
+        help="Cross-encoder to load with --rerank. Defaults to the "
+             "calibrated Xenova/ms-marco-MiniLM-L-6-v2 unless "
+             "ranking.reranker_model is set in your config.",
+    ),
+    rerank_n: Optional[int] = typer.Option(
+        None, "--rerank-n",
+        help="Candidates fed to the cross-encoder with --rerank. Defaults "
+             "to the calibrated 10 unless ranking.rerank_n is set in your "
+             "config.",
     ),
     idle_timeout_s: float = typer.Option(
         0.0, "--idle-timeout-s",
@@ -415,9 +620,10 @@ def serve(
     ),
 ):
     """Run the warm retrieval daemon: one long-lived `HybridRetriever`
-    (reranker pre-loaded) serving NDJSON requests over an AF_UNIX socket,
-    so `recall query`/the auto-recall hook skip the cold-start + Qdrant
-    store-lock cost on every call.
+    serving NDJSON requests over an AF_UNIX socket, so `recall query` and
+    the auto-recall hook skip the cold-start + Qdrant store-lock cost on
+    every call. The cross-encoder is NOT loaded unless you pass `--rerank`
+    (it measured no ordering gain for 4-13x the latency).
 
     While a daemon owns the store, anything that opens it directly (a
     second `recall serve`, a bare `recall query` without daemon routing)
@@ -428,9 +634,9 @@ def serve(
     import json as _json
 
     from recall import daemon_client
-    from recall.config import daemon_socket_path
+    from recall.daemon import resolve_daemon_socket
 
-    sock = socket or daemon_socket_path()
+    sock = Path(socket) if socket else resolve_daemon_socket()
 
     if status:
         result = daemon_client.status(sock)
@@ -457,6 +663,8 @@ def serve(
     exit_code = run_daemon(
         socket_path=sock,
         rerank=rerank,
+        reranker_model=reranker_model,
+        rerank_n=rerank_n,
         idle_timeout_s=idle_timeout_s,
         refresh_interval_s=refresh_interval_s,
     )
@@ -1109,9 +1317,9 @@ def _check_daemon(notes: list[str]) -> None:
     rest of doctor's report."""
     try:
         from recall import daemon_client
-        from recall.config import daemon_socket_path
+        from recall.daemon import resolve_daemon_socket
 
-        sock = daemon_socket_path()
+        sock = resolve_daemon_socket()
         result = daemon_client.status(sock)
     except Exception:
         return
@@ -1272,9 +1480,14 @@ def doctor(
             f"First reindex downloads {dense_model} (~440 MB) to {fe_cache} (one-time)."
         )
 
-    # Effective retrieval mode (RECALL_MODE env > config ranking.mode).
+    # Effective retrieval mode (RECALL_MODE env > config ranking.mode), via
+    # the shared resolver so doctor never disagrees with query/index/MCP.
     configured_mode = cfg.ranking.mode if cfg is not None else "hybrid"
-    effective_mode = os.environ.get("RECALL_MODE") or configured_mode
+    effective_mode = (
+        _effective_mode(cfg)
+        if cfg is not None
+        else (os.environ.get("RECALL_MODE") or configured_mode)
+    )
     if effective_mode == "hybrid" and not dense_cached:
         notes.append(
             "Retrieval mode: BM25-only fallback (dense model not cached); "
@@ -1554,7 +1767,9 @@ def stats(
              "(default: $BRAIN_ROOT or ~/.agent).",
     ),
 ):
-    """Auto-recall ROI + cross-source visibility.
+    """Auto-recall coverage, latency and utilization (+ cross-source tool-call visibility).
+
+    Pass `--utilization` for the per-prompt injected-document breakdown.
 
     Reads ~/.agent/runtime/logs/events.log.jsonl for AutoRecall events
     (per-prompt retrieval injections) AND scans Claude Code transcripts
