@@ -396,6 +396,21 @@ class TestSyncStatusParser:
         # No sync.log at all
         assert rps._check_sync_status(tmp_path) == "missing"
 
+    def test_unreadable_log_returns_missing_not_ok(self, tmp_path: Path):
+        """A log we cannot open tells us nothing about the last sync, so
+        it must read as 'missing' — not fall through to the mtime check
+        and get called 'ok' because the file was touched an hour ago."""
+        rps = self._import()
+        log = tmp_path / "sync.log"
+        log.write_text("2026-05-05T13:00:00Z sync: pushed\n")
+        log.chmod(0o000)
+        try:
+            if os.access(log, os.R_OK):
+                pytest.skip("running as root; the log stays readable")
+            assert rps._check_sync_status(tmp_path) == "missing"
+        finally:
+            log.chmod(0o644)
+
     def test_tail_reads_the_end_of_a_long_log_not_the_whole_file(
             self, tmp_path: Path):
         """sync.log is append-only and grows with the user's uptime; the

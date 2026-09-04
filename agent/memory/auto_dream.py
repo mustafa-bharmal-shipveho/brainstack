@@ -521,7 +521,8 @@ def _archive_rolls_all_namespaces(episodic_root, now=None) -> int:
     return total
 
 
-# Counters the health check reads out of the status file.
+# The counters the status file records, and the token each is printed
+# under — used only when reading them back out of `dream.log` text.
 _SUMMARY_INT_FIELDS = {
     "staged": "staged",
     "kept": "kept",

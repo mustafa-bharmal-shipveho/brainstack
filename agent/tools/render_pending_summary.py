@@ -417,9 +417,8 @@ def _last_run_oversize(tail_lines: list[str]) -> bool:
 _TAIL_CHUNK_BYTES = 128 * 1024
 
 
-def _sync_log_tail(brain_root: Path, limit: int = 400) -> list[str]:
-    """The last `limit` raw lines of `<brain>/sync.log` (git output
-    included — the remote-error parser needs the untouched tail).
+def _read_tail(path: Path, limit: int) -> list[str]:
+    """The last `limit` lines of `path`. Raises OSError if unreadable.
 
     Seeks to the end and reads backwards in chunks. sync.log is an
     append-only record of every hourly run and grows without bound; the
@@ -427,25 +426,31 @@ def _sync_log_tail(brain_root: Path, limit: int = 400) -> list[str]:
     to throw nearly all of it away is work that scales with the user's
     uptime.
     """
-    log = brain_root / "sync.log"
+    with path.open("rb") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        window = _TAIL_CHUNK_BYTES
+        while True:
+            start = max(0, size - window)
+            f.seek(start)
+            lines = f.read().decode("utf-8", "replace").splitlines()
+            # A window that did not reach the start of the file almost
+            # certainly cut a line in half — drop the partial. Safe even
+            # when it lands on a boundary: we only return once `limit`
+            # whole lines survive, or the window covers the whole file.
+            if start > 0:
+                lines = lines[1:]
+            if len(lines) >= limit or start == 0:
+                return lines[-limit:]
+            window *= 2
+
+
+def _sync_log_tail(brain_root: Path, limit: int = 400) -> list[str]:
+    """The last `limit` raw lines of `<brain>/sync.log` (git output
+    included — the remote-error parser needs the untouched tail), or `[]`
+    if the log is missing or unreadable."""
     try:
-        with log.open("rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            window = _TAIL_CHUNK_BYTES
-            while True:
-                start = max(0, size - window)
-                f.seek(start)
-                chunk = f.read()
-                # A window that did not reach the start of the file
-                # almost certainly cut a line in half — drop the partial.
-                text = chunk.decode("utf-8", "replace")
-                lines = text.splitlines()
-                if start > 0:
-                    lines = lines[1:]
-                if len(lines) >= limit or start == 0:
-                    return lines[-limit:]
-                window *= 2
+        return _read_tail(brain_root / "sync.log", limit)
     except OSError:
         return []
 
@@ -513,7 +518,12 @@ def _check_sync_status(
     if not log.is_file():
         return "missing"
     if tail_lines is None:
-        tail_lines = _sync_log_tail(brain_root)
+        try:
+            tail_lines = _read_tail(log, 400)
+        except OSError:
+            # Present but unreadable is not "the sync is fine" — say the
+            # same thing as a log that is not there at all.
+            return "missing"
     if held_back is None:
         held_back = _held_back_paths(tail_lines)
     sync_lines = [ln for ln in tail_lines[-100:] if "sync:" in ln]
@@ -832,14 +842,14 @@ def _status_inputs(brain_root: Path) -> dict:
 
     sync.log is read once and the hold-back scan runs once, so the status
     word and the file list the banner prints beside it always describe
-    the same run.
+    the same run. An empty tail is handed over as None so the status
+    check can read for itself WHY there was nothing — a missing log and
+    an unreadable one are both "missing", not "ok".
     """
     tail = _sync_log_tail(brain_root)
     held_back = _held_back_paths(tail) if tail else None
     return {
-        "sync_status": _check_sync_status(
-            brain_root, tail, held_back or {"secret": [], "oversize": []}
-        ),
+        "sync_status": _check_sync_status(brain_root, tail or None, held_back),
         "sync_error": _last_remote_error(tail) if tail else None,
         "held_back": held_back,
         "health": _load_health(brain_root),
