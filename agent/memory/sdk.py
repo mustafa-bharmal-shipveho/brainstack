@@ -298,20 +298,17 @@ def _episodic_stream_files(path: str) -> List[str]:
     """Every file in the episodic stream at `path`: rolled siblings
     (ascending by name) then `path` itself.
 
-    Mirrors `_atomic.episodic_files`, inlined so `stats()` keeps working
-    from callers that have not put `agent/memory/` on sys.path.
+    Thin wrapper — `_atomic.episodic_files` is THE anchored implementation
+    for agent/memory/; this just adapts its `Path` list to the `str` list
+    this module's callers expect. Local import: `agent/memory/` is not a
+    package, and `_atomic` is only importable once this directory is on
+    `sys.path` (see `_HERE` above).
     """
-    directory, name = os.path.split(path)
-    stem, suffix = os.path.splitext(name)
-    try:
-        rolled = sorted(
-            os.path.join(directory, f)
-            for f in os.listdir(directory or ".")
-            if f != name and f.startswith(stem + ".") and f.endswith(suffix)
-        )
-    except OSError:
-        rolled = []
-    return [*rolled, path]
+    if _HERE not in sys.path:
+        sys.path.insert(0, _HERE)
+    from _atomic import episodic_files  # type: ignore[import-not-found]
+
+    return [str(p) for p in episodic_files(path)]
 
 
 def _stream_has_any_file(path: str) -> bool:

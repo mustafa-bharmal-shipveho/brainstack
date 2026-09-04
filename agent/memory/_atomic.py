@@ -15,9 +15,22 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+# `<stem>.<YYYY-MM-DD>[.N]<suffix>` — the exact shape `rolled_name` (below)
+# produces. Anchored so a sibling that merely shares the stem prefix
+# (`AGENT_LEARNINGS_imported.jsonl`, `AGENT_LEARNINGS_other.jsonl`) is never
+# mistaken for a roll of this stream. Mirrored — same rule, own copy — in
+# `runtime/core/locking._rolled_pattern` and `recall/stats._is_rolled_sibling`
+# (different deploy trees); every agent/memory/ consumer (`sdk.py`,
+# `consolidate.py`) calls `episodic_files` below instead of keeping its own.
+def _rolled_pattern(stem: str, suffix: str) -> re.Pattern[str]:
+    return re.compile(
+        rf"^{re.escape(stem)}\.\d{{4}}-\d{{2}}-\d{{2}}(?:\.\d+)?{re.escape(suffix)}$"
+    )
 
 # S5 rotation threshold (20 MiB) — shared naming rule with
 # agent/harness/hooks/_episodic_io.ROTATE_BYTES and
@@ -87,25 +100,31 @@ def rotate_if_oversize(
 def episodic_files(current: Path) -> list[Path]:
     """Rolled siblings of `current` (ascending by name), then `current`.
 
-    The read side of rotation: history that moved into a rolled file must
-    stay visible to `sdk.stats`, the dream cycle, the consolidator and the
-    adapters' dedup preload. The glob is `<stem>*<suffix>`, which matches
-    every roll of this stream and skips sibling streams like
-    `_imported.jsonl`. Order is name-ascending, NOT chronological — byte
-    order puts `AGENT_LEARNINGS.<day>.1.jsonl` (the SECOND roll of that
-    day) before `AGENT_LEARNINGS.<day>.jsonl` (the first). Every consumer
-    that cares about time re-sorts by each entry's own timestamp
-    (`consolidate_once` does so explicitly); this list is only "every file
-    of the stream, current one last".
+    THE canonical implementation for the agent/memory/ tree — `sdk.py` and
+    `consolidate.py` both call this rather than keep their own copies. The
+    read side of rotation: history that moved into a rolled file must stay
+    visible to `sdk.stats`, the dream cycle, the consolidator and the
+    adapters' dedup preload. A candidate must match `_rolled_pattern`
+    (`<stem>.<YYYY-MM-DD>[.N]<suffix>`, anchored) to count as a roll of
+    this stream — a loose `<stem>*<suffix>` glob would also match an
+    unrelated sibling stream that merely shares the stem prefix, like
+    `AGENT_LEARNINGS_imported.jsonl`. Order is name-ascending, NOT
+    chronological — byte order puts `AGENT_LEARNINGS.<day>.1.jsonl` (the
+    SECOND roll of that day) before `AGENT_LEARNINGS.<day>.jsonl` (the
+    first). Every consumer that cares about time re-sorts by each entry's
+    own timestamp (`consolidate_once` does so explicitly); this list is
+    only "every file of the stream, current one last".
 
     `current` is always last, even when it does not exist yet (every
     consumer already tolerates a missing episodic file).
     """
     current = Path(current)
-    pattern = f"{current.stem}*{current.suffix}"
+    stem, suffix = current.stem, current.suffix
+    pattern = _rolled_pattern(stem, suffix)
     try:
         rolled = sorted(
-            p for p in current.parent.glob(pattern) if p.name != current.name
+            p for p in current.parent.glob(f"{stem}*{suffix}")
+            if p.name != current.name and pattern.match(p.name)
         )
     except OSError:
         rolled = []

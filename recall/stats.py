@@ -64,6 +64,12 @@ _AUTO_RECALL_PROBES = ('"event": "AutoRecall"', '"event":"AutoRecall"')
 # `<stem>.<YYYY-MM-DD>[.<n>]<suffix>` — the name logrotate leaves behind.
 _ROLLED_DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})(?:\.\d+)?$")
 
+# Anchored so a sibling that merely shares the stem prefix —
+# `AGENT_LEARNINGS_other.jsonl`, `events.log-foo.jsonl` — is never mistaken
+# for a roll of this stream. Mirrored — same rule, own copy, different
+# deploy tree — in `agent/memory/_atomic._rolled_pattern` and
+# `runtime/core/locking._rolled_pattern`.
+
 _DAY_MS = 24 * 60 * 60 * 1000
 
 
@@ -360,13 +366,27 @@ def iter_auto_recall_records(
                 yield rec
 
 
+def _is_rolled_sibling(name: str, stem: str, suffix: str) -> bool:
+    """True when `name` is exactly `<stem>.<YYYY-MM-DD>[.N]<suffix>` — the
+    shape rotation produces. A loose `<stem>*<suffix>` glob would also
+    match a sibling that merely shares the stem prefix
+    (`AGENT_LEARNINGS_other.jsonl`, `events.log-foo.jsonl`); this anchors
+    the middle segment against `_ROLLED_DATE_RE` so those are excluded.
+    """
+    if not (name.startswith(stem + ".") and name.endswith(suffix)):
+        return False
+    middle = name[len(stem) + 1: len(name) - len(suffix)]
+    return bool(_ROLLED_DATE_RE.match(middle))
+
+
 def _log_files(log_path: Path, *, since_ts_ms: int | None = None) -> list[Path]:
     """`log_path` plus its rotated siblings, oldest name first.
 
     Rotation renames `events.log.jsonl` to `events.log.<date>.jsonl`, so
-    the siblings share the stem and suffix. Deduplicated by path — the
-    glob matches the live file too, and counting it twice would double
-    every number in the report.
+    the siblings share the stem and suffix. A candidate must also satisfy
+    `_is_rolled_sibling` to count — see its docstring for the sibling this
+    excludes. Deduplicated by path — the glob matches the live file too,
+    and counting it twice would double every number in the report.
     """
     name = log_path.name
     suffix = ".jsonl" if name.endswith(".jsonl") else ""
@@ -375,7 +395,10 @@ def _log_files(log_path: Path, *, since_ts_ms: int | None = None) -> list[Path]:
     parent = log_path.parent
     if parent.is_dir():
         try:
-            paths.update(p for p in parent.glob(f"{stem}*{suffix}") if p.is_file())
+            paths.update(
+                p for p in parent.glob(f"{stem}*{suffix}")
+                if p.is_file() and (p == log_path or _is_rolled_sibling(p.name, stem, suffix))
+            )
         except OSError:
             pass
     keep: list[Path] = []
