@@ -426,6 +426,14 @@ if [ "$SYMLINK_NATIVE_FLAG_COUNT" -gt 1 ]; then
     exit 2
 fi
 
+# BRAIN_ROOT is settled: `--brain-root` has been parsed, and nothing
+# below reassigns it. Export once so every helper, sub-invocation of this
+# script, and scheduled unit it renders sees the SAME brain. This used to
+# be two dozen hand-written per-command assignment prefixes, and the ones
+# nobody remembered to add silently wrote to ~/.agent on a custom
+# --brain-root install.
+export BRAIN_ROOT
+
 
 # ----- Helper: install a secret scanner via the local package manager -----
 maybe_install_scanner() {
@@ -714,7 +722,7 @@ if [ "$MODE" = "migrate" ]; then
             echo "         run: ./install.sh --upgrade   to refresh tools" >&2
             exit 2
         fi
-        BRAIN_ROOT="$BRAIN_ROOT" "$PYTHON_BIN" "$BRAIN_ROOT/tools/migrate_dispatcher.py" interactive
+        "$PYTHON_BIN" "$BRAIN_ROOT/tools/migrate_dispatcher.py" interactive
         exit $?
     fi
     # --dry-run with a source: run plan, write nothing.
@@ -732,7 +740,7 @@ if [ "$MODE" = "migrate" ]; then
             echo "         run: ./install.sh --upgrade   to refresh tools" >&2
             exit 2
         fi
-        BRAIN_ROOT="$BRAIN_ROOT" "$PYTHON_BIN" "$BRAIN_ROOT/tools/migrate_dispatcher.py" plan "$MIGRATE_SOURCE" "$BRAIN_ROOT"
+        "$PYTHON_BIN" "$BRAIN_ROOT/tools/migrate_dispatcher.py" plan "$MIGRATE_SOURCE" "$BRAIN_ROOT"
         exit $?
     fi
     # Strip trailing slash. Shell completion happily appends one when the
@@ -944,9 +952,9 @@ if [ "$MODE" = "setup-auto-migrate" ] || [ "$MODE" = "remove-auto-migrate" ]; th
     # no trailing flags is the common case and used to error with
     # "EXTRA_ARGS[@]: unbound variable" before this guard.
     if [ "$MODE" = "setup-auto-migrate" ]; then
-        BRAIN_ROOT="$BRAIN_ROOT" "$PYTHON_BIN" "$helper" setup "${forwarded_args[@]}" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
+        "$PYTHON_BIN" "$helper" setup "${forwarded_args[@]}" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
     else
-        BRAIN_ROOT="$BRAIN_ROOT" "$PYTHON_BIN" "$helper" remove "${forwarded_args[@]}" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
+        "$PYTHON_BIN" "$helper" remove "${forwarded_args[@]}" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
     fi
     exit $?
 fi
@@ -1860,11 +1868,11 @@ if [ "$MODE" = "setup-pending-review-all" ] || [ "$MODE" = "remove-pending-revie
     fi
     if [ "$MODE" = "remove-pending-review-all" ]; then
         echo "==> Removing pending-review surfaces (statusline / Claude / Cursor / Codex / shell)…"
-        BRAIN_ROOT="$BRAIN_ROOT" "$SELF" --remove-statusline        2>&1 | sed 's/^/  /'
-        BRAIN_ROOT="$BRAIN_ROOT" "$SELF" --remove-pending-hook      2>&1 | sed 's/^/  /'
-        BRAIN_ROOT="$BRAIN_ROOT" "$SELF" --remove-cursor-rules      2>&1 | sed 's/^/  /'
-        BRAIN_ROOT="$BRAIN_ROOT" "$SELF" --remove-codex-agents-md   2>&1 | sed 's/^/  /'
-        BRAIN_ROOT="$BRAIN_ROOT" "$SELF" --remove-shell-banner      2>&1 | sed 's/^/  /'
+        "$SELF" --remove-statusline        2>&1 | sed 's/^/  /'
+        "$SELF" --remove-pending-hook      2>&1 | sed 's/^/  /'
+        "$SELF" --remove-cursor-rules      2>&1 | sed 's/^/  /'
+        "$SELF" --remove-codex-agents-md   2>&1 | sed 's/^/  /'
+        "$SELF" --remove-shell-banner      2>&1 | sed 's/^/  /'
         echo "==> Removal complete."
         exit 0
     fi
@@ -1874,11 +1882,11 @@ if [ "$MODE" = "setup-pending-review-all" ] || [ "$MODE" = "remove-pending-revie
     # Order: statusline first (most user-visible: appears as soon as
     # session opens), then directives that fire on first response.
     echo "==> Setting up pending-review surfaces (statusline / Claude / Cursor / Codex / shell)…"
-    BRAIN_ROOT="$BRAIN_ROOT" PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-statusline        2>&1 | sed 's/^/  [statusln] /'
-    BRAIN_ROOT="$BRAIN_ROOT" PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-pending-hook      2>&1 | sed 's/^/  [claude]   /'
-    BRAIN_ROOT="$BRAIN_ROOT" PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-cursor-rules      2>&1 | sed 's/^/  [cursor]   /'
-    BRAIN_ROOT="$BRAIN_ROOT" PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-codex-agents-md   2>&1 | sed 's/^/  [codex]    /'
-    BRAIN_ROOT="$BRAIN_ROOT" PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-shell-banner      2>&1 | sed 's/^/  [shell]    /'
+    PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-statusline        2>&1 | sed 's/^/  [statusln] /'
+    PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-pending-hook      2>&1 | sed 's/^/  [claude]   /'
+    PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-cursor-rules      2>&1 | sed 's/^/  [cursor]   /'
+    PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-codex-agents-md   2>&1 | sed 's/^/  [codex]    /'
+    PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-shell-banner      2>&1 | sed 's/^/  [shell]    /'
     echo
     echo "==> All five surfaces configured."
     echo "    Statusline:    Claude Code UI footer, visible immediately on session open"
@@ -1918,17 +1926,17 @@ if [[ "$MODE" == setup-recall-first-* ]] || [[ "$MODE" == remove-recall-first-* 
     # All-in-one fans out to the three single-host modes.
     if [ "$MODE" = "setup-recall-first-all" ]; then
         echo "==> Wiring recall-first directive into Claude / Codex / Cursor…"
-        BRAIN_ROOT="$BRAIN_ROOT" PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-recall-first-claude 2>&1 | sed 's/^/  [claude] /'
-        BRAIN_ROOT="$BRAIN_ROOT" PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-recall-first-codex  2>&1 | sed 's/^/  [codex]  /'
-        BRAIN_ROOT="$BRAIN_ROOT" PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-recall-first-cursor 2>&1 | sed 's/^/  [cursor] /'
+        PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-recall-first-claude 2>&1 | sed 's/^/  [claude] /'
+        PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-recall-first-codex  2>&1 | sed 's/^/  [codex]  /'
+        PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-recall-first-cursor 2>&1 | sed 's/^/  [cursor] /'
         echo "==> Done. Recall is now the first-line resource on all installed hosts."
         exit 0
     fi
     if [ "$MODE" = "remove-recall-first-all" ]; then
         echo "==> Removing recall-first directive from Claude / Codex / Cursor…"
-        BRAIN_ROOT="$BRAIN_ROOT" "$SELF" --remove-recall-first-claude 2>&1 | sed 's/^/  /'
-        BRAIN_ROOT="$BRAIN_ROOT" "$SELF" --remove-recall-first-codex  2>&1 | sed 's/^/  /'
-        BRAIN_ROOT="$BRAIN_ROOT" "$SELF" --remove-recall-first-cursor 2>&1 | sed 's/^/  /'
+        "$SELF" --remove-recall-first-claude 2>&1 | sed 's/^/  /'
+        "$SELF" --remove-recall-first-codex  2>&1 | sed 's/^/  /'
+        "$SELF" --remove-recall-first-cursor 2>&1 | sed 's/^/  /'
         echo "==> Removal complete."
         exit 0
     fi
@@ -3301,7 +3309,7 @@ else
                 # can still run `./install.sh --migrate <path>` directly
                 # (where SYMLINK_NATIVE=1 remains the default for that explicit
                 # invocation).
-                if BRAIN_ROOT="$BRAIN_ROOT" PYTHON_BIN="$PYTHON_BIN" "$SELF" --migrate "$src" --no-symlink >/dev/null 2>&1; then
+                if PYTHON_BIN="$PYTHON_BIN" "$SELF" --migrate "$src" --no-symlink >/dev/null 2>&1; then
                     migrated_count=$((migrated_count + 1))
                 fi
             fi
@@ -3321,7 +3329,7 @@ fi
 if [ "$NO_AUTO_MIGRATE" = "1" ]; then
     DEFAULT_AUTO_MIGRATE_STATUS="skipped"
 else
-    if BRAIN_ROOT="$BRAIN_ROOT" PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-auto-migrate >/dev/null 2>&1; then
+    if PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-auto-migrate >/dev/null 2>&1; then
         DEFAULT_AUTO_MIGRATE_STATUS="done"
     else
         DEFAULT_AUTO_MIGRATE_STATUS="failed"
@@ -3339,14 +3347,14 @@ if [ "$NO_LAUNCHD" = "1" ]; then
     DEFAULT_LAUNCHD_STATUS="skipped"
 elif [ "$PLATFORM" = "Darwin" ]; then
     DEFAULT_SCHEDULER_KIND="launchd"
-    if BRAIN_ROOT="$BRAIN_ROOT" PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-launchd >/dev/null 2>&1; then
+    if PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-launchd >/dev/null 2>&1; then
         DEFAULT_LAUNCHD_STATUS="done"
     else
         DEFAULT_LAUNCHD_STATUS="failed"
     fi
 elif [ "$PLATFORM" = "Linux" ] && command -v systemctl >/dev/null 2>&1; then
     DEFAULT_SCHEDULER_KIND="systemd"
-    if BRAIN_ROOT="$BRAIN_ROOT" PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-systemd >/dev/null 2>&1; then
+    if PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-systemd >/dev/null 2>&1; then
         DEFAULT_LAUNCHD_STATUS="done"
     else
         DEFAULT_LAUNCHD_STATUS="failed"
@@ -3368,7 +3376,7 @@ fi
 if [ "$NO_RECALL_FIRST" = "1" ]; then
     DEFAULT_RECALL_FIRST_STATUS="skipped"
 else
-    if BRAIN_ROOT="$BRAIN_ROOT" PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-recall-first-all >/dev/null 2>&1; then
+    if PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-recall-first-all >/dev/null 2>&1; then
         DEFAULT_RECALL_FIRST_STATUS="done"
     else
         DEFAULT_RECALL_FIRST_STATUS="failed"
@@ -3379,7 +3387,7 @@ fi
 if [ "$NO_AUTO_RECALL" = "1" ]; then
     DEFAULT_AUTO_RECALL_STATUS="skipped"
 else
-    if BRAIN_ROOT="$BRAIN_ROOT" PYTHON_BIN="$PYTHON_BIN" "$SELF" --enable-auto-recall >/dev/null 2>&1; then
+    if PYTHON_BIN="$PYTHON_BIN" "$SELF" --enable-auto-recall >/dev/null 2>&1; then
         DEFAULT_AUTO_RECALL_STATUS="done"
     else
         DEFAULT_AUTO_RECALL_STATUS="failed"
@@ -3401,7 +3409,7 @@ else
     # at it instead of making the user re-run --setup-daemon by hand.
     daemon_install_log="$BRAIN_ROOT/runtime/logs/install-daemon.log"
     mkdir -p "$BRAIN_ROOT/runtime/logs"
-    if BRAIN_ROOT="$BRAIN_ROOT" PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-daemon \
+    if PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-daemon \
             >/dev/null 2>"$daemon_install_log"; then
         DEFAULT_DAEMON_STATUS="done"
     else

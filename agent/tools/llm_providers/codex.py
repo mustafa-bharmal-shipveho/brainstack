@@ -50,20 +50,12 @@ class CodexProvider(LLMProvider):
     # gpt-5.5 is the default on ChatGPT-account auth. gpt-5 raw is blocked
     # for ChatGPT-account users (verified empirically).
     default_model = "gpt-5.5"
-    # Resolved absolute path once is_available() finds the CLI outside
-    # PATH (S5 R6) — argv[0] uses this instead of the bare name so a
-    # scheduled job with a minimal PATH can still exec it.
-    _bin: str | None = None
 
     def is_available(self) -> tuple[bool, str]:
         path, searched = find_cli("codex")
         if path is None:
-            return (
-                False,
-                f"codex CLI not on PATH (PATH={os.environ.get('PATH', '')}) "
-                f"nor in {', '.join(searched)} — install OpenAI Codex CLI or "
-                f"add its bin dir to PATH",
-            )
+            return (False, self._not_found("codex", searched,
+                                           "install OpenAI Codex CLI"))
         self._bin = path
         auth = Path(os.environ.get("HOME", str(Path.home())))
         auth = auth / ".codex" / "auth.json"

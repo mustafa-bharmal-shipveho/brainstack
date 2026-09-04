@@ -30,8 +30,9 @@ gets its own (longer) timeout, `BRAINSTACK_DIGEST_TIMEOUT_S` (default
 `BRAINSTACK_DIGEST_MAX_SECONDS`, defaults 3 / 1500) so it stops cleanly
 before the process-level timeout ever fires. Its
 `digests: processed=... pending=... elapsed_s=... budget_hit=...`
-summary line is logged and mirrored into `runtime/digest_status.json`
-so a backlog is visible instead of silently growing.
+summary line is quoted into this log; the CLI itself writes
+`runtime/digest_status.json` from the same numbers, so a backlog is
+visible instead of silently growing.
 
 Invoked by: ~/Library/LaunchAgents/com.brainstack.claude-extras.plist
 """
@@ -40,7 +41,6 @@ from __future__ import annotations
 import datetime
 import fcntl
 import os
-import re
 import subprocess
 import sys
 import time
@@ -57,85 +57,39 @@ PYTHON = os.environ.get("PYTHON", sys.executable)
 TOOLS_DIR = BRAIN_ROOT / "tools"
 
 
-def _env_float(name: str, default: float) -> float:
+def _env_num(name: str, default, cast):
+    """Read `$name` as `cast`, falling back to `default` when it is
+    unset, blank, or unparseable. An operator's typo must degrade to the
+    shipped budget, never to a crash in the hourly job."""
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
         return default
     try:
-        return float(raw)
-    except ValueError:
-        return default
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None or not raw.strip():
-        return default
-    try:
-        return int(raw)
+        return cast(raw)
     except ValueError:
         return default
 
 
 # Digest step's own budget — separate from the 600s adapter timeout so a
 # busy hour (many new sessions) can't get killed mid-summarize.
-DIGEST_TIMEOUT_S = _env_float("BRAINSTACK_DIGEST_TIMEOUT_S", 1800.0)
-DIGEST_LIMIT = _env_int("BRAINSTACK_DIGEST_LIMIT", 3)
-DIGEST_MAX_SECONDS = _env_float("BRAINSTACK_DIGEST_MAX_SECONDS", 1500.0)
+DIGEST_TIMEOUT_S = _env_num("BRAINSTACK_DIGEST_TIMEOUT_S", 1800.0, float)
+DIGEST_LIMIT = _env_num("BRAINSTACK_DIGEST_LIMIT", 3, int)
+DIGEST_MAX_SECONDS = _env_num("BRAINSTACK_DIGEST_MAX_SECONDS", 1500.0, float)
 
-_DIGEST_SUMMARY_RE = re.compile(
-    r"digests:\s+processed=(?P<processed>-?\d+)\s+"
-    r"pending=(?P<pending>-?\d+)\s+"
-    r"elapsed_s=(?P<elapsed_s>-?\d+(?:\.\d+)?)\s+"
-    r"budget_hit=(?P<budget_hit>True|False)"
-)
+_DIGEST_SUMMARY_PREFIX = "digests: "
 
 
-def _parse_digest_summary(stdout: str) -> tuple[str, dict] | None:
-    """Find the LAST `digests: processed=... ` line in `stdout` and
-    return `(raw_line, parsed_fields)`, or `None` if no such line is
-    present (e.g. the digest step errored before printing one)."""
-    if not stdout:
-        return None
-    found = None
-    for line in stdout.splitlines():
-        m = _DIGEST_SUMMARY_RE.search(line)
-        if m:
-            found = (line.strip(), m)
-    if found is None:
-        return None
-    line, m = found
-    return line, {
-        "processed": int(m.group("processed")),
-        "pending": int(m.group("pending")),
-        "elapsed_s": float(m.group("elapsed_s")),
-        "budget_hit": m.group("budget_hit") == "True",
-    }
+def _digest_summary_line(stdout: str) -> str:
+    """The LAST `digests: ...` line the digest step printed, or `""` if
+    it printed none (e.g. it errored before getting that far).
 
-
-def _write_digest_status(brain_root: Path, fields: dict) -> None:
-    """Write `runtime/digest_status.json` — the digest step's
-    machine-readable receipt, so a future health check can WARN when
-    `pending` grows for several ticks in a row. Best-effort: a
-    status-write failure must never fail the sync run it reports on."""
-    try:
-        memory_dir = str(Path(__file__).resolve().parent.parent / "memory")
-        if memory_dir not in sys.path:
-            sys.path.insert(0, memory_dir)
-        from _atomic import atomic_write_json  # type: ignore
-
-        payload = {
-            "ts": datetime.datetime.now(datetime.timezone.utc)
-                  .strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "processed": fields["processed"],
-            "pending": fields["pending"],
-            "elapsed_s": fields["elapsed_s"],
-            "budget_hit": fields["budget_hit"],
-        }
-        atomic_write_json(brain_root / "runtime" / "digest_status.json",
-                           payload)
-    except Exception as e:  # pragma: no cover — best-effort receipt
-        _log(f"WARN: failed to write digest_status.json: {e}")
+    Quoted into the log verbatim, never parsed: the CLI owns
+    `runtime/digest_status.json` and writes it from the numbers it
+    already holds."""
+    for line in reversed((stdout or "").splitlines()):
+        if line.strip().startswith(_DIGEST_SUMMARY_PREFIX):
+            return line.strip()
+    return ""
 
 
 def _log(msg: str) -> None:
@@ -261,11 +215,9 @@ def main() -> int:
                  "--max-seconds", str(DIGEST_MAX_SECONDS)],
                 timeout=DIGEST_TIMEOUT_S,
             )
-            parsed = _parse_digest_summary(out3)
-            if parsed is not None:
-                line, fields = parsed
-                _log(f"[digest_cli_incremental] {line}")
-                _write_digest_status(BRAIN_ROOT, fields)
+            summary_line = _digest_summary_line(out3)
+            if summary_line:
+                _log(f"[digest_cli_incremental] {summary_line}")
             elif rc3 == 0:
                 # Completed but printed no summary line — shouldn't
                 # happen, but don't let a missing receipt masquerade

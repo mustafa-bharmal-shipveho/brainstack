@@ -331,6 +331,18 @@ class LLMExtractor:
         return (f"llm_calls={self._call_count} "
                 f"llm_errors=" + ",".join(parts))
 
+    def error_counters(self) -> Dict[str, object]:
+        """Structured twin of `error_summary()`.
+
+        `dream_status.json` needs these as data, and re-parsing them out
+        of the rendered line is how the two surfaces drift. Always
+        returns both keys, including on a clean run (`error_summary()`
+        returns None there, but `llm_calls` is still worth recording)."""
+        return {
+            "llm_calls": self._call_count,
+            "llm_errors": dict(self._error_counts or {}),
+        }
+
     def _resolve(self):
         if self._provider is not None:
             return self._provider, self._system_prompt

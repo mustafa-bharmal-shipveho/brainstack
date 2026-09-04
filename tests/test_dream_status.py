@@ -13,8 +13,11 @@ reads:
      "kept": 43770, "archived": 25, "consolidate_claims": 0, "llm_calls": 3,
      "llm_errors": {"provider_unavailable": 3}, "error": null}
 
-The counters are parsed out of the summary line the cycle already prints,
-so the log and the status file can never disagree.
+The counters are the cycle's own tally, handed to the status writer
+directly — the printed line is a rendering of the same numbers, not the
+source of them. Re-parsing the text is the fallback for a caller holding
+nothing but `dream.log`, and that parser is pinned against
+`recall.health._parse_llm_errors` so the two readings of that text agree.
 
 Hermetic: tmp brain via BRAIN_ROOT plus patched module paths, never
 `~/.agent`. HOME and XDG_CONFIG_HOME are redirected so the consolidator
@@ -209,6 +212,58 @@ def test_dream_status_parses_llm_errors_from_summary(tmp_path, auto_dream):
     assert status["llm_errors"] == {"provider_unavailable": 3, "rate_limited": 1}
     assert status["ok"] is True
     assert status["error"] is None
+
+
+def test_dream_status_counters_come_from_the_cycle_not_the_line(
+        tmp_path, isolated_home, auto_dream, monkeypatch):
+    """The cycle hands its own tally to the status writer. Proof: a
+    summary line whose text says something else entirely still yields the
+    real numbers, because nothing re-reads the line."""
+    brain = make_brain(tmp_path / ".agent")
+    _patch_dream_globals(monkeypatch, auto_dream, brain)
+
+    auto_dream._write_cycle_status(
+        str(brain), "default",
+        "dream cycle: staged=999 kept=999 archived=999 "
+        "consolidate_claims=999 llm_calls=999 llm_errors=bogus=999",
+        counters={"staged": 2, "kept": 7, "archived": 1,
+                  "consolidate_claims": 3, "llm_calls": 4,
+                  "llm_errors": {"timeout": 1}},
+    )
+
+    status = _read_status(brain)
+    assert status["staged"] == 2
+    assert status["kept"] == 7
+    assert status["archived"] == 1
+    assert status["consolidate_claims"] == 3
+    assert status["llm_calls"] == 4
+    assert status["llm_errors"] == {"timeout": 1}
+
+
+# The shapes `LLMExtractor.error_summary()` actually emits, plus a clean
+# line that carries no `llm_errors=` token at all.
+_LLM_ERROR_LINES = (
+    "dream cycle: patterns=4 staged=2 prefiltered_out=1 pending_review=3 "
+    "archived=25 kept=43770 consolidate_claims=7 "
+    "llm_calls=3 llm_errors=provider_unavailable=3,rate_limited=1",
+    "dream cycle: staged=1 kept=9 archived=0 "
+    "llm_calls=1 llm_errors=timeout=1 lint_marked=0",
+    "dream cycle: staged=0 kept=0 archived=0 consolidate_claims=0",
+)
+
+
+@pytest.mark.parametrize("line", _LLM_ERROR_LINES)
+def test_llm_error_parsers_agree(auto_dream, line):
+    """`auto_dream._parse_summary_counters` and
+    `recall.health._parse_llm_errors` both read `dream.log` text when no
+    status file is available. Pin them on one fixture so they can never
+    disagree about what the last cycle failed with."""
+    from recall.health import _parse_llm_errors
+
+    assert (
+        auto_dream._parse_summary_counters(line)["llm_errors"]
+        == _parse_llm_errors(line)
+    )
 
 
 def test_dream_status_records_error_when_cycle_fails(tmp_path, auto_dream):

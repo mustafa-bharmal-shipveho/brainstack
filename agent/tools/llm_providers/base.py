@@ -49,6 +49,17 @@ def _expand_dir(entry: str, home: Path) -> str:
     return entry
 
 
+def fallback_bin_dirs(home: Path) -> list[str]:
+    """`FALLBACK_BIN_DIRS` expanded against `home`, in order.
+
+    Also the source of the PATH `auto_migrate_install` stamps into
+    generated launchd/systemd units: the job's PATH and the CLI lookup
+    are answers to the same question ("where does this machine keep
+    `claude` / `codex` / `recall`?") and must not drift apart.
+    """
+    return [_expand_dir(d, home) for d in FALLBACK_BIN_DIRS]
+
+
 def nvm_bin_dirs(home: Path) -> list[str]:
     """`~/.nvm/versions/node/v*/bin`, newest version first (parsed
     version tuple, not string sort — v9 must sort behind v20)."""
@@ -82,7 +93,7 @@ def find_cli(name: str, *, home: Path | None = None) -> tuple[str | None, list[s
         home if home is not None
         else Path(os.environ.get("HOME", str(Path.home())))
     )
-    dirs = [_expand_dir(d, resolved_home) for d in FALLBACK_BIN_DIRS]
+    dirs = fallback_bin_dirs(resolved_home)
     dirs.extend(nvm_bin_dirs(resolved_home))
 
     which = shutil.which(name)
@@ -147,6 +158,26 @@ class LLMProvider(ABC):
 
     name: str = ""
     default_model: str = ""
+    # Resolved absolute path once is_available() finds the CLI outside
+    # PATH (S5 R6) — argv[0] uses this instead of the bare name so a
+    # scheduled job with a minimal PATH can still exec it.
+    _bin: str | None = None
+
+    @staticmethod
+    def _not_found(cli: str, searched: list[str], install_hint: str) -> str:
+        """The skip reason for a CLI that is nowhere on this machine.
+
+        Names the PATH that was consulted, every fallback dir that was
+        searched, and what to install — a user who hits this must never
+        have to read source to know what is wrong. One wording for every
+        provider so the `ProviderNotAvailable` message stays readable
+        when several are listed together.
+        """
+        return (
+            f"{cli} CLI not on PATH (PATH={os.environ.get('PATH', '')}) "
+            f"nor in {', '.join(searched)} — {install_hint} or add "
+            f"its bin dir to PATH"
+        )
 
     @abstractmethod
     def is_available(self) -> tuple[bool, str]:

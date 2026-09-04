@@ -39,6 +39,7 @@ from auto_migrate_install import (  # noqa: E402
     generate_plist,
     generate_systemd_units,
 )
+from llm_providers.base import FALLBACK_BIN_DIRS  # noqa: E402
 
 LAUNCHD_TEMPLATES = (
     "com.user.agent-sync.plist",
@@ -151,6 +152,31 @@ def test_auto_migrate_generate_plist_path_includes_local_bin(
         f"(the adapters shell out to the same CLIs); got {path!r}"
     )
     assert f"{home}/.claude/local" in path.split(":"), path
+
+
+def test_generated_path_covers_every_provider_fallback_dir(
+    tmp_path: Path, monkeypatch
+):
+    """The dirs the provider lookup searches and the PATH the scheduled
+    job runs with answer the same question. Kept as two hand-written
+    lists they drifted: `find_cli` would resolve `claude` under
+    `~/.bun/bin`, then the job it was resolved for could not exec it.
+    Adding a dir to FALLBACK_BIN_DIRS must reach the unit for free."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    plist = plistlib.loads(
+        generate_plist(tmp_path / "brain", Path(sys.executable))
+    )
+    entries = plist["EnvironmentVariables"]["PATH"].split(":")
+
+    for raw in FALLBACK_BIN_DIRS:
+        expected = (str(home / raw[2:]) if raw.startswith("~/") else raw)
+        assert expected in entries, (
+            f"FALLBACK_BIN_DIRS entry {raw!r} is missing from the generated "
+            f"PATH {entries!r}"
+        )
 
 
 def test_auto_migrate_generate_systemd_units_path_includes_local_bin(

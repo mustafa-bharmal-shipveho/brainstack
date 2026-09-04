@@ -388,10 +388,11 @@ class TestDefaultInstallWiresTheDaemon:
     @darwin_only
     def test_fresh_full_install_forwards_custom_brain_root_to_daemon(self, tmp_path: Path):
         """`--brain-root /custom` must reach the recursive `--setup-daemon`
-        step. The parsed BRAIN_ROOT is a shell variable, not an exported
-        one, so an unforwarded recursion would silently configure the
-        LaunchAgent for the wrong brain. The env deliberately points
-        BRAIN_ROOT at a different dir so the flag has to win."""
+        step, which only happens because the installer exports BRAIN_ROOT
+        once the flag has been parsed. Drop that export (or reassign
+        BRAIN_ROOT after it) and the recursion silently configures the
+        LaunchAgent for the wrong brain. The env deliberately starts with
+        no BRAIN_ROOT at all, so nothing but the export can carry it."""
         import plistlib
 
         fake_home = tmp_path / "fakehome"
