@@ -140,7 +140,7 @@ scratchpad = 10000
 | `auto_recall_min_score` | float | `0.0` | reject RRF results below this score before injecting (`0.0` = floor off) |
 | `auto_recall_daemon_budget_ms` | int | `800` | socket connect+respond budget when routing through the warm recall daemon; effective budget is `min(this, auto_recall_timeout_ms)` |
 | `auto_recall_daemon_socket` | str | `"$BRAIN_ROOT/runtime/recall.sock"` | daemon socket path literal, resolved by `recall.config.daemon_socket_path` (env override > this literal > `$BRAIN_ROOT/runtime` > `$BRAIN_HOME` parent > `~/.agent/runtime`) |
-| `auto_recall_min_rerank` | float | `0.0` | reject candidates below this cross-encoder score (`0.0` = gate off); only enforceable when the daemon supplies rerank scores |
+| `auto_recall_min_rerank` | float \| `None` | `None` | reject candidates below this cross-encoder score; `None` (unset, or `"none"`/`"null"`) = gate off. Cross-encoder scores are raw logits (mostly negative), so `0.0` cannot express a calibrated negative threshold — any float, including a negative one, enables the gate. Only enforceable when the daemon supplies rerank scores |
 | `auto_recall_dedup` | bool | `true` | kill switch for the per-session dedup store (don't re-inject an unchanged doc already shown this session) |
 
 `auto_recall_timeout_ms` default is **1500ms**, down from an earlier 3000ms:

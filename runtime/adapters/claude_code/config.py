@@ -69,7 +69,7 @@ class RuntimeConfig:
         auto_recall_min_score = 0.0
         auto_recall_daemon_budget_ms = 800
         auto_recall_daemon_socket = "$BRAIN_ROOT/runtime/recall.sock"
-        auto_recall_min_rerank = 0.0
+        auto_recall_min_rerank = -1.5  # unset/omitted, or "none" -> gate off
         auto_recall_dedup = true
         [tool.recall.runtime.budget]
         claude_md = 4000
@@ -110,9 +110,12 @@ class RuntimeConfig:
     # so it always reflects the CURRENT brain root.
     auto_recall_daemon_socket: str = "$BRAIN_ROOT/runtime/recall.sock"
     # S4 relevance gate: reject candidates below this cross-encoder score.
-    # 0.0 = gate off (matches pre-S4 behavior). Calibrated value is written
-    # to the user's global runtime config by eval/calibrate_rerank_gate.py.
-    auto_recall_min_rerank: float = 0.0
+    # Cross-encoder scores are raw logits (mostly negative), so `0.0` cannot
+    # express a calibrated negative threshold — `None` is the "gate off"
+    # sentinel instead; any float, including a negative one, enables the
+    # gate. Calibrated value is written to the user's global runtime config
+    # by eval/calibrate_rerank_gate.py.
+    auto_recall_min_rerank: float | None = None
     # Per-session dedup store kill switch (S2). True = don't re-inject a
     # doc whose content hasn't changed since it was last shown this session.
     auto_recall_dedup: bool = True
@@ -259,7 +262,7 @@ class RuntimeConfig:
                 "auto_recall_daemon_socket", "str", defaults.auto_recall_daemon_socket
             ),
             auto_recall_min_rerank=scalar(
-                "auto_recall_min_rerank", "float", defaults.auto_recall_min_rerank
+                "auto_recall_min_rerank", "float_or_none", defaults.auto_recall_min_rerank
             ),
             auto_recall_dedup=scalar("auto_recall_dedup", "bool", defaults.auto_recall_dedup),
             budgets=cls._merge_budgets(sections),
@@ -373,6 +376,20 @@ def _coerce(value: object, kind: str) -> tuple[bool, object]:
         except (TypeError, ValueError):
             return False, None
     if kind == "float":
+        try:
+            return True, float(value)
+        except (TypeError, ValueError):
+            return False, None
+    if kind == "float_or_none":
+        # Lenient "gate off" sentinel: absent (caller never sees this value
+        # — the key isn't in the section), `None`, or a case-insensitive
+        # "none"/"null" string all mean the gate is off. Any other string
+        # is tried as a numeric literal (`"-1.9547"` -> `-1.9547`) before
+        # falling through to the next layer.
+        if value is None:
+            return True, None
+        if isinstance(value, str) and value.strip().lower() in ("none", "null", ""):
+            return True, None
         try:
             return True, float(value)
         except (TypeError, ValueError):

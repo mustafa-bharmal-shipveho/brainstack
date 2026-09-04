@@ -336,7 +336,7 @@ class TestNewDefaults:
         assert cfg.auto_recall_timeout_ms == 1500
         assert cfg.auto_recall_daemon_budget_ms == 800
         assert cfg.auto_recall_daemon_socket == "$BRAIN_ROOT/runtime/recall.sock"
-        assert cfg.auto_recall_min_rerank == pytest.approx(0.0)
+        assert cfg.auto_recall_min_rerank is None
         assert cfg.auto_recall_dedup is True
 
     def test_new_defaults_on_bare_dataclass(self):
@@ -345,7 +345,7 @@ class TestNewDefaults:
         assert cfg.auto_recall_timeout_ms == 1500
         assert cfg.auto_recall_daemon_budget_ms == 800
         assert cfg.auto_recall_daemon_socket == "$BRAIN_ROOT/runtime/recall.sock"
-        assert cfg.auto_recall_min_rerank == pytest.approx(0.0)
+        assert cfg.auto_recall_min_rerank is None
         assert cfg.auto_recall_dedup is True
 
     def test_existing_defaults_unchanged(self, runtime_home):
@@ -376,6 +376,53 @@ class TestNewDefaults:
         assert cfg.auto_recall_daemon_socket == "/tmp/custom-recall.sock"
         assert cfg.auto_recall_min_rerank == pytest.approx(0.35)
         assert cfg.auto_recall_dedup is False
+
+    def test_min_rerank_negative_float_from_cwd_pyproject(self, runtime_home):
+        """Cross-encoder scores are raw logits (mostly negative), so a
+        calibrated threshold is commonly negative. A cwd pyproject.toml
+        setting `auto_recall_min_rerank = -1.5` must load as -1.5, not be
+        rejected as falsy/invalid."""
+        runtime_home.write_cwd(
+            "[tool.recall.runtime]\nauto_recall_min_rerank = -1.5\n"
+        )
+
+        cfg = RuntimeConfig.load()
+
+        assert cfg.auto_recall_min_rerank == pytest.approx(-1.5)
+
+    def test_min_rerank_string_none_coerces_to_none(self, runtime_home):
+        runtime_home.write_global(
+            '[tool.recall.runtime]\nauto_recall_min_rerank = "none"\n'
+        )
+
+        cfg = RuntimeConfig.load()
+
+        assert cfg.auto_recall_min_rerank is None
+
+    def test_min_rerank_string_null_coerces_to_none(self, runtime_home):
+        runtime_home.write_global(
+            '[tool.recall.runtime]\nauto_recall_min_rerank = "null"\n'
+        )
+
+        cfg = RuntimeConfig.load()
+
+        assert cfg.auto_recall_min_rerank is None
+
+    def test_min_rerank_numeric_string_coerces_to_float(self, runtime_home):
+        runtime_home.write_global(
+            '[tool.recall.runtime]\nauto_recall_min_rerank = "-1.9547"\n'
+        )
+
+        cfg = RuntimeConfig.load()
+
+        assert cfg.auto_recall_min_rerank == pytest.approx(-1.9547)
+
+    def test_min_rerank_absent_stays_none(self, runtime_home):
+        runtime_home.write_global("[tool.recall.runtime]\nauto_recall_k = 3\n")
+
+        cfg = RuntimeConfig.load()
+
+        assert cfg.auto_recall_min_rerank is None
 
 
 # ---------------------------------------------------------------------------
@@ -494,6 +541,54 @@ class TestDaemonSocketPathResolution:
         got = recall_config.daemon_socket_path()
 
         assert _resolved(got) == _resolved(
+            runtime_home.home / ".agent" / "runtime" / "recall.sock"
+        )
+
+    def test_default_raw_literal_expands_via_brain_root_when_unset(self, runtime_home):
+        """Regression: the runtime config's default `raw` is the literal
+        `"$BRAIN_ROOT/runtime/recall.sock"`. Hooks do not export
+        `$BRAIN_ROOT` (the normal Claude Code hook environment), so this
+        must expand `$BRAIN_ROOT` via `recall.config.brain_root()` — which
+        falls back through an on-disk `~/.agent/memory` to `~/.agent` —
+        rather than leaving the literal `"$BRAIN_ROOT"` text in the path."""
+        runtime_home.monkeypatch.delenv("BRAIN_ROOT", raising=False)
+        runtime_home.monkeypatch.delenv("BRAIN_HOME", raising=False)
+        (runtime_home.home / ".agent" / "memory").mkdir(parents=True, exist_ok=True)
+
+        got = recall_config.daemon_socket_path("$BRAIN_ROOT/runtime/recall.sock")
+
+        assert "BRAIN_ROOT" not in str(got)
+        assert _resolved(got) == _resolved(
+            runtime_home.home / ".agent" / "runtime" / "recall.sock"
+        )
+
+    def test_default_raw_literal_expands_via_brain_home_parent(self, runtime_home, tmp_path):
+        """Same default raw literal, but `$BRAIN_HOME` is set (no
+        `$BRAIN_ROOT`): `brain_root()` resolves to `$BRAIN_HOME`'s parent."""
+        runtime_home.monkeypatch.delenv("BRAIN_ROOT", raising=False)
+        runtime_home.monkeypatch.setenv("BRAIN_HOME", str(tmp_path / "elsewhere" / "memory"))
+
+        got = recall_config.daemon_socket_path("$BRAIN_ROOT/runtime/recall.sock")
+
+        assert _resolved(got) == _resolved(
+            tmp_path / "elsewhere" / "runtime" / "recall.sock"
+        )
+
+    def test_runtime_config_property_matches_default_raw_fallback(self, runtime_home):
+        """`RuntimeConfig.daemon_socket_path` delegates to
+        `recall.config.daemon_socket_path`, so it must resolve the same
+        `~/.agent` fallback as the module-level function for the dataclass's
+        own default literal."""
+        runtime_home.monkeypatch.delenv("BRAIN_ROOT", raising=False)
+        runtime_home.monkeypatch.delenv("BRAIN_HOME", raising=False)
+        (runtime_home.home / ".agent" / "memory").mkdir(parents=True, exist_ok=True)
+
+        cfg = RuntimeConfig()
+
+        assert _resolved(cfg.daemon_socket_path) == _resolved(
+            recall_config.daemon_socket_path(cfg.auto_recall_daemon_socket)
+        )
+        assert _resolved(cfg.daemon_socket_path) == _resolved(
             runtime_home.home / ".agent" / "runtime" / "recall.sock"
         )
 
