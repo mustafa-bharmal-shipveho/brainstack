@@ -252,6 +252,39 @@ _RUN_TERMINAL_MARKERS: tuple[str, ...] = (
 )
 
 
+def _in_last_run(tail_lines: list[str], claims=None):
+    """Yield `(idx, line)` for the lines belonging to the most recent
+    sync run, newest first.
+
+    Three readers walk this tail backwards — quarantine, remote error,
+    held-back paths — and each needs the same two boundary rules, which
+    is exactly why they kept getting them differently:
+
+    - The EXIT trap's `health:` line always lands AFTER the run's
+      terminal marker, so it belongs to no run: it must neither end one
+      nor count as one's last line. (2026-09-04 smoke test, Defect 1.)
+    - The scan stops at the PREVIOUS run's terminal marker, so a failure
+      from five days ago is never quoted as if it were today's — but
+      only once a line has already been seen, or the current run's own
+      marker would end the scan before it reached anything.
+
+    `claims(line)` marks a line the caller reads as its own data; a
+    claimed line never ends the scan. Git's `fatal:` and the held-back
+    markers can sit ON the terminal line, and the caller wants them.
+    """
+    seen_run_line = False
+    for idx in range(len(tail_lines) - 1, -1, -1):
+        line = tail_lines[idx]
+        if _is_health_line(line):
+            continue  # transparent: belongs to no run, ends no run
+        if not (claims is not None and claims(line)):
+            if seen_run_line and any(m in line.lower()
+                                     for m in _RUN_TERMINAL_MARKERS):
+                return  # walked back into the previous run
+        seen_run_line = True
+        yield idx, line
+
+
 def _last_run_quarantined(tail_lines: list[str]) -> bool:
     """True if the most recent sync run held files back from the commit.
 
@@ -261,17 +294,8 @@ def _last_run_quarantined(tail_lines: list[str]) -> bool:
     partial sync is invisible. That silence is precisely the failure mode
     that let a month of memories sit unpushed — surface it instead.
     """
-    seen_run_line = False
-    for line in reversed(tail_lines):
-        if _is_health_line(line):
-            continue  # transparent: belongs to no run, ends no run
-        low = line.lower()
-        if seen_run_line and any(m in low for m in _RUN_TERMINAL_MARKERS):
-            break  # walked back into the previous run
-        seen_run_line = True
-        if "sync: held back" in low:
-            return True
-    return False
+    return any("sync: held back" in line.lower()
+               for _idx, line in _in_last_run(tail_lines))
 
 
 # sync.sh prefixes every log line with `date -u +%FT%TZ`. Stripping it
@@ -319,43 +343,43 @@ def _is_health_line(line: str) -> bool:
     return _LOG_TS_RE.sub("", line).strip().lower().startswith("health:")
 
 
+def _git_error_rank(stripped_low: str) -> Optional[int]:
+    """Index into `_GIT_ERROR_PREFIXES`, or None if the line is not one
+    of git's own failure lines."""
+    return next(
+        (r for r, prefixes in enumerate(_GIT_ERROR_PREFIXES)
+         if stripped_low.startswith(prefixes)),
+        None,
+    )
+
+
 def _last_remote_error(tail_lines: list[str]) -> Optional[str]:
     """The most informative git failure line from the most recent sync run,
     or `None` if the tail carries none.
 
-    Scoped to the last run: the scan walks backwards and stops at the
-    PREVIOUS run's terminal marker, so a failure from five days ago is
-    never quoted as if it were today's. Among this run's candidates,
-    GitHub's `remote: error:` / `! [remote rejected]` wins; failing that
-    the first `fatal:`; failing that whatever transport error is left.
-
-    `seen_run_line` — not "is this the physical last line?" — decides
-    whether a terminal marker ends the scan. The EXIT trap's `health:`
-    line always sits below the marker, so the index test broke on the
-    current run's own marker and never reached the git stderr above it.
+    Scoped to the last run (see `_in_last_run`). Among this run's
+    candidates, GitHub's `remote: error:` / `! [remote rejected]` wins;
+    failing that the first `fatal:`; failing that whatever transport
+    error is left.
     """
+    def _is_git_error(line: str) -> bool:
+        return _git_error_rank(_LOG_TS_RE.sub("", line).strip().lower()) is not None
+
     found: list[tuple[int, int, str]] = []
-    seen_run_line = False
-    for idx in range(len(tail_lines) - 1, -1, -1):
-        line = tail_lines[idx]
-        if _is_health_line(line):
-            continue  # transparent: belongs to no run, ends no run
+    for idx, line in _in_last_run(tail_lines, claims=_is_git_error):
         stripped = _LOG_TS_RE.sub("", line).strip()
-        low = stripped.lower()
-        rank = next(
-            (r for r, prefixes in enumerate(_GIT_ERROR_PREFIXES)
-             if low.startswith(prefixes)),
-            None,
-        )
+        rank = _git_error_rank(stripped.lower())
         if rank is not None:
             found.append((rank, idx, stripped))
-        elif seen_run_line and any(m in low for m in _RUN_TERMINAL_MARKERS):
-            break  # walked back into the previous run
-        seen_run_line = True
     if not found:
         return None
     found.sort(key=lambda t: (t[0], t[1]))
     return found[0][2]
+
+
+def _held_back(line: str) -> bool:
+    """True for either of sync.sh's two hold-back markers."""
+    return _QUARANTINE_MARKER in line or _OVERSIZE_MARKER in line
 
 
 def _held_back_paths(tail_lines: list[str]) -> dict[str, list[str]]:
@@ -365,27 +389,18 @@ def _held_back_paths(tail_lines: list[str]) -> dict[str, list[str]]:
     Two markers, two remedies: a quarantined file needs an allowlist entry
     or a scrub, an oversize file needs untracking. Returning them apart
     means the banner can give the right advice for each.
+
+    Scoped to the last run (see `_in_last_run`) — reading the boundary
+    wrong here is why the banner once said "see sync.log" instead of
+    naming the 51 MB file (2026-09-04 smoke test).
     """
     out: dict[str, list[str]] = {"secret": [], "oversize": []}
-    # Same boundary rule as `_last_remote_error`, for the same reason: the
-    # EXIT trap's `health:` line sits below the run's terminal marker, so
-    # an index test made the marker "not the last line" and the scan broke
-    # before reading a single held-back path. That is why the banner said
-    # "see sync.log" instead of naming the 51 MB file (2026-09-04 smoke
-    # test).
-    seen_run_line = False
-    for idx in range(len(tail_lines) - 1, -1, -1):
-        line = tail_lines[idx]
-        if _is_health_line(line):
-            continue  # transparent: belongs to no run, ends no run
+    for _idx, line in _in_last_run(tail_lines, claims=_held_back):
         if _QUARANTINE_MARKER in line:
             out["secret"].append(line.split(_QUARANTINE_MARKER, 1)[1].strip())
         elif _OVERSIZE_MARKER in line:
             raw = line.split(_OVERSIZE_MARKER, 1)[1].strip()
             out["oversize"].append(_OVERSIZE_SUFFIX_RE.sub("", raw).strip())
-        elif seen_run_line and any(m in line.lower() for m in _RUN_TERMINAL_MARKERS):
-            break  # walked back into the previous run
-        seen_run_line = True
     out["secret"].reverse()
     out["oversize"].reverse()
     return out
@@ -396,13 +411,41 @@ def _last_run_oversize(tail_lines: list[str]) -> bool:
     return bool(_held_back_paths(tail_lines)["oversize"])
 
 
+# How far back to read for the 400-line tail. sync.log lines are short,
+# so one read almost always suffices; the loop below doubles the window
+# rather than assume it.
+_TAIL_CHUNK_BYTES = 128 * 1024
+
+
 def _sync_log_tail(brain_root: Path, limit: int = 400) -> list[str]:
     """The last `limit` raw lines of `<brain>/sync.log` (git output
-    included — unlike `_check_sync_status`, which keeps `sync:` lines
-    only, the remote-error parser needs the untouched tail)."""
+    included — the remote-error parser needs the untouched tail).
+
+    Seeks to the end and reads backwards in chunks. sync.log is an
+    append-only record of every hourly run and grows without bound; the
+    banner only ever cares about the last one, so reading the whole file
+    to throw nearly all of it away is work that scales with the user's
+    uptime.
+    """
     log = brain_root / "sync.log"
     try:
-        return log.read_text().splitlines()[-limit:]
+        with log.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            window = _TAIL_CHUNK_BYTES
+            while True:
+                start = max(0, size - window)
+                f.seek(start)
+                chunk = f.read()
+                # A window that did not reach the start of the file
+                # almost certainly cut a line in half — drop the partial.
+                text = chunk.decode("utf-8", "replace")
+                lines = text.splitlines()
+                if start > 0:
+                    lines = lines[1:]
+                if len(lines) >= limit or start == 0:
+                    return lines[-limit:]
+                window *= 2
     except OSError:
         return []
 
@@ -436,10 +479,18 @@ def _health_age_hours(health: dict) -> float:
     return max(0.0, (now - generated).total_seconds() / 3600.0)
 
 
-def _check_sync_status(brain_root: Path) -> str:
+def _check_sync_status(
+    brain_root: Path,
+    tail_lines: Optional[list[str]] = None,
+    held_back: Optional[dict] = None,
+) -> str:
     """Return a precise sync-status string so the banner can render an
     accurate reason instead of a single misleading "TruffleHog blocked"
     line for every failure mode.
+
+    `tail_lines` / `held_back` let `_status_inputs` hand over what it has
+    already read and computed, so one render reads sync.log once and both
+    the status word and the banner's file list describe the same run.
 
     Values:
       - 'missing'             — sync.log doesn't exist (sync never ran)
@@ -461,13 +512,13 @@ def _check_sync_status(brain_root: Path) -> str:
     log = brain_root / "sync.log"
     if not log.is_file():
         return "missing"
-    try:
-        text = log.read_text()
-    except OSError:
-        return "missing"
-    tail_lines = [ln for ln in text.splitlines()[-100:] if "sync:" in ln]
-    if tail_lines:
-        last = tail_lines[-1].lower()
+    if tail_lines is None:
+        tail_lines = _sync_log_tail(brain_root)
+    if held_back is None:
+        held_back = _held_back_paths(tail_lines)
+    sync_lines = [ln for ln in tail_lines[-100:] if "sync:" in ln]
+    if sync_lines:
+        last = sync_lines[-1].lower()
         for marker, reason in _SYNC_BLOCKED_MARKERS:
             if marker in last:
                 return reason
@@ -475,7 +526,7 @@ def _check_sync_status(brain_root: Path) -> str:
         # Oversize first: a size hold-back also logs a "held back" line, so
         # the quarantine check below would otherwise claim a secret hit and
         # send the user hunting for a credential that does not exist.
-        if _last_run_oversize(tail_lines):
+        if held_back["oversize"]:
             return "oversize"
         if _last_run_quarantined(tail_lines):
             return "quarantined"
@@ -778,12 +829,19 @@ def _status_inputs(brain_root: Path) -> dict:
     two used to duplicate the sync-status call, and every new signal
     (sync_error, held_back, health) doubled the chance of one of them
     silently rendering a stale banner.
+
+    sync.log is read once and the hold-back scan runs once, so the status
+    word and the file list the banner prints beside it always describe
+    the same run.
     """
     tail = _sync_log_tail(brain_root)
+    held_back = _held_back_paths(tail) if tail else None
     return {
-        "sync_status": _check_sync_status(brain_root),
+        "sync_status": _check_sync_status(
+            brain_root, tail, held_back or {"secret": [], "oversize": []}
+        ),
         "sync_error": _last_remote_error(tail) if tail else None,
-        "held_back": _held_back_paths(tail) if tail else None,
+        "held_back": held_back,
         "health": _load_health(brain_root),
     }
 

@@ -59,6 +59,7 @@ sys.path.insert(0, str(_BASE / "memory"))
 
 from _atomic import atomic_write_text  # noqa: E402
 from migrate_dispatcher import discover_candidates, Candidate  # noqa: E402
+from llm_providers.base import fallback_bin_dirs  # noqa: E402
 
 LABEL = "com.brainstack.auto-migrate"
 DEFAULT_INTERVAL = 3600
@@ -152,6 +153,10 @@ def write_config(brain_root: Path, config: dict) -> None:
 # ---- Plist generation ----
 
 
+# Always on a POSIX PATH, and not worth a per-machine probe.
+_SYSTEM_BIN_DIRS = ("/usr/bin", "/bin")
+
+
 def _launchd_path() -> str:
     """PATH for generated launchd/systemd units — S5 requirement 6.
 
@@ -160,9 +165,14 @@ def _launchd_path() -> str:
     are actually installed on many machines. Lead with those so the
     adapters this dispatcher shells out to resolve the same binaries the
     user's shell does.
+
+    The list comes from `llm_providers.base.FALLBACK_BIN_DIRS` — the same
+    dirs the provider lookup searches when `which` comes up empty. Held
+    separately, the two drifted: a bin dir added for the lookup left the
+    scheduled job unable to exec what the lookup had just found.
     """
-    home = os.environ.get("HOME", str(Path.home()))
-    return f"{home}/.local/bin:{home}/.claude/local:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+    home = Path(os.environ.get("HOME", str(Path.home())))
+    return ":".join([*fallback_bin_dirs(home), *_SYSTEM_BIN_DIRS])
 
 
 def generate_plist(

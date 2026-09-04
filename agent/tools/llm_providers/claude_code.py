@@ -33,20 +33,12 @@ class ClaudeCodeProvider(LLMProvider):
     name = "claude-code"
     # Haiku 4.5 is the cost-optimal default for summarization.
     default_model = "claude-haiku-4-5"
-    # Resolved absolute path once is_available() finds the CLI outside
-    # PATH (S5 R6) — argv[0] uses this instead of the bare name so a
-    # scheduled job with a minimal PATH can still exec it.
-    _bin: str | None = None
 
     def is_available(self) -> tuple[bool, str]:
         path, searched = find_cli("claude")
         if path is None:
-            return (
-                False,
-                f"claude CLI not on PATH (PATH={os.environ.get('PATH', '')}) "
-                f"nor in {', '.join(searched)} — install Claude Code or add "
-                f"its bin dir to PATH",
-            )
+            return (False, self._not_found("claude", searched,
+                                           "install Claude Code"))
         # When the CLI is present, treat the provider as available even
         # without ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN in env.
         # The framework promise is subscription-billed via existing
