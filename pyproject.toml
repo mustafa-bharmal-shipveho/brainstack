@@ -109,14 +109,3 @@ ignore = [
     "UP037",
     "UP045",
 ]
-
-# v0.2 context runtime config. See docs/runtime.md.
-[tool.recall.runtime]
-log_dir = "~/.agent/runtime/logs"
-capture_raw = false
-
-[tool.recall.runtime.budget]
-claude_md = 4000
-hot = 2000
-retrieved = 20000
-scratchpad = 10000

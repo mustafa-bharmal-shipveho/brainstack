@@ -1,12 +1,23 @@
 """Runtime configuration loaded from pyproject.toml [tool.recall.runtime].
 
-For v0.2 we read pyproject.toml in a deterministic search order:
-  1. $RECALL_RUNTIME_CONFIG (explicit path override)
-  2. cwd / pyproject.toml
-  3. ~/.agent/runtime/pyproject.toml (brainstack default location)
+S1: `RuntimeConfig.load()` merges THREE file layers PER KEY (high to low
+precedence), rather than picking one file and reading every key from it:
 
-If nothing is found we fall back to safe defaults: log path under
-~/.agent/runtime/logs/, modest budgets, LRU policy.
+  1. $RECALL_RUNTIME_CONFIG (explicit path override; content trusted as-is)
+  2. ./pyproject.toml — only when it carries a non-empty [tool.recall.runtime]
+  3. global_config_path() — $BRAIN_ROOT/runtime/pyproject.toml, defaulting to
+     ~/.agent/runtime/pyproject.toml when $BRAIN_ROOT is unset
+
+For each key, the first layer that SETS it (and whose value coerces
+cleanly) wins; a key nobody set, or that every layer got wrong, falls
+through to the dataclass default. `[tool.recall.runtime.budget]` merges
+the same way per sub-key. This is what stops a project pyproject.toml
+that sets a single key (say `log_dir`) from silently resetting every OTHER
+key — including a user's global `enable_auto_recall = true` — to defaults.
+
+`load(config_path=...)` (explicit) stays a single-file read: no layering,
+no global merge. See docs/runtime.md ("Configuration") for the full key
+table and env vars.
 """
 from __future__ import annotations
 
@@ -41,7 +52,10 @@ _TOOL_BUCKET_OVERRIDES: dict[str, str] = {
 class RuntimeConfig:
     """The set of values the adapter needs to operate.
 
-    Loaded from pyproject.toml [tool.recall.runtime]. Schema:
+    Loaded from pyproject.toml [tool.recall.runtime], per-key layered
+    across $RECALL_RUNTIME_CONFIG / ./pyproject.toml / global_config_path()
+    (see module docstring + docs/runtime.md "Configuration" for the full
+    precedence rule and key table). Schema:
         [tool.recall.runtime]
         log_dir = "~/.agent/runtime/logs"
         capture_raw = false
@@ -50,8 +64,13 @@ class RuntimeConfig:
         enable_auto_recall = false
         auto_recall_k = 5
         auto_recall_budget_tokens = 1500
-        auto_recall_timeout_ms = 3000
+        auto_recall_timeout_ms = 1500
         auto_recall_min_chars = 8
+        auto_recall_min_score = 0.0
+        auto_recall_daemon_budget_ms = 800
+        auto_recall_daemon_socket = "$BRAIN_ROOT/runtime/recall.sock"
+        auto_recall_min_rerank = 0.0
+        auto_recall_dedup = true
         [tool.recall.runtime.budget]
         claude_md = 4000
         hot = 2000
@@ -150,102 +169,217 @@ class RuntimeConfig:
 
     @classmethod
     def load(cls, *, config_path: Path | None = None) -> "RuntimeConfig":
-        path = config_path or cls._discover_config()
-        if path is None:
-            return cls()
-        try:
-            with path.open("rb") as f:
-                data = tomllib.load(f)
-        except (OSError, tomllib.TOMLDecodeError):
-            return cls()
-        section = data.get("tool", {}).get("recall", {}).get("runtime", {})
-        if not isinstance(section, dict):
-            return cls()
-        budgets = dict(_DEFAULT_BUDGETS)
-        section_budgets = section.get("budget")
-        if isinstance(section_budgets, dict):
-            for k, v in section_budgets.items():
-                try:
-                    budgets[str(k)] = int(v)
-                except (TypeError, ValueError):
-                    pass
-        log_dir = Path(str(section.get("log_dir", "~/.agent/runtime/logs"))).expanduser()
-        # Lenient int parsing — malformed values fall back to defaults
-        # rather than crashing every hook invocation.
-        def _int(key: str, default: int) -> int:
-            try:
-                return int(section.get(key, default))
-            except (TypeError, ValueError):
-                return default
+        """Load the runtime config.
 
-        def _float(key: str, default: float) -> float:
-            try:
-                return float(section.get(key, default))
-            except (TypeError, ValueError):
-                return default
+        `config_path=...` (explicit) stays a single-file read: no layering,
+        no global merge — `test_adapter_hooks.py` relies on this for a
+        caller that already knows exactly which file it wants.
 
-        return cls(
+        Otherwise (S1): a per-key layered merge over, high to low,
+        `$RECALL_RUNTIME_CONFIG` > `./pyproject.toml` (only if it carries a
+        non-empty `[tool.recall.runtime]`) > `global_config_path()`. The
+        first layer that SETS a given key wins that key; a malformed value
+        in a layer is treated as "not set" and falls through to the next
+        layer, then to the dataclass default. `budget` merges the same way
+        per sub-key.
+        """
+        if config_path is not None:
+            return cls._load_one(config_path, layers=[config_path])
+        layers = cls._discover_layers()
+        if not layers:
+            return cls()
+        # A layer that exists but fails to parse contributes nothing rather
+        # than crashing the merge (`_read_section` returns `None` for that
+        # case) — it still occupies its slot in `config_layers`.
+        sections = [(_read_section(p) or {}) for p in layers]
+        kwargs = cls._merge_sections(sections)
+        return cls(**kwargs, config_path=layers[0], config_layers=list(layers))
+
+    @classmethod
+    def _load_one(cls, path: Path, *, layers: list[Path]) -> "RuntimeConfig":
+        section = _read_section(path)
+        if section is None:
+            # Missing file / unreadable / not valid TOML: bare defaults,
+            # no config_path — matches pre-S1 behavior exactly.
+            return cls()
+        kwargs = cls._merge_sections([section])
+        return cls(**kwargs, config_path=path, config_layers=list(layers))
+
+    @classmethod
+    def _merge_sections(cls, sections: list[dict]) -> dict:
+        """Per-key merge across `sections` (ordered high-precedence first).
+
+        Every value is looked up independently: the first section that both
+        HAS the key and coerces it successfully wins; sections that lack the
+        key, or whose value fails coercion, are skipped for that key (not
+        for the whole layer — a different key from the same low layer can
+        still win elsewhere).
+        """
+        defaults = cls()
+
+        def scalar(key: str, kind: str, default):
+            for section in sections:
+                if key in section:
+                    ok, value = _coerce(section[key], kind)
+                    if ok:
+                        return value
+            return default
+
+        log_dir = defaults.log_dir
+        for section in sections:
+            if "log_dir" in section:
+                log_dir = Path(str(section["log_dir"])).expanduser()
+                break
+
+        return dict(
             log_dir=log_dir,
-            capture_raw=bool(section.get("capture_raw", False)),
-            enable_reinjection=bool(section.get("enable_reinjection", False)),
-            reinjection_budget_tokens=_int("reinjection_budget_tokens", 1500),
-            enable_auto_recall=bool(section.get("enable_auto_recall", False)),
-            auto_recall_k=_int("auto_recall_k", 5),
-            auto_recall_budget_tokens=_int("auto_recall_budget_tokens", 1500),
-            auto_recall_timeout_ms=_int("auto_recall_timeout_ms", 3000),
-            auto_recall_min_chars=_int("auto_recall_min_chars", 8),
-            auto_recall_min_score=_float("auto_recall_min_score", 0.0),
-            budgets=budgets,
-            config_path=path,
-            # `load()` still reads a single file today (the per-key layered
-            # merge across $RECALL_RUNTIME_CONFIG / cwd / global lands in a
-            # later slice); record that one file as the sole layer so
-            # `config_layers` is at least truthful about current behavior.
-            config_layers=[path],
+            capture_raw=scalar("capture_raw", "bool", defaults.capture_raw),
+            enable_reinjection=scalar("enable_reinjection", "bool", defaults.enable_reinjection),
+            reinjection_budget_tokens=scalar(
+                "reinjection_budget_tokens", "int", defaults.reinjection_budget_tokens
+            ),
+            enable_auto_recall=scalar("enable_auto_recall", "bool", defaults.enable_auto_recall),
+            auto_recall_k=scalar("auto_recall_k", "int", defaults.auto_recall_k),
+            auto_recall_budget_tokens=scalar(
+                "auto_recall_budget_tokens", "int", defaults.auto_recall_budget_tokens
+            ),
+            auto_recall_timeout_ms=scalar(
+                "auto_recall_timeout_ms", "int", defaults.auto_recall_timeout_ms
+            ),
+            auto_recall_min_chars=scalar(
+                "auto_recall_min_chars", "int", defaults.auto_recall_min_chars
+            ),
+            auto_recall_min_score=scalar(
+                "auto_recall_min_score", "float", defaults.auto_recall_min_score
+            ),
+            auto_recall_daemon_budget_ms=scalar(
+                "auto_recall_daemon_budget_ms", "int", defaults.auto_recall_daemon_budget_ms
+            ),
+            auto_recall_daemon_socket=scalar(
+                "auto_recall_daemon_socket", "str", defaults.auto_recall_daemon_socket
+            ),
+            auto_recall_min_rerank=scalar(
+                "auto_recall_min_rerank", "float", defaults.auto_recall_min_rerank
+            ),
+            auto_recall_dedup=scalar("auto_recall_dedup", "bool", defaults.auto_recall_dedup),
+            budgets=cls._merge_budgets(sections),
         )
 
     @staticmethod
-    def _discover_config() -> Path | None:
-        """Find the pyproject.toml that owns the [tool.recall.runtime] section.
+    def _merge_budgets(sections: list[dict]) -> dict[str, int]:
+        """`budget` sub-table merge: per sub-key, first section (high to
+        low) that sets AND successfully coerces that sub-key wins; keys
+        nobody set keep the dataclass default (or are omitted, for a
+        custom key no layer ever validly set)."""
+        budgets = dict(_DEFAULT_BUDGETS)
+        layer_budgets: list[dict] = []
+        keys: set[str] = set(_DEFAULT_BUDGETS)
+        for section in sections:
+            b = section.get("budget")
+            b = b if isinstance(b, dict) else {}
+            layer_budgets.append(b)
+            keys.update(str(k) for k in b)
+        for key in keys:
+            for b in layer_budgets:
+                if key in b:
+                    try:
+                        budgets[key] = int(b[key])
+                        break
+                    except (TypeError, ValueError):
+                        continue
+        return budgets
 
-        Order of search:
-          1. $RECALL_RUNTIME_CONFIG (explicit override; not parsed for content)
-          2. cwd / pyproject.toml — IF it has [tool.recall.runtime]
-          3. ~/.agent/runtime/pyproject.toml — the default brainstack location
+    @staticmethod
+    def global_config_path() -> Path:
+        """The lowest-precedence file layer: `$BRAIN_ROOT/runtime/pyproject.toml`,
+        defaulting to `~/.agent/runtime/pyproject.toml` when `$BRAIN_ROOT` is
+        unset."""
+        return (
+            Path(os.environ.get("BRAIN_ROOT") or "~/.agent").expanduser()
+            / "runtime"
+            / "pyproject.toml"
+        )
 
-        Step 2 used to be "first existing file wins," which broke users who
-        set `enable_auto_recall = true` (or `enable_reinjection = true`) in
-        their global ~/.agent config but worked inside a project repo whose
-        pyproject.toml had no [tool.recall.runtime] section: the project
-        file shadowed the global one, returning the dataclass defaults.
-        Codex 2026-05-05 MED. Now we fall through when cwd's file lacks
-        the section.
+    @staticmethod
+    def _discover_layers() -> list[Path]:
+        """The ordered (high to low) list of file layers `load()` merges.
+
+        - `$RECALL_RUNTIME_CONFIG`: included if set AND the path exists
+          (content is not inspected — an explicit override is trusted as-is,
+          matching the pre-S1 behavior of this tier).
+        - `./pyproject.toml`: included ONLY if it carries a non-empty
+          `[tool.recall.runtime]` table. A project's own build pyproject.toml
+          (no such table at all) must not shadow the user's global config —
+          Codex 2026-05-05 MED, preserved from `_discover_config`.
+        - `global_config_path()`: included if the file exists, regardless of
+          whether its `[tool.recall.runtime]` table is present or empty —
+          this file is install.sh's dedicated home for the section, so mere
+          existence is enough to treat it as "the" config layer.
         """
+        layers: list[Path] = []
         env = os.environ.get("RECALL_RUNTIME_CONFIG")
         if env:
             p = Path(env).expanduser()
-            return p if p.exists() else None
+            if p.exists():
+                layers.append(p)
         cwd_pyproject = Path.cwd() / "pyproject.toml"
         if cwd_pyproject.exists() and _has_runtime_section(cwd_pyproject):
-            return cwd_pyproject
-        global_pyproject = Path("~/.agent/runtime/pyproject.toml").expanduser()
+            layers.append(cwd_pyproject)
+        global_pyproject = RuntimeConfig.global_config_path()
         if global_pyproject.exists():
-            return global_pyproject
-        # Last resort: cwd file even without the section (preserves prior
-        # default-emission behavior on projects that have a pyproject but
-        # no runtime config of their own)
-        return cwd_pyproject if cwd_pyproject.exists() else None
+            layers.append(global_pyproject)
+        return layers
 
 
 def _has_runtime_section(path: Path) -> bool:
-    """True iff `path` is a TOML file with a `[tool.recall.runtime]` table."""
+    """True iff `path` is a TOML file with a non-empty `[tool.recall.runtime]` table."""
+    section = _read_section(path)
+    return bool(section)
+
+
+def _read_section(path: Path) -> dict | None:
+    """Parse `path` and return its `[tool.recall.runtime]` table.
+
+    `{}` when the file parses but has no such table (still a valid,
+    contributing-nothing layer). `None` when the file cannot be read or
+    parsed at all — the caller treats that as "this layer doesn't exist."
+    """
     try:
         with path.open("rb") as f:
             data = tomllib.load(f)
     except (OSError, tomllib.TOMLDecodeError):
-        return False
+        return None
     section = data.get("tool", {}).get("recall", {}).get("runtime", {})
-    return isinstance(section, dict) and bool(section)
+    return section if isinstance(section, dict) else {}
+
+
+def _coerce(value: object, kind: str) -> tuple[bool, object]:
+    """Lenient per-value coercion. Returns `(ok, coerced)`; `ok=False` means
+    the caller should fall through to the next layer / the dataclass
+    default rather than crash the hook on a typo'd config value.
+
+    `bool` requires an actual TOML boolean (`isinstance(value, bool)`) —
+    `bool("maybe")` would otherwise silently succeed (any non-empty string
+    is truthy) and defeat the whole point of falling through on a bad
+    value.
+    """
+    if kind == "bool":
+        if isinstance(value, bool):
+            return True, value
+        return False, None
+    if kind == "int":
+        try:
+            return True, int(value)
+        except (TypeError, ValueError):
+            return False, None
+    if kind == "float":
+        try:
+            return True, float(value)
+        except (TypeError, ValueError):
+            return False, None
+    if kind == "str":
+        return True, str(value)
+    raise ValueError(f"unknown coercion kind: {kind!r}")
 
 
 __all__ = ["RuntimeConfig"]
