@@ -246,45 +246,42 @@ class HybridRetriever:
         else:
             fetch_n = max(2 * k, self._rerank_n, k + 10)
 
+        # RRF leg: over-fetch from EVERY collection. The deeper pull is what
+        # lets a demoted needs_review memory be replaced by a fresh one ranked
+        # just below it, rather than leaving a hole.
         merged: list[QueryResult] = []
-        use_rerank = self._reranker == "cross_encoder" if rerank is None else bool(rerank)
         for coll in targets:
-            if use_rerank:
-                # Return fetch_n reranked results (headroom for the
-                # needs_review policy, which may demote/drop some before the
-                # final top-k truncation). query_hybrid_rerank reranks a pool
-                # of max(rerank_n, fetch_n) and only skips when there's nothing
-                # to reorder, so the cross-encoder runs even when the corpus is
-                # smaller than fetch_n.
-                merged.extend(
-                    qb.query_hybrid_rerank(
-                        self._client,
-                        coll,
-                        query,
-                        fetch_n,
-                        type_filter=type_filter,
-                        source_filter=None,  # already constrained by collection
-                        dense_model=self._dense_model,
-                        sparse_model=self._sparse_model,
-                        reranker_model=self._reranker_model,
-                        rerank_n=self._rerank_n,
-                        mode=self._mode,
-                    )
+            merged.extend(
+                qb.query_hybrid(
+                    self._client,
+                    coll,
+                    query,
+                    fetch_n,
+                    type_filter=type_filter,
+                    source_filter=None,  # already constrained by collection
+                    dense_model=self._dense_model,
+                    sparse_model=self._sparse_model,
+                    mode=self._mode,
                 )
-            else:
-                merged.extend(
-                    qb.query_hybrid(
-                        self._client,
-                        coll,
-                        query,
-                        fetch_n,
-                        type_filter=type_filter,
-                        source_filter=None,  # already constrained by collection
-                        dense_model=self._dense_model,
-                        sparse_model=self._sparse_model,
-                        mode=self._mode,
-                    )
-                )
+            )
+        # Order the merged pool by RRF before the cross-encoder sees it, so
+        # `rerank_n` selects the globally best candidates rather than an
+        # arbitrary per-collection slice.
+        merged.sort(key=_rank_key)
+
+        use_rerank = self._reranker == "cross_encoder" if rerank is None else bool(rerank)
+        if use_rerank:
+            # ONE cross-encoder pass over the merged pool. `rerank_n` is a
+            # total budget across all collections: reranking per collection
+            # multiplied the cost by the number of sources and made the
+            # setting mean nothing at small k. Never rerank fewer than k, or
+            # we could not fill the requested page.
+            merged = qb.rerank_results(
+                query,
+                merged,
+                reranker_model=self._reranker_model,
+                limit=max(self._rerank_n, k),
+            )
         # Stable sort: rerank score when present, else RRF score; path breaks ties.
         merged.sort(key=_rank_key)
         # Down-rank / drop needs_review memories, then truncate to k.

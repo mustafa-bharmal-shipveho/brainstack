@@ -183,6 +183,103 @@ class TestSerializeRerankScore:
         assert out[0]["rerank_score"] is not None
 
 
+class TestRerankNCapsTotalPairs:
+    """`rerank_n` is a budget, not a per-collection floor.
+
+    Reranking used to run once PER COLLECTION on a pool of
+    `fetch_n = max(2*k, rerank_n, k+10)`. With two sources and k=10 that is
+    40 cross-encoder pairs for a nominal `rerank_n=10` — 4x the configured
+    budget, and the dominant cost in the hook's latency budget. The pool is
+    merged and RRF-ordered first; the cross-encoder then sees at most
+    `rerank_n` pairs in total.
+
+    Hermetic: the Qdrant client, collection setup, the hybrid query and the
+    cross-encoder are all faked, so no embedder, store or disk is touched.
+    """
+
+    K = 3
+    RERANK_N = 6
+
+    @pytest.fixture
+    def counting_encoder(self, monkeypatch):
+        seen: dict = {"calls": 0, "pairs": 0, "fetch_n": []}
+
+        class _Encoder:
+            def rerank(self, query, texts):
+                seen["calls"] += 1
+                seen["pairs"] += len(texts)
+                # Score by position so the rerank order REVERSES the RRF
+                # order: if the cap were applied after reranking rather than
+                # before, a different document would come out on top.
+                return [float(i) for i in range(len(texts))]
+
+        def _fake_query_hybrid(client, collection, query, k, **kwargs):
+            seen["fetch_n"].append(k)
+            # Two collections interleave on score: a00 1.00, b00 0.995,
+            # a01 0.99, b01 0.985, ...
+            offset = 0.0 if collection == "a" else 0.005
+            return [
+                QueryResult(
+                    document=_doc(f"{collection}{i:02d}"),
+                    score=1.0 - offset - i * 0.01,
+                )
+                for i in range(20)
+            ]
+
+        monkeypatch.setattr(qdrant_backend, "_qdrant_client_singleton", lambda *a, **k: object())
+        monkeypatch.setattr(qdrant_backend, "ensure_collection", lambda *a, **k: None)
+        monkeypatch.setattr(qdrant_backend, "query_hybrid", _fake_query_hybrid)
+        monkeypatch.setattr(qdrant_backend, "_get_cross_encoder", lambda model: _Encoder())
+        return seen
+
+    def _retriever(self):
+        from recall.core import HybridRetriever
+
+        return HybridRetriever(
+            collections=["a", "b"],
+            reranker="cross_encoder",
+            rerank_n=self.RERANK_N,
+            # The default policy, which is what inflated `fetch_n`.
+            needs_review_policy="demote",
+        )
+
+    def test_reranks_at_most_rerank_n_pairs_across_all_collections(
+        self, counting_encoder
+    ):
+        self._retriever().query("anything", k=self.K)
+        assert counting_encoder["pairs"] == self.RERANK_N, (
+            f"reranked {counting_encoder['pairs']} pairs for rerank_n="
+            f"{self.RERANK_N}; the cap must span collections, not repeat per one"
+        )
+
+    def test_reranks_once_not_once_per_collection(self, counting_encoder):
+        self._retriever().query("anything", k=self.K)
+        assert counting_encoder["calls"] == 1
+
+    def test_returns_k_results_ordered_by_rerank_score(self, counting_encoder):
+        results = self._retriever().query("anything", k=self.K)
+
+        assert len(results) == self.K
+        # Top-6 by RRF is a00, b00, a01, b01, a02, b02; the fake encoder
+        # scores by position, so b02 (last in, highest score) wins.
+        assert _names(results) == ["b02", "a02", "b01"]
+        scores = [r.rerank_score for r in results]
+        assert all(s is not None for s in scores)
+        assert scores == sorted(scores, reverse=True)
+
+    def test_rrf_score_survives_the_rerank(self, counting_encoder):
+        results = self._retriever().query("anything", k=self.K)
+        assert all(0.0 <= r.score <= 1.0 for r in results)
+
+    def test_rrf_leg_still_over_fetches_for_the_review_policy(self, counting_encoder):
+        # The deeper candidate pull is what lets a demoted needs_review memory
+        # be replaced by a fresh one below it. Capping the RERANK budget must
+        # not shrink the RRF fetch.
+        self._retriever().query("anything", k=self.K)
+        assert counting_encoder["fetch_n"], "query_hybrid was never called"
+        assert all(n >= 2 * self.K for n in counting_encoder["fetch_n"])
+
+
 class TestDenseFallbackActive:
     """`dense_fallback_active()` mirrors the once-per-process warn flag.
 
