@@ -32,6 +32,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 INSTALL_SH = REPO_ROOT / "install.sh"
 
 PLIST_NAME = "com.brainstack.recall-daemon.plist"
+TEMPLATE_PATH = REPO_ROOT / "templates" / PLIST_NAME
 
 
 def _summary_line(combined: str, opt_out_flag: str) -> str | None:
@@ -40,8 +41,9 @@ def _summary_line(combined: str, opt_out_flag: str) -> str | None:
     Same shape the other install tests assert on:
       ✓ <description> (--no-X)     — the default fired
       • Skipped <thing> (--no-X)   — --no-X was passed
+      ✗ <description> (--no-X)     — the default failed
     """
-    pattern = re.compile(rf"^\s*[✓•]\s.+\({re.escape(opt_out_flag)}\)\s*$", re.M)
+    pattern = re.compile(rf"^\s*[✓•✗]\s.+\({re.escape(opt_out_flag)}\)\s*$", re.M)
     match = pattern.search(combined)
     return match.group(0) if match else None
 
@@ -188,6 +190,101 @@ def test_setup_daemon_renders_plist_with_placeholders_replaced(tmp_path: Path):
 
 
 @darwin_only
+def test_setup_daemon_home_with_double_underscore_renders_fine(tmp_path: Path):
+    """A HOME (or BRAIN_ROOT/REPO_DIR) that happens to contain a literal
+    double underscore is not an unsubstituted placeholder. The old
+    post-render check was a blanket `grep -q '__'`, which false-positives on
+    any such path, deletes the plist it just wrote, and exits 2 -- so
+    Default 6 silently reports the daemon as 'failed' for a path that was
+    never a bug."""
+    fake_home = tmp_path / "fake__home__dir"
+    env = _fresh_env(fake_home)
+    _seed_brain_root(env)
+
+    result = _run("--setup-daemon", env=env)
+
+    assert result.returncode == 0, (
+        f"a HOME containing '__' must not be treated as an unsubstituted "
+        f"placeholder:\n{result.stdout}\n{result.stderr}"
+    )
+    plist_path = fake_home / "Library" / "LaunchAgents" / PLIST_NAME
+    assert plist_path.exists(), (
+        f"--setup-daemon deleted the plist it rendered because HOME "
+        f"contains '__':\n{result.stdout}\n{result.stderr}"
+    )
+    plist = plistlib.loads(plist_path.read_bytes())
+    assert plist["EnvironmentVariables"]["HOME"] == str(fake_home), plist
+
+
+@darwin_only
+def test_setup_daemon_renders_plist_with_space_and_ampersand_in_paths(tmp_path: Path):
+    """Rendering goes through Python now, not `sed -e "s|...|...|g"`: a
+    replacement value containing `&` makes sed re-insert the whole match,
+    and one containing `\\1` is read as a backreference. HOME and BRAIN_ROOT
+    both get a space and an `&` to prove the injection surface is gone and
+    the exact values still land in the rendered plist."""
+    fake_home = tmp_path / "fake home & co"
+    env = _fresh_env(fake_home)
+    brain = fake_home / "brain & data"
+    env["BRAIN_ROOT"] = str(brain)
+    _seed_brain_root(env)
+
+    result = _run("--setup-daemon", env=env)
+
+    assert result.returncode == 0, (
+        f"--setup-daemon must handle spaces and '&' in HOME/BRAIN_ROOT:\n"
+        f"{result.stdout}\n{result.stderr}"
+    )
+    plist_path = fake_home / "Library" / "LaunchAgents" / PLIST_NAME
+    assert plist_path.exists(), f"no plist rendered:\n{result.stdout}"
+
+    plist = plistlib.loads(plist_path.read_bytes())
+    envvars = plist["EnvironmentVariables"]
+    assert envvars["HOME"] == str(fake_home), envvars
+    assert envvars["BRAIN_ROOT"] == str(brain), envvars
+    for stream in ("StandardOutPath", "StandardErrorPath"):
+        assert str(brain) in plist[stream], plist[stream]
+
+
+@darwin_only
+def test_daemon_template_path_starts_with_home_local_bin():
+    """R6 consistency: launchd and systemd do not inherit a login shell's
+    PATH, so every scheduled job must put `~/.local/bin` first or it cannot
+    resolve the same `claude` / `codex` / `recall` the user gets from a
+    terminal (see tests/test_templates_path.py). The daemon template was the
+    one shipped plist that didn't."""
+    text = TEMPLATE_PATH.read_text(encoding="utf-8")
+    match = re.search(r"<key>PATH</key>\s*<string>([^<]+)</string>", text)
+    assert match, f"no PATH entry found in {TEMPLATE_PATH}"
+    path_value = match.group(1)
+    assert path_value.startswith("__HOME__/.local/bin:__REPO_DIR__/.venv/bin:"), (
+        f"{TEMPLATE_PATH} PATH must start with __HOME__/.local/bin, "
+        f"immediately followed by __REPO_DIR__/.venv/bin (so the venv's own "
+        f"qdrant_client/fastembed still win); got {path_value!r}"
+    )
+
+
+@darwin_only
+def test_setup_daemon_rendered_path_leads_with_home_local_bin(tmp_path: Path):
+    """End-to-end companion to the template-only check above: the fully
+    substituted PATH in the rendered plist must lead with the real HOME."""
+    fake_home = tmp_path / "fakehome"
+    env = _fresh_env(fake_home)
+    _seed_brain_root(env)
+
+    result = _run("--setup-daemon", env=env)
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    plist_path = fake_home / "Library" / "LaunchAgents" / PLIST_NAME
+    plist = plistlib.loads(plist_path.read_bytes())
+    path_value = plist["EnvironmentVariables"]["PATH"]
+    assert path_value.startswith(f"{fake_home}/.local/bin:"), (
+        f"rendered daemon PATH must lead with $HOME/.local/bin (R6); got "
+        f"{path_value!r}"
+    )
+
+
+@darwin_only
 def test_remove_daemon_deletes_plist(tmp_path: Path):
     """Teardown is reversible: --remove-daemon leaves nothing behind."""
     fake_home = tmp_path / "fakehome"
@@ -324,6 +421,46 @@ class TestDefaultInstallWiresTheDaemon:
             f"{str(custom)!r}, got {env_vars.get('BRAIN_ROOT')!r}"
         )
         assert str(fake_home / ".agent") not in plist_path.read_text()
+
+    @darwin_only
+    def test_daemon_failure_logs_stderr_and_summary_shows_last_line(self, tmp_path: Path):
+        """Default 6 used to run `--setup-daemon >/dev/null 2>&1`, so on
+        failure the summary just said 'failed' with no way to find out why.
+        Force a deterministic --setup-daemon failure -- a directory sitting
+        where the plist must go, so the render step can never write there --
+        and check the stderr lands in a log the summary points at."""
+        fake_home = tmp_path / "fakehome"
+        env = _fresh_env(fake_home)
+        blocked = fake_home / "Library" / "LaunchAgents" / PLIST_NAME
+        blocked.mkdir(parents=True)
+
+        result = _run(
+            "--brain-remote", "git@example.com:test/scratch.git",
+            "--yes",
+            env=env,
+        )
+
+        assert result.returncode == 0, (
+            f"a daemon failure must not fail the whole install:\n"
+            f"{result.stdout}\n{result.stderr}"
+        )
+        combined = result.stdout + result.stderr
+        line = _summary_line(combined, "--no-daemon")
+        assert line is not None and line.lstrip().startswith("✗"), (
+            f"expected a failed daemon summary line:\n{combined}"
+        )
+
+        log_path = Path(env["BRAIN_ROOT"]) / "runtime" / "logs" / "install-daemon.log"
+        assert log_path.exists() and log_path.stat().st_size > 0, (
+            f"Default 6 must capture --setup-daemon's stderr to "
+            f"{log_path}:\n{combined}"
+        )
+        last_line = log_path.read_text().strip().splitlines()[-1]
+        assert last_line, f"log at {log_path} has no content"
+        assert last_line in combined, (
+            f"the summary must print the log's last line after the failed "
+            f"line:\nlog last line: {last_line!r}\ncombined:\n{combined}"
+        )
 
     @darwin_only
     def test_full_install_with_no_daemon_writes_no_plist(self, tmp_path: Path):
