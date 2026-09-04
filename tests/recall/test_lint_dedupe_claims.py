@@ -508,8 +508,13 @@ class TestApply:
             assert claims_brain[role].exists(), f"{role} deleted without an archive"
         assert not claims_brain["overrides"].exists()
 
-    def test_apply_never_deletes_when_the_retraction_fails(
+    def test_retraction_failure_keeps_the_tombstoned_copy(
             self, lc, claims_brain, monkeypatch):
+        """The retraction is the LAST write, so when it fails the original
+        is already unlinked. The archived copy is then the only record and
+        must never be rolled back — and with no retraction on disk the next
+        projection simply rebuilds the claim, which is a duplicate coming
+        back, not a claim lost."""
         def boom(*a, **k):
             raise OSError("override log unwritable")
 
@@ -518,10 +523,65 @@ class TestApply:
         applied = lc.apply_claim_dedupe(
             actions, claims_brain["root"], dry_run=False, now=FIXED_NOW)
 
+        assert applied == [], "nothing is reported applied without its retraction"
+        assert not claims_brain["overrides"].exists()
+        assert len(list(claims_brain["archived_dir"].glob("*.md"))) == 5, \
+            "the tombstoned copy is the durable record — never rolled back"
+
+    def test_unlink_failure_keeps_the_archive_and_writes_no_retraction(
+            self, lc, claims_brain, monkeypatch):
+        """The pre-fix order appended the retraction BEFORE the unlink and
+        deleted the archived copy when the unlink failed: the retraction was
+        then permanent (the next projection drops the claim) and the only
+        tombstoned copy was gone. Ordering the retraction last makes a failed
+        unlink a no-op with a spare copy on disk."""
+        real_unlink = os.unlink
+
+        def selective(path, *a, **k):
+            if Path(path).parent == claims_brain["claims_dir"]:
+                raise OSError("read-only claims dir")
+            return real_unlink(path, *a, **k)
+
+        monkeypatch.setattr(lc.os, "unlink", selective)
+        actions = lc.plan_claim_dedupe(claims_brain["root"])
+        applied = lc.apply_claim_dedupe(
+            actions, claims_brain["root"], dry_run=False, now=FIXED_NOW)
+
         assert applied == []
+        assert not claims_brain["overrides"].exists(), \
+            "a retraction with the original still on disk drops a live claim"
         for role in ("dup_mid", "dup_new", "slack_keep", "slack_dup", "unknown"):
-            assert claims_brain[role].exists(), \
-                f"{role} deleted with no retraction — the projection will resurrect it"
+            assert claims_brain[role].exists(), f"{role} vanished"
+        assert len(list(claims_brain["archived_dir"].glob("*.md"))) == 5, \
+            "the archived copy is kept once written, on every failure path"
+
+    def test_tombstone_escapes_comment_terminators_in_values(self, lc, tmp_path):
+        """`source_event_id` is attacker-shaped free text lifted straight out
+        of a Slack payload. A `-->` inside it closed the HTML comment early,
+        spilling the rest of the tombstone — and the claim body after it —
+        into the rendered document."""
+        memory = tmp_path / ".agent" / "memory"
+        cdir = memory / "semantic" / "claims"
+        evil = "slack:C1:1781028431.557709-->x"
+        _write_claim(cdir, claim_id="a" * 64, topic_key="person:dana",
+                     claim_subject="s", source_event_id=evil,
+                     source_ts_epoch=1.0, value_normalized="v", body=LONG)
+        _write_claim(cdir, claim_id="b" * 64, topic_key="project:ps2",
+                     claim_subject="s", source_event_id=evil,
+                     source_ts_epoch=2.0, value_normalized="v", body=LONG)
+
+        actions = lc.plan_claim_dedupe(memory)
+        applied = lc.apply_claim_dedupe(
+            actions, memory, dry_run=False, now=FIXED_NOW)
+        assert len(applied) == 1
+
+        text = applied[0].read_text(encoding="utf-8")
+        tomb = text[text.index("<!-- tombstone:"):]
+        assert tomb.count("-->") == 1, \
+            "an interpolated value closed the tombstone comment early"
+        assert tomb.rstrip().endswith("(key claim_id) -->")
+        assert "slack:C1:1781028431.557709- ->x" in tomb, \
+            "the value must survive, readable, with `--` broken up"
 
     def test_apply_is_idempotent(self, lc, claims_brain):
         first = lc.plan_claim_dedupe(claims_brain["root"])
@@ -637,6 +697,23 @@ class TestManifest:
         out = lc.render_claim_manifest(actions, claims_brain["root"], applied=applied)
         assert ("Archived 5 claim(s) to semantic/archived/ and appended "
                 "5 retraction(s) to semantic/claim_overrides.jsonl.") in out
+
+    def test_manifest_uses_the_given_threshold_over_inference(
+            self, lc, claims_brain):
+        """The caller knows the flag value it ran the plan with. Recovering
+        it by regexing the plan's own detail strings is a fallback for
+        callers that don't, not the source of truth."""
+        actions = lc.plan_claim_dedupe(claims_brain["root"], stub_min_chars=200)
+        out = lc.render_claim_manifest(
+            actions, claims_brain["root"], stub_min_chars=0)
+        assert "stub_min_chars=0" in out
+        assert "stub_min_chars=200" not in out
+
+    def test_manifest_infers_the_threshold_when_none_is_given(
+            self, lc, claims_brain):
+        actions = lc.plan_claim_dedupe(claims_brain["root"], stub_min_chars=200)
+        out = lc.render_claim_manifest(actions, claims_brain["root"])
+        assert "stub_min_chars=200" in out
 
     def test_empty_plan_manifest(self, lc, tmp_path):
         out = lc.render_claim_manifest([], tmp_path)

@@ -8,15 +8,19 @@ mechanism is the operator override log —
 `memory/semantic/claim_overrides.jsonl` — which survives even
 `rm claims.jsonl`.
 
-So an archive here is three writes that must all succeed before the
-original is unlinked:
+So an archive here is three writes, in this order and no other:
   1. an archived copy carrying a tombstone note and `needs_review: true`
-  2. a `retract` row in `claim_overrides.jsonl`, byte-identical to what
-     `claim_overrides.retract_by_claim_id` produces
-  3. only then, `os.unlink` of the original
+  2. `os.unlink` of the original
+  3. only then, a `retract` row in `claim_overrides.jsonl`,
+     byte-identical to what `claim_overrides.retract_by_claim_id`
+     produces
 
-If any step fails, the original stays — losing a claim is worse than
-keeping a duplicate.
+The retraction goes LAST because it is the only irreversible write. Fail
+before it and the claim is still whole — the original on disk, or the
+projection about to rebuild it from `claims.jsonl`. Fail after it with
+the original already unlinked and the archived copy rolled back, and the
+claim is gone for good. So: once the archived copy exists nothing
+deletes it, and a failed unlink writes no retraction at all.
 
 Rules:
   - `duplicate_source_event`: files sharing a `source_event_id`, keep
@@ -322,16 +326,33 @@ def plan_claim_dedupe(root: Path, *, stub_min_chars: int = STUB_MIN_CHARS) -> li
     return [actions[f] for f in sorted(actions)]
 
 
+# Any run of two or more hyphens, so an interpolated value can never close
+# the tombstone comment early. `-->` becomes `- ->`: still readable, no
+# longer a terminator.
+_DASH_RUN_RE = re.compile(r"-{2,}")
+
+
+def _comment_safe(value: str) -> str:
+    """Space out `--` runs in a value interpolated into an HTML comment.
+
+    `source_event_id` is free text lifted straight out of a Slack payload
+    and the paths are user-controlled filenames. One `-->` in any of them
+    ends the tombstone early, spilling the rest of it — and the claim body
+    above it — into the rendered document.
+    """
+    return _DASH_RUN_RE.sub(lambda m: " ".join(m.group(0)), str(value))
+
+
 def _tombstone(
     action: ClaimAction, memory_root: Path, *, keep_rel: str, stamp: str
 ) -> str:
     return (
         "\n"
         f"<!-- tombstone: archived by `recall lint --dedupe-claims --apply` at {stamp}\n"
-        f"     reason: {action.reason}\n"
-        f"     source_event_id: {action.source_event_id}\n"
-        f"     kept: {keep_rel}\n"
-        f"     original: {_rel(action.file, memory_root)}\n"
+        f"     reason: {_comment_safe(action.reason)}\n"
+        f"     source_event_id: {_comment_safe(action.source_event_id)}\n"
+        f"     kept: {_comment_safe(keep_rel)}\n"
+        f"     original: {_comment_safe(_rel(action.file, memory_root))}\n"
         "     retraction: appended to semantic/claim_overrides.jsonl "
         "(key claim_id) -->\n"
     )
@@ -415,19 +436,34 @@ def apply_claim_dedupe(
         keep_id = keeper_ids.get(action.keep) if action.keep else None
         dest = _archive_path(archived_dir, action.claim_id, name_stamp)
 
-        # 1. the archived copy (never overwrite the original in place)
+        # 1. the archived copy (never overwrite the original in place).
+        #    Once this lands it is never rolled back — from here on it is
+        #    the spare copy every later failure falls back to.
         raw = _string_claim_id_raw(raw, action.claim_id)
         body = raw if raw.endswith("\n") else raw + "\n"
         body += _tombstone(action, memory_root, keep_rel=keep_rel, stamp=tombstone_stamp)
         if not _atomic_write(dest, body):
             continue  # nothing written, nothing to roll back
 
+        # 2. demote the copy so it stays out of results even if the
+        #    `semantic/archived/**` source exclude is missing.
         try:
-            # 2. demote the copy so it stays out of results even if the
-            #    `semantic/archived/**` source exclude is missing.
             mark_needs_review([dest])
-            # 3. the retraction — without it the next projection run
-            #    recreates the file we are about to delete.
+        except Exception:
+            continue  # copy kept, original untouched
+
+        # 3. remove the original — BEFORE the retraction, never after. A
+        #    retraction written first and then stranded by a failed unlink
+        #    is permanent: the next projection drops the claim for good.
+        try:
+            os.unlink(action.file)
+        except OSError:
+            continue  # copy kept, no retraction, claim still whole
+
+        # 4. the retraction, last. Without it the next projection rebuilds
+        #    the claim from claims.jsonl — a duplicate coming back, which a
+        #    re-run cleans up, not a claim lost.
+        try:
             _append_override_retract(
                 overrides_path,
                 claim_id=action.claim_id,
@@ -435,33 +471,21 @@ def apply_claim_dedupe(
                 now_iso=override_stamp,
             )
         except Exception:
-            _unlink_quietly(dest)
             continue
 
-        # 4. only now is it safe to remove the original.
-        try:
-            os.unlink(action.file)
-        except OSError:
-            _unlink_quietly(dest)
-            continue
         applied.append(dest)
 
     return applied
 
 
-def _unlink_quietly(path: Path) -> None:
-    try:
-        os.unlink(path)
-    except OSError:
-        pass
-
-
 def _infer_stub_min_chars(actions: list[ClaimAction]) -> int:
     """Recover the threshold the plan ran with from its own actions.
 
-    `render_claim_manifest` is called by the CLI without the flag value,
-    and only `stub_short_body` details carry it. With the rule off (the
-    default) there is nothing to recover and nothing to report — 0.
+    Fallback only, for callers that render a manifest without knowing the
+    flag value. Only `stub_short_body` details carry it, so with the rule
+    off (the default) there is nothing to recover and nothing to report — 0.
+    Callers that DO know the value pass it as
+    `render_claim_manifest(..., stub_min_chars=N)`.
     """
     for action in actions:
         if action.reason != REASON_SHORT_BODY:
@@ -473,10 +497,18 @@ def _infer_stub_min_chars(actions: list[ClaimAction]) -> int:
 
 
 def render_claim_manifest(
-    actions: list[ClaimAction], root: Path, *, applied: list[Path] | None = None
+    actions: list[ClaimAction],
+    root: Path,
+    *,
+    applied: list[Path] | None = None,
+    stub_min_chars: int | None = None,
 ) -> str:
     """Human-readable `== recall lint --dedupe-claims ==` manifest, or
-    the post-apply summary line when `applied` is given."""
+    the post-apply summary line when `applied` is given.
+
+    `stub_min_chars` is the threshold the plan ran with. Omit it and the
+    header falls back to inferring it from the actions' own detail
+    strings, which only works when the short-body rule actually fired."""
     memory_root = _memory_root(root)
     lines: list[str] = []
 
@@ -484,10 +516,14 @@ def render_claim_manifest(
         cdir = claims_dir(root)
         claims = _scan_claims(cdir) if cdir is not None else []
         n_events = len({c.source_event_id for c in claims})
+        threshold = (
+            stub_min_chars if stub_min_chars is not None
+            else _infer_stub_min_chars(actions)
+        )
         lines.append(
             f"== recall lint --dedupe-claims ==  ({len(claims)} claims, "
             f"{n_events} distinct source events; "
-            f"stub_min_chars={_infer_stub_min_chars(actions)})"
+            f"stub_min_chars={threshold})"
         )
     else:
         lines.append("== recall lint --dedupe-claims ==")
@@ -507,8 +543,9 @@ def render_claim_manifest(
         skipped = len(actions) - len(applied)
         if skipped > 0:
             lines.append(
-                f"{skipped} claim(s) left in place — the archive or the retraction "
-                f"failed, so the original was not deleted."
+                f"{skipped} claim(s) not fully archived — re-run to finish. "
+                f"Nothing was lost: the tombstoned copy is kept on every "
+                f"failure path."
             )
         return "\n".join(lines)
 
