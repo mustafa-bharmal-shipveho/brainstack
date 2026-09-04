@@ -289,6 +289,43 @@ class TestDefaultInstallWiresTheDaemon:
             )
 
     @darwin_only
+    def test_fresh_full_install_forwards_custom_brain_root_to_daemon(self, tmp_path: Path):
+        """`--brain-root /custom` must reach the recursive `--setup-daemon`
+        step. The parsed BRAIN_ROOT is a shell variable, not an exported
+        one, so an unforwarded recursion would silently configure the
+        LaunchAgent for the wrong brain. The env deliberately points
+        BRAIN_ROOT at a different dir so the flag has to win."""
+        import plistlib
+
+        fake_home = tmp_path / "fakehome"
+        env = _fresh_env(fake_home)
+        custom = tmp_path / "custom-brain"
+        # A real user's shell has no BRAIN_ROOT at all; only the flag names
+        # the brain. (With BRAIN_ROOT in the env, bash keeps the export
+        # attribute when the flag reassigns it and the bug is masked.)
+        env.pop("BRAIN_ROOT", None)
+
+        result = _run(
+            "--brain-remote", "git@example.com:test/scratch.git",
+            "--brain-root", str(custom),
+            "--yes",
+            env=env,
+        )
+        assert result.returncode == 0, (
+            f"fresh full install failed (rc={result.returncode}):\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        plist_path = fake_home / "Library" / "LaunchAgents" / PLIST_NAME
+        assert plist_path.exists(), f"daemon plist missing:\n{result.stdout}"
+        plist = plistlib.loads(plist_path.read_bytes())
+        env_vars = plist.get("EnvironmentVariables", {})
+        assert env_vars.get("BRAIN_ROOT") == str(custom), (
+            f"daemon plist BRAIN_ROOT should be the --brain-root value "
+            f"{str(custom)!r}, got {env_vars.get('BRAIN_ROOT')!r}"
+        )
+        assert str(fake_home / ".agent") not in plist_path.read_text()
+
+    @darwin_only
     def test_full_install_with_no_daemon_writes_no_plist(self, tmp_path: Path):
         fake_home = tmp_path / "fakehome"
         env = _fresh_env(fake_home)
