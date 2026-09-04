@@ -152,7 +152,7 @@ class TestBuildRecallBlock:
                 body="Always lead with executable artifact.",
             ),
         ])
-        block, telemetry = build_recall_block(
+        block, telemetry, _ = build_recall_block(
             "who is the head of platform?", retr, k=5, budget_tokens=1500,
             brain_root=Path("/brain"),
         )
@@ -199,7 +199,7 @@ class TestBuildRecallBlock:
                 body="Mike: head of platform.",
             ),
         ])
-        block, telemetry = build_recall_block(
+        block, telemetry, _ = build_recall_block(
             "who is the head of platform?", retr, k=5, budget_tokens=1500,
         )
         assert "auto-recall: 1 doc surfaced" in block
@@ -211,7 +211,7 @@ class TestBuildRecallBlock:
         `recall stats` cannot compute a real hit rate while every fire is
         labelled 'hit' regardless of what came back."""
         from runtime.adapters.claude_code.auto_recall import build_recall_block
-        block, telemetry = build_recall_block(
+        block, telemetry, _ = build_recall_block(
             "obscure query with no hits", _FakeRetriever(results=[]),
             k=5, budget_tokens=1500,
         )
@@ -235,7 +235,7 @@ class TestBuildRecallBlock:
             for i in range(5)
         ])
         budget = 500
-        block, _ = build_recall_block("x", retr, k=5, budget_tokens=budget)
+        block, _, _ = build_recall_block("x", retr, k=5, budget_tokens=budget)
         # The rendered block must stay within a small multiplier of the
         # budget. Allow 3x slack for the header + one over-budget section
         # being included before truncation kicks in.
@@ -256,7 +256,7 @@ class TestBuildRecallBlock:
                              score=0.20, body="weak match"),
         ])
         # Default: both included
-        block_default, telem_default = build_recall_block(
+        block_default, telem_default, _ = build_recall_block(
             "x", retr, k=5, budget_tokens=1500,
         )
         assert "/strong.md" in block_default
@@ -264,7 +264,7 @@ class TestBuildRecallBlock:
         assert telem_default["x_k_returned"] == 2
 
         # With floor: only the strong match survives
-        block_filtered, telem_filtered = build_recall_block(
+        block_filtered, telem_filtered, _ = build_recall_block(
             "x", retr, k=5, budget_tokens=1500, min_score=0.5,
         )
         assert "/strong.md" in block_filtered
@@ -280,7 +280,7 @@ class TestBuildRecallBlock:
                              name=f"d{i}", score=0.5, body="x")
             for i in range(20)
         ])
-        _, telemetry = build_recall_block("x", retr, k=20, budget_tokens=99999)
+        _, telemetry, _ = build_recall_block("x", retr, k=20, budget_tokens=99999)
         for k, v in telemetry.items():
             encoded = json.dumps(v).encode("utf-8")
             assert len(encoded) <= 1024, f"telemetry[{k}] is {len(encoded)} bytes"
@@ -308,7 +308,7 @@ class TestRelevanceGates:
             _FakeQueryResult(path="/brain/b.md", source="brain", name="b",
                              score=0.19, body="weaker"),
         ])
-        block, telemetry = build_recall_block(
+        block, telemetry, _ = build_recall_block(
             "q", retr, k=5, budget_tokens=1500, min_score=0.5,
         )
         assert block == ""
@@ -325,7 +325,7 @@ class TestRelevanceGates:
             _FakeQueryResult(path="/brain/high.md", source="brain", name="high",
                              score=0.61, rerank_score=0.9, body="on topic"),
         ])
-        block, telemetry = build_recall_block(
+        block, telemetry, _ = build_recall_block(
             "q", retr, k=5, budget_tokens=1500, min_rerank=0.5,
         )
         assert "/brain/high.md" in block
@@ -343,7 +343,7 @@ class TestRelevanceGates:
             _FakeQueryResult(path="/brain/b.md", source="brain", name="b",
                              score=0.88, rerank_score=0.05, body="b"),
         ])
-        block, telemetry = build_recall_block(
+        block, telemetry, _ = build_recall_block(
             "q", retr, k=5, budget_tokens=1500, min_rerank=0.5,
         )
         assert block == ""
@@ -365,7 +365,7 @@ class TestRelevanceGates:
             _FakeQueryResult(path="/brain/b.md", source="brain", name="b",
                              score=0.88, rerank_score=None, body="b"),
         ])
-        block, telemetry = build_recall_block(
+        block, telemetry, _ = build_recall_block(
             "q", retr, k=5, budget_tokens=1500, min_rerank=0.5,
         )
         assert "/brain/a.md" in block
@@ -387,7 +387,7 @@ class TestRelevanceGates:
             _FakeQueryResult(path="/brain/high.md", source="brain", name="high",
                              score=0.61, rerank_score=-0.50, body="on topic"),
         ])
-        block, telemetry = build_recall_block(
+        block, telemetry, _ = build_recall_block(
             "q", retr, k=5, budget_tokens=1500, min_rerank=-1.9547,
         )
         assert "/brain/high.md" in block
@@ -406,7 +406,7 @@ class TestRelevanceGates:
             _FakeQueryResult(path="/brain/b.md", source="brain", name="b",
                              score=0.61, rerank_score=0.4, body="b"),
         ])
-        block, telemetry = build_recall_block(
+        block, telemetry, _ = build_recall_block(
             "q", retr, k=5, budget_tokens=1500, min_rerank=None,
         )
         assert "/brain/a.md" in block
@@ -424,7 +424,7 @@ class TestRelevanceGates:
             _FakeQueryResult(path="/brain/zero.md", source="brain", name="zero",
                              score=0.61, rerank_score=0.0, body="zero"),
         ])
-        block, telemetry = build_recall_block(
+        block, telemetry, _ = build_recall_block(
             "q", retr, k=5, budget_tokens=1500, min_rerank=0.0,
         )
         assert "/brain/neg.md" not in block
@@ -441,7 +441,7 @@ class TestRelevanceGates:
             _FakeQueryResult(path="/brain/a.md", source="brain", name="a",
                              score=0.91, rerank_score=None, body="a"),
         ])
-        block, telemetry = build_recall_block(
+        block, telemetry, _ = build_recall_block(
             "q", retr, k=5, budget_tokens=1500, min_rerank=-1.9547,
         )
         assert "/brain/a.md" in block
@@ -463,7 +463,7 @@ class TestRelevanceGates:
             _FakeQueryResult(path="/brain/d.md", source="brain", name="d",
                              score=0.20, rerank_score=0.9, body="d"),
         ])
-        _, telemetry = build_recall_block(
+        _, telemetry, _ = build_recall_block(
             "q", retr, k=5, budget_tokens=1500, min_score=0.5, min_rerank=0.5,
         )
         # d.md failed the RRF pre-filter, so it is not a candidate at all.
@@ -494,14 +494,16 @@ class TestSessionDedup:
             _FakeQueryResult(path="/brain/lesson.md", source="brain",
                              name="lesson", score=0.9, body="Lesson body."),
         ])
-        first_block, first_telem = build_recall_block(
+        first_block, first_telem, first_injected = build_recall_block(
             "q", retr, k=5, budget_tokens=1500, dedup_store=store,
         )
         assert first_telem["x_outcome"] == "hit"
         assert first_telem["x_k_dedup"] == 0
         assert "/brain/lesson.md" in first_block
+        # The CALLER commits, as `hooks` does once it has printed the block.
+        store.record(first_injected)
 
-        second_block, second_telem = build_recall_block(
+        second_block, second_telem, _ = build_recall_block(
             "q again", retr, k=5, budget_tokens=1500, dedup_store=store,
         )
         assert second_block == ""
@@ -514,13 +516,14 @@ class TestSessionDedup:
         again. A memory the user just edited must reach the model."""
         from runtime.adapters.claude_code.auto_recall import build_recall_block
         store = self._store(tmp_path)
-        build_recall_block(
+        _, _, v1_injected = build_recall_block(
             "q", _FakeRetriever(results=[
                 _FakeQueryResult(path="/brain/lesson.md", source="brain",
                                  name="lesson", score=0.9, body="v1 body"),
             ]), k=5, budget_tokens=1500, dedup_store=store,
         )
-        block, telemetry = build_recall_block(
+        store.record(v1_injected)
+        block, telemetry, _ = build_recall_block(
             "q", _FakeRetriever(results=[
                 _FakeQueryResult(path="/brain/lesson.md", source="brain",
                                  name="lesson", score=0.9, body="v2 body"),
@@ -554,10 +557,13 @@ class TestTelemetryContractV12:
                                  name="fresh", score=0.84, rerank_score=0.91,
                                  body="brand new material")
 
-        # First fire records `seen` in the store.
-        build_recall_block("q", _FakeRetriever(results=[seen]), k=5,
-                           budget_tokens=1500, dedup_store=store)
-        block, telemetry = build_recall_block(
+        # First fire shows `seen`; the caller commits it to the store.
+        _, _, injected = build_recall_block(
+            "q", _FakeRetriever(results=[seen]), k=5,
+            budget_tokens=1500, dedup_store=store,
+        )
+        store.record(injected)
+        block, telemetry, _ = build_recall_block(
             "q", _FakeRetriever(results=[fresh, seen]), k=5,
             budget_tokens=1500, dedup_store=store,
         )
@@ -597,7 +603,7 @@ class TestTelemetryContractV12:
             )
             for i in range(40)
         ])
-        _, telemetry = build_recall_block(
+        _, telemetry, _ = build_recall_block(
             "q", retr, k=40, budget_tokens=99999, brain_root=Path("/brain"),
         )
         # All 40 were injected — truncation is a telemetry concern only.
@@ -637,7 +643,7 @@ class TestTelemetryContractV12:
         assert adapter.index_stale is False
         assert len(adapter.query("q", k=5)) == 1
 
-        block, telemetry = build_recall_block(
+        block, telemetry, _ = build_recall_block(
             "q", adapter, k=5, budget_tokens=1500, brain_root=Path("/brain"),
         )
         assert "daemon-supplied body" in block
@@ -983,7 +989,7 @@ class TestInjectionHardening:
 
     def test_body_cannot_escape_system_reminder_wrapper(self):
         from runtime.adapters.claude_code.auto_recall import build_recall_block
-        block, telemetry = build_recall_block(
+        block, telemetry, _ = build_recall_block(
             "what did Alice say about diffs?", self._adversarial_retriever(),
             k=5, budget_tokens=1500,
         )
@@ -999,7 +1005,7 @@ class TestInjectionHardening:
     def test_untrusted_preamble_present_exactly_once(self):
         from recall.sanitize import UNTRUSTED_PREAMBLE
         from runtime.adapters.claude_code.auto_recall import build_recall_block
-        block, _ = build_recall_block(
+        block, _, _ = build_recall_block(
             "what did Alice say about diffs?", self._adversarial_retriever(),
             k=5, budget_tokens=1500,
         )
@@ -1008,7 +1014,7 @@ class TestInjectionHardening:
     def test_each_excerpt_is_fenced(self):
         from recall.sanitize import close_fence, open_fence
         from runtime.adapters.claude_code.auto_recall import build_recall_block
-        block, _ = build_recall_block(
+        block, _, _ = build_recall_block(
             "what did Alice say about diffs?", self._adversarial_retriever(),
             k=5, budget_tokens=1500,
         )
@@ -1022,7 +1028,7 @@ class TestInjectionHardening:
 
     def test_per_doc_provenance_labels(self):
         from runtime.adapters.claude_code.auto_recall import build_recall_block
-        block, _ = build_recall_block(
+        block, _, _ = build_recall_block(
             "what did Alice say about diffs?", self._adversarial_retriever(),
             k=5, budget_tokens=1500,
         )
@@ -1053,7 +1059,7 @@ class TestInjectionHardening:
             _FakeQueryResult(path="/brain/long.md", source="brain",
                              name="long", score=0.9, body=long_body),
         ])
-        block, _ = build_recall_block("q", retr, k=5, budget_tokens=1500)
+        block, _, _ = build_recall_block("q", retr, k=5, budget_tokens=1500)
         assert " … [excerpt truncated]" in block
         # Marker sits inside the fence, after the excerpt — before the
         # closing fence line, not after it.
@@ -1070,5 +1076,5 @@ class TestInjectionHardening:
                              name="short", score=0.9,
                              body="a short body well under the cap"),
         ])
-        block, _ = build_recall_block("q", retr, k=5, budget_tokens=1500)
+        block, _, _ = build_recall_block("q", retr, k=5, budget_tokens=1500)
         assert "[excerpt truncated]" not in block

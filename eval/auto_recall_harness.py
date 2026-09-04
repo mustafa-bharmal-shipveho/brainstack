@@ -212,7 +212,7 @@ def _produce_sheet(prompts: list[str], out_path: Path,
         telemetry: dict = {}
         if not skip and retriever is not None:
             try:
-                block_text, telemetry = build_recall_block(
+                block_text, telemetry, _injected = build_recall_block(
                     prompt, retriever, k=k, budget_tokens=budget_tokens,
                     min_score=min_score,
                 )

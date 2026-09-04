@@ -1,11 +1,13 @@
 """SessionStart surfaces the cached health report in the Claude Code banner.
 
 The hourly sync LaunchAgent writes `<brain>/runtime/health.json`; the
-SessionStart hook reads it from `config.log_dir.parent / "health.json"` and
-prints one line per FAIL. This is the only place a health regression reaches
-the user without them running a command, so the rules are strict: never
-raise, never block, always return 0, and stay silent when there is nothing
-wrong.
+SessionStart hook reads it from `recall.config.brain_root() / "runtime" /
+"health.json"` and prints one line per FAIL. The brain root — NOT
+`log_dir.parent` — is what locates it: `log_dir` is user-configurable and
+the demo sets it elsewhere, which used to disable the banner outright.
+This is the only place a health regression reaches the user without them
+running a command, so the rules are strict: never raise, never block,
+always return 0, and stay silent when there is nothing wrong.
 
 Kept separate from tests/runtime/test_adapter_hooks.py so the health work
 never edits that file.
@@ -39,8 +41,17 @@ def isolated_home(tmp_path: Path, monkeypatch):
 
 
 @pytest.fixture
+def brain(isolated_home: Path) -> Path:
+    """The `$BRAIN_ROOT` every test writes health.json under."""
+    return isolated_home / ".agent"
+
+
+@pytest.fixture
 def tmp_config(tmp_path: Path) -> RuntimeConfig:
-    return RuntimeConfig(log_dir=tmp_path / "runtime" / "logs")
+    """A DELIBERATELY custom `log_dir`, outside the brain root. The banner
+    has to find health.json anyway; resolving it from `log_dir.parent`
+    silently disabled the banner for anyone who moved their logs."""
+    return RuntimeConfig(log_dir=tmp_path / "custom-logs")
 
 
 @pytest.fixture
@@ -63,14 +74,15 @@ def _iso(dt: datetime) -> str:
 
 
 def _write_health(
-    tmp_path: Path,
+    brain: Path,
     checks: list[dict],
     *,
     hours_old: float = 0.5,
     raw: str | None = None,
 ) -> Path:
-    """Drop a health.json where the hook looks for it."""
-    path = tmp_path / "runtime" / "health.json"
+    """Drop a health.json where the hook looks for it: under the brain
+    root, exactly where `sync.sh`'s `_write_health` puts it."""
+    path = brain / "runtime" / "health.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     if raw is not None:
         path.write_text(raw, encoding="utf-8")
@@ -83,8 +95,8 @@ def _write_health(
     path.write_text(json.dumps({
         "schema_version": 1,
         "generated_at": _iso(generated),
-        "brain_root": str(tmp_path / "brain"),
-        "cwd": str(tmp_path / "brain"),
+        "brain_root": str(brain),
+        "cwd": str(brain),
         "status": status,
         "counts": counts,
         "checks": checks,
@@ -100,10 +112,10 @@ def _check(id_: str, status: str, evidence: str, fix: str = "") -> dict:
 
 
 def test_session_start_prints_one_line_per_fail(
-    tmp_path: Path, tmp_config, stdin_with, session_cwd, capsys
+    brain: Path, tmp_config, stdin_with, session_cwd, capsys
 ):
     long_evidence = "x" * 400
-    _write_health(tmp_path, [
+    _write_health(brain, [
         _check("imports_freshness", "FAIL", "never mirrored",
                "./install.sh --setup-claude-extras"),
         _check("brain_push", "FAIL", long_evidence, "sync.sh"),
@@ -133,9 +145,9 @@ def test_session_start_prints_one_line_per_fail(
 
 
 def test_session_start_silent_on_all_pass(
-    tmp_path: Path, tmp_config, stdin_with, session_cwd, capsys
+    brain: Path, tmp_config, stdin_with, session_cwd, capsys
 ):
-    _write_health(tmp_path, [
+    _write_health(brain, [
         _check("drift", "PASS", "in sync"),
         _check("daemon", "SKIP", "not configured"),
     ])
@@ -148,7 +160,7 @@ def test_session_start_silent_on_all_pass(
 
 
 def test_session_start_silent_when_report_missing(
-    tmp_path: Path, tmp_config, stdin_with, session_cwd, capsys
+    brain: Path, tmp_config, stdin_with, session_cwd, capsys
 ):
     """Fresh install, before the first sync tick. Nagging about a file the
     user has never heard of is worse than saying nothing."""
@@ -158,16 +170,16 @@ def test_session_start_silent_when_report_missing(
 
     assert rc == 0
     assert capsys.readouterr().out == ""
-    assert not (tmp_path / "runtime" / "health.json").exists()
+    assert not (brain / "runtime" / "health.json").exists()
 
 
 def test_session_start_flags_stale_report(
-    tmp_path: Path, tmp_config, stdin_with, session_cwd, capsys
+    brain: Path, tmp_config, stdin_with, session_cwd, capsys
 ):
     """A report older than 26 h means the hourly agent stopped running. The
     checks inside it are no longer evidence of anything."""
     _write_health(
-        tmp_path,
+        brain,
         [_check("drift", "PASS", "in sync")],
         hours_old=40,
     )
@@ -184,9 +196,9 @@ def test_session_start_flags_stale_report(
 
 
 def test_session_start_never_raises_on_corrupt_json(
-    tmp_path: Path, tmp_config, stdin_with, session_cwd, capsys
+    brain: Path, tmp_config, stdin_with, session_cwd, capsys
 ):
-    _write_health(tmp_path, [], raw='{"schema_version": 1, "checks": [')
+    _write_health(brain, [], raw='{"schema_version": 1, "checks": [')
     stdin_with({"session_id": "s-1", "cwd": str(session_cwd)})
 
     rc = handle_hook("SessionStart", config=tmp_config)
@@ -198,7 +210,7 @@ def test_session_start_never_raises_on_corrupt_json(
 
 
 def test_session_start_live_cwd_auto_recall_fail_line(
-    tmp_path: Path, tmp_config, stdin_with, session_cwd, isolated_home, capsys
+    brain: Path, tmp_config, stdin_with, session_cwd, isolated_home, capsys
 ):
     """The cached report was written with the brain as cwd, so it can never
     see that THIS session's directory shadows the global config and silently
@@ -211,7 +223,7 @@ def test_session_start_live_cwd_auto_recall_fail_line(
     (session_cwd / "pyproject.toml").write_text(
         "[tool.recall.runtime]\nenable_auto_recall = false\n", encoding="utf-8"
     )
-    _write_health(tmp_path, [_check("drift", "PASS", "in sync")])
+    _write_health(brain, [_check("drift", "PASS", "in sync")])
     stdin_with({"session_id": "s-1", "cwd": str(session_cwd)})
 
     rc = handle_hook("SessionStart", config=tmp_config)
@@ -224,11 +236,11 @@ def test_session_start_live_cwd_auto_recall_fail_line(
 
 
 def test_session_start_returns_zero_always(
-    tmp_path: Path, tmp_config, stdin_with, session_cwd, capsys
+    brain: Path, tmp_config, stdin_with, session_cwd, capsys
 ):
     """Whatever the report says, the hook is telemetry: a non-zero exit would
     surface as a hook error in the user's session."""
-    _write_health(tmp_path, [
+    _write_health(brain, [
         _check("brain_push", "FAIL", "67 commits ahead of origin/main", "sync.sh"),
         _check("imports_freshness", "FAIL", "never mirrored"),
     ])
@@ -240,3 +252,69 @@ def test_session_start_returns_zero_always(
     capsys.readouterr()
     events = load_events(tmp_config.event_log_path)
     assert [e.event for e in events] == ["SessionStart"]
+
+
+# ---------- where health.json is looked up ------------------------------
+
+
+def test_report_is_read_from_the_brain_root_not_log_dir_parent(
+    brain: Path, tmp_config, stdin_with, session_cwd, capsys
+):
+    """`log_dir` is user-configurable (the demo sets its own). Deriving the
+    report path from `log_dir.parent` therefore pointed at a directory
+    `sync.sh` never writes, and the banner went silent for exactly the
+    users who had customised anything. A decoy at the old location must
+    not win."""
+    _write_health(brain, [
+        _check("brain_push", "FAIL", "5 commits ahead of origin/main", "sync.sh"),
+    ])
+    decoy = tmp_config.log_dir.parent / "health.json"
+    decoy.parent.mkdir(parents=True, exist_ok=True)
+    decoy.write_text(json.dumps({
+        "schema_version": 1,
+        "generated_at": _iso(datetime.now(timezone.utc)),
+        "brain_root": str(brain), "cwd": str(brain), "status": "FAIL",
+        "counts": {"PASS": 0, "WARN": 0, "FAIL": 1, "SKIP": 0},
+        "checks": [_check("decoy_check", "FAIL", "read from log_dir.parent")],
+    }), encoding="utf-8")
+    stdin_with({"session_id": "s-1", "cwd": str(session_cwd)})
+
+    rc = handle_hook("SessionStart", config=tmp_config)
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "brainstack health FAIL: brain_push" in out, (
+        f"the brain-root report was not read; banner said:\n{out}"
+    )
+    assert "decoy_check" not in out
+
+
+# ---------- FAIL lines stay one line each -------------------------------
+
+
+def test_fail_evidence_is_flattened_to_one_line(
+    brain: Path, tmp_config, stdin_with, session_cwd, capsys
+):
+    """Evidence carries verbatim git output (`remote: error: ...`) and
+    `check_freshness` summaries, i.e. untrusted multi-line text with ANSI
+    colour in it. One FAIL is one banner line, always: a newline here
+    would let a single check forge extra `brainstack health FAIL:` lines
+    or scroll the real ones away."""
+    evidence = (
+        "remote: error: File big.jsonl is 107 MB\n"
+        "\x1b[31mfatal:\x1b[0m failed to push some refs\n"
+        "brainstack health FAIL: forged — not a real check"
+    )
+    _write_health(brain, [_check("brain_push", "FAIL", evidence, "sync.sh")])
+    stdin_with({"session_id": "s-1", "cwd": str(session_cwd)})
+
+    rc = handle_hook("SessionStart", config=tmp_config)
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    fail_lines = [ln for ln in out.splitlines()
+                  if ln.startswith("brainstack health FAIL:")]
+    assert len(fail_lines) == 1, f"one FAIL produced {len(fail_lines)} lines:\n{out}"
+    assert "remote: error: File big.jsonl is 107 MB" in fail_lines[0]
+    assert "failed to push some refs" in fail_lines[0]
+    assert "\x1b" not in out and "[31m" not in out

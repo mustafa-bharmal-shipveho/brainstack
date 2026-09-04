@@ -619,3 +619,147 @@ class TestInprocLoaderStaysCheap:
         # Never pay the cross-encoder load in a per-prompt subprocess, even
         # when the user's config asks for one — the daemon does reranking.
         assert retriever.kwargs.get("reranker") == "none"
+
+
+# ---------- the record-before-print window --------------------------------
+
+class TestDedupRecordedOnlyAfterTheBlockIsPrinted:
+    """`dedup_store.record` marks documents "already shown this session".
+
+    It used to run inside the worker thread, at the end of
+    `build_recall_block` — i.e. BEFORE the main thread had printed
+    anything. If `t.join(timeout)` expired in the window between that
+    write and the `out_q.put`, the hook logged `timeout`, printed nothing,
+    and the store on disk still claimed those docs had been shown. Every
+    later prompt in the session then deduped them away, so the documents
+    the user most needed were unreachable for the rest of the session —
+    and the telemetry said `timeout`, never `dedup`.
+
+    The record is therefore a MAIN-THREAD step taken only on the `ok`
+    path, after `print(block)` has actually run.
+    """
+
+    def test_worker_that_times_out_after_building_records_nothing(
+        self, tmp_config: RuntimeConfig, stdin_with, monkeypatch, capsys
+    ):
+        """The exact race: the block is built, then the worker stalls past
+        the hook's deadline. Nothing is printed, so nothing may be marked
+        as shown."""
+        import runtime.adapters.claude_code.auto_recall as ar_mod
+
+        _patch(monkeypatch, daemon_return=(
+            _wire_response([_wire_result("/brain/memory/escalation.md")]), None,
+        ), loader=_RecordingLoader())
+        monkeypatch.setattr(tmp_config, "auto_recall_timeout_ms", 60)
+
+        real = ar_mod.build_recall_block
+
+        def stall_after_building(*args, **kwargs):
+            built = real(*args, **kwargs)
+            # The main thread's join(0.06s) expires inside this sleep.
+            time.sleep(1.0)
+            return built
+
+        monkeypatch.setattr(ar_mod, "build_recall_block", stall_after_building)
+        stdin_with({"session_id": "sess-timeout", "prompt": _PROMPT})
+        handle_hook("UserPromptSubmit", config=tmp_config)
+
+        out = capsys.readouterr().out
+        assert "auto-recall:" not in out, "a timed-out fire must print nothing"
+        store = tmp_config.log_dir / "injected" / "sess-timeout.json"
+        assert not store.exists(), (
+            f"{store.name} was written for a fire the user never saw; those "
+            f"docs are now deduped away for the rest of the session"
+        )
+        assert _auto_recall_ext(tmp_config)["x_outcome"] == "timeout"
+
+    def test_record_runs_on_the_main_thread(
+        self, tmp_config: RuntimeConfig, stdin_with, monkeypatch, capsys
+    ):
+        """Pins WHERE the write happens. The worker is a daemon thread the
+        hook can abandon at any instant; only the main thread knows whether
+        the block reached the user."""
+        import threading
+
+        from runtime.adapters.claude_code.dedup import SessionDedupStore
+
+        _patch(monkeypatch, daemon_return=(
+            _wire_response([_wire_result("/brain/memory/escalation.md")]), None,
+        ), loader=_RecordingLoader())
+
+        callers: list[str] = []
+        real_record = SessionDedupStore.record
+
+        def spy(self, injected):
+            callers.append(threading.current_thread().name)
+            return real_record(self, injected)
+
+        monkeypatch.setattr(SessionDedupStore, "record", spy)
+        stdin_with({"session_id": "sess-main", "prompt": _PROMPT})
+        handle_hook("UserPromptSubmit", config=tmp_config)
+
+        assert "auto-recall:" in capsys.readouterr().out
+        assert callers == ["MainThread"], (
+            f"dedup.record ran on {callers!r}; the worker thread cannot know "
+            f"whether the block was printed"
+        )
+        assert (tmp_config.log_dir / "injected" / "sess-main.json").exists()
+
+    def test_builder_returns_the_injected_candidates(self):
+        """`build_recall_block` hands the injected candidates back instead
+        of recording them itself, so the caller owns the commit point."""
+        from runtime.adapters.claude_code.auto_recall import build_recall_block
+
+        results = [_FakeQueryResult(path="/brain/memory/a.md", source="brain",
+                                    name="a", score=0.9, body="body a")]
+        block, telemetry, injected = build_recall_block(
+            "q", _RecordingLoader(results)(), k=5, budget_tokens=1500,
+        )
+        assert block
+        assert telemetry["x_k_returned"] == 1
+        assert [c.path for c in injected] == ["/brain/memory/a.md"]
+
+    def test_builder_does_not_write_the_store_itself(self, tmp_path: Path):
+        """Even handed a live store, the builder only READS it (`split`)."""
+        from runtime.adapters.claude_code.auto_recall import build_recall_block
+        from runtime.adapters.claude_code.dedup import SessionDedupStore
+
+        store = SessionDedupStore(tmp_path / "injected", "s")
+        results = [_FakeQueryResult(path="/brain/memory/a.md", source="brain",
+                                    name="a", score=0.9, body="body a")]
+        _, _, injected = build_recall_block(
+            "q", _RecordingLoader(results)(), k=5, budget_tokens=1500,
+            dedup_store=store,
+        )
+        assert injected, "the candidate should have survived the gates"
+        assert not store.path.exists(), (
+            "build_recall_block wrote the dedup store; the commit point "
+            "belongs to the caller that prints the block"
+        )
+
+
+# ---------- socket resolution has exactly one implementation --------------
+
+def test_resolve_daemon_socket_delegates_to_recall_config(
+    tmp_config: RuntimeConfig, monkeypatch, tmp_path: Path
+):
+    """`hooks._resolve_daemon_socket` is a thin pass-through to
+    `recall.config.daemon_socket_path` (via the config property). It used
+    to carry a full inline re-implementation of the same precedence behind
+    a `try/except`; two copies of a resolution order is how the hook and
+    the daemon end up on different sockets."""
+    import recall.config as rcfg
+
+    seen: list[str | None] = []
+
+    def fake(raw=None):
+        seen.append(raw)
+        return tmp_path / "from-recall-config.sock"
+
+    monkeypatch.setattr(rcfg, "daemon_socket_path", fake)
+    monkeypatch.setattr(tmp_config, "auto_recall_daemon_socket", "/cfg/x.sock")
+
+    assert hooks_mod._resolve_daemon_socket(tmp_config) == (
+        tmp_path / "from-recall-config.sock"
+    )
+    assert seen == ["/cfg/x.sock"]

@@ -92,8 +92,11 @@ def episodic_files(current: Path) -> list[Path]:
     adapters' dedup preload. The glob is `<stem>*<suffix>`, which matches
     every roll of this stream and skips sibling streams like
     `_imported.jsonl`. Order is name-ascending, NOT chronological — byte
-    order puts `AGENT_LEARNINGS.<day>.1.jsonl` before
-    `AGENT_LEARNINGS.<day>.jsonl`.
+    order puts `AGENT_LEARNINGS.<day>.1.jsonl` (the SECOND roll of that
+    day) before `AGENT_LEARNINGS.<day>.jsonl` (the first). Every consumer
+    that cares about time re-sorts by each entry's own timestamp
+    (`consolidate_once` does so explicitly); this list is only "every file
+    of the stream, current one last".
 
     `current` is always last, even when it does not exist yet (every
     consumer already tolerates a missing episodic file).

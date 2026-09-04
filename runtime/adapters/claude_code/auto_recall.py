@@ -8,7 +8,8 @@ Architecture:
 - `should_skip()` is the cheap first gate (no I/O). Filters short
   prompts, slash commands, bareword acks.
 - `build_recall_block()` runs the query, formats the system-reminder
-  block, returns telemetry. Caller (hook) handles timeout + I/O.
+  block, and returns `(block, telemetry, injected)`. Caller (hook)
+  handles timeout, printing, and the dedup-store write.
 - `_load_retriever()` builds the production HybridRetriever lazily on
   first call. Fail-loud if dependencies are missing — caller catches.
 
@@ -183,8 +184,11 @@ def build_recall_block(
     min_rerank: float | None = None,
     dedup_store: "Any | None" = None,
     brain_root: "Any | None" = None,
-) -> tuple[str, dict]:
-    """Run recall, render the injection block, return (block, telemetry).
+) -> "tuple[str, dict, list[RecallCandidate]]":
+    """Run recall, render the injection block.
+
+    Returns `(block, telemetry, injected)`, where `injected` is the
+    candidates that actually made it into `block`.
 
     Pipeline (telemetry contract v1.2)::
 
@@ -193,7 +197,15 @@ def build_recall_block(
                          ->  rerank gate      (rerank_score >= min_rerank,
                                                off iff min_rerank is None)
                          ->  session dedup    (dedup_store.split)
-                         ->  budgeted render  ->  dedup_store.record
+                         ->  budgeted render
+
+    `dedup_store` is READ here (`split`) and never written. Recording what
+    was shown is the CALLER's job, after it has printed the block: this
+    function runs in a worker thread the hook abandons on timeout, and a
+    `record` from that thread marks documents "already shown" for a block
+    the user never saw — deduping them away for the rest of the session.
+    See `hooks._handle_auto_recall` and
+    tests/runtime/test_hook_daemon_path.py::TestDedupRecordedOnlyAfterTheBlockIsPrinted.
 
     Block format::
 
@@ -218,10 +230,10 @@ def build_recall_block(
     measurement. The rerank score is appended AFTER the closing paren for
     exactly that reason. See TestTelemetryContractV12.
 
-    Returns `("", telemetry)` when nothing is injected — caller suppresses
-    the print. The outcome then distinguishes WHY: `miss` (retrieval ran,
-    nothing survived the gates) from `dedup` (everything that survived was
-    already shown this session).
+    Returns `("", telemetry, [])` when nothing is injected — caller
+    suppresses the print. The outcome then distinguishes WHY: `miss`
+    (retrieval ran, nothing survived the gates) from `dedup` (everything
+    that survived was already shown this session).
 
     The token budget is enforced via `OfflineTokenCounter`; a doc that
     would breach it is dropped whole rather than rendered half.
@@ -348,9 +360,6 @@ def build_recall_block(
         injected.append(c)
         used_tokens += section_tokens
 
-    if dedup_store is not None and injected:
-        dedup_store.record(injected)
-
     if injected:
         outcome = "hit"
     elif duplicates and not fresh:
@@ -392,7 +401,7 @@ def build_recall_block(
         telemetry["x_index_stale"] = bool(index_stale)
 
     if not injected:
-        return "", telemetry
+        return "", telemetry, []
 
     header = _render_header(
         n_docs=len(injected), n_dedup=k_dedup, query_ms=query_ms,
@@ -401,7 +410,7 @@ def build_recall_block(
     )
     # Blank line between sections keeps the block readable at a glance.
     body = "".join(f"{s}\n" for s in sections)
-    return f"{header}{body}</system-reminder>", telemetry
+    return f"{header}{body}</system-reminder>", telemetry, injected
 
 
 def _render_header(*, n_docs: int, n_dedup: int, query_ms: int,

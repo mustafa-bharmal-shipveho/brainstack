@@ -480,6 +480,17 @@ def _archive_rolls_all_namespaces(episodic_root, now=None) -> int:
 
     Runs for namespaces with no registered clusterer on purpose — that is
     the whole point (see `_archive_expired_rolls`).
+
+    LOCKING. Each non-default namespace is swept while holding ITS OWN
+    `<AGENT_LEARNINGS.jsonl>.lock` sentinel, because the sweep moves that
+    namespace's files and its adapters read exactly those files under the
+    same sentinel: `codex_adapter` and `claude_session_adapter` glob
+    `AGENT_LEARNINGS*.jsonl` to preload their dedup set. A roll vanishing
+    mid-preload silently shrinks that set and the next import duplicates
+    the history it covered. The default namespace's sentinel is
+    DELIBERATELY not re-acquired here: `run_dream_cycle` holds it for the
+    whole read-modify-write window, and flock is per open file
+    description, so a second acquire from the same process would deadlock.
     """
     total = 0
     default_current = os.path.join(episodic_root, "AGENT_LEARNINGS.jsonl")
@@ -493,11 +504,20 @@ def _archive_rolls_all_namespaces(episodic_root, now=None) -> int:
         ns_dir = os.path.join(episodic_root, name)
         if name == "snapshots" or not os.path.isdir(ns_dir):
             continue
-        total += _archive_expired_rolls(
-            os.path.join(ns_dir, "AGENT_LEARNINGS.jsonl"),
-            os.path.join(ns_dir, "snapshots"),
-            now=now,
-        )
+        ns_current = os.path.join(ns_dir, "AGENT_LEARNINGS.jsonl")
+        try:
+            with _episodic_locked_path(ns_current):
+                total += _archive_expired_rolls(
+                    ns_current,
+                    os.path.join(ns_dir, "snapshots"),
+                    now=now,
+                )
+        except OSError:
+            # Cannot open that namespace's sentinel (read-only dir, fd
+            # exhaustion). Skip it rather than sweep it unlocked — the
+            # cost is bounded disk, the alternative is a duplicated
+            # import. Best-effort, like the archive itself.
+            continue
     return total
 
 

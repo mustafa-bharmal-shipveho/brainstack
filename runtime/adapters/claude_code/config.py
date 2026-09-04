@@ -123,9 +123,9 @@ class RuntimeConfig:
     tool_bucket_overrides: dict[str, str] = field(default_factory=lambda: dict(_TOOL_BUCKET_OVERRIDES))
     config_path: Path | None = None
     # Ordered list (highest precedence first) of the config layers that
-    # contributed to this instance. Today `load()` still reads a single
-    # file, so this is `[config_path]` or `[]` — the per-key layered merge
-    # (S1) will populate it with every layer consulted.
+    # contributed to this instance: every file `_discover_layers()`
+    # consulted for a per-key merge. An explicit `load(config_path=...)`
+    # skips layering entirely, so there it is just `[config_path]`.
     config_layers: list[Path] = field(default_factory=list)
 
     @property
@@ -291,17 +291,6 @@ class RuntimeConfig:
                     except (TypeError, ValueError):
                         continue
         return budgets
-
-    @staticmethod
-    def global_config_path() -> Path:
-        """The lowest-precedence file layer: `$BRAIN_ROOT/runtime/pyproject.toml`,
-        defaulting to `~/.agent/runtime/pyproject.toml` when `$BRAIN_ROOT` is
-        unset."""
-        return (
-            Path(os.environ.get("BRAIN_ROOT") or "~/.agent").expanduser()
-            / "runtime"
-            / "pyproject.toml"
-        )
 
     @staticmethod
     def _discover_layers() -> list[Path]:

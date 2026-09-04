@@ -129,10 +129,17 @@ def _episodic_paths(brain_root: str, namespace: str = "default") -> List[str]:
 
     Default namespace walks the top-level `memory/episodic/` stream plus
     every sub-namespace directory holding its own stream (so we see ALL
-    producer streams from one consolidation run). Within each directory the
-    order is rolled files ascending, then the current file — chronological
-    for the consolidator's watermark. `snapshots/` is skipped: files there
-    are archived history, already consolidated.
+    producer streams from one consolidation run). `snapshots/` is skipped:
+    files there are archived history, already consolidated.
+
+    Within each directory the order is rolled files NAME-ascending, then
+    the current file. That is NOT chronological — byte order puts the
+    second roll of a day (`AGENT_LEARNINGS.<day>.1.jsonl`) before the
+    first (`AGENT_LEARNINGS.<day>.jsonl`). Nothing here depends on it:
+    `consolidate_once` re-sorts every loaded entry by
+    `(source_ts, is_tombstone, event_id)` before batching, precisely so
+    raw file order cannot leak into watermark semantics. Callers must not
+    read this list as a timeline.
     """
     if namespace != "default" and not _NAMESPACE_RE.match(namespace or ""):
         raise ValueError(f"invalid namespace: {namespace!r}")
