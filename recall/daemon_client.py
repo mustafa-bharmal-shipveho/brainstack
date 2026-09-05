@@ -30,6 +30,14 @@ from pathlib import Path
 # `recall.daemon` so this module stays free of the heavy import chain.
 PROTOCOL_VERSION = 1
 
+# Reasons that mean the daemon is DOWN — nothing is listening, so nothing
+# holds the embedded store's exclusive lock and an in-process fallback is
+# safe. Every other reason (`timeout`, `protocol_error`, `server_error`)
+# means something IS listening: falling back would block on that lock and
+# surface as "index is busy". The hook, the CLI, the MCP handler and the
+# daemon's own stale-socket probe all branch on this one set.
+DAEMON_DOWN_REASONS = frozenset({"no_socket", "connection_refused"})
+
 _RECV_CHUNK = 65536
 
 
@@ -225,6 +233,7 @@ def reindex(socket_path: Path | str, *, timeout_s: float = 600.0) -> dict:
 
 __all__ = [
     "DaemonUnavailable",
+    "DAEMON_DOWN_REASONS",
     "PROTOCOL_VERSION",
     "request",
     "query",

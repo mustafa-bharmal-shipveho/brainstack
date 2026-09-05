@@ -428,3 +428,79 @@ class TestSingleCandidateIsStillScored:
     def test_non_positive_limit_still_short_circuits(self, counting_encoder):
         assert qdrant_backend.rerank_results("q", [_qr("a", score=0.5)], limit=0) == []
         assert counting_encoder["calls"] == 0
+
+
+class TestRerankOversamplesWithoutReviewPolicy:
+    """With `needs_review_policy="ignore"` the RRF leg used to fetch exactly
+    `k` candidates, so the cross-encoder could only reorder the RRF top-k and
+    `rerank_n` meant nothing for a single-collection brain: a document ranked
+    just below the top-k by RRF could never be promoted. The pool must be at
+    least `rerank_n` deep whenever reranking is on (Codex review, pass 3).
+
+    Hermetic: one collection, faked client/query/encoder. The fake encoder
+    scores by position so the rerank order REVERSES the RRF order — whichever
+    candidate is LAST in the pool wins, which is exactly the candidate a
+    `fetch_n == k` pool never contained.
+    """
+
+    K = 3
+    RERANK_N = 6
+
+    @pytest.fixture
+    def single_collection(self, monkeypatch):
+        seen: dict = {"fetch_n": [], "pairs": 0}
+
+        class _Encoder:
+            def rerank(self, query, texts):
+                seen["pairs"] += len(texts)
+                return [float(i) for i in range(len(texts))]
+
+        def _fake_query_hybrid(client, collection, query, k, **kwargs):
+            seen["fetch_n"].append(k)
+            return [
+                QueryResult(document=_doc(f"a{i:02d}"), score=1.0 - i * 0.01)
+                for i in range(20)
+            ]
+
+        monkeypatch.setattr(qdrant_backend, "_qdrant_client_singleton", lambda *a, **k: object())
+        monkeypatch.setattr(qdrant_backend, "ensure_collection", lambda *a, **k: None)
+        monkeypatch.setattr(qdrant_backend, "query_hybrid", _fake_query_hybrid)
+        monkeypatch.setattr(qdrant_backend, "_get_cross_encoder", lambda model: _Encoder())
+        return seen
+
+    def _retriever(self, reranker: str):
+        from recall.core import HybridRetriever
+
+        return HybridRetriever(
+            collections=["a"],
+            reranker=reranker,
+            rerank_n=self.RERANK_N,
+            needs_review_policy="ignore",
+        )
+
+    def test_rrf_leg_fetches_at_least_rerank_n_when_reranking(self, single_collection):
+        self._retriever("cross_encoder").query("anything", k=self.K)
+        assert single_collection["fetch_n"] == [self.RERANK_N], (
+            f"fetched {single_collection['fetch_n']} candidates for "
+            f"rerank_n={self.RERANK_N}; the cross-encoder can only promote "
+            f"what the RRF leg pulled"
+        )
+
+    def test_candidate_below_rrf_top_k_can_be_promoted(self, single_collection):
+        results = self._retriever("cross_encoder").query("anything", k=self.K)
+        # Pool a00..a05 by RRF; the fake encoder scores by position, so a05
+        # (never in an RRF top-3) must come out on top.
+        assert _names(results) == ["a05", "a04", "a03"]
+        assert single_collection["pairs"] == self.RERANK_N
+
+    def test_per_request_rerank_override_widens_the_pool(self, single_collection):
+        # The daemon holds ONE retriever and flips reranking per request; the
+        # pool depth has to follow the effective decision, not the constructor.
+        self._retriever("none").query("anything", k=self.K, rerank=True)
+        assert single_collection["fetch_n"] == [self.RERANK_N]
+
+    def test_no_over_fetch_when_reranking_is_off(self, single_collection):
+        # policy=ignore + no reranker is the cheap path; keep it cheap.
+        self._retriever("none").query("anything", k=self.K)
+        assert single_collection["fetch_n"] == [self.K]
+        assert single_collection["pairs"] == 0

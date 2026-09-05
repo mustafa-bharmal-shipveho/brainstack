@@ -413,9 +413,16 @@ def fake_daemon(short_sock_dir):
         retriever=_UNSET,
         sock_name: str = "recall.sock",
         start: bool = True,
+        ready_timeout_s: "float | None" = None,
         **kwargs,
     ):
         sock = short_sock_dir / sock_name
+        if ready_timeout_s is None:
+            # A REAL retriever pays the embedder + cross-encoder load in the
+            # warm-up before the first accept(); on a loaded machine that
+            # is tens of seconds, and it measures the machine, not the
+            # daemon. Fakes are ready in milliseconds.
+            ready_timeout_s = 120.0 if retriever is None else 10.0
         if retriever is _UNSET:
             retriever = _FakeRetriever(results)
         kwargs.setdefault("refresh_interval_s", 0.0)
@@ -432,7 +439,7 @@ def fake_daemon(short_sock_dir):
 
             t = threading.Thread(target=_serve, daemon=True, name="test-recall-daemon")
             t.start()
-            _wait_for_socket(sock, thread_state=state)
+            _wait_for_socket(sock, timeout=ready_timeout_s, thread_state=state)
         return daemon, sock, retriever
 
     yield _make
@@ -1649,8 +1656,14 @@ def test_four_concurrent_real_queries(
     def _client(i: int) -> None:
         try:
             barrier.wait(timeout=10)
+            # This test proves the four queries SERIALIZE correctly, not
+            # that they are fast: on a loaded machine three reranked
+            # queries can hold the lock longer than the default 2 s queue
+            # bound, so declare a client budget the daemon queues against.
             responses[i] = _send(
-                sock, {"v": 1, "op": "query", "prompt": prompts[i], "k": 3},
+                sock,
+                {"v": 1, "op": "query", "prompt": prompts[i], "k": 3,
+                 "budget_ms": 60_000},
                 timeout=120.0,
             )
         except BaseException as exc:  # noqa: BLE001 - reported below

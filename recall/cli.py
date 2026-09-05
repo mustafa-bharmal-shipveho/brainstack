@@ -184,7 +184,7 @@ def _query_via_daemon(
             rerank=rerank,
         )
     except daemon_client.DaemonUnavailable as exc:
-        if exc.reason in {"no_socket", "connection_refused"}:
+        if exc.reason in daemon_client.DAEMON_DOWN_REASONS:
             return None
         typer.echo(
             f"recall query: the daemon at {sock} is running but did not answer "
@@ -525,7 +525,7 @@ def reindex():
             try:
                 resp = daemon_client.reindex(sock)
             except daemon_client.DaemonUnavailable as exc:
-                if exc.reason not in {"no_socket", "connection_refused"}:
+                if exc.reason not in daemon_client.DAEMON_DOWN_REASONS:
                     typer.echo(
                         f"recall reindex: the daemon at {sock} is running but "
                         f"the refresh failed ({exc.reason}: {exc}). It owns the "

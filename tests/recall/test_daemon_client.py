@@ -221,3 +221,15 @@ def test_query_happy_path_returns_payload(fake_server):
     assert seen[0]["k"] == 3
     # the server bounds its queue wait by ~2x this hint, so it must be forwarded
     assert seen[0]["budget_ms"] == 1000
+
+
+def test_daemon_down_reasons_is_the_shared_fallback_contract():
+    """Every daemon client (hook, CLI, MCP, the daemon's own stale-socket
+    probe) decides "safe to fall back in-process?" from the SAME set. A
+    caller that hard-codes its own copy drifts the moment a reason is added."""
+    from recall.daemon_client import DAEMON_DOWN_REASONS
+
+    assert DAEMON_DOWN_REASONS == frozenset({"no_socket", "connection_refused"})
+    assert "timeout" not in DAEMON_DOWN_REASONS
+    assert "server_error" not in DAEMON_DOWN_REASONS
+    assert "protocol_error" not in DAEMON_DOWN_REASONS

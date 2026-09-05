@@ -1073,7 +1073,7 @@ class RecallDaemon:
                 path, {"v": PROTOCOL_VERSION, "op": "status"}, budget_ms=1000
             )
         except daemon_client.DaemonUnavailable as exc:
-            if exc.reason not in {"no_socket", "connection_refused"}:
+            if exc.reason not in daemon_client.DAEMON_DOWN_REASONS:
                 # SOMETHING is listening here — it just did not answer
                 # cleanly. `status()` would flatten this to None and we would
                 # unlink a live daemon's socket, leaving two processes

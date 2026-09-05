@@ -25,12 +25,17 @@ _DAEMON_BUDGET_MS = 5000
 def _query_via_daemon(
     query: str, k: int, source: Optional[str], type: Optional[str]
 ) -> Optional[list[dict]]:
-    """Try the warm daemon first. Returns None when it is not usable, so the
-    caller falls through to the in-process path.
+    """Try the warm daemon first. Returns None only when the daemon is DOWN
+    (`no_socket` / `connection_refused`), so the caller falls through to the
+    in-process path.
 
     Without this, every MCP query would hit "index is busy" the moment the
     user installs the daemon — it holds the embedded store's exclusive
-    process lock for as long as it runs.
+    process lock for as long as it runs. That same lock is why a daemon
+    that is UP but did not answer (`timeout`, `protocol_error`,
+    `server_error`) must NOT fall back: the in-process path would block on
+    the lock and fail with the same "index is busy", hiding the real cause.
+    It raises instead, and the MCP layer reports the error to the caller.
     """
     if os.environ.get("RECALL_NO_DAEMON") == "1":
         return None
@@ -52,10 +57,14 @@ def _query_via_daemon(
             source_filter=source,
             type_filter=type,
         )
-    except daemon_client.DaemonUnavailable:
-        return None
-    except Exception:  # noqa: BLE001 - the daemon is a soft dependency
-        return None
+    except daemon_client.DaemonUnavailable as exc:
+        if exc.reason in daemon_client.DAEMON_DOWN_REASONS:
+            return None
+        raise RuntimeError(
+            f"recall daemon is running but did not answer ({exc.reason}): {exc}. "
+            "It owns the index while it runs, so the query was not retried "
+            "in-process. Retry shortly, or check `recall serve --status`."
+        ) from exc
     return [wire_to_serialized(item) for item in (resp.get("results") or [])]
 
 

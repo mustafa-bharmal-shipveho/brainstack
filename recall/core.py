@@ -262,13 +262,19 @@ class HybridRetriever:
         if not targets:
             return []
 
-        # When a needs_review policy is active we fetch a deeper candidate
-        # pool than k: demoting or excluding a flagged memory should let a
-        # fresh memory ranked just below it take the freed slot, rather than
-        # leaving a hole or keeping the stale one only because it was in the
-        # top-k window.
+        use_rerank = self._reranker == "cross_encoder" if rerank is None else bool(rerank)
+
+        # Candidate pool depth. Two things want more than k:
+        #   * a needs_review policy (demote/exclude): a fresh memory ranked
+        #     just below a flagged one should take the freed slot rather than
+        #     leaving a hole or keeping the stale one because it was in the
+        #     top-k window;
+        #   * the cross-encoder: it can only reorder what the RRF leg pulled,
+        #     so with a k-deep pool `rerank_n` means nothing and a candidate
+        #     just below the RRF top-k can never be promoted.
+        # policy=ignore with reranking off is the cheap path; keep it k.
         if self._needs_review_policy == "ignore":
-            fetch_n = k
+            fetch_n = max(k, self._rerank_n) if use_rerank else k
         else:
             fetch_n = max(2 * k, self._rerank_n, k + 10)
 
@@ -295,7 +301,6 @@ class HybridRetriever:
         # arbitrary per-collection slice.
         merged.sort(key=_rank_key)
 
-        use_rerank = self._reranker == "cross_encoder" if rerank is None else bool(rerank)
         if use_rerank:
             # ONE cross-encoder pass over the merged pool. `rerank_n` is a
             # total budget across all collections: reranking per collection
