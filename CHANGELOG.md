@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Installer: an identity that exists only in the installing shell (`EMAIL`, `GIT_AUTHOR_EMAIL`,
+  `GIT_COMMITTER_EMAIL`) is persisted into the brain's `.git/config`, so the hourly sync — which
+  runs under launchd with a minimal environment — can keep committing. Previously only the seed
+  commit worked. A configured git identity is still left alone.
+
 ## v0.7.0 (2026-09-04)
 
 **Reliability overhaul: every memory captured, every injection honest, failures visible within a day.**

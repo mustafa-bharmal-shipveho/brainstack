@@ -3150,28 +3150,43 @@ if [ -n "$BRAIN_REMOTE" ]; then
     else
         git remote add origin "$BRAIN_REMOTE"
     fi
-    # A fresh machine, a CI runner or a service account often has no git
-    # identity anywhere. Without one the seed commit dies with "Author
-    # identity unknown" AFTER the brain was laid out and BEFORE the hooks,
-    # LaunchAgents and daemon were installed — a half-install, exit 128
-    # (2026-09-08 full-day QA). Give the brain a REPO-LOCAL identity, where
-    # the hourly sync.sh commit (launchd, minimal environment) finds it too.
-    # A configured identity — global, local, or GIT_AUTHOR_*/GIT_COMMITTER_*
-    # in the environment — is left alone.
-    # Seed when either (a) git says the commit would fail — `git var` applies
-    # the same rules as `git commit` (config, EMAIL, GIT_*_IDENT variables,
-    # auto-detection) — or (b) nothing EXPLICIT is configured and git would
-    # fall back to an auto-detected `user@host.local`: a CI runner gets that
-    # far, but a brain's history should not be built on a guessed identity.
-    if ! git var GIT_AUTHOR_IDENT >/dev/null 2>&1 \
-        || ! git var GIT_COMMITTER_IDENT >/dev/null 2>&1 \
-        || { [ -z "$(git config user.email 2>/dev/null)" ] \
-             && [ -z "${GIT_AUTHOR_EMAIL:-}${GIT_COMMITTER_EMAIL:-}${EMAIL:-}" ]; }; then
-        git config user.name "brainstack"
-        git config user.email "brainstack@localhost"
-        echo "    No git identity configured; set a repo-local one for the brain"
-        echo "    (brainstack <brainstack@localhost>). Change it any time with:"
-        echo "      git -C $BRAIN_ROOT config user.email you@example.com"
+    # The brain's commit identity must be DURABLE. The hourly sync.sh runs
+    # under launchd with a minimal environment, so an identity that exists
+    # only in this shell (EMAIL, GIT_AUTHOR_EMAIL, GIT_COMMITTER_EMAIL) makes
+    # the seed commit succeed and every later auto-commit die with "Author
+    # identity unknown" (Codex review, pass 5). A fresh machine, CI runner or
+    # service account has no identity at all and used to die at the seed
+    # commit — after the brain was laid out and before hooks, LaunchAgents
+    # and daemon were installed (2026-09-08 QA).
+    #   * git config already has an email (global or local): leave it alone.
+    #   * only the shell has one: persist THAT into the brain's .git/config,
+    #     so history carries the user's address rather than a placeholder.
+    #   * nothing anywhere: brainstack <brainstack@localhost>, repo-local.
+    if [ -z "$(git config user.email 2>/dev/null)" ]; then
+        seed_email="${GIT_COMMITTER_EMAIL:-${GIT_AUTHOR_EMAIL:-${EMAIL:-}}}"
+        seed_name="${GIT_COMMITTER_NAME:-${GIT_AUTHOR_NAME:-}}"
+        if [ -n "$seed_email" ]; then
+            if [ -z "$seed_name" ]; then
+                seed_name="$(id -F 2>/dev/null || true)"
+                [ -n "$seed_name" ] || seed_name="$(id -un)"
+            fi
+            git config user.name "$seed_name"
+            git config user.email "$seed_email"
+            echo "    Persisted your shell's git identity into the brain repo ($seed_name <$seed_email>)"
+            echo "    so the scheduled sync (which runs with a minimal environment) can commit."
+        else
+            git config user.name "brainstack"
+            git config user.email "brainstack@localhost"
+            echo "    No git identity configured; set a repo-local one for the brain"
+            echo "    (brainstack <brainstack@localhost>). Change it any time with:"
+            echo "      git -C $BRAIN_ROOT config user.email you@example.com"
+        fi
+    elif ! git var GIT_COMMITTER_IDENT >/dev/null 2>&1; then
+        # An email is configured but git still cannot build an ident (no
+        # name and an un-guessable host): give it a name so the seed commit
+        # cannot die here.
+        git config user.name "${GIT_COMMITTER_NAME:-${GIT_AUTHOR_NAME:-brainstack}}"
+        echo "    git could not build a committer identity; set user.name repo-locally."
     fi
     # Stage + commit if there's anything to commit
     git add -A

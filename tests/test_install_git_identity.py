@@ -54,10 +54,11 @@ def _no_identity_env(tmp_path: Path) -> dict[str, str]:
     return env
 
 
-def _git(brain: Path, *args: str) -> str:
+def _git(brain: Path, *args: str, env_extra: dict[str, str] | None = None) -> str:
+    env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
+    env.update(env_extra or {})
     return subprocess.run(
-        ["git", "-C", str(brain), *args], capture_output=True, text=True,
-        env={**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"},
+        ["git", "-C", str(brain), *args], capture_output=True, text=True, env=env,
     ).stdout.strip()
 
 
@@ -87,10 +88,13 @@ def test_install_without_any_git_identity_still_seeds_the_brain(tmp_path):
 
 
 @pytest.mark.skipif(_find_py310() is None, reason="needs Python >= 3.10 on PATH")
-def test_install_leaves_a_configured_git_identity_alone(tmp_path):
+def test_install_leaves_a_git_config_identity_alone(tmp_path):
+    """An identity that lives in git config (global here) is durable: the
+    hourly sync finds it too. Nothing is written to the brain's .git/config."""
     env = _no_identity_env(tmp_path)
-    env["GIT_AUTHOR_NAME"] = env["GIT_COMMITTER_NAME"] = "Real Person"
-    env["GIT_AUTHOR_EMAIL"] = env["GIT_COMMITTER_EMAIL"] = "real@example.test"
+    gitconfig = tmp_path / "home" / "gitconfig"
+    gitconfig.write_text("[user]\n\tname = Real Person\n\temail = real@example.test\n")
+    env["GIT_CONFIG_GLOBAL"] = str(gitconfig)
     brain = tmp_path / "home" / ".agent"
     remote = tmp_path / "remote.git"
     subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(remote)], check=True)
@@ -102,5 +106,49 @@ def test_install_leaves_a_configured_git_identity_alone(tmp_path):
     )
 
     assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
-    assert _git(brain, "log", "-1", "--format=%ae") == "real@example.test"
+    assert _git(brain, "log", "-1", "--format=%ae", env_extra={"GIT_CONFIG_GLOBAL": str(gitconfig)}) == "real@example.test"
     assert _git(brain, "config", "--local", "user.email") == ""
+
+
+@pytest.mark.parametrize(
+    "env_identity, expected_email",
+    [
+        ({"GIT_AUTHOR_NAME": "Env Person", "GIT_AUTHOR_EMAIL": "env@example.test",
+          "GIT_COMMITTER_NAME": "Env Person", "GIT_COMMITTER_EMAIL": "env@example.test"},
+         "env@example.test"),
+        ({"EMAIL": "only@example.test"}, "only@example.test"),
+    ],
+    ids=["GIT_*_EMAIL", "EMAIL-only"],
+)
+@pytest.mark.skipif(_find_py310() is None, reason="needs Python >= 3.10 on PATH")
+def test_environment_only_identity_is_persisted_repo_locally(tmp_path, env_identity, expected_email):
+    """Codex review pass 5: an identity that exists only in the installing
+    shell's environment (`EMAIL`, `GIT_AUTHOR_EMAIL`, ...) makes the seed
+    commit succeed and then vanishes — the hourly sync runs under launchd
+    with a minimal environment and dies with 'Author identity unknown'.
+    The installer must persist THAT identity into the brain's .git/config,
+    so history carries the user's address rather than a placeholder."""
+    env = _no_identity_env(tmp_path)
+    env.update(env_identity)
+    brain = tmp_path / "home" / ".agent"
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(remote)], check=True)
+
+    r = subprocess.run(
+        [str(INSTALL_SH), "--yes", "--brain-root", str(brain),
+         "--brain-remote", f"file://{remote}"],
+        capture_output=True, text=True, env=env, stdin=subprocess.DEVNULL, timeout=180,
+    )
+
+    assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
+    assert _git(brain, "config", "--local", "user.email") == expected_email
+    assert _git(brain, "config", "--local", "user.name") != ""
+    assert _git(brain, "log", "-1", "--format=%ae") == expected_email
+    # And a later commit from a bare environment — what launchd gives sync.sh — works.
+    (brain / "later.md").write_text("later\n")
+    bare = {"HOME": str(tmp_path / "home"), "PATH": "/usr/bin:/bin",
+            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": str(tmp_path / "home" / "no-such-gitconfig")}
+    subprocess.run(["git", "-C", str(brain), "add", "later.md"], check=True, env=bare)
+    c = subprocess.run(["git", "-C", str(brain), "commit", "-q", "-m", "later"],
+                       capture_output=True, text=True, env=bare)
+    assert c.returncode == 0, c.stderr
