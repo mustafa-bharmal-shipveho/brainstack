@@ -502,6 +502,27 @@ def _health_age_hours(health: dict) -> float:
     return max(0.0, (now - generated).total_seconds() / 3600.0)
 
 
+def _last_run_sync_lines(tail_lines: list[str]) -> list[str]:
+    """The most recent run's own `sync:` lines, newest first, down to and
+    INCLUDING the terminal-marker line that ends it.
+
+    Not `_in_last_run`: that helper assumes the marker is a run's last line,
+    and the scan_gate-missing path logs its marker and then a
+    `sync: reinstall …` hint, so the marker read as the PREVIOUS run's end
+    and the blocked classification was unreachable. Every blocked marker
+    sync.sh writes sits on the terminal line itself, so stopping at the
+    first marker seen (newest first) keeps the scan inside one run.
+    """
+    out: list[str] = []
+    for ln in reversed(tail_lines):
+        if _is_health_line(ln) or not _is_sync_run_line(ln):
+            continue
+        out.append(ln)
+        if any(m in ln.lower() for m in _RUN_TERMINAL_MARKERS):
+            break
+    return out
+
+
 def _check_sync_status(
     brain_root: Path,
     tail_lines: Optional[list[str]] = None,
@@ -545,13 +566,17 @@ def _check_sync_status(
     if held_back is None:
         held_back = _held_back_paths(tail_lines)
     # A run's own lines only: `health: stderr:` can quote anything, including
-    # an old "sync: ... push failed" (staff delta review, M3).
-    sync_lines = [ln for ln in tail_lines[-100:] if _is_sync_run_line(ln)]
+    # an old "sync: ... push failed" (staff delta review, M3). And EVERY line
+    # of the last run, newest first — not just the last one: the
+    # scan_gate-missing path logs its marker and then a `sync: reinstall …`
+    # hint, which made that run read as ok (follow-up 3, M3).
+    sync_lines = _last_run_sync_lines(tail_lines[-100:])
     if sync_lines:
-        last = sync_lines[-1].lower()
-        for marker, reason in _SYNC_BLOCKED_MARKERS:
-            if marker in last:
-                return reason
+        for ln in sync_lines:  # newest first
+            low = ln.lower()
+            for marker, reason in _SYNC_BLOCKED_MARKERS:
+                if marker in low:
+                    return reason
         # Pushed, but not everything went. Never let this pass as 'ok'.
         # Oversize first: a size hold-back also logs a "held back" line, so
         # the quarantine check below would otherwise claim a secret hit and

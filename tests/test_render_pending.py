@@ -1561,6 +1561,36 @@ class TestSyncErrorAndHealthSections:
 
         assert status == "ok", status
 
+    def test_sync_status_sees_a_blocked_marker_behind_a_trailing_sync_line(self, tmp_path: Path):
+        """Staff review follow-up 3, M3 (pre-existing): the scan_gate-missing
+        path logs its marker and THEN a `sync: reinstall …` hint. Reading only
+        the run's last `sync:` line classified that run as ok, so
+        blocked-scanner was unreachable for it. Every line of the last run
+        counts, most recent first."""
+        rps = self._import()
+        tail = [
+            "2026-09-08T18:20:00Z sync: starting",
+            "2026-09-08T18:20:01Z sync: scan_gate.py missing at /x/tools/scan_gate.py; refusing to push",
+            "2026-09-08T18:20:01Z sync: reinstall with ./install.sh to restore the secret gate",
+            "2026-09-08T18:20:03Z health: wrote runtime/health.json",
+        ]
+        (tmp_path / "sync.log").write_text("\n".join(tail) + "\n")
+
+        assert rps._check_sync_status(tmp_path, tail_lines=tail) == "blocked-scanner"
+
+    def test_sync_status_does_not_pick_up_the_previous_runs_block(self, tmp_path: Path):
+        rps = self._import()
+        tail = [
+            "2026-09-08T17:20:01Z sync: scan_gate.py missing at /x/tools/scan_gate.py; refusing to push",
+            "2026-09-08T17:20:01Z sync: reinstall with ./install.sh to restore the secret gate",
+            "2026-09-08T18:20:00Z sync: starting",
+            "2026-09-08T18:20:05Z sync: pushed",
+            "2026-09-08T18:20:06Z health: wrote runtime/health.json",
+        ]
+        (tmp_path / "sync.log").write_text("\n".join(tail) + "\n")
+
+        assert rps._check_sync_status(tmp_path, tail_lines=tail) == "ok"
+
     def test_remote_error_parsers_agree(self):
         """`recall.health._sync_log_remote_error` and this twin are read by
         the same user on the same log. Pin them on one fixture so they can

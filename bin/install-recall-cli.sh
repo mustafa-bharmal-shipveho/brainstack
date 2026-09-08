@@ -74,8 +74,12 @@ fi
 # again. Cheap: deps are already satisfied, only the scripts are rewritten.
 if ! grep -q "from recall.cli import main" "$VENV_RECALL"; then
     log "regenerating $VENV_RECALL (console-script entry point changed)"
-    "$VENV_DIR/bin/pip" install --quiet -e "${REPO_DIR}[embeddings,mcp]"
-    if ! grep -q "from recall.cli import main" "$VENV_RECALL"; then
+    # pip's build isolation downloads hatchling, so this needs the network.
+    # Offline it fails — and under `set -e` a bare call would end the helper
+    # here, before the warning and before the symlink step. Fall through.
+    if ! "$VENV_DIR/bin/pip" install --quiet -e "${REPO_DIR}[embeddings,mcp]"; then
+        warn "pip could not regenerate the wrapper (offline?); $VENV_RECALL still enters through the old entry point. Run later: $VENV_DIR/bin/pip install -e '${REPO_DIR}[embeddings,mcp]'"
+    elif ! grep -q "from recall.cli import main" "$VENV_RECALL"; then
         warn "$VENV_RECALL still enters through the old entry point; run: $VENV_DIR/bin/pip install -e '${REPO_DIR}[embeddings,mcp]'"
     fi
 fi
