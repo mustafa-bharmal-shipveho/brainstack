@@ -13,6 +13,9 @@ dream had failed nightly for ~80 cycles; none of it surfaced anywhere a person l
   Code discard an injection that was already printed, or make sync/dream/tests read a good run
   as a failure. `recall doctor`'s hook-interpreter probe decides by a stdout sentinel, not by
   the return code.
+- `recall-mcp`: when the daemon is up but a query fails (timeout, protocol or server error) the
+  error now reaches the MCP client instead of a silent in-process retry against the store the daemon
+  holds; only a missing or refused socket falls back.
 - `bin/install-recall-cli.sh` regenerates a stale `recall` console-script wrapper (the entry point
   moved to `recall.cli:main`), and its `--quiet` mode no longer exits on the first log line — which
   had silently skipped the CLI step of every `./install.sh --upgrade`.

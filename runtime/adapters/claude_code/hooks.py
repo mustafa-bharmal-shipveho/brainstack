@@ -802,6 +802,10 @@ if __name__ == "__main__":
     # grpcio can abort at interpreter teardown under load. Claude Code adds
     # this hook's stdout to the context only on exit 0, so that abort would
     # throw away the injection printed a moment earlier. See recall._exit.
-    from recall._exit import hard_exit
-
+    # Guarded: this module stays usable without `recall` on the path (the
+    # `import_error` degrade path above), and then there is no grpc to fear.
+    try:
+        from recall._exit import hard_exit
+    except ImportError:  # pragma: no cover - only without the recall package
+        sys.exit(main())
     hard_exit(main())

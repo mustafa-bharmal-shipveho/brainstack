@@ -153,5 +153,9 @@ def test_hook_script_exits_through_hard_exit():
         Path(__file__).resolve().parents[2]
         / "runtime" / "adapters" / "claude_code" / "hooks.py"
     ).read_text()
-    assert "hard_exit(main())" in src
-    assert "sys.exit(main())" not in src
+    main_block = src[src.index('if __name__ == "__main__":'):]
+    assert "hard_exit(main())" in main_block
+    # A plain sys.exit survives only as the fallback for a machine without
+    # the recall package on the path (no grpc to fear there).
+    assert main_block.count("sys.exit(main())") <= 1
+    assert "except ImportError" in main_block

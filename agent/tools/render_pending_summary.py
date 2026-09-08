@@ -342,8 +342,11 @@ _GIT_ERROR_PREFIXES: tuple[tuple[str, ...], ...] = (
 def _is_sync_run_line(line: str) -> bool:
     """True for a line a sync run wrote itself (`sync:`-prefixed, or one of
     the terminal markers). Twin of `recall.health._is_sync_run_line`."""
-    low = _LOG_TS_RE.sub("", line).strip().lower()
-    return low.startswith("sync:") or any(m in low for m in _RUN_TERMINAL_MARKERS)
+    # Only the prefix: every terminal marker sync.sh writes is itself a
+    # `sync:` line, and a stray un-prefixed line that merely CONTAINS a marker
+    # phrase ("UserWarning: previous push failed, see log") must not end a
+    # run (staff delta review, M1).
+    return _LOG_TS_RE.sub("", line).strip().lower().startswith("sync:")
 
 
 def _is_health_line(line: str) -> bool:
@@ -541,7 +544,9 @@ def _check_sync_status(
             return "missing"
     if held_back is None:
         held_back = _held_back_paths(tail_lines)
-    sync_lines = [ln for ln in tail_lines[-100:] if "sync:" in ln]
+    # A run's own lines only: `health: stderr:` can quote anything, including
+    # an old "sync: ... push failed" (staff delta review, M3).
+    sync_lines = [ln for ln in tail_lines[-100:] if _is_sync_run_line(ln)]
     if sync_lines:
         last = sync_lines[-1].lower()
         for marker, reason in _SYNC_BLOCKED_MARKERS:

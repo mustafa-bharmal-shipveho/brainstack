@@ -871,8 +871,11 @@ def _is_sync_run_line(line: str) -> bool:
     not anchor the backward scan, or the current run's own terminal marker
     ends the scan before it reaches the git stderr above it.
     """
-    low = _strip_log_timestamp(line).lower()
-    return low.startswith("sync:") or any(m in low for m in _RUN_TERMINAL_MARKERS)
+    # Only the prefix: every terminal marker sync.sh writes is itself a
+    # `sync:` line, and a stray un-prefixed line that merely CONTAINS a marker
+    # phrase ("UserWarning: previous push failed, see log") must not end a
+    # run (staff delta review, M1).
+    return _strip_log_timestamp(line).lower().startswith("sync:")
 
 
 def _git_error_rank(line: str) -> Optional[int]:

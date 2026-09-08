@@ -440,7 +440,8 @@ export BRAIN_ROOT
 # not per-HOME: `launchctl unload <plist in a sandbox HOME>` unloads the real
 # user's job of that Label. Two full-day QA sandboxes (2026-09-04, 2026-09-08)
 # ran --uninstall this way and silently stopped the live nightly dream and
-# hourly sync for days. Every launchctl call goes through here.
+# hourly sync for days. New launchctl calls go through here; the older
+# sites keep their inline `BRAINSTACK_SKIP_LAUNCHCTL` checks.
 _launchctl() {
     if [ "${BRAINSTACK_SKIP_LAUNCHCTL:-0}" = "1" ]; then
         return 0
@@ -3157,8 +3158,10 @@ if [ -n "$BRAIN_REMOTE" ]; then
     # the hourly sync.sh commit (launchd, minimal environment) finds it too.
     # A configured identity — global, local, or GIT_AUTHOR_*/GIT_COMMITTER_*
     # in the environment — is left alone.
-    if [ -z "$(git config user.email 2>/dev/null)" ] \
-        && [ -z "${GIT_AUTHOR_EMAIL:-}${GIT_COMMITTER_EMAIL:-}" ]; then
+    # Ask git the way `git commit` will (config, EMAIL, GIT_*_IDENT vars,
+    # sane auto-detection); either ident failing means the commit would.
+    if ! git var GIT_AUTHOR_IDENT >/dev/null 2>&1 \
+        || ! git var GIT_COMMITTER_IDENT >/dev/null 2>&1; then
         git config user.name "brainstack"
         git config user.email "brainstack@localhost"
         echo "    No git identity configured; set a repo-local one for the brain"

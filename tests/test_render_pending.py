@@ -1533,6 +1533,34 @@ class TestSyncErrorAndHealthSections:
         assert rps._held_back_paths(tail)["secret"] == ["memory/semantic/leaky.md"]
         assert rps._last_run_quarantined(tail) is True
 
+    def test_remote_error_ignores_a_marker_phrase_on_an_unprefixed_line(self):
+        """Staff delta review, M1: only a `sync:` line can end a run; a stray
+        line that merely contains "push failed" must not."""
+        rps = self._import()
+        tail = self._failed_push_tail()
+        tail[-1:-1] = ["UserWarning: previous push failed, see log"]
+
+        assert rps._last_remote_error(tail) == self.REMOTE_ERROR
+
+    def test_sync_status_ignores_a_quoted_sync_line_inside_health_stderr(self, tmp_path: Path):
+        """Staff delta review, M3: `health: stderr:` lines can quote anything,
+        including an old `sync: ... push failed` message. The run's status
+        comes from the run's own last `sync:` line — here `sync: pushed`."""
+        rps = self._import()
+        tail = [
+            "2026-09-08T13:54:20Z sync: starting",
+            "2026-09-08T13:54:34Z sync: pushed",
+            "2026-09-08T13:54:36Z health: stderr: WARNING previous run: "
+            "sync: commit succeeded but push failed; brain is committed locally",
+            "2026-09-08T13:54:36Z health: wrote runtime/health.json",
+        ]
+
+        (tmp_path / "sync.log").write_text("\n".join(tail) + "\n")
+
+        status = rps._check_sync_status(tmp_path, tail_lines=tail)
+
+        assert status == "ok", status
+
     def test_remote_error_parsers_agree(self):
         """`recall.health._sync_log_remote_error` and this twin are read by
         the same user on the same log. Pin them on one fixture so they can

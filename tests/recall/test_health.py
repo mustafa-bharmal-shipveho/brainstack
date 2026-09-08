@@ -1352,3 +1352,16 @@ def test_sync_log_remote_error_stays_scoped_with_stray_stderr_after_a_clean_run(
     ]
 
     assert health._sync_log_remote_error("\n".join(tail) + "\n") is None
+
+
+def test_sync_log_remote_error_ignores_a_marker_phrase_on_an_unprefixed_line():
+    """Staff delta review, M1: `UserWarning: previous push failed, see log`
+    is stray stderr, not a run's terminal line — only a `sync:` line can end
+    a run. Treating the phrase alone as a marker lost the real error."""
+    tail = (
+        SYNC_TAIL_WITH_HEALTH_TRAILER[:-1]
+        + ["UserWarning: previous push failed, see log"]
+        + SYNC_TAIL_WITH_HEALTH_TRAILER[-1:]
+    )
+
+    assert health._sync_log_remote_error("\n".join(tail) + "\n") == REMOTE_ERROR_LINE
