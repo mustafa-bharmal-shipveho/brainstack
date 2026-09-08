@@ -122,6 +122,27 @@ class TestShouldSkip:
             assert skip is True, f"expected skip on {word!r}"
             assert reason == "ack"
 
+    def test_short_multiword_acks_skipped(self):
+        """"ok thanks" fired a real daemon query in the 2026-09-08 full-day
+        QA: the ack list only knew bare words, and punctuation inside the
+        phrase ("OK, thanks!") defeated the rstrip. Two-word acks and
+        go-ahead phrases carry nothing to retrieve on."""
+        from runtime.adapters.claude_code.auto_recall import should_skip
+        for phrase in ["ok thanks", "OK, thanks!", "got it", "sounds good",
+                       "yes please", "no thanks", "go ahead", "looks good",
+                       "makes sense", "lgtm", "Perfect.", "sure"]:
+            skip, reason = should_skip(phrase, min_chars=2)
+            assert skip is True, f"expected skip on {phrase!r}"
+            assert reason == "ack", (phrase, reason)
+
+    def test_ack_word_inside_a_real_prompt_is_not_an_ack(self):
+        from runtime.adapters.claude_code.auto_recall import should_skip
+        for prompt in ["ok so how do I rotate the episodic logs?",
+                       "thanks, now show me the sync failure from yesterday",
+                       "sure, but what did I decide about symlinks?"]:
+            skip, _ = should_skip(prompt, min_chars=8)
+            assert skip is False, prompt
+
     def test_normal_question_not_skipped(self):
         from runtime.adapters.claude_code.auto_recall import should_skip
         skip, _ = should_skip("what do I do during an incident?", min_chars=8)

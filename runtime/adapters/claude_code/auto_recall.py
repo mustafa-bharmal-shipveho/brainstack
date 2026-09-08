@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import os
 import sys
 import time
@@ -33,13 +34,23 @@ from typing import Any, Protocol
 # before lookup. These represent "user is acknowledging, not asking" — no
 # benefit to surfacing memories for them.
 _ACKS = frozenset({
-    "yes", "y", "yep", "yeah", "yup",
-    "no", "n", "nope", "nah",
-    "ok", "okay", "k", "kk",
-    "go", "do it", "done",
+    "yes", "y", "yep", "yeah", "yup", "yes please", "sure", "sure thing",
+    "no", "n", "nope", "nah", "no thanks",
+    "ok", "okay", "k", "kk", "ok thanks", "okay thanks", "ok great", "ok cool",
+    "go", "go ahead", "do it", "do that", "done", "proceed", "continue",
     "stop", "wait", "pause",
-    "thanks", "ty", "thx", "thank you",
+    "thanks", "ty", "thx", "thank you", "thanks a lot", "many thanks",
+    "got it", "understood", "noted", "makes sense", "sounds good",
+    "looks good", "lgtm", "perfect", "great", "nice", "cool", "awesome",
+    "will do", "ship it",
 })
+
+def _normalize_ack(text: str) -> str:
+    """Lower-case, drop punctuation, collapse whitespace: "OK, thanks!" ->
+    "ok thanks". Punctuation INSIDE a phrase used to defeat the rstrip-only
+    check, so two-word acks fired real queries."""
+    return " ".join(re.sub(r"[^\w\s]", " ", text.lower()).split())
+
 
 # Excerpt cap per-doc in chars (rough proxy for ~125 tokens). The token-
 # budget enforcement below is the authoritative bound; this is just to
@@ -169,7 +180,7 @@ def should_skip(prompt: str, *, min_chars: int) -> tuple[bool, str | None]:
         return True, "too_short"
     if stripped.startswith("/"):
         return True, "slash"
-    if stripped.lower().rstrip(" !.?,").rstrip() in _ACKS:
+    if _normalize_ack(stripped) in _ACKS:
         return True, "ack"
     return False, None
 

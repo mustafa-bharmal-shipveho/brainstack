@@ -1929,7 +1929,12 @@ if [[ "$MODE" == setup-recall-first-* ]] || [[ "$MODE" == remove-recall-first-* 
         PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-recall-first-claude 2>&1 | sed 's/^/  [claude] /'
         PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-recall-first-codex  2>&1 | sed 's/^/  [codex]  /'
         PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-recall-first-cursor 2>&1 | sed 's/^/  [cursor] /'
-        echo "==> Done. Recall is now the first-line resource on all installed hosts."
+        if [ -d "$HOME/.claude" ] || [ -d "$HOME/.codex" ] || [ -d "$HOME/.cursor" ]; then
+            echo "==> Done. Recall is now the first-line resource on all installed hosts."
+        else
+            echo "==> No supported host found (Claude Code, Codex CLI or Cursor): nothing wired."
+            echo "    Re-run ./install.sh --setup-recall-first-all after installing one."
+        fi
         exit 0
     fi
     if [ "$MODE" = "remove-recall-first-all" ]; then
@@ -3393,7 +3398,14 @@ if [ "$NO_RECALL_FIRST" = "1" ]; then
     DEFAULT_RECALL_FIRST_STATUS="skipped"
 else
     if PYTHON_BIN="$PYTHON_BIN" "$SELF" --setup-recall-first-all >/dev/null 2>&1; then
-        DEFAULT_RECALL_FIRST_STATUS="done"
+        # "done" only if there was a host to wire. The sub-step skips a
+        # missing ~/.claude / ~/.codex / ~/.cursor (correctly), and the
+        # summary used to say ✓ done over three skips (2026-09-08 QA).
+        if [ -d "$HOME/.claude" ] || [ -d "$HOME/.codex" ] || [ -d "$HOME/.cursor" ]; then
+            DEFAULT_RECALL_FIRST_STATUS="done"
+        else
+            DEFAULT_RECALL_FIRST_STATUS="skipped (no ~/.claude, ~/.codex or ~/.cursor found; re-run ./install.sh --setup-recall-first-all after installing one)"
+        fi
     else
         DEFAULT_RECALL_FIRST_STATUS="failed"
     fi
@@ -3404,7 +3416,13 @@ if [ "$NO_AUTO_RECALL" = "1" ]; then
     DEFAULT_AUTO_RECALL_STATUS="skipped"
 else
     if PYTHON_BIN="$PYTHON_BIN" "$SELF" --enable-auto-recall >/dev/null 2>&1; then
-        DEFAULT_AUTO_RECALL_STATUS="done"
+        # The flag is on, but the hook only exists if ~/.claude does: say so
+        # instead of reporting a hook that was never registered.
+        if [ -d "$HOME/.claude" ]; then
+            DEFAULT_AUTO_RECALL_STATUS="done"
+        else
+            DEFAULT_AUTO_RECALL_STATUS="skipped (Claude Code not found: no ~/.claude; re-run ./install.sh --enable-auto-recall after installing it)"
+        fi
     else
         DEFAULT_AUTO_RECALL_STATUS="failed"
     fi
@@ -3441,7 +3459,7 @@ fi
 _mark_for() {
     case "$1" in
         done) echo "✓" ;;
-        skipped) echo "•" ;;
+        skipped|skipped\ *) echo "•" ;;
         failed) echo "✗" ;;
         *) echo "?" ;;
     esac
