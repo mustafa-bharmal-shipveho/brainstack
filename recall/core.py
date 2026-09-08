@@ -28,6 +28,12 @@ class Document:
 class QueryResult:
     document: Document
     score: float
+    # S4: cross-encoder rerank score, travels alongside the cheap RRF
+    # `score` rather than replacing it. None on any path that never loaded
+    # a reranker (in-process auto-recall fallback, reranker="none").
+    # Declared AFTER score so existing positional callers
+    # (`QueryResult(doc, score)`) keep working unchanged.
+    rerank_score: Optional[float] = None
 
 
 _NEEDS_REVIEW_RAW_RE = re.compile(
@@ -71,6 +77,39 @@ def _is_needs_review(doc: Document) -> bool:
     return False
 
 
+def _rank_key(r: QueryResult) -> tuple[float, str]:
+    """Sort key: best signal first, path as the deterministic tie-break.
+
+    The cross-encoder score is the more accurate signal and the one the S4
+    relevance gate thresholds on, so it wins whenever it is present. Results
+    from a no-reranker path carry `rerank_score is None` and fall back to the
+    cheap RRF `score`, which is today's behaviour unchanged.
+    """
+    primary = r.rerank_score if r.rerank_score is not None else r.score
+    return (-float(primary), r.document.path)
+
+
+def _demote_rerank_score(value: float, penalty: float) -> float:
+    """Apply `penalty` to a cross-encoder score so it always moves DOWN.
+
+    Cross-encoder outputs are raw logits, and most real ones are NEGATIVE.
+    Plain `value * penalty` with `penalty` < 1 shrinks a negative score
+    toward zero — which under `_rank_key` is a PROMOTION, and also lifts the
+    doc over a negative `auto_recall_min_rerank` threshold. So: multiply
+    positives, divide negatives, and leave zero alone (it has no direction to
+    move). A non-positive `penalty` means "bury it", which for a negative
+    score is `-inf` rather than a division by zero or a sign flip.
+
+    The RRF `score` needs none of this: fused rank reciprocals are always
+    positive, so multiplication is already sign-safe there.
+    """
+    if value > 0.0:
+        return value * penalty
+    if value < 0.0:
+        return value / penalty if penalty > 0.0 else float("-inf")
+    return value
+
+
 def apply_review_policy(
     results: list[QueryResult], policy: str, penalty: float
 ) -> list[QueryResult]:
@@ -78,9 +117,15 @@ def apply_review_policy(
 
     - "exclude": flagged memories are removed entirely.
     - "demote":  flagged memories keep their place in the candidate set but
-                 their score is multiplied by `penalty`, so fresh memories of
-                 comparable relevance outrank them. Results are re-sorted
-                 (score desc, then path) so the caller's top-k truncation
+                 BOTH their RRF `score` and their `rerank_score` (when they
+                 have one) are penalised, so fresh memories of comparable
+                 relevance outrank them. Penalising only the RRF score would
+                 let a stale doc with a high cross-encoder score keep the top
+                 slot AND sail through `auto_recall_min_rerank` at full
+                 strength. The RRF score is scaled (`score * penalty`); the
+                 rerank score goes through `_demote_rerank_score`, which is
+                 sign-safe because logits are usually negative. Results are
+                 re-sorted by `_rank_key` so the caller's top-k truncation
                  reflects the penalty.
     - anything else ("ignore"): returned unchanged.
 
@@ -92,12 +137,20 @@ def apply_review_policy(
         return [r for r in results if not _is_needs_review(r.document)]
     if policy == "demote":
         adjusted = [
-            QueryResult(document=r.document, score=r.score * penalty)
+            QueryResult(
+                document=r.document,
+                score=r.score * penalty,
+                rerank_score=(
+                    _demote_rerank_score(r.rerank_score, penalty)
+                    if r.rerank_score is not None
+                    else None
+                ),
+            )
             if _is_needs_review(r.document)
             else r
             for r in results
         ]
-        adjusted.sort(key=lambda r: (-r.score, r.document.path))
+        adjusted.sort(key=_rank_key)
         return adjusted
     return results
 
@@ -192,6 +245,11 @@ class HybridRetriever:
         k: int,
         type_filter: Optional[str] = None,
         source_filter: Optional[str] = None,
+        # S4: explicit override for whether to rerank. `None` (default)
+        # preserves today's behavior (driven by `self._reranker`); a caller
+        # (the daemon holds ONE retriever and flips reranking per request)
+        # may force True/False.
+        rerank: Optional[bool] = None,
     ) -> list[QueryResult]:
         from recall import qdrant_backend as qb
 
@@ -204,57 +262,62 @@ class HybridRetriever:
         if not targets:
             return []
 
-        # When a needs_review policy is active we fetch a deeper candidate
-        # pool than k: demoting or excluding a flagged memory should let a
-        # fresh memory ranked just below it take the freed slot, rather than
-        # leaving a hole or keeping the stale one only because it was in the
-        # top-k window.
+        use_rerank = self._reranker == "cross_encoder" if rerank is None else bool(rerank)
+
+        # Candidate pool depth. Two things want more than k:
+        #   * a needs_review policy (demote/exclude): a fresh memory ranked
+        #     just below a flagged one should take the freed slot rather than
+        #     leaving a hole or keeping the stale one because it was in the
+        #     top-k window;
+        #   * the cross-encoder: it can only reorder what the RRF leg pulled,
+        #     so with a k-deep pool `rerank_n` means nothing and a candidate
+        #     just below the RRF top-k can never be promoted.
+        # policy=ignore with reranking off is the cheap path; keep it k.
         if self._needs_review_policy == "ignore":
-            fetch_n = k
+            fetch_n = max(k, self._rerank_n) if use_rerank else k
         else:
             fetch_n = max(2 * k, self._rerank_n, k + 10)
 
+        # RRF leg: over-fetch from EVERY collection. The deeper pull is what
+        # lets a demoted needs_review memory be replaced by a fresh one ranked
+        # just below it, rather than leaving a hole.
         merged: list[QueryResult] = []
-        use_rerank = self._reranker == "cross_encoder"
         for coll in targets:
-            if use_rerank:
-                # Return fetch_n reranked results (headroom for the
-                # needs_review policy, which may demote/drop some before the
-                # final top-k truncation). query_hybrid_rerank reranks a pool
-                # of max(rerank_n, fetch_n) and only skips when there's nothing
-                # to reorder, so the cross-encoder runs even when the corpus is
-                # smaller than fetch_n.
-                merged.extend(
-                    qb.query_hybrid_rerank(
-                        self._client,
-                        coll,
-                        query,
-                        fetch_n,
-                        type_filter=type_filter,
-                        source_filter=None,  # already constrained by collection
-                        dense_model=self._dense_model,
-                        sparse_model=self._sparse_model,
-                        reranker_model=self._reranker_model,
-                        rerank_n=self._rerank_n,
-                        mode=self._mode,
-                    )
+            merged.extend(
+                qb.query_hybrid(
+                    self._client,
+                    coll,
+                    query,
+                    fetch_n,
+                    type_filter=type_filter,
+                    source_filter=None,  # already constrained by collection
+                    dense_model=self._dense_model,
+                    sparse_model=self._sparse_model,
+                    mode=self._mode,
                 )
-            else:
-                merged.extend(
-                    qb.query_hybrid(
-                        self._client,
-                        coll,
-                        query,
-                        fetch_n,
-                        type_filter=type_filter,
-                        source_filter=None,  # already constrained by collection
-                        dense_model=self._dense_model,
-                        sparse_model=self._sparse_model,
-                        mode=self._mode,
-                    )
-                )
-        # Stable sort by score desc, then path for determinism
-        merged.sort(key=lambda r: (-r.score, r.document.path))
+            )
+        # Order the merged pool by RRF before the cross-encoder sees it, so
+        # `rerank_n` selects the globally best candidates rather than an
+        # arbitrary per-collection slice.
+        merged.sort(key=_rank_key)
+
+        if use_rerank:
+            # ONE cross-encoder pass over the merged pool. `rerank_n` is a
+            # total budget across all collections: reranking per collection
+            # multiplied the cost by the number of sources and made the
+            # setting mean nothing at small k. Never rerank fewer than k, or
+            # we could not fill the requested page.
+            merged = qb.rerank_results(
+                query,
+                merged,
+                reranker_model=self._reranker_model,
+                limit=max(self._rerank_n, k),
+            )
+            # Re-sort: rerank score when present, else RRF score; path breaks
+            # ties. Only reranking can change the order — without it `merged`
+            # is still in the `_rank_key` order it was sorted into above, and
+            # re-sorting it was a full sort to reach the same list.
+            merged.sort(key=_rank_key)
         # Down-rank / drop needs_review memories, then truncate to k.
         merged = apply_review_policy(
             merged, self._needs_review_policy, self._needs_review_penalty

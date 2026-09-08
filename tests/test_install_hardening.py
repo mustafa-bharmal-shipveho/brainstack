@@ -365,6 +365,9 @@ class TestMultipleOptOutsCompose:
         Remaining two (--setup-auto-migrate, --enable-auto-recall) still fire."""
         fake_home = tmp_path / "fakehome"
         env = _fresh_env(fake_home)
+        # The auto-recall default reports "skipped (Claude Code not found)"
+        # when ~/.claude is absent; this test is about the default FIRING.
+        (fake_home / ".claude").mkdir(parents=True, exist_ok=True)
 
         result = _run(
             "--brain-remote", "git@example.com:test/scratch.git",

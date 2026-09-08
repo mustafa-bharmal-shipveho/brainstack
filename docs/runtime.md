@@ -83,6 +83,78 @@ Cursor or Codex CLI adapter is a contained change.
 | `runtime/adapters/claude_code/cli.py` | `recall runtime` subcommand group |
 | `runtime/adapters/claude_code/installer.py` | Idempotent `install-hooks` |
 
+## Configuration ([tool.recall.runtime])
+
+`RuntimeConfig.load()` reads a `[tool.recall.runtime]` table, merged **per
+key** across up to three file layers (first layer that sets a given key
+wins that key — a project file that sets one key does not reset every
+other key to the dataclass default):
+
+1. `$RECALL_RUNTIME_CONFIG` — explicit path override, content trusted as-is.
+2. `./pyproject.toml` — consulted only when it carries a **non-empty**
+   `[tool.recall.runtime]` table. A project's own build `pyproject.toml`
+   (no such table at all — like brainstack's own, deliberately) is skipped
+   rather than shadowing the layer below it.
+3. `RuntimeConfig.global_config_path()` — `$BRAIN_ROOT/runtime/pyproject.toml`,
+   defaulting to `~/.agent/runtime/pyproject.toml` when `$BRAIN_ROOT` is
+   unset. This is install.sh's dedicated home for the section and is
+   consulted whenever the file exists, even if its table is currently empty.
+
+Any key no layer sets — or that every layer set to a malformed value — falls
+back to the dataclass default below. `[tool.recall.runtime.budget]` merges
+the same way, per sub-key. `RuntimeConfig.load(config_path=...)` (an
+explicit path, used by callers that already know exactly which file they
+want) is a single-file read: no layering, no fallback to the global file.
+
+Example (this is the shape install.sh writes to the global file, NOT
+something brainstack's own `pyproject.toml` carries — see precedence rule
+2 above):
+
+```toml
+[tool.recall.runtime]
+log_dir = "~/.agent/runtime/logs"
+capture_raw = false
+enable_auto_recall = true
+auto_recall_min_score = 0.30
+
+[tool.recall.runtime.budget]
+claude_md = 4000
+hot = 2000
+retrieved = 20000
+scratchpad = 10000
+```
+
+### Keys
+
+| key | type | default | notes |
+|---|---|---|---|
+| `log_dir` | path | `~/.agent/runtime/logs` | event log + manifest + dedup-store root |
+| `capture_raw` | bool | `false` | opt-in raw-payload capture, see "Data policy" below |
+| `enable_reinjection` | bool | `false` | `UserPromptSubmit` re-injection of evicted items |
+| `reinjection_budget_tokens` | int | `1500` | token cap for a reinjection block |
+| `enable_auto_recall` | bool | `false` | fire `recall query` on every substantive prompt and inject top-K |
+| `auto_recall_k` | int | `5` | results requested per auto-recall fire |
+| `auto_recall_budget_tokens` | int | `1500` | token cap for the injected auto-recall block |
+| `auto_recall_timeout_ms` | int | **1500** | hard wall-clock bound on the whole auto-recall worker — see rationale below |
+| `auto_recall_min_chars` | int | `8` | prompts shorter than this never trigger auto-recall |
+| `auto_recall_min_score` | float | `0.0` | reject RRF results below this score before injecting (`0.0` = floor off) |
+| `auto_recall_daemon_budget_ms` | int | `800` | socket connect+respond budget when routing through the warm recall daemon; effective budget is `min(this, auto_recall_timeout_ms)` |
+| `auto_recall_daemon_socket` | str | `"$BRAIN_ROOT/runtime/recall.sock"` | daemon socket path literal, resolved by `recall.config.daemon_socket_path` (env override > this literal > `$BRAIN_ROOT/runtime` > `$BRAIN_HOME` parent > `~/.agent/runtime`) |
+| `auto_recall_min_rerank` | float \| `None` | `None` | reject candidates below this cross-encoder score; `None` (unset, or `"none"`/`"null"`) = gate off. Cross-encoder scores are raw logits (mostly negative), so `0.0` cannot express a calibrated negative threshold — any float, including a negative one, enables the gate. Only enforceable when the daemon supplies rerank scores |
+| `auto_recall_dedup` | bool | `true` | kill switch for the per-session dedup store (don't re-inject an unchanged doc already shown this session) |
+
+`auto_recall_timeout_ms` default is **1500ms**, down from an earlier 3000ms:
+a warm recall daemon answers in roughly 60–130ms plus rerank, so the hard
+bound on the whole worker no longer needs to absorb a cold Qdrant/embedder
+load on every fire. When the daemon is down, the in-process fallback (which
+still pays that cold-start cost) will legitimately time out under 1500ms;
+that is reported honestly as `x_outcome=timeout` rather than silently
+widening the bound to hide it.
+
+Env vars: `RECALL_RUNTIME_CONFIG` (layer 1 above), `RECALL_DAEMON_SOCKET`
+(overrides `auto_recall_daemon_socket` resolution unconditionally, including
+for the daemon and CLI, not just the hook).
+
 ## The Engine
 
 The Engine is the runtime's state machine. It receives a stream of typed

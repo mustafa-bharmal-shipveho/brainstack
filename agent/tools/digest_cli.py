@@ -11,9 +11,16 @@ Subcommands:
         Walk historical sessions and produce per-session digests. Idempotent
         via content-SHA sidecar — safe to re-run.
 
-    digest_cli.py incremental
+    digest_cli.py incremental [--limit N] [--max-seconds S]
         Same as `backfill` but intended for the hourly LaunchAgent.
-        Always processes BOTH sources, no limit.
+        Always considers BOTH sources, but PROCESSES at most N pending
+        (not-yet-digested) sessions and stops cleanly once S seconds
+        have elapsed, so a busy hour with many new sessions can't blow
+        past the LaunchAgent's own timeout. Prints a
+        `digests: processed=P pending=Q elapsed_s=E budget_hit=<bool>`
+        summary line for the log and writes the same numbers to
+        `<brain>/runtime/digest_status.json`.
+        Defaults: --limit 3, --max-seconds 1500.
 
     digest_cli.py status
         Print sidecar stats + counts of episodic lines + markdown
@@ -25,6 +32,7 @@ codex exec). No separate API key needed.
 from __future__ import annotations
 
 import argparse
+import datetime
 import os
 import sys
 from pathlib import Path
@@ -32,8 +40,10 @@ from pathlib import Path
 # Path setup so we can import the adapter and providers.
 _THIS = Path(__file__).resolve()
 sys.path.insert(0, str(_THIS.parent))
+sys.path.insert(0, str(_THIS.parent.parent / "memory"))
 
 import claude_session_digest_adapter as adapter  # type: ignore
+from _atomic import atomic_write_json  # type: ignore  # noqa: E402
 from llm_providers import PROVIDERS, resolve_provider  # type: ignore
 from llm_providers.base import LLMError, ProviderNotAvailable  # type: ignore
 
@@ -168,12 +178,80 @@ def _wrap_limit(adapter_mod, limit: int) -> None:
 
 
 def _cmd_incremental(args) -> int:
-    """Same as backfill --source both, no limit. Designed for the
-    hourly LaunchAgent."""
-    args.source = "both"
-    args.limit = 0
-    args.dry_run = False
-    return _cmd_backfill(args)
+    """Bounded incremental digest run for the hourly LaunchAgent.
+
+    Unlike `backfill --limit N` (which caps total DISCOVERED sessions,
+    including free idempotent skips), this caps the number of sessions
+    actually PROCESSED (LLM calls made) and stops cleanly once
+    `--max-seconds` elapses, rather than running until the LaunchAgent's
+    own timeout kills the process mid-summarize. Progress is
+    sidecar-idempotent either way, so a bounded run never loses work —
+    it just leaves the rest for the next hourly tick, reported via the
+    `digests: processed=... pending=...` summary line below."""
+    brain = _brain_root()
+    try:
+        provider = resolve_provider(args.provider)
+    except (ValueError, ProviderNotAvailable) as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+
+    print(f"using provider: {provider.name} "
+          f"(default_model={provider.default_model})")
+
+    try:
+        stats = adapter.backfill(
+            brain_root=brain,
+            projects_root=_projects_root(),
+            codex_root=_codex_root(),
+            provider=provider,
+            log=print,
+            limit=args.limit,
+            max_seconds=args.max_seconds,
+        )
+    except ProviderNotAvailable as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+
+    print("---")
+    print(f"discovered:    {stats['discovered']}")
+    print(f"written:       {stats['digests_written']}")
+    print(f"skipped (sha): {stats['skipped_idempotent']}")
+    print(f"failed:        {stats['failed']}")
+    # Human-readable receipt in the hourly log.
+    print(
+        f"digests: processed={stats['processed']} "
+        f"pending={stats['pending']} "
+        f"elapsed_s={stats['elapsed_s']:.1f} "
+        f"budget_hit={stats['budget_hit']}"
+    )
+    _write_digest_status(brain, stats)
+    return 0
+
+
+def _write_digest_status(brain_root: Path, stats: dict) -> None:
+    """Write `runtime/digest_status.json` — the digest step's
+    machine-readable receipt, so a future health check can WARN when
+    `pending` grows for several ticks in a row.
+
+    Written here rather than by the hourly wrapper: this is where the
+    numbers live. The wrapper used to scrape them back out of the
+    printed line, which meant the receipt and the log could disagree
+    about a run the wrapper had already seen.
+
+    Best-effort: a status-write failure must never fail the run it
+    reports on."""
+    try:
+        atomic_write_json(brain_root / "runtime" / "digest_status.json", {
+            "ts": datetime.datetime.now(datetime.timezone.utc)
+                  .strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "processed": int(stats["processed"]),
+            "pending": int(stats["pending"]),
+            "elapsed_s": round(float(stats["elapsed_s"]), 1),
+            "budget_hit": bool(stats["budget_hit"]),
+        })
+    except Exception as e:  # pragma: no cover — best-effort receipt
+        print(f"WARN: failed to write digest_status.json: {e}",
+              file=sys.stderr)
 
 
 def _cmd_status(args) -> int:
@@ -222,6 +300,12 @@ def main(argv: list[str] | None = None) -> int:
 
     si = sub.add_parser("incremental")
     si.add_argument("--provider", default=None)
+    si.add_argument("--limit", type=int, default=3,
+                    help="max sessions to actually digest this run "
+                         "(default: 3)")
+    si.add_argument("--max-seconds", type=float, default=1500,
+                    help="stop starting new sessions once this many "
+                         "seconds have elapsed (default: 1500)")
 
     st = sub.add_parser("status")
 
@@ -235,11 +319,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "backfill":
         return _cmd_backfill(args)
     if args.cmd == "incremental":
-        # incremental shares backfill flags; set defaults
-        args.source = "both"
-        args.limit = 0
-        args.dry_run = False
-        return _cmd_backfill(args)
+        return _cmd_incremental(args)
     if args.cmd == "status":
         return _cmd_status(args)
 

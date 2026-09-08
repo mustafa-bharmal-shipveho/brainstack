@@ -29,12 +29,11 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import subprocess
 import time
 from pathlib import Path
 
-from .base import LLMProvider, LLMResult, LLMError
+from .base import LLMProvider, LLMResult, LLMError, find_cli
 
 
 # Capture everything between the `codex\n` boundary and (`tokens used` |
@@ -53,8 +52,11 @@ class CodexProvider(LLMProvider):
     default_model = "gpt-5.5"
 
     def is_available(self) -> tuple[bool, str]:
-        if not shutil.which("codex"):
-            return (False, "codex CLI not on PATH — install OpenAI Codex CLI")
+        path, searched = find_cli("codex")
+        if path is None:
+            return (False, self._not_found("codex", searched,
+                                           "install OpenAI Codex CLI"))
+        self._bin = path
         auth = Path(os.environ.get("HOME", str(Path.home())))
         auth = auth / ".codex" / "auth.json"
         if not auth.is_file():
@@ -145,9 +147,8 @@ class CodexProvider(LLMProvider):
                         return None
         return None
 
-    @staticmethod
-    def _build_cmd(model: str | None) -> list[str]:
-        cmd = ["codex", "exec", "--skip-git-repo-check"]
+    def _build_cmd(self, model: str | None) -> list[str]:
+        cmd = [self._bin or "codex", "exec", "--skip-git-repo-check"]
         if model:
             cmd += ["-m", model]
         return cmd

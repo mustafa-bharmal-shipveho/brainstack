@@ -72,6 +72,22 @@ def _reset_sparse_fallback_warning_for_tests() -> None:
     _SPARSE_FALLBACK_WARN_ONCE.clear()
 
 
+# S4: cross-encoder input cap in characters. Long docs cost rerank latency
+# roughly linearly in token count; capping keeps a burst of long memories
+# from blowing the daemon's per-query budget.
+RERANK_TEXT_CAP = 2000
+
+
+def dense_fallback_active() -> bool:
+    """True when this process has warned (and is running on) BM25-only
+    fallback because the dense embedder was unavailable.
+
+    Mirrors `_SPARSE_FALLBACK_WARN_ONCE.is_set()` so the hook can report
+    `x_degraded` honestly instead of guessing.
+    """
+    return _SPARSE_FALLBACK_WARN_ONCE.is_set()
+
+
 # FastEmbed types are imported lazily so unit tests that monkeypatch the
 # embedder factories don't pay the import cost.
 _DENSE_DEFAULT = "BAAI/bge-base-en-v1.5"
@@ -133,7 +149,9 @@ def _qdrant_busy_message(cache_dir: Path) -> str:
     return (
         f"embedded Qdrant index is busy at {qdrant_path}; another recall process "
         "is using it. Retry shortly, use a separate XDG_CACHE_HOME, or run a "
-        "shared recall/Qdrant service for heavy concurrent agents."
+        "shared recall/Qdrant service for heavy concurrent agents. "
+        "If `recall serve --status` shows a running daemon, use the CLI (it "
+        "routes through the daemon) or stop it with `recall serve --stop`."
     )
 
 
@@ -637,59 +655,54 @@ def query_hybrid(
     return out
 
 
-def query_hybrid_rerank(
-    client: QdrantClient,
-    collection: str,
+def rerank_results(
     query: str,
-    k: int,
-    type_filter: Optional[str] = None,
-    source_filter: Optional[str] = None,
-    dense_model: str = _DENSE_DEFAULT,
-    sparse_model: str = _SPARSE_DEFAULT,
+    candidates: Sequence[QueryResult],
+    *,
     reranker_model: str = _RERANKER_DEFAULT,
-    rerank_n: int = _RERANK_OVERSAMPLE,
-    mode: str = "hybrid",
+    limit: int = _RERANK_OVERSAMPLE,
 ) -> list[QueryResult]:
-    """Hybrid query + cross-encoder rerank.
+    """Cross-encode a MERGED candidate pool once, and only `limit` deep.
 
-    1. Pull top-`rerank_n` from `query_hybrid` (oversample)
-    2. Score every (query, doc.text) pair with the cross-encoder
-    3. Sort by rerank score descending, return top-k
+    `candidates` must already be in the caller's preferred pre-rerank order
+    (RRF score descending); the first `limit` are scored and the rest are
+    dropped. Dropping rather than keeping them un-scored is deliberate: the
+    two scales are not comparable (RRF fusion scores are small positives,
+    cross-encoder outputs are raw logits that are usually negative), so a
+    mixed list cannot be sorted meaningfully.
 
-    The cross-encoder scores are 0-1 floats from FastEmbed and replace the
-    Qdrant fusion score in the returned `QueryResult.score` for transparency.
+    `limit` is a TOTAL budget. Callers that query several collections must
+    merge first and call this once — reranking per collection multiplies the
+    cost by the number of sources, which is the single most expensive thing
+    the retrieval path can do.
+
+    Returns the scored subset, rerank score descending, path breaking ties.
+    Each result keeps its RRF `score` and gains a `rerank_score`.
+
+    A pool of exactly one is still scored, even though there is nothing to
+    reorder. The relevance gate reads `rerank_score is None` as "no opinion,
+    let it through", so skipping the single pair to save a model load let one
+    off-topic memory bypass `auto_recall_min_rerank` outright — and a pool of
+    one is precisely where the gate is the only thing standing between the
+    user and an irrelevant memory. An EMPTY pool still short-circuits: there
+    is no pair to score.
     """
-    if k <= 0:
+    if limit <= 0 or not candidates:
         return []
-    n = max(rerank_n, k)
-    candidates = query_hybrid(
-        client,
-        collection,
-        query,
-        n,
-        type_filter=type_filter,
-        source_filter=source_filter,
-        dense_model=dense_model,
-        sparse_model=sparse_model,
-        mode=mode,
-    )
-    if not candidates:
-        return []
-    if len(candidates) <= 1:
-        # Nothing to reorder. (We deliberately do NOT short-circuit at <=k:
-        # callers oversample `k` for a downstream policy/truncation step, so
-        # reranking still determines which candidates survive — skipping it
-        # there silently bypassed the cross-encoder.)
-        return candidates
+    pool = list(candidates[:limit])
 
     encoder = _get_cross_encoder(reranker_model)
-    texts = [c.document.text for c in candidates]
-    rerank_scores = list(encoder.rerank(query, texts))
-    paired = list(zip(candidates, rerank_scores))
-    paired.sort(key=lambda x: -float(x[1]))
+    # Cap the encoder input: rerank cost grows roughly linearly in token
+    # count, so a burst of long memories would otherwise blow the daemon's
+    # per-query budget. `eval/calibrate_rerank_gate.py` scores the same
+    # capped text, so the calibrated threshold matches what runs here.
+    texts = [c.document.text[:RERANK_TEXT_CAP] for c in pool]
+    scores = list(encoder.rerank(query, texts))
+    paired = list(zip(pool, scores))
+    paired.sort(key=lambda x: (-float(x[1]), x[0].document.path))
     return [
-        QueryResult(document=c.document, score=float(s))
-        for c, s in paired[:k]
+        QueryResult(document=c.document, score=c.score, rerank_score=float(s))
+        for c, s in paired
     ]
 
 

@@ -54,7 +54,36 @@ def serialize_results(results: Iterable[QueryResult]) -> list[dict]:
                 "type": _to_json_safe(fm.get("type")),
                 "description": _untrusted_field(fm.get("description") or ""),
                 "score": round(float(r.score), 6),
+                "rerank_score": (
+                    round(float(r.rerank_score), 6)
+                    if r.rerank_score is not None
+                    else None
+                ),
                 "provenance": provenance_label(fm),
             }
         )
     return out
+
+
+def wire_to_serialized(item: dict) -> dict:
+    """Project a daemon wire result onto `serialize_results`' exact shape.
+
+    Every consumer of `recall query` — the CLI's JSON output and the MCP
+    tool alike — parses that shape. If routing through the socket dropped
+    or renamed a key, installing the daemon would be a silent breaking
+    change, and a client could tell whether the daemon was running. One
+    projection, so the two callers cannot drift apart.
+    """
+    rerank_score = item.get("rerank_score")
+    return {
+        "path": item.get("path"),
+        "source": item.get("source"),
+        "name": item.get("name"),
+        "type": item.get("type"),
+        "description": item.get("description"),
+        "score": round(float(item.get("score") or 0.0), 6),
+        "rerank_score": (
+            None if rerank_score is None else round(float(rerank_score), 6)
+        ),
+        "provenance": item.get("provenance"),
+    }

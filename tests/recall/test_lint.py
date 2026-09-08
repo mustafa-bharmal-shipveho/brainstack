@@ -545,3 +545,55 @@ class TestAutoClear:
         cleared = lint.unmark_needs_review(flagged)
         assert mem in cleared
         assert "needs_review" not in mem.read_text(encoding="utf-8")
+
+
+# --------------------------------------------------------------------------
+# lint_dirs — scoped lint with brain-wide wikilink resolution
+#
+# The nightly dream cycle lints `memory/` and `imports/` only, but a plan
+# under imports/ linking `[[a-lesson]]` in memory/ is a LIVE link. Known
+# keys must therefore be computed over the WHOLE brain, not per-subdir, or
+# every cross-tree link is reported broken — the false-positive class lint
+# exists to avoid.
+# --------------------------------------------------------------------------
+def test_lint_dirs_resolves_wikilinks_across_memory_and_imports(tmp_path):
+    brain = tmp_path / ".agent"
+    _write(
+        brain / "memory" / "semantic" / "lessons" / "atomic-writes.md",
+        "---\nname: atomic-writes\ndescription: Temp file plus rename.\n"
+        "type: lesson\n---\nWrite to a sibling temp file, then rename.\n",
+    )
+    # Lives in imports/, targets memory/ — must resolve.
+    _write(
+        brain / "imports" / "claude" / "plans" / "live.md",
+        "---\nname: live\n---\nSee [[atomic-writes]] before shipping.\n",
+    )
+    # Genuinely broken — must still be caught.
+    _write(
+        brain / "imports" / "claude" / "plans" / "dead.md",
+        "---\nname: dead\n---\nSee [[no-such-memory]].\n",
+    )
+    # Outside both subdirs — out of scope, even though it is broken.
+    _write(
+        brain / "notes" / "outside.md",
+        "---\nname: outside\n---\nSee [[also-missing]].\n",
+    )
+
+    findings = lint.lint_dirs(brain, kinds=frozenset({"broken_wikilink"}))
+    assert {f.file.name for f in findings} == {"dead.md"}
+
+
+def test_lint_dirs_tolerates_a_missing_subdir(tmp_path):
+    """A brain with no `imports/` yet is the common first-run shape."""
+    brain = tmp_path / ".agent"
+    _write(brain / "memory" / "a.md", "---\nname: a\n---\nSee [[ghost]].\n")
+    findings = lint.lint_dirs(brain, kinds=frozenset({"broken_wikilink"}))
+    assert [f.file.name for f in findings] == ["a.md"]
+
+
+def test_lint_dirs_sorted_by_file_line_kind(tmp_path):
+    brain = tmp_path / ".agent"
+    _write(brain / "memory" / "z.md", "---\nname: z\n---\nSee [[ghost]].\n")
+    _write(brain / "memory" / "a.md", "---\nname: a\n---\nSee [[ghost]].\n")
+    findings = lint.lint_dirs(brain, kinds=frozenset({"broken_wikilink"}))
+    assert findings == sorted(findings, key=lambda f: (str(f.file), f.line, f.kind))

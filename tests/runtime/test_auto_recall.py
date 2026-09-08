@@ -57,12 +57,19 @@ def stdin_with(monkeypatch):
 @dataclass
 class _FakeQueryResult:
     """Duck-typed stand-in for recall.core.QueryResult — only fields the
-    auto_recall block-builder actually reads."""
+    auto_recall block-builder actually reads.
+
+    `rerank_score` is None on the in-process path (no cross-encoder is ever
+    loaded there); the daemon fills it. `content_sha256` empty means "the
+    builder must hash the body itself" — the dedup store keys on that sha,
+    so a changed body must produce a different key."""
     path: str
     source: str
     name: str
     score: float
     body: str = ""
+    rerank_score: float | None = None
+    content_sha256: str = ""
 
 
 class _FakeRetriever:
@@ -115,6 +122,27 @@ class TestShouldSkip:
             assert skip is True, f"expected skip on {word!r}"
             assert reason == "ack"
 
+    def test_short_multiword_acks_skipped(self):
+        """"ok thanks" fired a real daemon query in the 2026-09-08 full-day
+        QA: the ack list only knew bare words, and punctuation inside the
+        phrase ("OK, thanks!") defeated the rstrip. Two-word acks and
+        go-ahead phrases carry nothing to retrieve on."""
+        from runtime.adapters.claude_code.auto_recall import should_skip
+        for phrase in ["ok thanks", "OK, thanks!", "got it", "sounds good",
+                       "yes please", "no thanks", "go ahead", "looks good",
+                       "makes sense", "lgtm", "Perfect.", "sure"]:
+            skip, reason = should_skip(phrase, min_chars=2)
+            assert skip is True, f"expected skip on {phrase!r}"
+            assert reason == "ack", (phrase, reason)
+
+    def test_ack_word_inside_a_real_prompt_is_not_an_ack(self):
+        from runtime.adapters.claude_code.auto_recall import should_skip
+        for prompt in ["ok so how do I rotate the episodic logs?",
+                       "thanks, now show me the sync failure from yesterday",
+                       "sure, but what did I decide about symlinks?"]:
+            skip, _ = should_skip(prompt, min_chars=8)
+            assert skip is False, prompt
+
     def test_normal_question_not_skipped(self):
         from runtime.adapters.claude_code.auto_recall import should_skip
         skip, _ = should_skip("what do I do during an incident?", min_chars=8)
@@ -145,8 +173,9 @@ class TestBuildRecallBlock:
                 body="Always lead with executable artifact.",
             ),
         ])
-        block, telemetry = build_recall_block(
-            "who is the head of platform?", retr, k=5, budget_tokens=1500
+        block, telemetry, _ = build_recall_block(
+            "who is the head of platform?", retr, k=5, budget_tokens=1500,
+            brain_root=Path("/brain"),
         )
         # Block must be a <system-reminder> wrapping the metadata + excerpts
         assert block.startswith("<system-reminder>")
@@ -165,16 +194,52 @@ class TestBuildRecallBlock:
         assert telemetry["x_k_requested"] == 5
         assert telemetry["x_top_scores"] == [0.84, 0.71]
         assert telemetry["x_sources"] == {"imports": 1, "brain": 1}
+        # v1.2 contract: nothing was gated out, both docs survived.
+        assert telemetry["x_k_candidates"] == 2
+        assert telemetry["x_k_gated_out"] == 0
+        assert telemetry["x_k_dedup"] == 0
+        # x_paths are relativized against the brain root so the stats
+        # planner can join them back with `recall.config.brain_root()`.
+        assert telemetry["x_paths"] == [
+            "imports/kb/key-contacts.md",
+            "memory/semantic/lessons/feedback.md",
+        ]
+        assert telemetry["x_paths_truncated"] is False
+        # No reranker on this path → the rerank score list is empty, NOT
+        # a list of zeros (a miss must stay distinguishable from a 0.0 score).
+        assert telemetry["x_rerank_scores"] == []
+
+    def test_singular_doc_count_uses_singular_noun(self):
+        """`1 docs surfaced` reads as a typo. With exactly one result the
+        header must say `1 doc surfaced`, not `1 docs surfaced`."""
+        from runtime.adapters.claude_code.auto_recall import build_recall_block
+        retr = _FakeRetriever(results=[
+            _FakeQueryResult(
+                path="/brain/imports/kb/key-contacts.md",
+                source="imports", name="key-contacts", score=0.84,
+                body="Mike: head of platform.",
+            ),
+        ])
+        block, telemetry, _ = build_recall_block(
+            "who is the head of platform?", retr, k=5, budget_tokens=1500,
+        )
+        assert "auto-recall: 1 doc surfaced" in block
+        assert "auto-recall: 1 docs surfaced" not in block
+        assert telemetry["x_k_returned"] == 1
 
     def test_empty_results_emit_no_block(self):
+        """Retrieval ran and returned nothing. That is a MISS, not a hit:
+        `recall stats` cannot compute a real hit rate while every fire is
+        labelled 'hit' regardless of what came back."""
         from runtime.adapters.claude_code.auto_recall import build_recall_block
-        block, telemetry = build_recall_block(
+        block, telemetry, _ = build_recall_block(
             "obscure query with no hits", _FakeRetriever(results=[]),
             k=5, budget_tokens=1500,
         )
         assert block == ""
-        assert telemetry["x_outcome"] == "hit"
+        assert telemetry["x_outcome"] == "miss"
         assert telemetry["x_k_returned"] == 0
+        assert telemetry["x_k_candidates"] == 0
 
     def test_budget_truncates_excerpts(self):
         """When the running token total exceeds budget_tokens, later docs
@@ -191,7 +256,7 @@ class TestBuildRecallBlock:
             for i in range(5)
         ])
         budget = 500
-        block, _ = build_recall_block("x", retr, k=5, budget_tokens=budget)
+        block, _, _ = build_recall_block("x", retr, k=5, budget_tokens=budget)
         # The rendered block must stay within a small multiplier of the
         # budget. Allow 3x slack for the header + one over-budget section
         # being included before truncation kicks in.
@@ -212,7 +277,7 @@ class TestBuildRecallBlock:
                              score=0.20, body="weak match"),
         ])
         # Default: both included
-        block_default, telem_default = build_recall_block(
+        block_default, telem_default, _ = build_recall_block(
             "x", retr, k=5, budget_tokens=1500,
         )
         assert "/strong.md" in block_default
@@ -220,7 +285,7 @@ class TestBuildRecallBlock:
         assert telem_default["x_k_returned"] == 2
 
         # With floor: only the strong match survives
-        block_filtered, telem_filtered = build_recall_block(
+        block_filtered, telem_filtered, _ = build_recall_block(
             "x", retr, k=5, budget_tokens=1500, min_score=0.5,
         )
         assert "/strong.md" in block_filtered
@@ -236,10 +301,378 @@ class TestBuildRecallBlock:
                              name=f"d{i}", score=0.5, body="x")
             for i in range(20)
         ])
-        _, telemetry = build_recall_block("x", retr, k=20, budget_tokens=99999)
+        _, telemetry, _ = build_recall_block("x", retr, k=20, budget_tokens=99999)
         for k, v in telemetry.items():
             encoded = json.dumps(v).encode("utf-8")
             assert len(encoded) <= 1024, f"telemetry[{k}] is {len(encoded)} bytes"
+
+
+# ---------- relevance gates (S4 consumer) ----------
+
+class TestRelevanceGates:
+    """Two independent floors run before injection:
+
+    1. the RRF `min_score` pre-filter (cheap, always available)
+    2. the cross-encoder `min_rerank` gate (only when the daemon supplied
+       rerank scores)
+
+    A candidate that fails either one is counted in `x_k_gated_out` and
+    never rendered. When every candidate fails, the outcome is `miss` —
+    the whole point of the gate is that abstaining is a legitimate,
+    *measurable* result rather than a silent zero-doc 'hit'."""
+
+    def test_min_score_gate_yields_miss_not_hit(self):
+        from runtime.adapters.claude_code.auto_recall import build_recall_block
+        retr = _FakeRetriever(results=[
+            _FakeQueryResult(path="/brain/a.md", source="brain", name="a",
+                             score=0.21, body="weak"),
+            _FakeQueryResult(path="/brain/b.md", source="brain", name="b",
+                             score=0.19, body="weaker"),
+        ])
+        block, telemetry, _ = build_recall_block(
+            "q", retr, k=5, budget_tokens=1500, min_score=0.5,
+        )
+        assert block == ""
+        assert telemetry["x_outcome"] == "miss"
+        assert telemetry["x_k_candidates"] == 2
+        assert telemetry["x_k_gated_out"] == 2
+        assert telemetry["x_k_returned"] == 0
+
+    def test_rerank_gate_blocks_low_passes_high(self):
+        from runtime.adapters.claude_code.auto_recall import build_recall_block
+        retr = _FakeRetriever(results=[
+            _FakeQueryResult(path="/brain/low.md", source="brain", name="low",
+                             score=0.88, rerank_score=0.2, body="off topic"),
+            _FakeQueryResult(path="/brain/high.md", source="brain", name="high",
+                             score=0.61, rerank_score=0.9, body="on topic"),
+        ])
+        block, telemetry, _ = build_recall_block(
+            "q", retr, k=5, budget_tokens=1500, min_rerank=0.5,
+        )
+        assert "/brain/high.md" in block
+        assert "/brain/low.md" not in block
+        assert telemetry["x_outcome"] == "hit"
+        assert telemetry["x_k_candidates"] == 2
+        assert telemetry["x_k_gated_out"] == 1
+        assert telemetry["x_k_returned"] == 1
+
+    def test_rerank_gate_abstains_to_miss(self):
+        from runtime.adapters.claude_code.auto_recall import build_recall_block
+        retr = _FakeRetriever(results=[
+            _FakeQueryResult(path="/brain/a.md", source="brain", name="a",
+                             score=0.91, rerank_score=0.10, body="a"),
+            _FakeQueryResult(path="/brain/b.md", source="brain", name="b",
+                             score=0.88, rerank_score=0.05, body="b"),
+        ])
+        block, telemetry, _ = build_recall_block(
+            "q", retr, k=5, budget_tokens=1500, min_rerank=0.5,
+        )
+        assert block == ""
+        assert telemetry["x_outcome"] == "miss"
+        assert telemetry["x_k_gated_out"] == 2
+        # The scores that caused the abstention stay in telemetry so a
+        # miss is diagnosable without re-running the query.
+        assert telemetry["x_rerank_scores"] == [0.1, 0.05]
+
+    def test_rerank_none_passes_when_gate_on(self):
+        """In-process fallback path: no cross-encoder is ever loaded, so
+        every `rerank_score` is None. The gate must degrade to RRF-only
+        rather than gating everything out — otherwise auto-recall goes
+        permanently silent whenever the daemon is down."""
+        from runtime.adapters.claude_code.auto_recall import build_recall_block
+        retr = _FakeRetriever(results=[
+            _FakeQueryResult(path="/brain/a.md", source="brain", name="a",
+                             score=0.91, rerank_score=None, body="a"),
+            _FakeQueryResult(path="/brain/b.md", source="brain", name="b",
+                             score=0.88, rerank_score=None, body="b"),
+        ])
+        block, telemetry, _ = build_recall_block(
+            "q", retr, k=5, budget_tokens=1500, min_rerank=0.5,
+        )
+        assert "/brain/a.md" in block
+        assert "/brain/b.md" in block
+        assert telemetry["x_outcome"] == "hit"
+        assert telemetry["x_k_gated_out"] == 0
+        assert telemetry["x_k_returned"] == 2
+        assert telemetry["x_rerank_scores"] == []
+
+    def test_negative_threshold_still_gates(self):
+        """Calibrated cross-encoder thresholds are RAW LOGITS, and the
+        chosen one is NEGATIVE (eval/RESULTS.md: -1.9547). A `> 0.0`
+        enable-check therefore silently disabled the gate for exactly the
+        value the calibration tells us to ship. Any float enables it."""
+        from runtime.adapters.claude_code.auto_recall import build_recall_block
+        retr = _FakeRetriever(results=[
+            _FakeQueryResult(path="/brain/low.md", source="brain", name="low",
+                             score=0.88, rerank_score=-3.10, body="off topic"),
+            _FakeQueryResult(path="/brain/high.md", source="brain", name="high",
+                             score=0.61, rerank_score=-0.50, body="on topic"),
+        ])
+        block, telemetry, _ = build_recall_block(
+            "q", retr, k=5, budget_tokens=1500, min_rerank=-1.9547,
+        )
+        assert "/brain/high.md" in block
+        assert "/brain/low.md" not in block
+        assert telemetry["x_outcome"] == "hit"
+        assert telemetry["x_k_gated_out"] == 1
+        assert telemetry["x_k_returned"] == 1
+
+    def test_none_threshold_disables_the_gate(self):
+        """`None` — not `0.0` — is the OFF switch. With the gate off even
+        a deeply negative rerank score is injected."""
+        from runtime.adapters.claude_code.auto_recall import build_recall_block
+        retr = _FakeRetriever(results=[
+            _FakeQueryResult(path="/brain/a.md", source="brain", name="a",
+                             score=0.88, rerank_score=-9.0, body="a"),
+            _FakeQueryResult(path="/brain/b.md", source="brain", name="b",
+                             score=0.61, rerank_score=0.4, body="b"),
+        ])
+        block, telemetry, _ = build_recall_block(
+            "q", retr, k=5, budget_tokens=1500, min_rerank=None,
+        )
+        assert "/brain/a.md" in block
+        assert "/brain/b.md" in block
+        assert telemetry["x_k_gated_out"] == 0
+        assert telemetry["x_k_returned"] == 2
+
+    def test_zero_threshold_gates_negative_scores(self):
+        """0.0 is a THRESHOLD, not a sentinel: it admits scores >= 0 and
+        rejects negative ones. Callers that want the gate off pass None."""
+        from runtime.adapters.claude_code.auto_recall import build_recall_block
+        retr = _FakeRetriever(results=[
+            _FakeQueryResult(path="/brain/neg.md", source="brain", name="neg",
+                             score=0.88, rerank_score=-0.01, body="neg"),
+            _FakeQueryResult(path="/brain/zero.md", source="brain", name="zero",
+                             score=0.61, rerank_score=0.0, body="zero"),
+        ])
+        block, telemetry, _ = build_recall_block(
+            "q", retr, k=5, budget_tokens=1500, min_rerank=0.0,
+        )
+        assert "/brain/neg.md" not in block
+        assert "/brain/zero.md" in block
+        assert telemetry["x_k_gated_out"] == 1
+        assert telemetry["x_k_returned"] == 1
+
+    def test_rerank_none_passes_under_a_negative_threshold(self):
+        """The in-process fallback supplies no rerank scores at all. That
+        must keep degrading to RRF-only under a negative threshold too,
+        otherwise auto-recall goes silent whenever the daemon is down."""
+        from runtime.adapters.claude_code.auto_recall import build_recall_block
+        retr = _FakeRetriever(results=[
+            _FakeQueryResult(path="/brain/a.md", source="brain", name="a",
+                             score=0.91, rerank_score=None, body="a"),
+        ])
+        block, telemetry, _ = build_recall_block(
+            "q", retr, k=5, budget_tokens=1500, min_rerank=-1.9547,
+        )
+        assert "/brain/a.md" in block
+        assert telemetry["x_k_gated_out"] == 0
+
+    def test_x_top_scores_are_candidate_scores(self):
+        """`x_top_scores` / `x_rerank_scores` describe the CANDIDATES that
+        survived the RRF pre-filter, before the rerank gate and dedup.
+        Sampling the injected set instead would make every miss look like
+        it had no candidates at all."""
+        from runtime.adapters.claude_code.auto_recall import build_recall_block
+        retr = _FakeRetriever(results=[
+            _FakeQueryResult(path="/brain/a.md", source="brain", name="a",
+                             score=0.90, rerank_score=0.1, body="a"),
+            _FakeQueryResult(path="/brain/b.md", source="brain", name="b",
+                             score=0.80, rerank_score=0.9, body="b"),
+            _FakeQueryResult(path="/brain/c.md", source="brain", name="c",
+                             score=0.70, rerank_score=0.1, body="c"),
+            _FakeQueryResult(path="/brain/d.md", source="brain", name="d",
+                             score=0.20, rerank_score=0.9, body="d"),
+        ])
+        _, telemetry, _ = build_recall_block(
+            "q", retr, k=5, budget_tokens=1500, min_score=0.5, min_rerank=0.5,
+        )
+        # d.md failed the RRF pre-filter, so it is not a candidate at all.
+        assert telemetry["x_top_scores"] == [0.9, 0.8, 0.7]
+        assert telemetry["x_rerank_scores"] == [0.1, 0.9, 0.1]
+        # a and c then failed the rerank gate; only b was injected.
+        assert telemetry["x_k_candidates"] == 4
+        assert telemetry["x_k_gated_out"] == 3
+        assert telemetry["x_k_returned"] == 1
+
+
+# ---------- per-session dedup ----------
+
+class TestSessionDedup:
+    """Injecting the same doc on every prompt of a long session burns
+    context for zero new information. The dedup store remembers
+    (path -> sha256-of-body) per session; a candidate whose content is
+    unchanged is dropped and counted in `x_k_dedup`."""
+
+    def _store(self, tmp_path: Path):
+        from runtime.adapters.claude_code.dedup import SessionDedupStore
+        return SessionDedupStore(tmp_path / "injected", "session-abc")
+
+    def test_dedup_second_call_yields_dedup_outcome(self, tmp_path: Path):
+        from runtime.adapters.claude_code.auto_recall import build_recall_block
+        store = self._store(tmp_path)
+        retr = _FakeRetriever(results=[
+            _FakeQueryResult(path="/brain/lesson.md", source="brain",
+                             name="lesson", score=0.9, body="Lesson body."),
+        ])
+        first_block, first_telem, first_injected = build_recall_block(
+            "q", retr, k=5, budget_tokens=1500, dedup_store=store,
+        )
+        assert first_telem["x_outcome"] == "hit"
+        assert first_telem["x_k_dedup"] == 0
+        assert "/brain/lesson.md" in first_block
+        # The CALLER commits, as `hooks` does once it has printed the block.
+        store.record(first_injected)
+
+        second_block, second_telem, _ = build_recall_block(
+            "q again", retr, k=5, budget_tokens=1500, dedup_store=store,
+        )
+        assert second_block == ""
+        assert second_telem["x_outcome"] == "dedup"
+        assert second_telem["x_k_dedup"] == 1
+        assert second_telem["x_k_returned"] == 0
+
+    def test_changed_content_reinjects(self, tmp_path: Path):
+        """Same path, different body → different sha → the doc is fresh
+        again. A memory the user just edited must reach the model."""
+        from runtime.adapters.claude_code.auto_recall import build_recall_block
+        store = self._store(tmp_path)
+        _, _, v1_injected = build_recall_block(
+            "q", _FakeRetriever(results=[
+                _FakeQueryResult(path="/brain/lesson.md", source="brain",
+                                 name="lesson", score=0.9, body="v1 body"),
+            ]), k=5, budget_tokens=1500, dedup_store=store,
+        )
+        store.record(v1_injected)
+        block, telemetry, _ = build_recall_block(
+            "q", _FakeRetriever(results=[
+                _FakeQueryResult(path="/brain/lesson.md", source="brain",
+                                 name="lesson", score=0.9, body="v2 body"),
+            ]), k=5, budget_tokens=1500, dedup_store=store,
+        )
+        assert "/brain/lesson.md" in block
+        assert "v2 body" in block
+        assert telemetry["x_outcome"] == "hit"
+        assert telemetry["x_k_dedup"] == 0
+        assert telemetry["x_k_returned"] == 1
+
+
+# ---------- telemetry contract v1.2 ----------
+
+class TestTelemetryContractV12:
+    """The header text is a public interface: the utilization sampler
+    parses transcripts with fixed regexes, so any reformat silently zeroes
+    out every historical measurement. These tests are the guard."""
+
+    def test_header_format_stable_for_utilization_regex(self, tmp_path: Path):
+        import re
+
+        from runtime.adapters.claude_code.auto_recall import build_recall_block
+        from runtime.adapters.claude_code.dedup import SessionDedupStore
+
+        store = SessionDedupStore(tmp_path / "injected", "sess-1")
+        seen = _FakeQueryResult(path="/brain/seen.md", source="brain",
+                                name="seen", score=0.77, rerank_score=0.55,
+                                body="already shown this session")
+        fresh = _FakeQueryResult(path="/brain/fresh.md", source="brain",
+                                 name="fresh", score=0.84, rerank_score=0.91,
+                                 body="brand new material")
+
+        # First fire shows `seen`; the caller commits it to the store.
+        _, _, injected = build_recall_block(
+            "q", _FakeRetriever(results=[seen]), k=5,
+            budget_tokens=1500, dedup_store=store,
+        )
+        store.record(injected)
+        block, telemetry, _ = build_recall_block(
+            "q", _FakeRetriever(results=[fresh, seen]), k=5,
+            budget_tokens=1500, dedup_store=store,
+        )
+
+        # Regex 1 — the sampler's docs+latency counter. `docs?` because the
+        # header pluralizes the noun: "1 doc surfaced" / "2 docs surfaced".
+        header = re.search(r"auto-recall: (\d+) docs? surfaced in (\d+)ms", block)
+        assert header is not None, f"header regex did not match:\n{block}"
+        assert header.group(1) == "1"
+
+        # Regex 2 — the sampler's per-doc path+score extractor.
+        docs = re.findall(r"## (\S+\.md) \(score ([0-9.]+)\)", block)
+        assert docs == [("/brain/fresh.md", "0.84")]
+
+        # New in v1.2: rerank score appended AFTER the closing paren, so
+        # regex 2 keeps matching, and a dedup count line in the header.
+        assert " · rerank 0.91" in block
+        assert "dedup: 1 already shown this session" in block
+
+        assert telemetry["x_outcome"] == "hit"
+        assert telemetry["x_k_dedup"] == 1
+        assert telemetry["x_k_returned"] == 1
+
+    def test_x_paths_truncated_under_1024_bytes(self):
+        """events.py rejects any x_* value over 1024 bytes at dump time, so
+        an unbounded x_paths list would make the hook drop the whole
+        telemetry record on wide-k fires. Drop from the end and say so.
+
+        The builder targets 1000 bytes, not 1024: the slack absorbs the
+        difference between the compact separators events.py measures with
+        and whatever a future consumer re-encodes with."""
+        from runtime.adapters.claude_code.auto_recall import build_recall_block
+        retr = _FakeRetriever(results=[
+            _FakeQueryResult(
+                path=f"/brain/memory/semantic/lessons/{'segment-' * 6}{i:02d}.md",
+                source="brain", name=f"d{i}", score=0.9, body="x",
+            )
+            for i in range(40)
+        ])
+        _, telemetry, _ = build_recall_block(
+            "q", retr, k=40, budget_tokens=99999, brain_root=Path("/brain"),
+        )
+        # All 40 were injected — truncation is a telemetry concern only.
+        assert telemetry["x_k_returned"] == 40
+        assert telemetry["x_paths_truncated"] is True
+        paths = telemetry["x_paths"]
+        assert 0 < len(paths) < 40
+        assert len(json.dumps(paths).encode("utf-8")) <= 1000
+        assert all(not p.startswith("/") for p in paths), paths
+
+    def test_daemon_results_adapter_sets_query_ms_and_degraded(self):
+        """`DaemonResults` wraps a daemon wire response so the block builder
+        never learns which path produced the results. It carries the
+        daemon's own measurements, which the builder must prefer over its
+        local stopwatch (the local one would include socket time)."""
+        from runtime.adapters.claude_code.auto_recall import (
+            DaemonResults,
+            build_recall_block,
+        )
+        resp = {
+            "v": 1, "ok": True, "query_ms": 42, "degraded": True,
+            "reranked": True, "index_stale": False,
+            "results": [{
+                "path": "/brain/memory/semantic/lessons/a.md",
+                "source": "brain", "title": "A", "name": "a",
+                "type": "lesson", "description": "d",
+                "score": 0.66, "rerank_score": 0.93,
+                "provenance": "recall-remember",
+                "frontmatter": {"source": "recall-remember"},
+                "body": "daemon-supplied body",
+                "content_sha256": "a" * 64,
+            }],
+        }
+        adapter = DaemonResults(resp)
+        assert adapter.query_ms == 42
+        assert adapter.degraded is True
+        assert adapter.index_stale is False
+        assert len(adapter.query("q", k=5)) == 1
+
+        block, telemetry, _ = build_recall_block(
+            "q", adapter, k=5, budget_tokens=1500, brain_root=Path("/brain"),
+        )
+        assert "daemon-supplied body" in block
+        assert telemetry["x_query_ms"] == 42
+        assert telemetry["x_degraded"] is True
+        assert telemetry["x_index_stale"] is False
+        assert telemetry["x_rerank_scores"] == [0.93]
+        assert telemetry["x_paths"] == ["memory/semantic/lessons/a.md"]
 
 
 # ---------- hook integration tests ----------
@@ -317,8 +750,20 @@ class TestPyprojectDiscovery:
 
 class TestHookIntegration:
     """End-to-end through `handle_hook("UserPromptSubmit", ...)`. These
-    pin the full path: stdin payload → skip filter → retriever → stdout +
-    AutoRecall event written."""
+    pin the full path: stdin payload → skip filter → daemon attempt →
+    in-process fallback → stdout + AutoRecall event written."""
+
+    @pytest.fixture(autouse=True)
+    def _no_daemon(self, monkeypatch):
+        """Every test in this class exercises the IN-PROCESS path. Pin the
+        daemon seam to 'no socket' so the suite never reaches for the
+        developer's live daemon and the fallback branch is the one under
+        test."""
+        from runtime.adapters.claude_code import hooks as hooks_mod
+        monkeypatch.setattr(
+            hooks_mod, "_daemon_query",
+            lambda *a, **kw: (None, "no_socket"),
+        )
 
     def _patch_retriever(self, monkeypatch, retriever):
         """Replace the retriever factory the hook uses with a stub."""
@@ -356,6 +801,22 @@ class TestHookIntegration:
         assert ar[0].extensions.get("x_outcome") == "skip"
         assert ar[0].extensions.get("x_skip_reason") == "too_short"
 
+    def test_skip_has_latency_ms(
+        self, tmp_config: RuntimeConfig, stdin_with, monkeypatch, capsys
+    ):
+        """`x_latency_ms` is emitted on EVERY outcome, skip included. A
+        latency distribution computed only over hits is a survivorship
+        lie — the cheap skips are exactly what keeps the p50 honest."""
+        self._patch_retriever(monkeypatch, _FakeRetriever(results=[]))
+        stdin_with({"session_id": "s", "prompt": "hi"})
+        handle_hook("UserPromptSubmit", config=tmp_config)
+        ar = [e for e in load_events(tmp_config.event_log_path)
+              if e.event == "AutoRecall"]
+        assert len(ar) == 1
+        assert ar[0].extensions.get("x_outcome") == "skip"
+        assert isinstance(ar[0].extensions.get("x_latency_ms"), int)
+        assert ar[0].extensions["x_latency_ms"] >= 0
+
     def test_happy_path_emits_block_and_telemetry(
         self, tmp_config: RuntimeConfig, stdin_with, monkeypatch, capsys
     ):
@@ -377,8 +838,41 @@ class TestHookIntegration:
         events = load_events(tmp_config.event_log_path)
         ar = [e for e in events if e.event == "AutoRecall"]
         assert len(ar) == 1
-        assert ar[0].extensions.get("x_outcome") == "hit"
-        assert ar[0].extensions.get("x_k_returned") == 1
+        ext = ar[0].extensions
+        assert ext.get("x_outcome") == "hit"
+        assert ext.get("x_k_returned") == 1
+        # The daemon was not reachable, so the hook fell back in-process
+        # and said so. Both facts are needed to read a latency histogram:
+        # a 900 ms p50 means one thing on "daemon" and another on "inproc".
+        assert ext.get("x_path") == "inproc"
+        assert str(ext.get("x_daemon_error") or "").startswith("no_socket")
+        # Full worker wall must bound the retrieval-only measurement.
+        assert ext["x_latency_ms"] >= ext["x_query_ms"]
+
+    def test_timeout_records_latency_ms(
+        self, tmp_path: Path, stdin_with, monkeypatch, capsys
+    ):
+        """On timeout the hook still reports how long it actually waited,
+        measured at the kill. Without it a timeout is indistinguishable
+        from an instant failure when tuning `auto_recall_timeout_ms`."""
+        cfg = RuntimeConfig(
+            log_dir=tmp_path / "logs",
+            enable_auto_recall=True,
+            auto_recall_timeout_ms=50,
+            auto_recall_min_chars=4,
+        )
+        self._patch_retriever(monkeypatch, _FakeRetriever(
+            results=[_FakeQueryResult(path="/p.md", source="brain",
+                                      name="p", score=0.9, body="x")],
+            sleep_seconds=0.5,
+        ))
+        stdin_with({"session_id": "s", "prompt": "long enough prompt"})
+        handle_hook("UserPromptSubmit", config=cfg)
+        ar = [e for e in load_events(cfg.event_log_path)
+              if e.event == "AutoRecall"]
+        assert len(ar) == 1
+        assert ar[0].extensions.get("x_outcome") == "timeout"
+        assert ar[0].extensions.get("x_latency_ms") >= 50
 
     def test_timeout_emits_no_block_telemetry_records_outcome(
         self, tmp_path: Path, stdin_with, monkeypatch, capsys
@@ -516,7 +1010,7 @@ class TestInjectionHardening:
 
     def test_body_cannot_escape_system_reminder_wrapper(self):
         from runtime.adapters.claude_code.auto_recall import build_recall_block
-        block, telemetry = build_recall_block(
+        block, telemetry, _ = build_recall_block(
             "what did Alice say about diffs?", self._adversarial_retriever(),
             k=5, budget_tokens=1500,
         )
@@ -532,7 +1026,7 @@ class TestInjectionHardening:
     def test_untrusted_preamble_present_exactly_once(self):
         from recall.sanitize import UNTRUSTED_PREAMBLE
         from runtime.adapters.claude_code.auto_recall import build_recall_block
-        block, _ = build_recall_block(
+        block, _, _ = build_recall_block(
             "what did Alice say about diffs?", self._adversarial_retriever(),
             k=5, budget_tokens=1500,
         )
@@ -541,7 +1035,7 @@ class TestInjectionHardening:
     def test_each_excerpt_is_fenced(self):
         from recall.sanitize import close_fence, open_fence
         from runtime.adapters.claude_code.auto_recall import build_recall_block
-        block, _ = build_recall_block(
+        block, _, _ = build_recall_block(
             "what did Alice say about diffs?", self._adversarial_retriever(),
             k=5, budget_tokens=1500,
         )
@@ -555,7 +1049,7 @@ class TestInjectionHardening:
 
     def test_per_doc_provenance_labels(self):
         from runtime.adapters.claude_code.auto_recall import build_recall_block
-        block, _ = build_recall_block(
+        block, _, _ = build_recall_block(
             "what did Alice say about diffs?", self._adversarial_retriever(),
             k=5, budget_tokens=1500,
         )
@@ -573,3 +1067,35 @@ class TestInjectionHardening:
         assert len(non_none) == 1, (
             f"expected exactly one attributed doc, got labels {labels!r}"
         )
+
+    def test_truncated_excerpt_carries_a_marker(self):
+        """A body longer than the 500-char excerpt cap is cut mid-sentence
+        with nothing to signal that it continues. Append a marker inside
+        the fence, after the excerpt, so a reading model can tell a
+        truncated excerpt from a complete one."""
+        from recall.sanitize import close_fence
+        from runtime.adapters.claude_code.auto_recall import build_recall_block
+        long_body = "word " * 200  # 1000 chars, well over the 500-char cap
+        retr = _FakeRetriever(results=[
+            _FakeQueryResult(path="/brain/long.md", source="brain",
+                             name="long", score=0.9, body=long_body),
+        ])
+        block, _, _ = build_recall_block("q", retr, k=5, budget_tokens=1500)
+        assert " … [excerpt truncated]" in block
+        # Marker sits inside the fence, after the excerpt — before the
+        # closing fence line, not after it.
+        marker_idx = block.index("[excerpt truncated]")
+        close_idx = block.index(close_fence(1))
+        assert marker_idx < close_idx
+
+    def test_untruncated_excerpt_has_no_marker(self):
+        """A body that fits within the cap is rendered whole — no marker,
+        since nothing was cut."""
+        from runtime.adapters.claude_code.auto_recall import build_recall_block
+        retr = _FakeRetriever(results=[
+            _FakeQueryResult(path="/brain/short.md", source="brain",
+                             name="short", score=0.9,
+                             body="a short body well under the cap"),
+        ])
+        block, _, _ = build_recall_block("q", retr, k=5, budget_tokens=1500)
+        assert "[excerpt truncated]" not in block

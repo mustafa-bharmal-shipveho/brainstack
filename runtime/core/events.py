@@ -1,4 +1,4 @@
-"""Event log schema v1.1 — the per-hook record stream (contract; writer in Phase 4).
+"""Event log schema v1.2 — the per-hook record stream (contract; writer in Phase 4).
 
 Each hook firing produces one EventRecord. Records are appended to a JSONL
 log (`runtime/.../events.log.jsonl`) under the same flock pattern as the
@@ -16,7 +16,10 @@ Data policy (codex review fix):
   - Any raw-content capture is opt-in and goes to a separate file (the
     harness's payload-samples.jsonl, or a runtime-side flag set explicitly).
 
-Schema is versioned; loaders reject unknown versions. Forward-compat keys
+Schema is versioned. The WRITER always stamps EVENT_LOG_SCHEMA_VERSION; the
+LOADER accepts any version in SUPPORTED_EVENT_SCHEMA_VERSIONS and preserves
+whichever one the record carries, so a log that spans a version bump stays
+readable and consumers can tell old semantics from new. Forward-compat keys
 under `x_*` prefix are preserved across round-trips.
 """
 from __future__ import annotations
@@ -27,10 +30,31 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
-EVENT_LOG_SCHEMA_VERSION = "1.1"
+EVENT_LOG_SCHEMA_VERSION = "1.2"
 # 1.0 -> 1.1 added items_added: list[InjectionItemSnapshot] so replay can
 # reconstruct manifests deterministically without external state. Phase 3
 # Skeptic finding #2.
+#
+# 1.1 -> 1.2 (S2): the AutoRecall telemetry contract became HONEST.
+# x_outcome gained "dedup" and stopped reporting "hit" for a fire that
+# surfaced nothing (a zero-doc fire is now "miss"), so a v1.1 `hit` and a
+# v1.2 `hit` do not mean the same thing. New fields: x_path ("daemon" |
+# "inproc"), x_daemon_error, x_index_stale, x_query_ms, x_degraded,
+# x_k_candidates, x_k_gated_out, x_k_dedup, x_paths, x_paths_truncated,
+# x_rerank_scores.
+#
+# Because the semantics changed, `recall stats` MUST split its aggregates
+# on the record's own schema_version rather than assume the current one —
+# which is why load_event preserves what the line carried instead of
+# rewriting it to the constant. The live log holds ~120k lines at 1.1; a
+# hard equality check against the constant would break every reader
+# (stats, `recall runtime replay`, reinjection) the moment it moved.
+SUPPORTED_EVENT_SCHEMA_VERSIONS = frozenset({"1.0", "1.1", "1.2"})
+
+# Rotation threshold shared with runtime/core/locking.py's locked_append
+# (rotate_bytes kwarg). 20 MiB matches the live events.log.jsonl size that
+# motivated S5's rotation work.
+EVENT_LOG_ROTATE_BYTES = 20 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -215,10 +239,12 @@ def load_event(raw: str | bytes | Mapping[str, Any]) -> EventRecord:
 
     if not isinstance(data, dict):
         raise ValueError("event must be a JSON object")
-    if data.get("schema_version") != EVENT_LOG_SCHEMA_VERSION:
+    if data.get("schema_version") not in SUPPORTED_EVENT_SCHEMA_VERSIONS:
         raise ValueError(
             f"unsupported event schema_version: {data.get('schema_version')!r} "
-            f"(this runtime understands {EVENT_LOG_SCHEMA_VERSION!r})"
+            f"(this runtime understands "
+            f"{sorted(SUPPORTED_EVENT_SCHEMA_VERSIONS)!r}, writes "
+            f"{EVENT_LOG_SCHEMA_VERSION!r})"
         )
     missing = _REQUIRED_KEYS - set(data.keys())
     if missing:
@@ -283,9 +309,17 @@ def load_event(raw: str | bytes | Mapping[str, Any]) -> EventRecord:
 
 
 def append_event(log_path: Path | str, event: EventRecord) -> None:
-    """Atomic append to the JSONL log via runtime/core/locking.locked_append."""
-    from runtime.core.locking import locked_append
-    locked_append(log_path, dump_event(event))
+    """Atomic append to the JSONL log via runtime/core/locking.locked_append.
+
+    `append_event` is the only writer of the event log, so it owns the
+    rotation threshold: `locked_append` rolls the current file aside once
+    it reaches `EVENT_LOG_ROTATE_BYTES`. Read through the module global at
+    call time so a test (or a future config layer) can lower it.
+    """
+    from runtime.core import locking
+    locking.locked_append(
+        log_path, dump_event(event), rotate_bytes=EVENT_LOG_ROTATE_BYTES,
+    )
 
 
 def load_events(log_path: Path | str) -> list[EventRecord]:
@@ -302,8 +336,28 @@ def load_events(log_path: Path | str) -> list[EventRecord]:
     return out
 
 
+def load_events_all(log_path: Path | str) -> list[EventRecord]:
+    """Read every event across the rolled history AND the current log.
+
+    `load_events` reads the current file only (reinjection's contract:
+    replay from the live log). This variant is for anything auditing
+    history across a rotation boundary (`recall stats`, the S5 stats
+    planner). Rolled files are read oldest-first via
+    `runtime.core.locking.iter_log_paths`, imported lazily so this module
+    doesn't take a hard dependency on the rotation helper landing first.
+    """
+    from runtime.core import locking
+
+    out: list[EventRecord] = []
+    for p in locking.iter_log_paths(Path(log_path)):
+        out.extend(load_events(p))
+    return out
+
+
 __all__ = [
     "EVENT_LOG_SCHEMA_VERSION",
+    "SUPPORTED_EVENT_SCHEMA_VERSIONS",
+    "EVENT_LOG_ROTATE_BYTES",
     "EventRecord",
     "OutputSummary",
     "append_event",
@@ -311,5 +365,6 @@ __all__ = [
     "event_id_for",
     "load_event",
     "load_events",
+    "load_events_all",
     "summarize_output",
 ]

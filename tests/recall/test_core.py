@@ -167,6 +167,14 @@ class TestCrossEncoderReranker:
         )
         names = [r.document.frontmatter["name"] for r in results]
         assert "incident-runbook" in names
+        # The cross-encoder score now rides ALONGSIDE the RRF score instead of
+        # replacing it: the S4 relevance gate pre-filters on the cheap RRF
+        # score and decides on the rerank score, so both must survive.
+        assert results[0].rerank_score is not None
+        assert 0.0 <= results[0].score <= 1.0, (
+            f"score {results[0].score} is not an RRF score — the cross-encoder "
+            "score overwrote it"
+        )
 
     def test_reranker_none_skips_third_stage(self):
         docs = [
@@ -216,6 +224,105 @@ class TestCrossEncoderReranker:
         results = retriever.query("alpha bravo charlie delta echo", k=3)
         assert called["n"] >= 1, "cross-encoder was never invoked (rerank bypassed)"
         assert results[0].document.frontmatter["name"] == "winner"
+
+    def test_query_rerank_override_true_on_none_retriever(self):
+        # `HybridRetriever.query(..., rerank=True)` forces the third stage
+        # even when the retriever was built with reranker="none". The daemon
+        # holds ONE retriever and flips reranking per request, so the override
+        # has to beat the constructor value.
+        docs = [
+            _make_doc("alpha", "alpha bravo charlie", body="alpha bravo charlie"),
+            _make_doc("bravo", "delta echo foxtrot", body="delta echo foxtrot"),
+            _make_doc("charlie", "golf hotel india", body="golf hotel india"),
+        ]
+        retriever = HybridRetriever(docs, reranker="none", rerank_n=10)
+
+        baseline = retriever.query("alpha bravo", k=2)
+        assert baseline, "expected results without the override"
+        assert all(r.rerank_score is None for r in baseline), (
+            "reranker='none' must not produce rerank scores by default"
+        )
+
+        forced = retriever.query("alpha bravo", k=2, rerank=True)
+        assert forced, "expected results with rerank=True"
+        assert forced[0].rerank_score is not None
+        assert 0.0 <= forced[0].score <= 1.0, "RRF score must survive the rerank"
+
+    def test_query_rerank_override_false_skips_encoder(self, monkeypatch):
+        # `rerank=False` must not merely discard the rerank score — it must
+        # never load or call the cross-encoder at all. The in-process hook
+        # fallback depends on this to stay inside its latency budget.
+        from recall import qdrant_backend as qb
+
+        calls = {"n": 0}
+
+        class _CountingEncoder:
+            def rerank(self, query, texts):
+                calls["n"] += 1
+                return [0.0 for _ in texts]
+
+        monkeypatch.setattr(qb, "_get_cross_encoder", lambda model: _CountingEncoder())
+
+        docs = [
+            _make_doc(f"d{i}", f"alpha bravo charlie number {i}") for i in range(3)
+        ]
+        retriever = HybridRetriever(docs, reranker="cross_encoder", rerank_n=10)
+        results = retriever.query("alpha bravo charlie", k=2, rerank=False)
+
+        assert results, "expected results with rerank=False"
+        assert calls["n"] == 0, "cross-encoder was invoked despite rerank=False"
+        assert all(r.rerank_score is None for r in results)
+
+    def test_demote_scales_rerank_score_too(self, monkeypatch):
+        # A needs_review memory must be demoted on the signal the ranking
+        # actually uses. If `demote` scaled only the RRF score, a stale doc
+        # with a high cross-encoder score would keep the top slot AND sail
+        # through the `auto_recall_min_rerank` gate at full strength.
+        from recall import qdrant_backend as qb
+
+        class _FakeEncoder:
+            def rerank(self, query, texts):
+                return [1.0 if "RERANKWINNER" in t else 0.0 for t in texts]
+
+        monkeypatch.setattr(qb, "_get_cross_encoder", lambda model: _FakeEncoder())
+
+        flagged = Document(
+            path="/synth/brain/stale-runbook.md",
+            source="brain",
+            title="stale-runbook",
+            frontmatter={
+                "name": "stale-runbook",
+                "description": "alpha bravo charlie",
+                "type": "reference",
+                "needs_review": True,
+            },
+            body="RERANKWINNER",
+            text=(
+                "stale-runbook alpha bravo charlie alpha bravo charlie "
+                "alpha bravo charlie RERANKWINNER"
+            ),
+        )
+        docs = [flagged] + [
+            _make_doc(f"d{i}", "alpha bravo charlie") for i in range(3)
+        ]
+        retriever = HybridRetriever(
+            docs,
+            reranker="cross_encoder",
+            rerank_n=10,
+            needs_review_policy="demote",
+            needs_review_penalty=0.5,
+        )
+        results = retriever.query("alpha bravo charlie", k=4)
+
+        by_name = {r.document.frontmatter["name"]: r for r in results}
+        assert "stale-runbook" in by_name, "flagged doc should be demoted, not dropped"
+        # Raw encoder score 1.0 x penalty 0.5.
+        assert by_name["stale-runbook"].rerank_score == pytest.approx(0.5)
+        others = [r for name, r in by_name.items() if name != "stale-runbook"]
+        assert others, "expected unflagged results alongside the demoted one"
+        assert all(r.rerank_score == pytest.approx(0.0) for r in others), (
+            "unflagged results must keep their raw rerank scores"
+        )
 
     def test_reranker_default_is_none(self):
         # Sanity: HybridRetriever() default value matches RankingConfig default.

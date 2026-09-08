@@ -67,7 +67,11 @@ _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE.parent / "memory"))
 
-from _atomic import atomic_write_text  # noqa: E402
+from _atomic import (  # noqa: E402
+    atomic_write_text,
+    episodic_files,
+    rotate_if_oversize,
+)
 
 # Redaction: re-use redact_jsonl.py's `redact_string()` with the shared
 # per-brain pattern set from _redact_common (builtin + multiline + private
@@ -133,25 +137,30 @@ def _load_seen_from_episodic(episodic_path: Path) -> set[str]:
     Defends against sidecar loss: if `_imported.jsonl` is deleted but
     `AGENT_LEARNINGS.jsonl` still has the episodes, reading them gives
     us the same dedup guarantee a fresh sidecar would.
+
+    Reads rolled siblings as well as the current file. Once rotation moves
+    history into `AGENT_LEARNINGS.<day>.jsonl`, a current-file-only preload
+    would think the whole backlog was unimported and duplicate it.
     """
     seen: set[str] = set()
-    if not episodic_path.is_file():
-        return seen
-    try:
-        for line in episodic_path.read_text().splitlines():
-            if not line.strip():
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            src = row.get("source")
-            if isinstance(src, dict):
-                tuid = src.get("tool_use_id")
-                if isinstance(tuid, str):
-                    seen.add(tuid)
-    except OSError:
-        pass
+    for path in episodic_files(episodic_path):
+        if not path.is_file():
+            continue
+        try:
+            for line in path.read_text().splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                src = row.get("source")
+                if isinstance(src, dict):
+                    tuid = src.get("tool_use_id")
+                    if isinstance(tuid, str):
+                        seen.add(tuid)
+        except OSError:
+            continue
     return seen
 
 
@@ -487,7 +496,16 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if new_episodes:
         episodic_path.parent.mkdir(parents=True, exist_ok=True)
-        existing_text = episodic_path.read_text() if episodic_path.is_file() else ""
+        # Full-file rewrite: roll an oversize file away BEFORE reading it,
+        # or every import re-reads and re-writes the whole backlog. The
+        # dedup preload above already globs the rolled files, so rotating
+        # here cannot cause a re-import.
+        rolled = rotate_if_oversize(episodic_path)
+        existing_text = (
+            episodic_path.read_text()
+            if rolled is None and episodic_path.is_file()
+            else ""
+        )
         new_text = existing_text + "\n".join(new_episodes) + ("\n" if new_episodes else "")
         atomic_write_text(episodic_path, new_text)
         print(f"  wrote:            {episodic_path}")

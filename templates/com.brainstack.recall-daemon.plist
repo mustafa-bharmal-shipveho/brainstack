@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Warm recall daemon launchd job (S3).
+
+  Holds one HybridRetriever and owns the embedded Qdrant store, so the
+  Claude Code auto-recall hook, `recall query`, `recall reindex`, and
+  recall-mcp all answer in tens of milliseconds instead of paying a cold
+  embedder/Qdrant load on every fire. The cross-encoder reranker is opt-in
+  (add the `rerank` flag to ProgramArguments); it is off by default because
+  it measured no ordering gain for several times the latency.
+
+  Install with `install.sh` and its `setup-daemon` flag, not by hand. That
+  path renders the placeholders, lints the result, and loads it.
+
+  Placeholders. All four must be substituted; install.sh refuses to load a
+  rendered plist that still contains a double underscore, because launchd
+  silently refuses such a unit and the user just never gets a daemon:
+    PYTHON_ABS   absolute path to the venv's python3 (e.g.
+                 /Users/you/brainstack/.venv/bin/python3)
+    REPO_DIR     absolute path to the brainstack checkout (PYTHONPATH)
+    BRAIN_ROOT   absolute path to the brain root (usually ~/.agent)
+    HOME         the user's home directory
+  Each appears below wrapped in double underscores.
+
+  Tear down with install.sh's `remove-daemon` flag: it unloads the job,
+  deletes this file, and stops any resident daemon.
+
+  NOTE: this is an XML comment, so it must not contain two consecutive
+  hyphens. Write flags as `setup-daemon`, never with their leading dashes.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.brainstack.recall-daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON_ABS__</string>
+        <string>-m</string>
+        <string>recall.cli</string>
+        <string>serve</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>__REPO_DIR__</string>
+        <key>BRAIN_ROOT</key>
+        <string>__BRAIN_ROOT__</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:__REPO_DIR__/.venv/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>__BRAIN_ROOT__/runtime/logs/recall-daemon.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>__BRAIN_ROOT__/runtime/logs/recall-daemon.stderr.log</string>
+</dict>
+</plist>

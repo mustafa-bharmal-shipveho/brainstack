@@ -396,6 +396,42 @@ class TestSyncStatusParser:
         # No sync.log at all
         assert rps._check_sync_status(tmp_path) == "missing"
 
+    def test_unreadable_log_returns_missing_not_ok(self, tmp_path: Path):
+        """A log we cannot open tells us nothing about the last sync, so
+        it must read as 'missing' — not fall through to the mtime check
+        and get called 'ok' because the file was touched an hour ago."""
+        rps = self._import()
+        log = tmp_path / "sync.log"
+        log.write_text("2026-05-05T13:00:00Z sync: pushed\n")
+        log.chmod(0o000)
+        try:
+            if os.access(log, os.R_OK):
+                pytest.skip("running as root; the log stays readable")
+            assert rps._check_sync_status(tmp_path) == "missing"
+        finally:
+            log.chmod(0o644)
+
+    def test_tail_reads_the_end_of_a_long_log_not_the_whole_file(
+            self, tmp_path: Path):
+        """sync.log is append-only and grows with the user's uptime; the
+        banner only ever cares about the last run. The seek-based tail
+        must return exactly what reading the whole file and slicing would
+        — including when the last 400 lines are fatter than one read
+        window, and when the window boundary splits a UTF-8 character."""
+        rps = self._import()
+        log = tmp_path / "sync.log"
+
+        for body in (
+            "".join(f"{i} héllo\n" for i in range(5000)),
+            "".join(f"{i} " + "x" * 2000 + "\n" for i in range(600)),
+            "a\nb\nc",          # no trailing newline
+            "",                  # empty file
+        ):
+            log.write_text(body)
+            assert rps._sync_log_tail(tmp_path) == (
+                body.splitlines()[-400:]
+            ), f"tail diverged for a {len(body)}-byte log"
+
 
 class TestComposeSummarySyncMessageMatchesReason:
     """The rendered Sync section MUST say what actually happened. The bug we
@@ -1260,3 +1296,554 @@ class TestSyncStatusMissingScanner:
             f"sync section must mention the missing scanner so the user "
             f"knows to install trufflehog/gitleaks; got:\n{body}"
         )
+
+
+# ---------- TestSyncErrorAndHealthSections ------------------------------
+
+
+class TestSyncErrorAndHealthSections:
+    """S5 requirements 2 and 3: PENDING_REVIEW.md must quote the actual git
+    error behind a failed push, name the files a size gate held back, and
+    carry a `## Health` section fed by `runtime/health.json`.
+
+    The failure this closes: on 2026-09-04 the brain had been stuck 67
+    commits behind for five days because a 107 MB episodic file was rejected
+    by GitHub. `sync.log` had the exact `remote: error:` line the whole time.
+    PENDING_REVIEW said "the next hourly sync will retry" and nothing else,
+    so the retry loop looked like patience instead of a wall."""
+
+    def _import(self):
+        import importlib
+        import render_pending_summary
+        importlib.reload(render_pending_summary)
+        return render_pending_summary
+
+    def _seed_log(self, brain: Path, last_lines: list[str]) -> None:
+        """Write a sync.log whose tail is the given lines, fresh mtime."""
+        log = brain / "sync.log"
+        log.write_text("\n".join(last_lines) + "\n")
+        import time
+        os.utime(log, (time.time(), time.time()))
+
+    REMOTE_ERROR = (
+        "remote: error: File memory/episodic/codex/AGENT_LEARNINGS.jsonl is "
+        "107.26 MB; this exceeds GitHub's file size limit of 100.00 MB"
+    )
+
+    @staticmethod
+    def _section(body: str, heading: str) -> str:
+        """The body of one `## ` section, up to the next heading.
+
+        Negative assertions about the Health section have to be scoped this
+        way: words like "drift" and "in sync" are legitimate elsewhere in
+        PENDING_REVIEW.md, so searching the whole document would either pass
+        for the wrong reason or fail on unrelated text."""
+        lines = body.splitlines()
+        assert heading in lines, f"no {heading!r} section in:\n{body}"
+        out: list[str] = []
+        for ln in lines[lines.index(heading) + 1:]:
+            if ln.startswith("## "):
+                break
+            out.append(ln)
+        return "\n".join(out)
+
+    def _health(self, checks: list[dict], *, stale: bool = False,
+                hours_old: float = 0.5) -> dict:
+        import datetime as _dt
+        generated = (
+            _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=hours_old)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        counts = {"PASS": 0, "WARN": 0, "FAIL": 0, "SKIP": 0}
+        for c in checks:
+            counts[c["status"]] = counts.get(c["status"], 0) + 1
+        status = "FAIL" if counts["FAIL"] else ("WARN" if counts["WARN"] else "PASS")
+        return {
+            "schema_version": 1,
+            "generated_at": generated,
+            "brain_root": "/Users/x/.agent",
+            "cwd": "/Users/x/.agent",
+            "status": status,
+            "counts": counts,
+            "checks": checks,
+            "stale": stale,
+        }
+
+    # ---------- blocked-network detail ----------
+
+    def test_network_block_quotes_remote_error(self, tmp_path: Path):
+        """"push failed" alone is not actionable. The line git printed is."""
+        rps = self._import()
+        tail = [
+            "2026-09-04T13:00:00Z sync: starting",
+            "2026-09-04T13:00:09Z Enumerating objects: 42, done.",
+            f"2026-09-04T13:00:10Z {self.REMOTE_ERROR}",
+            "2026-09-04T13:00:11Z sync: commit succeeded but push failed",
+        ]
+        assert rps._last_remote_error(tail) == self.REMOTE_ERROR, (
+            "the parser must pick the remote: error: line out of the run"
+        )
+
+        body = rps.compose_summary(
+            tmp_path, drift_report=None, sync_status="blocked-network",
+            sync_error=self.REMOTE_ERROR,
+        )
+        assert "Last remote error:" in body
+        assert self.REMOTE_ERROR in body
+        assert f"`{self.REMOTE_ERROR}`" in body, (
+            "the raw git line must be quoted verbatim, not paraphrased"
+        )
+        # The old advice still applies: the commit is safe locally — and the
+        # command names the brain this banner was rendered for, not `~/.agent`.
+        assert f"{tmp_path}/tools/sync.sh" in body
+
+    def test_network_block_without_error_falls_back(self, tmp_path: Path):
+        """Older sync.log formats capture no git output. Say so rather than
+        implying we know the cause."""
+        rps = self._import()
+        body = rps.compose_summary(
+            tmp_path, drift_report=None, sync_status="blocked-network",
+        )
+        assert "no git error captured in sync.log" in body
+        assert "Last remote error:" not in body
+
+    def test_network_block_hints_large_file_on_gh001(self, tmp_path: Path):
+        """A size rejection is a permanent failure: retrying hourly forever
+        will not fix it. Point at the check that names the file."""
+        rps = self._import()
+        body = rps.compose_summary(
+            tmp_path, drift_report=None, sync_status="blocked-network",
+            sync_error="remote: error: GH001: Large files detected. You may want "
+                       "to try Git Large File Storage",
+        )
+        assert "recall health" in body
+        assert "large_tracked_files" in body
+
+    # ---------- oversize hold-back ----------
+
+    def test_oversize_status_lists_paths(self, tmp_path: Path):
+        rps = self._import()
+        self._seed_log(tmp_path, [
+            "2026-09-04T13:00:00Z sync: oversize (not pushed): "
+            "memory/episodic/codex/AGENT_LEARNINGS.jsonl "
+            "(114294784 bytes > 52428800-byte limit)",
+            "2026-09-04T13:00:01Z sync: held back 1 oversize file(s) (>50 MB); "
+            "syncing the rest",
+            "2026-09-04T13:00:02Z sync: pushed",
+        ])
+
+        status = rps._check_sync_status(tmp_path)
+        assert status == "oversize", (
+            f"a run that pushed but skipped a >50 MB file is not 'ok'; got {status!r}"
+        )
+
+        body = rps.compose_summary(
+            tmp_path, drift_report=None, sync_status=status,
+            held_back={"secret": [],
+                       "oversize": ["memory/episodic/codex/AGENT_LEARNINGS.jsonl"]},
+        )
+        assert "held back 1 file" in body
+        assert "50 MB" in body
+        assert "memory/episodic/codex/AGENT_LEARNINGS.jsonl" in body
+        assert "rm --cached" in body
+        assert "./install.sh --upgrade" in body
+
+    def test_held_back_paths_parses_both_kinds(self, tmp_path: Path):
+        """Secret quarantine and size hold-back use different markers and
+        need different advice; one parser returns both, keyed apart."""
+        rps = self._import()
+        tail = [
+            "2026-09-04T13:00:00Z sync: quarantined (not pushed): "
+            "memory/semantic/lessons/leaky.md",
+            "2026-09-04T13:00:01Z sync: oversize (not pushed): "
+            "memory/episodic/codex/AGENT_LEARNINGS.jsonl "
+            "(114294784 bytes > 52428800-byte limit)",
+            "2026-09-04T13:00:02Z sync: pushed",
+        ]
+
+        held = rps._held_back_paths(tail)
+
+        assert held["secret"] == ["memory/semantic/lessons/leaky.md"]
+        assert held["oversize"] == ["memory/episodic/codex/AGENT_LEARNINGS.jsonl"], (
+            "the size suffix must be stripped; the value is a path"
+        )
+        assert rps._last_run_oversize(tail) is True
+
+    # ---------- the trailing `health:` line the EXIT trap always writes ----
+
+    # sync.sh's EXIT trap appends this on EVERY exit path, so the run's
+    # terminal `sync:` marker is never physically the last line of the log.
+    # A backward scan that treats the marker as "not the last line" breaks
+    # one line above the git stderr it was sent to find, which is why no
+    # push failure ever reached the banner with its cause attached
+    # (2026-09-04 smoke test, Defect 1).
+    HEALTH_TRAILER = "2026-09-04T15:36:24Z health: wrote runtime/health.json"
+    TERMINAL_MARKER = (
+        "2026-09-04T15:36:23Z sync: commit succeeded but push failed; "
+        "brain is committed locally"
+    )
+    FIRST_FATAL = (
+        "fatal: '/tmp/rsd-smoke-oAQ6/remote.git' does not appear to be a "
+        "git repository"
+    )
+
+    def _failed_push_tail(self) -> list[str]:
+        return [
+            "2026-09-04T15:36:20Z sync: starting",
+            f"2026-09-04T15:36:22Z {self.REMOTE_ERROR}",
+            self.TERMINAL_MARKER,
+            self.HEALTH_TRAILER,
+        ]
+
+    def test_remote_error_survives_the_trailing_health_line(self):
+        rps = self._import()
+
+        assert rps._last_remote_error(self._failed_push_tail()) == self.REMOTE_ERROR
+
+    STRAY_STDERR = [
+        "Traceback (most recent call last):",
+        '  File "/Users/me/.local/bin/recall", line 8, in <module>',
+        "libc++abi: terminating due to uncaught exception of type "
+        "std::__1::system_error: recursive_mutex lock failed: Invalid argument",
+    ]
+
+    def test_remote_error_survives_unprefixed_stderr_after_the_marker(self):
+        """`recall health` runs from the EXIT trap, after the marker; anything
+        it wrote to stderr un-prefixed is neither `health:` nor `sync:`.
+        Such lines belong to no run and must not anchor the scan, or the
+        current run's own marker ends it before the git stderr above
+        (staff follow-up review, M1)."""
+        rps = self._import()
+        tail = self._failed_push_tail()
+        tail[-1:-1] = self.STRAY_STDERR  # between the marker and the trailer
+
+        assert rps._last_remote_error(tail) == self.REMOTE_ERROR
+
+    def test_held_back_paths_survive_unprefixed_stderr_after_the_marker(self):
+        rps = self._import()
+        tail = [
+            "2026-09-04T15:34:53Z sync: quarantined (not pushed): "
+            "memory/semantic/leaky.md",
+            "2026-09-04T15:34:53Z sync: held back 1 file(s) with possible "
+            "secrets; syncing the rest",
+            "2026-09-04T15:34:53Z sync: pushed",
+            *self.STRAY_STDERR,
+            "2026-09-04T15:34:59Z health: wrote runtime/health.json",
+        ]
+
+        assert rps._held_back_paths(tail)["secret"] == ["memory/semantic/leaky.md"]
+        assert rps._last_run_quarantined(tail) is True
+
+    def test_remote_error_ignores_a_marker_phrase_on_an_unprefixed_line(self):
+        """Staff delta review, M1: only a `sync:` line can end a run; a stray
+        line that merely contains "push failed" must not."""
+        rps = self._import()
+        tail = self._failed_push_tail()
+        tail[-1:-1] = ["UserWarning: previous push failed, see log"]
+
+        assert rps._last_remote_error(tail) == self.REMOTE_ERROR
+
+    def test_sync_status_ignores_a_quoted_sync_line_inside_health_stderr(self, tmp_path: Path):
+        """Staff delta review, M3: `health: stderr:` lines can quote anything,
+        including an old `sync: ... push failed` message. The run's status
+        comes from the run's own last `sync:` line — here `sync: pushed`."""
+        rps = self._import()
+        tail = [
+            "2026-09-08T13:54:20Z sync: starting",
+            "2026-09-08T13:54:34Z sync: pushed",
+            "2026-09-08T13:54:36Z health: stderr: WARNING previous run: "
+            "sync: commit succeeded but push failed; brain is committed locally",
+            "2026-09-08T13:54:36Z health: wrote runtime/health.json",
+        ]
+
+        (tmp_path / "sync.log").write_text("\n".join(tail) + "\n")
+
+        status = rps._check_sync_status(tmp_path, tail_lines=tail)
+
+        assert status == "ok", status
+
+    def test_remote_error_parsers_agree(self):
+        """`recall.health._sync_log_remote_error` and this twin are read by
+        the same user on the same log. Pin them on one fixture so they can
+        never disagree about what the last run failed with."""
+        rps = self._import()
+        from recall.health import _sync_log_remote_error
+
+        tail = self._failed_push_tail()
+
+        assert (
+            rps._last_remote_error(tail)
+            == _sync_log_remote_error("\n".join(tail) + "\n")
+            == self.REMOTE_ERROR
+        )
+
+    def test_remote_error_returns_first_fatal_when_remote_never_answered(self):
+        """A dead remote, bad key or DNS failure prints `fatal:` and never
+        `remote: error:`. The first fatal names the cause; the second is
+        boilerplate."""
+        rps = self._import()
+        from recall.health import _sync_log_remote_error
+
+        tail = [
+            "2026-09-04T15:36:20Z sync: starting",
+            f"2026-09-04T15:36:21Z {self.FIRST_FATAL}",
+            "2026-09-04T15:36:21Z fatal: Could not read from remote repository.",
+            self.TERMINAL_MARKER,
+            self.HEALTH_TRAILER,
+        ]
+
+        assert (
+            rps._last_remote_error(tail)
+            == _sync_log_remote_error("\n".join(tail) + "\n")
+            == self.FIRST_FATAL
+        )
+
+    def test_remote_error_scoped_to_the_last_run(self):
+        """Two consecutive runs in the order sync.sh writes them: marker,
+        then the EXIT trap's `health:` line. A five-day-old rejection must
+        never be quoted as if it were today's."""
+        rps = self._import()
+        from recall.health import _sync_log_remote_error
+
+        tail = [
+            "2026-08-30T10:00:00Z remote: error: OLD-RUN-ERROR must not be quoted",
+            "2026-08-30T10:00:01Z sync: commit succeeded but push failed",
+            "2026-08-30T10:00:02Z health: wrote runtime/health.json",
+            f"2026-09-04T15:36:22Z {self.REMOTE_ERROR}",
+            self.TERMINAL_MARKER,
+            self.HEALTH_TRAILER,
+        ]
+
+        assert (
+            rps._last_remote_error(tail)
+            == _sync_log_remote_error("\n".join(tail) + "\n")
+            == self.REMOTE_ERROR
+        )
+
+    def test_remote_error_skips_interleaved_health_lines(self):
+        """A `health:` line can also land mid-run. It is transparent either
+        way — it ends no run and is never quoted, even carrying "error:"."""
+        rps = self._import()
+        from recall.health import _sync_log_remote_error
+
+        tail = [
+            "2026-08-30T10:00:00Z remote: error: OLD-RUN-ERROR must not be quoted",
+            "2026-08-30T10:00:01Z sync: pushed",
+            "2026-09-04T15:36:19Z health: error: could not write runtime/health.json",
+            f"2026-09-04T15:36:22Z {self.REMOTE_ERROR}",
+            self.TERMINAL_MARKER,
+            self.HEALTH_TRAILER,
+        ]
+
+        assert (
+            rps._last_remote_error(tail)
+            == _sync_log_remote_error("\n".join(tail) + "\n")
+            == self.REMOTE_ERROR
+        )
+
+    def test_remote_error_never_quotes_a_health_line(self):
+        """`health:` lines are brainstack's own output. A clean push followed
+        by a failed health write is not a push failure."""
+        rps = self._import()
+        from recall.health import _sync_log_remote_error
+
+        tail = [
+            "2026-09-04T15:36:23Z sync: pushed",
+            "2026-09-04T15:36:24Z health: error: could not write runtime/health.json",
+        ]
+
+        assert rps._last_remote_error(tail) is None
+        assert _sync_log_remote_error("\n".join(tail) + "\n") is None
+
+    def test_held_back_paths_survive_the_trailing_health_line(self, tmp_path: Path):
+        """Same boundary bug, same fix: the oversize path list came back
+        empty in production, so the banner fell back to "see sync.log"
+        instead of naming the file (2026-09-04 smoke test)."""
+        rps = self._import()
+        tail = [
+            "2026-09-04T15:34:53Z sync: oversize (not pushed): "
+            "memory/semantic/digests/huge-transcript-dump.md "
+            "(53477376 bytes > 52428800-byte limit)",
+            "2026-09-04T15:34:53Z sync: held back 1 oversize file(s) (>50 MB); "
+            "syncing the rest",
+            "2026-09-04T15:34:53Z sync: pushed",
+            "2026-09-04T15:34:59Z health: wrote runtime/health.json",
+        ]
+
+        held = rps._held_back_paths(tail)
+
+        assert held["oversize"] == [
+            "memory/semantic/digests/huge-transcript-dump.md"
+        ]
+        assert rps._last_run_oversize(tail) is True
+        assert rps._last_run_quarantined(tail) is True
+
+        # ...and the banner names the file instead of falling back to
+        # "see sync.log", which is all the user got in the smoke run.
+        body = rps.compose_summary(
+            tmp_path, drift_report=None, sync_status="oversize", held_back=held,
+        )
+        assert "`memory/semantic/digests/huge-transcript-dump.md`" in body
+        assert "sync.log`" not in body
+
+    # ---------- fix hints name the brain they run against ----------
+
+    @pytest.mark.parametrize("sync_status", [
+        "blocked-noscanner", "blocked-trufflehog", "blocked-precommit",
+        "blocked-network", "blocked-scanner", "blocked-unstage",
+        "quarantined", "oversize",
+    ])
+    def test_fix_hints_name_the_actual_brain_root(
+        self, tmp_path: Path, sync_status: str
+    ):
+        """Every command in this file is pasted into a shell. Hardcoding
+        `~/.agent` told a sandbox user to run `git -C ~/.agent rm --cached`
+        against a repository that was not the one the banner described
+        (2026-09-04 smoke test, "Read as a human" #8)."""
+        rps = self._import()
+        brain = tmp_path / "sandbox-brain"
+        (brain / "memory" / "candidates").mkdir(parents=True)
+
+        body = rps.compose_summary(
+            brain, drift_report=None, sync_status=sync_status,
+            sync_error=self.REMOTE_ERROR,
+            held_back={"secret": [], "oversize": []},
+            health=self._health([
+                {"id": "brain_push", "status": "FAIL",
+                 "evidence": "2 commits ahead of origin/main", "fix": ""},
+            ]),
+        )
+
+        assert "~/.agent" not in body, (
+            "the banner must never name a brain the user is not running"
+        )
+        assert str(brain) in body
+
+    def test_oversize_fallback_points_at_this_brains_sync_log(self, tmp_path: Path):
+        rps = self._import()
+        brain = tmp_path / "sandbox-brain"
+        (brain / "memory" / "candidates").mkdir(parents=True)
+
+        body = rps.compose_summary(
+            brain, drift_report=None, sync_status="oversize",
+            held_back={"secret": [], "oversize": []},
+        )
+
+        assert f"`{brain}/sync.log`" in body
+        assert f"git -C {brain} rm --cached <path>" in body
+
+    def test_fix_hints_keep_tilde_for_the_default_brain(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """`/Users/<you>/.agent/tools/sync.sh` is correct but noisy. When the
+        brain really is the default, keep the short readable form."""
+        rps = self._import()
+        monkeypatch.setenv("HOME", str(tmp_path))
+        brain = tmp_path / ".agent"
+        (brain / "memory" / "candidates").mkdir(parents=True)
+
+        body = rps.compose_summary(
+            brain, drift_report=None, sync_status="quarantined",
+        )
+
+        assert "`~/.agent/sync.log`" in body
+        assert str(tmp_path) not in body
+
+    # ---------- health section ----------
+
+    def test_health_section_lists_fail_and_warn_with_fix(self, tmp_path: Path):
+        rps = self._import()
+        health = self._health([
+            {"id": "imports_freshness", "status": "FAIL",
+             "evidence": "mirror imports/claude/projects: never mirrored",
+             "fix": "./install.sh --setup-claude-extras"},
+            {"id": "log_sizes", "status": "WARN",
+             "evidence": "events.log.jsonl 66.4 MB exceed 20 MB", "fix": ""},
+            {"id": "daemon", "status": "SKIP", "evidence": "not configured",
+             "fix": ""},
+            {"id": "drift", "status": "PASS", "evidence": "in sync", "fix": ""},
+        ])
+
+        body = rps.compose_summary(
+            tmp_path, drift_report={"in_sync": True, "summary": "in sync"},
+            sync_status="ok", health=health,
+        )
+
+        assert "## Health" in body
+        section = self._section(body, "## Health")
+        assert ("- FAIL `imports_freshness` — mirror imports/claude/projects: "
+                "never mirrored") in section
+        assert "fix: ./install.sh --setup-claude-extras" in section
+        assert "- WARN `log_sizes` — events.log.jsonl 66.4 MB exceed 20 MB" in section
+        # Passing and skipped checks are noise here; the full report has them.
+        assert "daemon" not in section
+        assert "in sync" not in section
+        assert "recall health" in section
+        assert "⚠️ health 1 fail" in body
+
+    def test_health_all_pass_keeps_all_clear(self, tmp_path: Path):
+        """A clean health report must not cost the user the one-liner; a
+        WARN must break it, or the section would never be read."""
+        rps = self._import()
+        clean = self._health([
+            {"id": "drift", "status": "PASS", "evidence": "in sync", "fix": ""},
+            {"id": "daemon", "status": "SKIP", "evidence": "not configured",
+             "fix": ""},
+        ])
+
+        body = rps.compose_summary(
+            tmp_path, drift_report={"in_sync": True, "summary": "in sync"},
+            sync_status="ok", health=clean,
+        )
+        assert "all clear" in body.lower()
+        assert "## Health" not in body
+
+        warned = self._health([
+            {"id": "log_sizes", "status": "WARN",
+             "evidence": "events.log.jsonl 66.4 MB exceed 20 MB", "fix": ""},
+        ])
+        noisy = rps.compose_summary(
+            tmp_path, drift_report={"in_sync": True, "summary": "in sync"},
+            sync_status="ok", health=warned,
+        )
+        assert "all clear" not in noisy.lower()
+        assert "## Health" in noisy
+
+    def test_stale_health_flagged_in_headline(self, tmp_path: Path):
+        """A 40-hour-old report is not evidence that anything is fine. It is
+        evidence that the hourly agent died."""
+        rps = self._import()
+        stale = self._health(
+            [{"id": "drift", "status": "PASS", "evidence": "in sync", "fix": ""}],
+            stale=True, hours_old=40.1,
+        )
+
+        body = rps.compose_summary(
+            tmp_path, drift_report={"in_sync": True, "summary": "in sync"},
+            sync_status="ok", health=stale,
+        )
+
+        assert "all clear" not in body.lower()
+        assert "⚠️ health stale" in body
+        assert "40h old" in body
+        assert "LaunchAgent" in body
+
+    def test_health_lines_do_not_break_sync_status_classification(
+        self, tmp_path: Path
+    ):
+        """sync.sh writes `health:` lines from the same trap that ends a run,
+        so they land AFTER the terminal `sync:` marker. The classifier reads
+        `sync:` lines only; a health line must never shadow the verdict."""
+        rps = self._import()
+
+        self._seed_log(tmp_path, [
+            "2026-09-04T13:00:00Z sync: pushed",
+            "2026-09-04T13:00:01Z health: wrote runtime/health.json",
+        ])
+        assert rps._check_sync_status(tmp_path) == "ok"
+
+        self._seed_log(tmp_path, [
+            "2026-09-04T13:00:00Z sync: commit succeeded but push failed; "
+            "brain is committed locally",
+            "2026-09-04T13:00:01Z health: recall CLI not found; skipped",
+        ])
+        assert rps._check_sync_status(tmp_path) == "blocked-network"

@@ -312,6 +312,65 @@ def resolve_brain_home() -> Path:
     return xdg_data_home() / "brain"
 
 
+def daemon_socket_path(raw: "str | None" = None) -> Path:
+    """Resolve the warm recall daemon's AF_UNIX socket path (S3).
+
+    Single resolution order shared by the hook, the CLI, and the daemon
+    itself: `$RECALL_DAEMON_SOCKET` env override > `raw` (config literal,
+    with `$BRAIN_ROOT`/`~` expansion) > `$BRAIN_ROOT/runtime/recall.sock` >
+    `$BRAIN_HOME`'s parent > `~/.agent/runtime/recall.sock`.
+
+    `raw`'s `$BRAIN_ROOT` / `${BRAIN_ROOT}` placeholder is expanded via
+    `brain_root()` rather than the raw `BRAIN_ROOT` env var directly. The
+    runtime config's own default literal is `"$BRAIN_ROOT/runtime/recall.sock"`,
+    but the normal Claude Code hook environment does NOT export
+    `$BRAIN_ROOT` — hooks never set it. Expanding through the raw env alone
+    would leave the literal text `"$BRAIN_ROOT"` in the returned path.
+    `brain_root()` carries the same "env > $BRAIN_HOME's parent > ~/.agent
+    convention" fallback that a bare `BRAIN_ROOT` env lookup would want, so
+    the default resolves to a real path (typically `~/.agent/runtime/recall.sock`)
+    even with `BRAIN_ROOT` unset.
+
+    The last three tiers (no `raw` at all) deliberately check the raw env
+    vars directly (not `resolve_brain_home()`'s fuller fallback chain, which
+    also probes `~/.agent/memory` on disk and an XDG default) — the daemon
+    socket has its own, simpler default of `~/.agent/runtime/recall.sock`
+    regardless of whether a brain happens to exist on disk yet.
+    """
+    env = os.environ.get("RECALL_DAEMON_SOCKET")
+    if env:
+        return _expand(env)
+    if raw:
+        if "$BRAIN_ROOT" in raw or "${BRAIN_ROOT}" in raw:
+            brain_root_value = str(brain_root())
+            raw = raw.replace("${BRAIN_ROOT}", brain_root_value)
+            raw = raw.replace("$BRAIN_ROOT", brain_root_value)
+        return _expand(raw)
+    brain_root_env = os.environ.get("BRAIN_ROOT")
+    if brain_root_env:
+        return _expand(brain_root_env) / "runtime" / "recall.sock"
+    brain_home_env = os.environ.get("BRAIN_HOME")
+    if brain_home_env:
+        return _expand(brain_home_env).parent / "runtime" / "recall.sock"
+    return _expand("~/.agent") / "runtime" / "recall.sock"
+
+
+def brain_root() -> Path:
+    """Resolve the brain's root directory (parent of the `memory/` tree).
+
+    `$BRAIN_ROOT` if set; else the parent of `resolve_brain_home()` when
+    that resolves to a `memory` directory; else `resolve_brain_home()`
+    itself.
+    """
+    env = os.environ.get("BRAIN_ROOT")
+    if env:
+        return _expand(env)
+    home = resolve_brain_home()
+    if home.name == "memory":
+        return home.parent
+    return home
+
+
 def config_path() -> Path:
     return xdg_config_home() / "recall" / "config.json"
 
@@ -409,6 +468,11 @@ def default_config() -> Config:
                     # semantic similarity, drowning out the actual source lessons.
                     "MEMORY.md",
                     "semantic/LESSONS.md",
+                    # Tombstoned/archived memories (`recall lint --dedupe-claims`,
+                    # `recall forget`): recoverable by hand, but never
+                    # retrievable and never injectable. Without this, an
+                    # "archived" claim or lesson stays fully live in the index.
+                    "semantic/archived/**",
                 ],
             ),
             _imports_source_default(),
@@ -588,7 +652,7 @@ def _config_from_dict(data: dict) -> Config:
             mode=mode,
             embedder=str(ranking_raw.get("embedder", "BAAI/bge-base-en-v1.5")),
             sparse_embedder=str(ranking_raw.get("sparse_embedder", "Qdrant/bm25")),
-            reranker=str(ranking_raw.get("reranker", "cross_encoder")),
+            reranker=str(ranking_raw.get("reranker", "none")),
             reranker_model=str(
                 ranking_raw.get("reranker_model", "jinaai/jina-reranker-v1-turbo-en")
             ),
@@ -602,7 +666,7 @@ def _config_from_dict(data: dict) -> Config:
             mode=str(ranking_raw.get("mode", "hybrid")),
             embedder=str(ranking_raw.get("embedder", "BAAI/bge-base-en-v1.5")),
             sparse_embedder=str(ranking_raw.get("sparse_embedder", "Qdrant/bm25")),
-            reranker=str(ranking_raw.get("reranker", "cross_encoder")),
+            reranker=str(ranking_raw.get("reranker", "none")),
             reranker_model=str(
                 ranking_raw.get("reranker_model", "jinaai/jina-reranker-v1-turbo-en")
             ),

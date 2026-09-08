@@ -20,8 +20,91 @@ See `llm_providers/__README.md` for a worked example.
 """
 from __future__ import annotations
 
+import os
+import re
+import shutil
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from pathlib import Path
+
+# S5 requirement 6: launchd/systemd jobs run with a minimal PATH that
+# omits `~/.local/bin`, `~/.claude/local`, nvm, etc. — where `claude` /
+# `codex` are actually installed on many machines. `find_cli` searches
+# these directories (in order) after `shutil.which` comes up empty.
+FALLBACK_BIN_DIRS = (
+    "~/.local/bin", "~/.claude/local", "/opt/homebrew/bin",
+    "/usr/local/bin", "~/.npm-global/bin", "~/.bun/bin",
+)
+
+_NVM_VERSION_RE = re.compile(r"v(\d+)\.(\d+)\.(\d+)")
+
+
+def _expand_dir(entry: str, home: Path) -> str:
+    """Expand a `~`-prefixed entry against `home`; leave absolute
+    entries (e.g. `/opt/homebrew/bin`) untouched."""
+    if entry == "~":
+        return str(home)
+    if entry.startswith("~/"):
+        return str(home / entry[2:])
+    return entry
+
+
+def fallback_bin_dirs(home: Path) -> list[str]:
+    """`FALLBACK_BIN_DIRS` expanded against `home`, in order.
+
+    Also the source of the PATH `auto_migrate_install` stamps into
+    generated launchd/systemd units: the job's PATH and the CLI lookup
+    are answers to the same question ("where does this machine keep
+    `claude` / `codex` / `recall`?") and must not drift apart.
+    """
+    return [_expand_dir(d, home) for d in FALLBACK_BIN_DIRS]
+
+
+def nvm_bin_dirs(home: Path) -> list[str]:
+    """`~/.nvm/versions/node/v*/bin`, newest version first (parsed
+    version tuple, not string sort — v9 must sort behind v20)."""
+    base = home / ".nvm" / "versions" / "node"
+    if not base.is_dir():
+        return []
+    versions: list[tuple[tuple[int, int, int], Path]] = []
+    for entry in base.iterdir():
+        if not entry.is_dir():
+            continue
+        m = _NVM_VERSION_RE.fullmatch(entry.name)
+        if not m:
+            continue
+        versions.append((tuple(int(g) for g in m.groups()), entry))  # type: ignore[arg-type]
+    versions.sort(key=lambda t: t[0], reverse=True)
+    return [str(entry / "bin") for _, entry in versions]
+
+
+def find_cli(name: str, *, home: Path | None = None) -> tuple[str | None, list[str]]:
+    """Resolve `name` to an absolute path: `shutil.which` first (bare —
+    honors the caller's real PATH), then `FALLBACK_BIN_DIRS` (expanded
+    against `home`), then `nvm_bin_dirs(home)`, newest node version
+    first. Returns `(path_or_None, dirs_searched)`; `dirs_searched` is
+    always the fully expanded list so a miss can be reported precisely.
+
+    Each fallback dir is checked via `shutil.which(name, path=dir)`
+    (not a manual `os.access` probe) so a test that mocks `shutil.which`
+    wholesale — to simulate "nothing on this machine has the CLI" —
+    correctly short-circuits every lookup, not just the bare one."""
+    resolved_home = (
+        home if home is not None
+        else Path(os.environ.get("HOME", str(Path.home())))
+    )
+    dirs = fallback_bin_dirs(resolved_home)
+    dirs.extend(nvm_bin_dirs(resolved_home))
+
+    which = shutil.which(name)
+    if which:
+        return (which, dirs)
+
+    for d in dirs:
+        hit = shutil.which(name, path=d)
+        if hit:
+            return (hit, dirs)
+    return (None, dirs)
 
 
 class LLMError(Exception):
@@ -75,6 +158,26 @@ class LLMProvider(ABC):
 
     name: str = ""
     default_model: str = ""
+    # Resolved absolute path once is_available() finds the CLI outside
+    # PATH (S5 R6) — argv[0] uses this instead of the bare name so a
+    # scheduled job with a minimal PATH can still exec it.
+    _bin: str | None = None
+
+    @staticmethod
+    def _not_found(cli: str, searched: list[str], install_hint: str) -> str:
+        """The skip reason for a CLI that is nowhere on this machine.
+
+        Names the PATH that was consulted, every fallback dir that was
+        searched, and what to install — a user who hits this must never
+        have to read source to know what is wrong. One wording for every
+        provider so the `ProviderNotAvailable` message stays readable
+        when several are listed together.
+        """
+        return (
+            f"{cli} CLI not on PATH (PATH={os.environ.get('PATH', '')}) "
+            f"nor in {', '.join(searched)} — {install_hint} or add "
+            f"its bin dir to PATH"
+        )
 
     @abstractmethod
     def is_available(self) -> tuple[bool, str]:

@@ -15,8 +15,120 @@ from __future__ import annotations
 
 import json
 import os
+import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+# `<stem>.<YYYY-MM-DD>[.N]<suffix>` — the exact shape `rolled_name` (below)
+# produces. Anchored so a sibling that merely shares the stem prefix
+# (`AGENT_LEARNINGS_imported.jsonl`, `AGENT_LEARNINGS_other.jsonl`) is never
+# mistaken for a roll of this stream. Mirrored — same rule, own copy — in
+# `runtime/core/locking._rolled_pattern` and `recall/stats._is_rolled_sibling`
+# (different deploy trees); every agent/memory/ consumer (`sdk.py`,
+# `consolidate.py`) calls `episodic_files` below instead of keeping its own.
+def _rolled_pattern(stem: str, suffix: str) -> re.Pattern[str]:
+    return re.compile(
+        rf"^{re.escape(stem)}\.\d{{4}}-\d{{2}}-\d{{2}}(?:\.\d+)?{re.escape(suffix)}$"
+    )
+
+# S5 rotation threshold (20 MiB) — shared naming rule with
+# agent/harness/hooks/_episodic_io.ROTATE_BYTES and
+# runtime/core/events.EVENT_LOG_ROTATE_BYTES.
+ROTATE_BYTES = 20 * 1024 * 1024
+
+
+def _today() -> str:
+    """UTC calendar day as `YYYY-MM-DD`, the stamp `rolled_name` inserts."""
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def rolled_name(path: Path, day: str) -> Path:
+    """Compute the rotated sibling name for `path` on day `day`.
+
+    Only the FINAL suffix counts as the extension, so a compound stem
+    survives: `AGENT_LEARNINGS.jsonl` -> `AGENT_LEARNINGS.<day>.jsonl`. On
+    a same-day collision a counter goes before the suffix
+    (`AGENT_LEARNINGS.<day>.1.jsonl`, `.2`, ...), so a day that rolls
+    several times never overwrites an earlier roll.
+    """
+    path = Path(path)
+    stem, suffix = path.stem, path.suffix
+    candidate = path.parent / f"{stem}.{day}{suffix}"
+    counter = 0
+    while candidate.exists():
+        counter += 1
+        candidate = path.parent / f"{stem}.{day}.{counter}{suffix}"
+    return candidate
+
+
+def rotate_if_oversize(
+    path: Path, *, max_bytes: int | None = None, today: str | None = None
+) -> Path | None:
+    """Rename `path` out of the way when it is STRICTLY LARGER than
+    `max_bytes`, returning the rolled path (or `None` if untouched).
+
+    Strictly greater, not at-or-over: a file sitting exactly at the
+    threshold must not roll, or a brain hovering at the limit would roll on
+    every write. `max_bytes` defaults to `ROTATE_BYTES` resolved HERE
+    rather than as a def-time default, so callers that thread no threshold
+    through (the codex / claude-session adapters) still see a
+    monkeypatched value.
+
+    This is the rotation site for the full-file REWRITERS. They read the
+    whole namespace file and write it back, so without a roll first an
+    oversize file is re-read and re-written on every import and never
+    shrinks. Callers hold the `.auto-migrate.lock` for their namespace.
+    """
+    limit = ROTATE_BYTES if max_bytes is None else max_bytes
+    path = Path(path)
+    if not limit:
+        return None
+    try:
+        if path.stat().st_size <= limit:
+            return None
+    except OSError:
+        return None  # missing / unreadable — nothing to roll
+    rolled = rolled_name(path, today or _today())
+    try:
+        os.replace(path, rolled)
+    except OSError:
+        return None
+    return rolled
+
+
+def episodic_files(current: Path) -> list[Path]:
+    """Rolled siblings of `current` (ascending by name), then `current`.
+
+    THE canonical implementation for the agent/memory/ tree — `sdk.py` and
+    `consolidate.py` both call this rather than keep their own copies. The
+    read side of rotation: history that moved into a rolled file must stay
+    visible to `sdk.stats`, the dream cycle, the consolidator and the
+    adapters' dedup preload. A candidate must match `_rolled_pattern`
+    (`<stem>.<YYYY-MM-DD>[.N]<suffix>`, anchored) to count as a roll of
+    this stream — a loose `<stem>*<suffix>` glob would also match an
+    unrelated sibling stream that merely shares the stem prefix, like
+    `AGENT_LEARNINGS_imported.jsonl`. Order is name-ascending, NOT
+    chronological — byte order puts `AGENT_LEARNINGS.<day>.1.jsonl` (the
+    SECOND roll of that day) before `AGENT_LEARNINGS.<day>.jsonl` (the
+    first). Every consumer that cares about time re-sorts by each entry's
+    own timestamp (`consolidate_once` does so explicitly); this list is
+    only "every file of the stream, current one last".
+
+    `current` is always last, even when it does not exist yet (every
+    consumer already tolerates a missing episodic file).
+    """
+    current = Path(current)
+    stem, suffix = current.stem, current.suffix
+    pattern = _rolled_pattern(stem, suffix)
+    try:
+        rolled = sorted(
+            p for p in current.parent.glob(f"{stem}*{suffix}")
+            if p.name != current.name and pattern.match(p.name)
+        )
+    except OSError:
+        rolled = []
+    return [*rolled, current]
 
 
 def atomic_write_bytes(path: os.PathLike[str] | str, data: bytes) -> None:

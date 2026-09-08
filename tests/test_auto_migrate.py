@@ -93,6 +93,12 @@ def _stage_brain(tmp_path: Path) -> Path:
         REPO_ROOT / "agent" / "tools" / "auto_migrate_install.py",
     ):
         shutil.copy(f, brain / "tools" / f.name)
+    # install.sh rsyncs the whole agent/tools/ tree, so a real brain never
+    # has auto_migrate_install.py without llm_providers/ beside it — and
+    # the generated unit's PATH is built from that package's bin-dir list.
+    shutil.copytree(REPO_ROOT / "agent" / "tools" / "llm_providers",
+                    brain / "tools" / "llm_providers",
+                    ignore=shutil.ignore_patterns("__pycache__"))
     shutil.copy(REPO_ROOT / "agent" / "memory" / "_atomic.py", brain / "memory")
     return brain
 

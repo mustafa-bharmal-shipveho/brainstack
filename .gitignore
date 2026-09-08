@@ -53,3 +53,6 @@ tmp/
 demo/brain/
 demo/.cache/
 demo/.config/
+
+# sqlite in-memory session artifact accidentally created by tooling
+:memory:*

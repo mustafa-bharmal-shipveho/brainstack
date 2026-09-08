@@ -268,7 +268,9 @@ class TestClaudeCodeProvider:
             )
 
         cmd = captured["cmd"]
-        assert cmd[0] == "claude"
+        # argv[0] is the resolved binary path once find_cli locates it
+        # outside PATH (S5 R6), so match the basename, not the bare name.
+        assert cmd[0].endswith("claude")
         assert "-p" in cmd
         assert "--output-format" in cmd and "json" in cmd
         assert "--model" in cmd and "haiku" in cmd
@@ -434,7 +436,9 @@ class TestCodexProvider:
             )
 
         cmd = captured["cmd"]
-        assert cmd[0] == "codex"
+        # argv[0] is the resolved binary path once find_cli locates it
+        # outside PATH (S5 R6), so match the basename, not the bare name.
+        assert cmd[0].endswith("codex")
         assert "exec" in cmd
         assert "--skip-git-repo-check" in cmd
         # Codex output post-hoc parsed: "answer" key must be present

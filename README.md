@@ -16,7 +16,7 @@ Your coding agents already learn things every session, then forget them by the n
 
 ![brainstack: a prompt is auto-enriched with a past lesson, the lesson is traced to its source, and an agent's durable write is refused](demo/demo.gif)
 
-Four beats: the per-prompt hook injects a past lesson before you ask; `recall trace` walks that lesson back to its provenance and originating session; a piped (non-human) `recall remember --reviewed` is refused while the default write lands staged for your review; `recall stats` shows the week's auto-recall ROI. Generated from [`demo/demo.tape`](demo/demo.tape) against a fully synthetic brain built by [`demo/make_demo_brain.py`](demo/make_demo_brain.py) (placeholder names only, safe to publish). Regenerate with `make demo` (requires [vhs](https://github.com/charmbracelet/vhs)).
+Four beats: the per-prompt hook injects a past lesson before you ask; `recall trace` walks that lesson back to its provenance and originating session; a piped (non-human) `recall remember --reviewed` is refused while the default write lands staged for your review; `recall stats` shows the week's auto-recall coverage and latency. Generated from [`demo/demo.tape`](demo/demo.tape) against a fully synthetic brain built by [`demo/make_demo_brain.py`](demo/make_demo_brain.py) (placeholder names only, safe to publish). Regenerate with `make demo` (requires [vhs](https://github.com/charmbracelet/vhs)).
 
 ## Why you can trust it
 
@@ -96,6 +96,7 @@ The full install enables everything. Skip any subset by passing flags to `./inst
 | `--no-launchd` | Hourly sync + nightly dream scheduler (launchd agents on macOS, systemd user timers on Linux) | You want to script the schedule yourself |
 | `--no-recall-first` | Recall-first directive in `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.cursor/.cursorrules` | You don't use those agents, or wire elsewhere |
 | `--no-auto-recall` | Claude Code UserPromptSubmit hook firing recall on every prompt | Want only agent-driven recall, not the unconditional sweep |
+| `--no-daemon` | Warm recall daemon LaunchAgent that keeps the retriever resident; reranking is opt-in (macOS; `--setup-daemon` / `--remove-daemon` manage it directly, see [docs/recall-daemon.md](docs/recall-daemon.md)) | Every query then pays a cold model load; only worth it if you cannot spare a resident process |
 | `--setup-systemd` | (Adds systemd user timers explicitly; `--remove-systemd` tears them down) | Wire Linux scheduling without re-running the full install |
 | `--yes` | (Accepts the install plan and migrate-discovery prompts non-interactively) | CI / scripted installs |
 | `--no-prompt` | (Decline all migrate prompts; still runs the other defaults) | CI / scripted installs |
@@ -167,6 +168,7 @@ Useful commands:
 | `recall reindex` | Rebuild the retrieval cache after large imports/edits. |
 | `recall stats --since 7d` | Inspect auto-recall usage and latency. |
 | `recall doctor` | Diagnose wiring: hook interpreter, model cache, retrieval mode, scanner, install root. Run this FIRST when something looks wrong. |
+| `recall health` | Check the running system: sync backlog, mirror freshness, log sizes, dream cycle, launch agents, drift. Exits 1 on FAIL. See [Health checks](#health-checks). |
 | `recall runtime replay` | Reconstruct what entered the agent's context, from logs. |
 
 Retrieval details and benchmark notes: [`recall/README.md`](recall/README.md).
@@ -254,6 +256,34 @@ recall runtime install-hooks
 
 Hooks are registered with the repo venv's Python interpreter; `recall doctor` verifies the hook interpreter, model cache, retrieval mode, scanner, and install root. Setup details: [`docs/claude-code-setup.md`](docs/claude-code-setup.md).
 
+### Health checks
+
+`recall doctor` checks that brainstack is wired correctly. `recall health` checks that it is still *working*: the background jobs run unattended, so a failure there is silent until something surfaces it.
+
+```bash
+recall health            # human-readable report; exit 1 on FAIL, 0 on PASS/WARN
+recall health --json     # same report as JSON
+recall doctor --health   # doctor output with the health report appended
+```
+
+Nine checks run against the live brain:
+
+| Check | Fails when |
+|---|---|
+| `imports_freshness` | The `~/.claude/projects/*/memory` mirror lags more than 24 h (over 2 h warns). |
+| `launch_agents` | A LaunchAgent plist is installed but launchd is not running it. A non-zero last exit warns. |
+| `brain_push` | The brain is ahead of its remote and the last successful push is over 3 h old. Quotes the `remote: error:` line from `sync.log`. |
+| `large_tracked_files` | A git-tracked file is over 50 MB, so GitHub will reject the push. |
+| `log_sizes` | An event log or episodic file is over 20 MB (warn). |
+| `dream_cycle` | The last dream cycle is over 36 h old, or the LLM provider was unavailable. |
+| `drift` | The brain no longer matches the brainstack checkout it was installed from (warn). |
+| `auto_recall_config` | A `pyproject.toml` in your working directory silently shadows the global config and turns auto-recall off. |
+| `daemon` | The recall daemon is configured but its socket refuses connections. |
+
+Every failing check carries a `fix:` line with the exact command to run.
+
+The hourly sync agent writes the report to `~/.agent/runtime/health.json`. Two surfaces read that cached file, so a regression reaches you without running anything: the Claude Code `SessionStart` hook prints one line per failure, and `~/.agent/PENDING_REVIEW.md` gains a `## Health` section. A report older than 26 h is reported as stale rather than trusted, because that usually means the hourly agent itself stopped.
+
 ## Bring existing memories
 
 The full install discovers `~/.claude/projects/*/memory`, `~/.codex/`, and `~/.cursor/` and prompts y/n before importing each. If you skipped that (minimal install, `--skip-migrate`, `--no-prompt`) or want to import additional sources later:
@@ -329,7 +359,7 @@ recall remember "always run the exact CI command from the repo config"
 recall query "what should I remember before changing CI?"
 recall forget ci-command
 recall pending --review                  # review staged candidates
-recall stats --since 24h                 # see auto-recall ROI
+recall stats --since 24h                 # coverage, miss/dedup/timeout rates, latency
 recall doctor                            # diagnose missing wiring
 ```
 

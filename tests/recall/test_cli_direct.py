@@ -163,6 +163,59 @@ def test_doctor_reports_missing_path(runner, isolated_xdg, write_config):
     assert "ghost" in result.stdout or "/nonexistent" in result.stdout
 
 
+def test_doctor_missing_path_printed_once_when_configured_equals_resolved(
+    runner, isolated_xdg, write_config
+):
+    """The configured path here is already a literal absolute path, so
+    `resolved_path` is byte-identical to it. Printing an arrow between two
+    copies of the same string ("<p> -> <p>") would falsely imply a mapping
+    happened; print the path once instead."""
+    write_config(
+        sources=[
+            {
+                "name": "ghost",
+                "path": "/nonexistent/path/should/not/exist",
+                "glob": "**/*.md",
+                "frontmatter": "optional",
+                "exclude": [],
+            }
+        ]
+    )
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 1
+    assert (
+        "Source 'ghost' path missing: /nonexistent/path/should/not/exist"
+        in result.stdout
+    )
+    assert "→" not in result.stdout
+
+
+def test_doctor_missing_path_shows_arrow_when_configured_path_differs(
+    runner, isolated_xdg, write_config
+):
+    """When the configured path uses a `$VAR` that expands to something
+    else, the resolved path genuinely differs from what's in config.json —
+    show both, joined by an arrow, so the user can see what expanded to
+    what."""
+    write_config(
+        sources=[
+            {
+                "name": "imports",
+                "path": "$BRAIN_HOME/imports-ghost",
+                "glob": "**/*.md",
+                "frontmatter": "optional",
+                "exclude": [],
+            }
+        ]
+    )
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 1
+    assert (
+        "Source 'imports' path missing: $BRAIN_HOME/imports-ghost → "
+        in result.stdout
+    )
+
+
 # ---------------------------------------------------------------------------
 # Doctor adoption-audit checks (red phase: behavior not implemented yet)
 #
@@ -386,3 +439,312 @@ def test_doctor_flags_hooks_pointing_at_missing_clone(
     assert "moved" in result.output.lower(), (
         f"the Issue should hint the clone may have moved:\n{result.output}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Warm daemon routing (S3)
+#
+# While `recall serve` runs it OWNS the embedded Qdrant store (exclusive
+# process lock). Anything that opens the store directly gets "index is busy",
+# so the CLI has to route through the socket instead of racing it. These
+# tests pin the three user-visible surfaces of that: doctor's health line,
+# `serve --status` as a scriptable probe, and `query --no-daemon` as the
+# escape hatch.
+# ---------------------------------------------------------------------------
+
+
+def _short_sock_dir():
+    """AF_UNIX paths are capped at 104 bytes on macOS; tmp_path exceeds it."""
+    import shutil
+    import tempfile
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _ctx():
+        d = tempfile.mkdtemp(prefix="rsd-", dir="/tmp")
+        try:
+            yield Path(d)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    return _ctx()
+
+
+def test_doctor_reports_daemon_not_running(runner, isolated_xdg, monkeypatch, tmp_path):
+    """Doctor states the daemon's status. A missing daemon is not an error —
+    it means every hook pays the slow in-process path, which the user needs
+    told, with the command that fixes it."""
+    _isolate_home(monkeypatch, tmp_path)
+    _setup_brain_dirs()
+    with _short_sock_dir() as sock_dir:
+        monkeypatch.setenv("RECALL_DAEMON_SOCKET", str(sock_dir / "absent.sock"))
+
+        result = runner.invoke(app, ["doctor"])
+
+    assert "Daemon: not running" in result.output, (
+        f"doctor must report daemon status:\n{result.output}"
+    )
+    assert "--setup-daemon" in result.output, (
+        f"the not-running note must point at the fix:\n{result.output}"
+    )
+
+
+def test_serve_status_exit_1_when_absent(runner, isolated_xdg, monkeypatch):
+    """`recall serve --status` is a scriptable probe: exit 1 = not running.
+
+    launchd health checks and `install.sh` both branch on the exit code, so
+    a crash or a 0 here would report a dead daemon as healthy.
+    """
+    with _short_sock_dir() as sock_dir:
+        monkeypatch.setenv("RECALL_DAEMON_SOCKET", str(sock_dir / "absent.sock"))
+
+        result = runner.invoke(app, ["serve", "--status"])
+
+    assert result.exit_code == 1, (
+        f"--status must exit 1 when no daemon is running:\n{result.output}"
+    )
+    assert "not running" in result.output.lower(), result.output
+
+
+def test_serve_status_works_without_the_daemon_module(
+    runner, isolated_xdg, monkeypatch
+):
+    """`--status` and `doctor`'s daemon note resolve the socket through
+    `recall.config`, never `recall.daemon`.
+
+    Importing the daemon module pulls `recall.index` -> `qdrant_client`, so
+    a probe whose whole job is "is anything listening on this path?" either
+    pays ~0.9 s for a path join or, on an install where qdrant is not
+    importable, fails outright instead of answering "not running".
+    `sys.modules[name] = None` is exactly how Python reports an
+    unimportable module, so this simulates that install.
+    """
+    import sys
+
+    monkeypatch.setitem(sys.modules, "recall.daemon", None)
+    with _short_sock_dir() as sock_dir:
+        monkeypatch.setenv("RECALL_DAEMON_SOCKET", str(sock_dir / "absent.sock"))
+
+        status = runner.invoke(app, ["serve", "--status"])
+        notes: list[str] = []
+        from recall.cli import _check_daemon, _resolve_daemon_socket
+
+        resolved = _resolve_daemon_socket()
+        _check_daemon(notes)
+
+    assert status.exit_code == 1, (
+        f"--status must still answer when recall.daemon cannot be imported:\n"
+        f"{status.output}\n{status.exception!r}"
+    )
+    assert "not running" in status.output.lower(), status.output
+    assert resolved is not None and resolved.name == "absent.sock", resolved
+    assert notes and "Daemon: not running" in notes[0], notes
+
+
+def test_daemon_probes_do_not_import_the_daemon_module(isolated_xdg, tmp_path):
+    """The laziness itself, checked in a clean interpreter.
+
+    An in-process assertion would be meaningless: any earlier test in the
+    session may already have imported `recall.daemon`.
+    """
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    probe = textwrap.dedent(
+        """
+        import sys
+        from recall.cli import _check_daemon, _resolve_daemon_socket
+
+        _resolve_daemon_socket()
+        _check_daemon([])
+        assert "recall.daemon" not in sys.modules, (
+            "resolving the daemon socket imported recall.daemon (and with it "
+            "recall.index -> qdrant_client) just to join a few path components"
+        )
+        print("ok")
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        # Pinned at a path nothing listens on: the probe must never reach a
+        # daemon the developer actually has running.
+        env={**os.environ, "RECALL_DAEMON_SOCKET": str(tmp_path / "absent.sock")},
+    )
+    assert result.returncode == 0, (
+        f"stdout={result.stdout}\nstderr={result.stderr}"
+    )
+
+
+def test_query_no_daemon_flag_accepted(
+    runner, isolated_xdg, write_config, empty_brain
+):
+    """`--no-daemon` forces the in-process path (debugging, or a wedged
+    daemon). It has to parse and behave like today's query."""
+    write_config(
+        sources=[
+            {
+                "name": "empty",
+                "path": str(empty_brain),
+                "glob": "**/*.md",
+                "frontmatter": "optional",
+                "exclude": [],
+            }
+        ]
+    )
+
+    result = runner.invoke(app, ["query", "--no-daemon", "anything"])
+
+    assert "No such option" not in result.output, result.output
+    assert result.exit_code == 0, result.output
+    assert result.stdout.strip() == "[]"
+
+
+@pytest.mark.embeddings
+def test_query_routes_via_daemon_and_matches_direct_shape(
+    runner, isolated_xdg, write_config, auto_memory_brain, monkeypatch
+):
+    """Daemon-routed results are indistinguishable from direct ones.
+
+    Every consumer of `recall query` parses this JSON. If routing through the
+    socket drops or renames a key, the daemon becomes a silent breaking change
+    the moment a user installs it.
+    """
+    import json as _json
+    import stat as _stat
+    import threading as _threading
+    import time as _time
+    from dataclasses import dataclass
+    from typing import Optional as _Optional
+
+    from recall.daemon import RecallDaemon
+
+    write_config(
+        sources=[
+            {
+                "name": "brain",
+                "path": str(auto_memory_brain),
+                "glob": "**/*.md",
+                "frontmatter": "auto-memory",
+                "exclude": [],
+            }
+        ]
+    )
+    assert runner.invoke(app, ["reindex"]).exit_code == 0
+
+    # Shape from the direct path, with the daemon explicitly bypassed.
+    direct = runner.invoke(app, ["query", "--no-daemon", "atomic", "writes"])
+    assert direct.exit_code == 0, direct.output
+    direct_rows = _json.loads(direct.stdout)
+    assert direct_rows, "direct query returned nothing to compare against"
+
+    @dataclass
+    class _Doc:
+        path: str
+        source: str
+        title: str
+        frontmatter: dict
+        body: str
+        text: str
+
+    @dataclass
+    class _Res:
+        document: _Doc
+        score: float
+        rerank_score: _Optional[float] = None
+
+    class _Retriever:
+        def query(self, query, k, type_filter=None, source_filter=None, rerank=None):
+            return [
+                _Res(
+                    document=_Doc(
+                        path="/brain/semantic/lessons/feedback_atomic_writes.md",
+                        source="brain",
+                        title="atomic-writes",
+                        frontmatter={
+                            "name": "atomic-writes",
+                            "type": "feedback",
+                            "description": "write to tmp then rename",
+                        },
+                        body="Always write to a tmp file then os.replace it.",
+                        text="atomic-writes",
+                    ),
+                    score=0.42,
+                    rerank_score=0.91,
+                )
+            ][:k]
+
+    with _short_sock_dir() as sock_dir:
+        sock = sock_dir / "recall.sock"
+        daemon = RecallDaemon(
+            socket_path=sock, retriever=_Retriever(), refresh_interval_s=0.0
+        )
+        t = _threading.Thread(target=daemon.serve_forever, daemon=True)
+        t.start()
+        deadline = _time.monotonic() + 10
+        while _time.monotonic() < deadline and not sock.exists():
+            _time.sleep(0.01)
+        assert sock.exists() and _stat.S_ISSOCK(sock.stat().st_mode), (
+            "fake daemon never bound its socket"
+        )
+        monkeypatch.setenv("RECALL_DAEMON_SOCKET", str(sock))
+        try:
+            routed = runner.invoke(app, ["query", "atomic", "writes"])
+        finally:
+            daemon.shutdown()
+
+    assert routed.exit_code == 0, routed.output
+    routed_rows = _json.loads(routed.stdout)
+    assert routed_rows, f"daemon-routed query returned nothing:\n{routed.output}"
+    assert set(routed_rows[0]) == set(direct_rows[0]), (
+        f"daemon-routed JSON shape differs from the direct path.\n"
+        f"  daemon only: {set(routed_rows[0]) - set(direct_rows[0])}\n"
+        f"  direct only: {set(direct_rows[0]) - set(routed_rows[0])}"
+    )
+    assert "rerank_score" in routed_rows[0]
+    assert routed_rows[0]["rerank_score"] == pytest.approx(0.91)
+    # Proof it really came from the daemon, not a silent local fallback.
+    assert routed_rows[0]["name"] == "atomic-writes"
+    assert routed_rows[0]["score"] == pytest.approx(0.42)
+
+
+def test_doctor_hook_probe_trusts_the_sentinel_not_the_exit_code(
+    runner, isolated_xdg, monkeypatch, tmp_path
+):
+    """An interpreter that imports qdrant_client fine and then aborts at
+    teardown (grpcio under load: exit 134) is a HEALTHY hook interpreter —
+    the hook's own exit path sidesteps that teardown. Deciding by return
+    code flagged a working install and told the user to repin it."""
+    home = _isolate_home(monkeypatch, tmp_path)
+    _setup_brain_dirs()
+    stub = tmp_path / "abort-at-exit-python"
+    stub.write_text("#!/bin/sh\necho qdrant_client-ok\nexit 134\n")
+    stub.chmod(0o755)
+    _write_claude_settings(home, _brainstack_hook_command(str(stub)))
+
+    result = runner.invoke(app, ["doctor"])
+
+    assert "--enable-auto-recall" not in result.output, result.output
+    assert "qdrant_client OK" in result.output, result.output
+
+
+def test_doctor_hook_probe_requires_the_sentinel_even_on_exit_zero(
+    runner, isolated_xdg, monkeypatch, tmp_path
+):
+    """The converse: exit 0 without the sentinel is not proof of anything
+    (a wrapper that swallows `-c`, a shell that is not Python)."""
+    home = _isolate_home(monkeypatch, tmp_path)
+    _setup_brain_dirs()
+    stub = tmp_path / "silent-python"
+    stub.write_text("#!/bin/sh\nexit 0\n")
+    stub.chmod(0o755)
+    _write_claude_settings(home, _brainstack_hook_command(str(stub)))
+
+    result = runner.invoke(app, ["doctor"])
+
+    assert result.exit_code != 0, result.output
+    assert "./install.sh --enable-auto-recall" in result.output

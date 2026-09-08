@@ -99,13 +99,37 @@ def _write_watermark(path: str, last_event_id: str,
 
 # --- Episodic walker -------------------------------------------------
 
-def _episodic_paths(brain_root: str, namespace: str = "default") -> List[str]:
-    """List every AGENT_LEARNINGS.jsonl for a namespace.
+def _episodic_stream(current: str) -> List[str]:
+    """Every file in the episodic stream at `current`: rolled siblings
+    (ascending by name) then the current file.
 
-    Default namespace walks the top-level `memory/episodic/AGENT_LEARNINGS.jsonl`
-    plus every sub-namespace directory containing its own
-    `AGENT_LEARNINGS.jsonl` (so we see ALL producer streams from one
-    consolidation run).
+    Thin wrapper — `_atomic.episodic_files` is THE anchored implementation
+    for agent/memory/ (shared with `sdk.py`). Rotation moves history into
+    `AGENT_LEARNINGS.<day>.jsonl` siblings, so a consolidator that only
+    read the current file would stop seeing every event older than the
+    last roll. `current` may not exist (just rolled away, or never
+    written); `_iter_episodic_events` already tolerates a missing path.
+    """
+    from _atomic import episodic_files  # local import — avoid cycles
+    return [str(p) for p in episodic_files(current)]
+
+
+def _episodic_paths(brain_root: str, namespace: str = "default") -> List[str]:
+    """List every AGENT_LEARNINGS*.jsonl for a namespace.
+
+    Default namespace walks the top-level `memory/episodic/` stream plus
+    every sub-namespace directory holding its own stream (so we see ALL
+    producer streams from one consolidation run). `snapshots/` is skipped:
+    files there are archived history, already consolidated.
+
+    Within each directory the order is rolled files NAME-ascending, then
+    the current file. That is NOT chronological — byte order puts the
+    second roll of a day (`AGENT_LEARNINGS.<day>.1.jsonl`) before the
+    first (`AGENT_LEARNINGS.<day>.jsonl`). Nothing here depends on it:
+    `consolidate_once` re-sorts every loaded entry by
+    `(source_ts, is_tombstone, event_id)` before batching, precisely so
+    raw file order cannot leak into watermark semantics. Callers must not
+    read this list as a timeline.
     """
     if namespace != "default" and not _NAMESPACE_RE.match(namespace or ""):
         raise ValueError(f"invalid namespace: {namespace!r}")
@@ -115,19 +139,19 @@ def _episodic_paths(brain_root: str, namespace: str = "default") -> List[str]:
         return []
     paths: List[str] = []
     if namespace == "default":
-        top = os.path.join(ep_root, "AGENT_LEARNINGS.jsonl")
-        if os.path.isfile(top):
-            paths.append(top)
+        paths.extend(_episodic_stream(os.path.join(ep_root, "AGENT_LEARNINGS.jsonl")))
         # Also include sub-namespaces — producers may write under
         # `episodic/<their-namespace>/AGENT_LEARNINGS.jsonl`.
         for name in sorted(os.listdir(ep_root)):
-            sub = os.path.join(ep_root, name, "AGENT_LEARNINGS.jsonl")
-            if os.path.isfile(sub) and name not in ("snapshots",):
-                paths.append(sub)
+            if name == "snapshots" or not os.path.isdir(os.path.join(ep_root, name)):
+                continue
+            paths.extend(
+                _episodic_stream(os.path.join(ep_root, name, "AGENT_LEARNINGS.jsonl"))
+            )
     else:
-        sub = os.path.join(ep_root, namespace, "AGENT_LEARNINGS.jsonl")
-        if os.path.isfile(sub):
-            paths.append(sub)
+        paths.extend(
+            _episodic_stream(os.path.join(ep_root, namespace, "AGENT_LEARNINGS.jsonl"))
+        )
     return paths
 
 

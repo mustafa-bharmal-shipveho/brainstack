@@ -34,7 +34,34 @@ from runtime.core.events import (
 
 
 def test_event_log_schema_version_constant() -> None:
-    assert EVENT_LOG_SCHEMA_VERSION == "1.1"
+    assert EVENT_LOG_SCHEMA_VERSION == "1.2"
+
+
+def test_supported_versions_contains_1_1_and_1_2() -> None:
+    """The loader accepts a SET of versions, not one. The live log holds
+    ~120k lines written at 1.1; a hard equality check would make `recall
+    stats`, `recall runtime replay` and reinjection all fail on the first
+    legacy line the moment the constant moved to 1.2."""
+    # Lazy import: keeps this file collectable before the constant lands.
+    from runtime.core.events import SUPPORTED_EVENT_SCHEMA_VERSIONS
+
+    assert "1.1" in SUPPORTED_EVENT_SCHEMA_VERSIONS
+    assert "1.2" in SUPPORTED_EVENT_SCHEMA_VERSIONS
+    assert EVENT_LOG_SCHEMA_VERSION in SUPPORTED_EVENT_SCHEMA_VERSIONS
+
+
+def test_load_event_accepts_legacy_1_1_and_keeps_version() -> None:
+    """A 1.1 record loads AND keeps its own version. Stats splits legacy
+    from v1.2 semantics on that field — rewriting it to 1.2 on load would
+    make every historical `x_outcome: hit` look like an honest one."""
+    legacy = json.dumps({
+        "schema_version": "1.1",
+        "ts_ms": 1, "event": "AutoRecall", "session_id": "s", "turn": 0,
+        "x_outcome": "hit", "x_k_returned": 0,
+    })
+    e = load_event(legacy)
+    assert e.schema_version == "1.1"
+    assert e.extensions["x_outcome"] == "hit"
 
 
 def test_event_round_trip() -> None:
