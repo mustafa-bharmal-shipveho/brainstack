@@ -673,3 +673,41 @@ def test_crashing_recall_health_is_logged_not_claimed_written(brain_repo, tmp_pa
     assert any("health: recall health exited 3" in ln for ln in lines), lines[-6:]
     assert not any("health: wrote runtime/health.json" in ln for ln in lines), lines[-6:]
 
+
+
+def test_recall_health_stderr_is_isolated_and_a_written_file_counts(brain_repo, tmp_path):
+    """`recall` in a venv with grpcio can abort at interpreter teardown
+    (exit 134, `recursive_mutex lock failed`) AFTER writing health.json.
+    Two things must hold: nothing it printed to stderr lands in sync.log
+    un-prefixed (an un-prefixed line after the run's marker blinds every
+    scanner to the whole run), and a file that WAS written counts as
+    written — the exit code is a teardown artefact, not the verdict
+    (staff follow-up review, M1 + M2)."""
+    aborting = tmp_path / "recall-abort" / "recall"
+    aborting.parent.mkdir()
+    aborting.write_text(
+        "#!/bin/sh\n"
+        "out=\n"
+        "while [ $# -gt 0 ]; do if [ \"$1\" = --write ]; then out=$2; fi; shift; done\n"
+        "mkdir -p \"$(dirname \"$out\")\"\n"
+        "printf \'{\"schema_version\": 1, \"checks\": []}\' > \"$out\"\n"
+        "echo \'Traceback (most recent call last):\' >&2\n"
+        "echo \'  File \"recall\", line 8, in <module>\' >&2\n"
+        "echo \'libc++abi: terminating due to uncaught exception: "
+        "recursive_mutex lock failed\' >&2\n"
+        "exit 134\n"
+    )
+    aborting.chmod(0o755)
+
+    res = _run_sync(brain_repo, env_overrides={"RECALL_BIN": str(aborting)})
+
+    assert res.returncode in (0, 1), res.stderr
+    lines = _log_lines(brain_repo)
+    last_sync = max(i for i, ln in enumerate(lines) if " sync: " in ln)
+    trailer = lines[last_sync + 1:]
+    assert trailer, lines[-6:]
+    assert all(" health: " in ln for ln in trailer), trailer
+    assert any("recursive_mutex" in ln for ln in trailer), trailer
+    assert any("health: wrote runtime/health.json" in ln for ln in trailer), trailer
+    assert not any("not refreshed" in ln for ln in trailer), trailer
+    assert (brain_repo.brain / "runtime" / "health.json").is_file()

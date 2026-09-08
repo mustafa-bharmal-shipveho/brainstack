@@ -1499,6 +1499,40 @@ class TestSyncErrorAndHealthSections:
 
         assert rps._last_remote_error(self._failed_push_tail()) == self.REMOTE_ERROR
 
+    STRAY_STDERR = [
+        "Traceback (most recent call last):",
+        '  File "/Users/me/.local/bin/recall", line 8, in <module>',
+        "libc++abi: terminating due to uncaught exception of type "
+        "std::__1::system_error: recursive_mutex lock failed: Invalid argument",
+    ]
+
+    def test_remote_error_survives_unprefixed_stderr_after_the_marker(self):
+        """`recall health` runs from the EXIT trap, after the marker; anything
+        it wrote to stderr un-prefixed is neither `health:` nor `sync:`.
+        Such lines belong to no run and must not anchor the scan, or the
+        current run's own marker ends it before the git stderr above
+        (staff follow-up review, M1)."""
+        rps = self._import()
+        tail = self._failed_push_tail()
+        tail[-1:-1] = self.STRAY_STDERR  # between the marker and the trailer
+
+        assert rps._last_remote_error(tail) == self.REMOTE_ERROR
+
+    def test_held_back_paths_survive_unprefixed_stderr_after_the_marker(self):
+        rps = self._import()
+        tail = [
+            "2026-09-04T15:34:53Z sync: quarantined (not pushed): "
+            "memory/semantic/leaky.md",
+            "2026-09-04T15:34:53Z sync: held back 1 file(s) with possible "
+            "secrets; syncing the rest",
+            "2026-09-04T15:34:53Z sync: pushed",
+            *self.STRAY_STDERR,
+            "2026-09-04T15:34:59Z health: wrote runtime/health.json",
+        ]
+
+        assert rps._held_back_paths(tail)["secret"] == ["memory/semantic/leaky.md"]
+        assert rps._last_run_quarantined(tail) is True
+
     def test_remote_error_parsers_agree(self):
         """`recall.health._sync_log_remote_error` and this twin are read by
         the same user on the same log. Pin them on one fixture so they can

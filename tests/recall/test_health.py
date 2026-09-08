@@ -1313,3 +1313,42 @@ def test_write_report_atomic_replaces(tmp_path: Path):
     # os.replace semantics: the temp file never survives a successful write.
     leftovers = [p.name for p in path.parent.iterdir() if p.name != "health.json"]
     assert leftovers == []
+
+
+# What the EXIT trap's `recall health` can leave in sync.log when a venv's
+# grpcio aborts at interpreter teardown: un-prefixed, after the run's marker.
+STRAY_STDERR_AFTER_MARKER = [
+    "Traceback (most recent call last):",
+    '  File "/Users/me/.local/bin/recall", line 8, in <module>',
+    "libc++abi: terminating due to uncaught exception of type "
+    "std::__1::system_error: recursive_mutex lock failed: Invalid argument",
+]
+
+
+def test_sync_log_remote_error_survives_unprefixed_stderr_after_the_marker():
+    """Un-prefixed lines after the marker are neither `health:` (transparent)
+    nor `sync:` (a run's own line). Treating them as run lines made the
+    current run's own marker end the scan before the git stderr above it,
+    so every real failure read as "no error" (staff follow-up review, M1)."""
+    tail = (
+        SYNC_TAIL_WITH_HEALTH_TRAILER[:-1]
+        + STRAY_STDERR_AFTER_MARKER
+        + SYNC_TAIL_WITH_HEALTH_TRAILER[-1:]
+    )
+
+    got = health._sync_log_remote_error("\n".join(tail) + "\n")
+
+    assert got == REMOTE_ERROR_LINE
+
+
+def test_sync_log_remote_error_stays_scoped_with_stray_stderr_after_a_clean_run():
+    """The previous run failed, the current one pushed; garbage after the
+    current marker must not make yesterday's error current."""
+    tail = SYNC_TAIL_WITH_HEALTH_TRAILER + [
+        "2026-09-04T16:36:20Z sync: starting",
+        "2026-09-04T16:36:23Z sync: pushed",
+        *STRAY_STDERR_AFTER_MARKER,
+        "2026-09-04T16:36:24Z health: wrote runtime/health.json",
+    ]
+
+    assert health._sync_log_remote_error("\n".join(tail) + "\n") is None

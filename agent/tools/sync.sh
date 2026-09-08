@@ -134,16 +134,49 @@ _write_health() {
         echo "$(date -u +%FT%TZ) health: recall CLI not found; skipped" >> "$LOG_FILE"
         return 0
     fi
-    # `recall health` exits 1 when a check FAILs (still a good write); >=2 or a
-    # missing file means the CLI itself broke, which must be visible here.
-    local health_rc=0
+    # `recall health` exits 1 when a check FAILs (still a good write). Whether
+    # the file was refreshed is decided by the FILE — newer than a stamp taken
+    # before the run — not by the exit code: a venv whose grpcio aborts at
+    # interpreter teardown returns 134 (or dies with SIGSEGV) after a perfectly
+    # good write. Only tools launchd's minimal PATH is guaranteed to have are
+    # used here (no mktemp/tail/stat): the scratch files sit beside the log
+    # under names the brain's .gitignore already covers (*.tmp).
+    local health_rc=0 hj stamp stderr_tmp
+    hj="$BRAIN_ROOT/runtime/health.json"
+    stamp="$LOG_FILE.health-stamp.$$.tmp"
+    stderr_tmp="$LOG_FILE.health-stderr.$$.tmp"
+    : > "$stamp"
     "$recall_bin" health --json --brain-root "$BRAIN_ROOT" --cwd "$BRAIN_ROOT" \
-        --write "$BRAIN_ROOT/runtime/health.json" >/dev/null 2>>"$LOG_FILE" || health_rc=$?
-    if [ "$health_rc" -ge 2 ] || [ ! -s "$BRAIN_ROOT/runtime/health.json" ]; then
-        echo "$(date -u +%FT%TZ) health: recall health exited $health_rc (health.json not refreshed)" >> "$LOG_FILE"
-    else
-        echo "$(date -u +%FT%TZ) health: wrote runtime/health.json" >> "$LOG_FILE"
+        --write "$hj" >/dev/null 2>"$stderr_tmp" || health_rc=$?
+    # Its stderr reaches the log PREFIXED. The scanners treat `health:` lines
+    # as transparent; an un-prefixed line landing after the run's terminal
+    # marker made them blind to the whole run. Keep the last 20 lines only.
+    if [ -s "$stderr_tmp" ]; then
+        local -a errlines=()
+        local ln
+        while IFS= read -r ln || [ -n "$ln" ]; do
+            errlines+=("$ln")
+        done < "$stderr_tmp"
+        local n=${#errlines[@]} i=0
+        [ "$n" -gt 20 ] && i=$((n - 20))
+        while [ "$i" -lt "$n" ]; do
+            echo "$(date -u +%FT%TZ) health: stderr: ${errlines[$i]}" >> "$LOG_FILE"
+            i=$((i + 1))
+        done
     fi
+    rm -f "$stderr_tmp"
+    # `-ot` (not older than) rather than `-nt`: a write in the same second as
+    # the stamp is equal, not newer, and still counts.
+    if [ -s "$hj" ] && ! [ "$hj" -ot "$stamp" ]; then
+        if [ "$health_rc" -ge 2 ]; then
+            echo "$(date -u +%FT%TZ) health: wrote runtime/health.json (recall exited $health_rc after writing it; teardown abort, see stderr above)" >> "$LOG_FILE"
+        else
+            echo "$(date -u +%FT%TZ) health: wrote runtime/health.json" >> "$LOG_FILE"
+        fi
+    else
+        echo "$(date -u +%FT%TZ) health: recall health exited $health_rc (health.json not refreshed)" >> "$LOG_FILE"
+    fi
+    rm -f "$stamp"
 }
 
 # Single EXIT trap for the whole script — runs on every exit path (success,

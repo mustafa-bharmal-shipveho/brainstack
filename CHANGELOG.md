@@ -7,6 +7,20 @@ Driven by the 2026-09-04 audit (`recall` was helping in ~8% of the turns it fire
 memories never reached the brain; the brain remote had been blocked for 5 days by a 115 MB log;
 dream had failed nightly for ~80 cycles; none of it surfaced anywhere a person looks).
 
+- Deterministic exit: the Claude Code hook and the `recall` console script leave through
+  `os._exit` after flushing and running atexit handlers, so grpcio's occasional abort at
+  interpreter teardown (exit 134 under load, after the work is done) can no longer make Claude
+  Code discard an injection that was already printed, or make sync/dream/tests read a good run
+  as a failure. `recall doctor`'s hook-interpreter probe decides by a stdout sentinel, not by
+  the return code.
+- Installer first-run fixes: a machine with no git identity gets a repo-local one for the brain
+  instead of a half-install that dies at the seed commit; the summary says "skipped (not found)"
+  for host surfaces that do not exist instead of "done"; two-word acks ("ok thanks", "got it")
+  no longer cost a retrieval query.
+- Sync log hygiene: `sync.sh` writes `recall health`'s stderr into `sync.log` prefixed with
+  `health:` and decides "wrote runtime/health.json" by the file's mtime, not the exit code; the
+  remote-error, quarantine and oversize scanners anchor on a run's own `sync:` lines, so a stray
+  traceback after the run's marker no longer blinds them to that run.
 - Warm daemon (`recall serve`): a launchd-managed process (`--setup-daemon`, on by default in the
   full install, `--no-daemon` to opt out) holds the retriever warm and owns the embedded Qdrant
   store; the Claude Code hook, `recall query`, `recall reindex` and `recall-mcp` route through it

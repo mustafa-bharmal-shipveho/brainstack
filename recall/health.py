@@ -861,6 +861,20 @@ def _is_health_log_line(line: str) -> bool:
     return _strip_log_timestamp(line).lower().startswith("health:")
 
 
+def _is_sync_run_line(line: str) -> bool:
+    """True for a line a sync run wrote itself.
+
+    sync.sh prefixes every line of its own with `sync:`; git's stderr (the
+    error lines, recognised by `_git_error_rank`) is the only other thing a
+    run leaves in the log. Anything else — a traceback or a warning the EXIT
+    trap's `recall health` printed un-prefixed — belongs to no run and must
+    not anchor the backward scan, or the current run's own terminal marker
+    ends the scan before it reaches the git stderr above it.
+    """
+    low = _strip_log_timestamp(line).lower()
+    return low.startswith("sync:") or any(m in low for m in _RUN_TERMINAL_MARKERS)
+
+
 def _git_error_rank(line: str) -> Optional[int]:
     """Which `_GIT_ERROR_PREFIXES` tier `line` belongs to, or `None`."""
     low = _strip_log_timestamp(line).lower()
@@ -885,7 +899,8 @@ def _sync_log_remote_error(text: str) -> Optional[str]:
     decides whether a terminal marker ends the scan. The EXIT trap's
     `health:` line always sits below the marker, so the index test broke
     on the current run's own marker and never reached the git stderr
-    above it.
+    above it. Only a run's OWN lines (`sync:` or git stderr) set it: a
+    stray un-prefixed line below the marker is not evidence a run exists.
     """
     lines = (text or "").splitlines()[-400:]
     found: list = []
@@ -897,7 +912,11 @@ def _sync_log_remote_error(text: str) -> Optional[str]:
         rank = _git_error_rank(line)
         if rank is not None:
             found.append((rank, idx, line))
-        elif seen_run_line and any(m in line.lower() for m in _RUN_TERMINAL_MARKERS):
+            seen_run_line = True
+            continue
+        if not _is_sync_run_line(line):
+            continue  # stray stderr after the marker: belongs to no run
+        if seen_run_line and any(m in line.lower() for m in _RUN_TERMINAL_MARKERS):
             break  # walked back into the previous run
         seen_run_line = True
     if not found:

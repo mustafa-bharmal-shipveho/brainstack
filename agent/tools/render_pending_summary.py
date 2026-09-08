@@ -271,6 +271,12 @@ def _in_last_run(tail_lines: list[str], claims=None):
     `claims(line)` marks a line the caller reads as its own data; a
     claimed line never ends the scan. Git's `fatal:` and the held-back
     markers can sit ON the terminal line, and the caller wants them.
+
+    - Only a run's OWN lines anchor the scan: `sync:` lines (every line
+      sync.sh writes itself) and claimed lines. A stray un-prefixed line
+      below the marker — a traceback the trap's `recall health` printed —
+      is neither, and treating it as a run line made the current run's
+      own marker end the scan before the git stderr above it.
     """
     seen_run_line = False
     for idx in range(len(tail_lines) - 1, -1, -1):
@@ -278,6 +284,8 @@ def _in_last_run(tail_lines: list[str], claims=None):
         if _is_health_line(line):
             continue  # transparent: belongs to no run, ends no run
         claimed = claims is not None and claims(line)
+        if not claimed and not _is_sync_run_line(line):
+            continue  # stray stderr after the marker: belongs to no run
         if seen_run_line and not claimed and any(
                 m in line.lower() for m in _RUN_TERMINAL_MARKERS):
             return  # walked back into the previous run
@@ -329,6 +337,13 @@ _GIT_ERROR_PREFIXES: tuple[tuple[str, ...], ...] = (
     ("fatal:",),
     ("error:", "ssh:", "permission denied", "could not resolve"),
 )
+
+
+def _is_sync_run_line(line: str) -> bool:
+    """True for a line a sync run wrote itself (`sync:`-prefixed, or one of
+    the terminal markers). Twin of `recall.health._is_sync_run_line`."""
+    low = _LOG_TS_RE.sub("", line).strip().lower()
+    return low.startswith("sync:") or any(m in low for m in _RUN_TERMINAL_MARKERS)
 
 
 def _is_health_line(line: str) -> bool:
