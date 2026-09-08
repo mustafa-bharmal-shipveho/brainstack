@@ -19,6 +19,7 @@ from typing import NoReturn, Optional
 import typer
 
 from recall import __version__
+from recall._exit import hard_exit
 from recall.config import (
     Config,
     cache_dir,
@@ -1235,6 +1236,9 @@ def _parse_hook_command(cmd: str) -> tuple[Optional[str], Optional[str]]:
     return interp, script
 
 
+_QDRANT_PROBE_OK = "qdrant_client-ok"
+
+
 def _check_hook_interpreters(notes: list[str], issues: list[str]) -> None:
     """Doctor sub-check: every installed brainstack hook must point at an
     interpreter that can actually import qdrant_client, or auto-recall
@@ -1264,13 +1268,17 @@ def _check_hook_interpreters(notes: list[str], issues: list[str]) -> None:
                 "location."
             )
             continue
+        # The import can succeed and the interpreter still die at teardown
+        # (grpcio under load), so the return code is not the verdict: a
+        # sentinel printed AFTER the import is. Exit 0 without it proves
+        # nothing either (a wrapper that swallows `-c`).
         try:
             probe = subprocess.run(
-                [interp, "-c", "import qdrant_client"],
+                [interp, "-c", f"import qdrant_client; print({_QDRANT_PROBE_OK!r})"],
                 capture_output=True,
                 timeout=10,
             )
-            ok = probe.returncode == 0
+            ok = _QDRANT_PROBE_OK.encode() in probe.stdout
         except (OSError, subprocess.TimeoutExpired):
             ok = False
         if ok:
@@ -2053,8 +2061,22 @@ def _session_current_ts_ms(log_path: "Path") -> int | None:
     return max(starts) if starts else None
 
 
-def main():
-    app()
+def main() -> None:
+    """Console-script entry point.
+
+    Typer/Click end in `sys.exit`, which hands control to the interpreter's
+    normal finalisation — where grpcio (via qdrant_client) can abort under
+    load AFTER the command did its work and turn a good run into exit 134.
+    Every consumer of `recall`'s exit code (sync.sh, dream, doctor, the
+    tests) reads that as failure, so the code Typer chose is carried out
+    through `hard_exit` instead. See `recall._exit`.
+    """
+    code: object = 0
+    try:
+        app()
+    except SystemExit as exc:
+        code = exc.code
+    hard_exit(code)
 
 
 if __name__ == "__main__":

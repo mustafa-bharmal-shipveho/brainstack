@@ -710,3 +710,41 @@ def test_query_routes_via_daemon_and_matches_direct_shape(
     # Proof it really came from the daemon, not a silent local fallback.
     assert routed_rows[0]["name"] == "atomic-writes"
     assert routed_rows[0]["score"] == pytest.approx(0.42)
+
+
+def test_doctor_hook_probe_trusts_the_sentinel_not_the_exit_code(
+    runner, isolated_xdg, monkeypatch, tmp_path
+):
+    """An interpreter that imports qdrant_client fine and then aborts at
+    teardown (grpcio under load: exit 134) is a HEALTHY hook interpreter —
+    the hook's own exit path sidesteps that teardown. Deciding by return
+    code flagged a working install and told the user to repin it."""
+    home = _isolate_home(monkeypatch, tmp_path)
+    _setup_brain_dirs()
+    stub = tmp_path / "abort-at-exit-python"
+    stub.write_text("#!/bin/sh\necho qdrant_client-ok\nexit 134\n")
+    stub.chmod(0o755)
+    _write_claude_settings(home, _brainstack_hook_command(str(stub)))
+
+    result = runner.invoke(app, ["doctor"])
+
+    assert "--enable-auto-recall" not in result.output, result.output
+    assert "qdrant_client OK" in result.output, result.output
+
+
+def test_doctor_hook_probe_requires_the_sentinel_even_on_exit_zero(
+    runner, isolated_xdg, monkeypatch, tmp_path
+):
+    """The converse: exit 0 without the sentinel is not proof of anything
+    (a wrapper that swallows `-c`, a shell that is not Python)."""
+    home = _isolate_home(monkeypatch, tmp_path)
+    _setup_brain_dirs()
+    stub = tmp_path / "silent-python"
+    stub.write_text("#!/bin/sh\nexit 0\n")
+    stub.chmod(0o755)
+    _write_claude_settings(home, _brainstack_hook_command(str(stub)))
+
+    result = runner.invoke(app, ["doctor"])
+
+    assert result.exit_code != 0, result.output
+    assert "./install.sh --enable-auto-recall" in result.output

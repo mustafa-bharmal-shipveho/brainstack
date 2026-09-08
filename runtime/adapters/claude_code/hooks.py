@@ -772,4 +772,10 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Not `sys.exit`: the in-process fallback imports qdrant_client, whose
+    # grpcio can abort at interpreter teardown under load. Claude Code adds
+    # this hook's stdout to the context only on exit 0, so that abort would
+    # throw away the injection printed a moment earlier. See recall._exit.
+    from recall._exit import hard_exit
+
+    hard_exit(main())

@@ -45,7 +45,7 @@ dev = [
 ]
 
 [project.scripts]
-recall = "recall.cli:app"
+recall = "recall.cli:main"
 recall-mcp = "recall.mcp_server:main"
 
 [tool.hatch.build.targets.wheel]
