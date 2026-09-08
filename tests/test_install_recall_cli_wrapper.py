@@ -94,3 +94,23 @@ def test_missing_wrapper_still_installs_with_extras(fake_repo):
     assert r.returncode == 0, r.stdout + r.stderr
     assert "[embeddings,mcp]" in _pip_calls(fake_repo), _pip_calls(fake_repo)
     assert fake_repo["wrapper"].exists()
+
+
+def test_failed_regeneration_warns_and_still_symlinks(fake_repo):
+    """Staff review follow-up 3, M1: regeneration needs the network (pip's
+    build isolation downloads hatchling). Offline, the pip call fails; under
+    `set -e` that used to exit the helper before its own warning and before
+    the ~/.local/bin symlink step. The helper must warn and fall through."""
+    fake_repo["wrapper"].write_text(OLD_WRAPPER)
+    fake_repo["wrapper"].chmod(0o755)
+    pip = fake_repo["repo"] / ".venv" / "bin" / "pip"
+    pip.write_text(f"#!/bin/sh\necho \"pip $*\" >> \"{fake_repo['calls']}\"\necho 'no network' >&2\nexit 1\n")
+    pip.chmod(0o755)
+
+    r = _run(fake_repo)
+
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "install" in _pip_calls(fake_repo), "regeneration was not even attempted"
+    assert "old entry point" in r.stderr, r.stderr
+    symlink = Path(fake_repo["env"]["HOME"]) / ".local" / "bin" / "recall"
+    assert symlink.is_symlink(), "the symlink step was skipped after the failed pip"
