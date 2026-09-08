@@ -3158,10 +3158,15 @@ if [ -n "$BRAIN_REMOTE" ]; then
     # the hourly sync.sh commit (launchd, minimal environment) finds it too.
     # A configured identity — global, local, or GIT_AUTHOR_*/GIT_COMMITTER_*
     # in the environment — is left alone.
-    # Ask git the way `git commit` will (config, EMAIL, GIT_*_IDENT vars,
-    # sane auto-detection); either ident failing means the commit would.
+    # Seed when either (a) git says the commit would fail — `git var` applies
+    # the same rules as `git commit` (config, EMAIL, GIT_*_IDENT variables,
+    # auto-detection) — or (b) nothing EXPLICIT is configured and git would
+    # fall back to an auto-detected `user@host.local`: a CI runner gets that
+    # far, but a brain's history should not be built on a guessed identity.
     if ! git var GIT_AUTHOR_IDENT >/dev/null 2>&1 \
-        || ! git var GIT_COMMITTER_IDENT >/dev/null 2>&1; then
+        || ! git var GIT_COMMITTER_IDENT >/dev/null 2>&1 \
+        || { [ -z "$(git config user.email 2>/dev/null)" ] \
+             && [ -z "${GIT_AUTHOR_EMAIL:-}${GIT_COMMITTER_EMAIL:-}${EMAIL:-}" ]; }; then
         git config user.name "brainstack"
         git config user.email "brainstack@localhost"
         echo "    No git identity configured; set a repo-local one for the brain"
