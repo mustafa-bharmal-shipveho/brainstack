@@ -34,8 +34,10 @@ PROTOCOL_VERSION = 1
 # holds the embedded store's exclusive lock and an in-process fallback is
 # safe. Every other reason (`timeout`, `protocol_error`, `server_error`)
 # means something IS listening: falling back would block on that lock and
-# surface as "index is busy". The hook, the CLI, the MCP handler and the
-# daemon's own stale-socket probe all branch on this one set.
+# surface as "index is busy". The CLI, the MCP handler and the daemon's own
+# stale-socket probe branch on this set. The hook keeps a superset of its
+# own (adds `import_error`: this module itself missing is also "nothing is
+# listening") because it must stay importable without the recall package.
 DAEMON_DOWN_REASONS = frozenset({"no_socket", "connection_refused"})
 
 _RECV_CHUNK = 65536
