@@ -35,7 +35,9 @@ for arg in "$@"; do
     esac
 done
 
-log() { [ "$QUIET" -eq 0 ] && echo "==> $*"; }
+# `if`, not `[ ] &&`: under `set -e` a bare `[ "$QUIET" -eq 0 ] && echo`
+# returns 1 when quiet, and the first log line killed every `--quiet` run.
+log() { if [ "$QUIET" -eq 0 ]; then echo "==> $*"; fi; }
 warn() { echo "WARN: $*" >&2; }
 
 # 1. venv
@@ -63,6 +65,19 @@ fi
 if [ ! -x "$VENV_RECALL" ]; then
     warn "pip install completed but $VENV_RECALL is still missing"
     exit 1
+fi
+
+# 2b. Regenerate a STALE wrapper. pip writes the console script once; when
+# the entry point moves (v0.7.0: `recall.cli:app` -> `recall.cli:main`, the
+# deterministic-exit path), every existing install keeps a wrapper that
+# imports `app` directly and bypasses `main()`/`hard_exit` until pip is run
+# again. Cheap: deps are already satisfied, only the scripts are rewritten.
+if ! grep -q "from recall.cli import main" "$VENV_RECALL"; then
+    log "regenerating $VENV_RECALL (console-script entry point changed)"
+    "$VENV_DIR/bin/pip" install --quiet -e "${REPO_DIR}[embeddings,mcp]"
+    if ! grep -q "from recall.cli import main" "$VENV_RECALL"; then
+        warn "$VENV_RECALL still enters through the old entry point; run: $VENV_DIR/bin/pip install -e '${REPO_DIR}[embeddings,mcp]'"
+    fi
 fi
 
 # 3. symlink into ~/.local/bin

@@ -13,6 +13,9 @@ dream had failed nightly for ~80 cycles; none of it surfaced anywhere a person l
   Code discard an injection that was already printed, or make sync/dream/tests read a good run
   as a failure. `recall doctor`'s hook-interpreter probe decides by a stdout sentinel, not by
   the return code.
+- `bin/install-recall-cli.sh` regenerates a stale `recall` console-script wrapper (the entry point
+  moved to `recall.cli:main`), and its `--quiet` mode no longer exits on the first log line — which
+  had silently skipped the CLI step of every `./install.sh --upgrade`.
 - `BRAINSTACK_SKIP_LAUNCHCTL=1` now covers every launchctl call (uninstall, claude-extras): launchd
   labels are per-user, so a sandbox uninstall used to unload the real nightly dream and hourly
   sync agents. The SessionStart banner now also speaks up when there is no health report but
