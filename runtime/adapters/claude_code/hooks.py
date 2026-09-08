@@ -573,6 +573,26 @@ def _print_health_banner(config: RuntimeConfig, payload: dict[str, Any]) -> None
     print(_HEALTH_FOOTER)
 
 
+def _sync_stopped_line(report_path: Path, _health: Any) -> str | None:
+    """One banner line when `runtime/health.json` is absent but the brain's
+    `sync.log` was last written more than the stale window ago. None when
+    there is no sync.log (never synced) or it is recent (first tick pending)."""
+    sync_log = report_path.parent.parent / "sync.log"
+    try:
+        age_h = (time.time() - sync_log.stat().st_mtime) / 3600.0
+    except OSError:
+        return None
+    stale_hours = float(getattr(_health, "HEALTH_STALE_HOURS", _HEALTH_STALE_HOURS_DEFAULT))
+    if age_h <= stale_hours:
+        return None
+    return (
+        f"brainstack health: no report yet and sync.log was last written "
+        f"{int(age_h)}h ago (>{int(stale_hours)}h); the hourly sync LaunchAgent "
+        f"may be dead or unloaded. run 'recall health' and "
+        f"'launchctl list | grep agent-sync'"
+    )
+
+
 def _health_banner_lines(config: RuntimeConfig,
                          payload: dict[str, Any]) -> list[str]:
     """The banner body, without the footer. Split out so the printing
@@ -591,7 +611,13 @@ def _health_banner_lines(config: RuntimeConfig,
         # same file. Contract from the health slice owner, 2026-09-04.
         report, stale = _health.read_report(path)
         if report is None:
-            return []
+            # No report is silence on a brain that has never synced. But a
+            # sync.log that stopped growing before the stale window while no
+            # report exists means the hourly agent died before it ever wrote
+            # one — the live brain on 2026-09-08, three days after a sandbox
+            # uninstall had unloaded the LaunchAgents, and nothing said so.
+            line = _sync_stopped_line(path, _health)
+            return [line] if line else []
         if stale:
             # The checks inside a stale report are no longer evidence of
             # anything, so they are not reported as if they were.

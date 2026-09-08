@@ -436,6 +436,18 @@ export BRAIN_ROOT
 
 
 # ----- Helper: install a secret scanner via the local package manager -----
+# launchctl, unless BRAINSTACK_SKIP_LAUNCHCTL=1. launchd labels are per-USER,
+# not per-HOME: `launchctl unload <plist in a sandbox HOME>` unloads the real
+# user's job of that Label. Two full-day QA sandboxes (2026-09-04, 2026-09-08)
+# ran --uninstall this way and silently stopped the live nightly dream and
+# hourly sync for days. Every launchctl call goes through here.
+_launchctl() {
+    if [ "${BRAINSTACK_SKIP_LAUNCHCTL:-0}" = "1" ]; then
+        return 0
+    fi
+    launchctl "$@"
+}
+
 maybe_install_scanner() {
     local name="$1"
     [ -z "$name" ] && return 0
@@ -1205,7 +1217,7 @@ if [ "$MODE" = "setup-claude-extras" ] || [ "$MODE" = "remove-claude-extras" ]; 
     plist_path="$HOME/Library/LaunchAgents/com.brainstack.claude-extras.plist"
     if [ "$MODE" = "remove-claude-extras" ]; then
         if [ -f "$plist_path" ]; then
-            launchctl unload "$plist_path" 2>/dev/null || true
+            _launchctl unload "$plist_path" 2>/dev/null || true
             rm -f "$plist_path"
             echo "==> com.brainstack.claude-extras LaunchAgent removed."
         else
@@ -1246,8 +1258,12 @@ if [ "$MODE" = "setup-claude-extras" ] || [ "$MODE" = "remove-claude-extras" ]; 
         echo "install: rendered plist failed plutil --lint; not loading. See $plist_path" >&2
         exit 2
     fi
-    launchctl unload "$plist_path" 2>/dev/null || true
-    launchctl load "$plist_path"
+    if [ "${BRAINSTACK_SKIP_LAUNCHCTL:-0}" = "1" ]; then
+        echo "  wrote $plist_path (skipped launchctl load: BRAINSTACK_SKIP_LAUNCHCTL=1)"
+    else
+        launchctl unload "$plist_path" 2>/dev/null || true
+        launchctl load "$plist_path"
+    fi
     echo "==> com.brainstack.claude-extras LaunchAgent installed."
     echo "    plist:           $plist_path"
     echo "    runs every:      3600s"
@@ -2558,7 +2574,7 @@ if [ "$MODE" = "uninstall" ]; then
         "$plist_dir/com.brainstack.claude-extras.plist" \
         "$plist_dir/com.brainstack.recall-daemon.plist"; do
         if [ -f "$plist" ]; then
-            launchctl unload "$plist" 2>/dev/null || true
+            _launchctl unload "$plist" 2>/dev/null || true
             rm -f "$plist"
             echo "  removed $plist"
         fi

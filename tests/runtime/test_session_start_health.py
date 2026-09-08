@@ -173,6 +173,45 @@ def test_session_start_silent_when_report_missing(
     assert not (brain / "runtime" / "health.json").exists()
 
 
+def test_session_start_missing_report_with_a_stale_sync_log_is_flagged(
+    brain: Path, tmp_config, stdin_with, session_cwd, capsys
+):
+    """No health.json is silence ONLY on a brain that has never synced. A
+    sync.log that stopped growing more than 26 h ago while no report exists
+    means the hourly agent stopped before it ever wrote one — the 2026-09-08
+    live brain, where a sandbox uninstall had unloaded the LaunchAgents and
+    nothing said so for three days."""
+    import os, time
+    log = brain / "sync.log"
+    log.write_text("2026-09-05T00:33:30Z sync: commit succeeded but push failed\n")
+    old = time.time() - 40 * 3600
+    os.utime(log, (old, old))
+    stdin_with({"session_id": "s-1", "cwd": str(session_cwd)})
+
+    rc = handle_hook("SessionStart", config=tmp_config)
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "brainstack health:" in out
+    assert "sync.log" in out and "26h" in out
+    assert "LaunchAgent" in out
+    assert "recall health" in out
+
+
+def test_session_start_missing_report_with_a_fresh_sync_log_stays_silent(
+    brain: Path, tmp_config, stdin_with, session_cwd, capsys
+):
+    """The first tick after install: sync.log is minutes old and the report
+    is simply not written yet. Nothing to say."""
+    (brain / "sync.log").write_text("2026-09-08T13:39:06Z sync: no changes\n")
+    stdin_with({"session_id": "s-1", "cwd": str(session_cwd)})
+
+    rc = handle_hook("SessionStart", config=tmp_config)
+
+    assert rc == 0
+    assert capsys.readouterr().out == ""
+
+
 def test_session_start_flags_stale_report(
     brain: Path, tmp_config, stdin_with, session_cwd, capsys
 ):

@@ -13,6 +13,10 @@ dream had failed nightly for ~80 cycles; none of it surfaced anywhere a person l
   Code discard an injection that was already printed, or make sync/dream/tests read a good run
   as a failure. `recall doctor`'s hook-interpreter probe decides by a stdout sentinel, not by
   the return code.
+- `BRAINSTACK_SKIP_LAUNCHCTL=1` now covers every launchctl call (uninstall, claude-extras): launchd
+  labels are per-user, so a sandbox uninstall used to unload the real nightly dream and hourly
+  sync agents. The SessionStart banner now also speaks up when there is no health report but
+  `sync.log` stopped growing more than 26 h ago (sync agent dead or unloaded).
 - Installer first-run fixes: a machine with no git identity gets a repo-local one for the brain
   instead of a half-install that dies at the seed commit; the summary says "skipped (not found)"
   for host surfaces that do not exist instead of "done"; two-word acks ("ok thanks", "got it")
