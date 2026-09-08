@@ -3128,6 +3128,22 @@ if [ -n "$BRAIN_REMOTE" ]; then
     else
         git remote add origin "$BRAIN_REMOTE"
     fi
+    # A fresh machine, a CI runner or a service account often has no git
+    # identity anywhere. Without one the seed commit dies with "Author
+    # identity unknown" AFTER the brain was laid out and BEFORE the hooks,
+    # LaunchAgents and daemon were installed — a half-install, exit 128
+    # (2026-09-08 full-day QA). Give the brain a REPO-LOCAL identity, where
+    # the hourly sync.sh commit (launchd, minimal environment) finds it too.
+    # A configured identity — global, local, or GIT_AUTHOR_*/GIT_COMMITTER_*
+    # in the environment — is left alone.
+    if [ -z "$(git config user.email 2>/dev/null)" ] \
+        && [ -z "${GIT_AUTHOR_EMAIL:-}${GIT_COMMITTER_EMAIL:-}" ]; then
+        git config user.name "brainstack"
+        git config user.email "brainstack@localhost"
+        echo "    No git identity configured; set a repo-local one for the brain"
+        echo "    (brainstack <brainstack@localhost>). Change it any time with:"
+        echo "      git -C $BRAIN_ROOT config user.email you@example.com"
+    fi
     # Stage + commit if there's anything to commit
     git add -A
     if ! git diff --cached --quiet; then
