@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## v0.8.0 (2026-09-14)
+
+**OMP session ingestion: memory keeps accumulating when your daily driver isn't Claude Code.**
+
 - Session digests: OMP (oh-my-pi) coding-agent transcripts at `~/.omp/agent/sessions/<slug>/<ts>_<uuid>.jsonl`
   are ingested through the same NormalizedSession pipeline as Claude Code and Codex sessions, so the
   hourly scanner picks them up with no extra setup. `recall digest backfill --source` gains `omp` and
