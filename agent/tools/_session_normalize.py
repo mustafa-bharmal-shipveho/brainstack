@@ -1,8 +1,9 @@
 """Unified session-transcript normalizer.
 
-Reads either:
+Reads any of:
   - `~/.claude/projects/<slug>/<uuid>.jsonl` (Claude Code sessions)
   - `~/.codex/sessions/<Y>/<M>/<D>/rollout-*.jsonl` (Codex CLI sessions)
+  - `~/.omp/agent/sessions/<slug>/<timestamp>_<uuid>.jsonl` (OMP sessions)
 
 …and returns a `NormalizedSession` so the digest adapter doesn't care
 about upstream format quirks. The contract is pinned by
@@ -33,7 +34,7 @@ class NormalizedMessage:
 @dataclass
 class NormalizedSession:
     session_id: str
-    source: Literal["claude", "codex"]
+    source: Literal["claude", "codex", "omp"]
     started_at: str
     ended_at: str
     cwd: str | None
@@ -303,6 +304,158 @@ def normalize_codex_session(path: Path | str) -> NormalizedSession | None:
         cwd=cwd,
         git_branch=git_branch,
         project_slug=None,  # Codex doesn't have a project_slug concept
+        model=model,
+        messages=messages,
+        raw_token_estimate=_token_estimate(*text_bytes_for_estimate),
+    )
+
+
+# ---------------------------------------------------------------------------
+# OMP normalization
+# ---------------------------------------------------------------------------
+
+# OMP (`~/.omp/agent/sessions/<slug>/<timestamp>_<uuid>.jsonl`) event
+# types that carry no conversation content. `session` and `model_change`
+# are NOT here — they're mined for metadata (id/cwd and model) before
+# being skipped as turns.
+_OMP_SKIP_TYPES = {
+    "title",                 # {"title", "updatedAt"} — display metadata
+    "title_change",          # renames; digest generates its own title
+    "thinking_level_change", # reasoning-effort config, not content
+    "custom",                # e.g. tool_execution_start — redundant with
+                             # the assistant message's toolCall block
+    "custom_message",        # harness nudges (launch-completion, ...)
+    "ttsr_injection",        # rule-injection bookkeeping
+}
+
+
+def _omp_text_blocks(content) -> str:
+    """Concatenate the text of an OMP message content array. Handles
+    `text` blocks only; `thinking`/`toolCall` are the caller's job.
+    Tolerates a bare string (defensive — not observed in the wild)."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            parts.append(str(block.get("text", "")))
+    return "\n".join(p for p in parts if p)
+
+
+def _omp_assistant_text(message: dict) -> tuple[str, list[dict]]:
+    """Pull text + thinking + toolCall blocks out of an OMP assistant
+    message. Thinking is kept (same rationale as Claude: the summarizer
+    needs the WHY). toolCall normalizes to the Claude tool_use shape
+    ({id, name, input}) so downstream prompt assembly doesn't care."""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content, []
+    if not isinstance(content, list):
+        return "", []
+    parts: list[str] = []
+    tool_calls: list[dict] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "text":
+            parts.append(str(block.get("text", "")))
+        elif btype == "thinking":
+            parts.append(str(block.get("thinking", "")))
+        elif btype == "toolCall":
+            tool_calls.append({
+                "id": block.get("id"),
+                "name": block.get("name"),
+                "input": block.get("arguments"),
+            })
+    return "\n".join(p for p in parts if p), tool_calls
+
+
+def normalize_omp_session(
+    path: Path | str, *, project_slug: str | None,
+) -> NormalizedSession | None:
+    """Parse a single OMP session jsonl into NormalizedSession. Returns
+    None when the file has no user/assistant turns.
+
+    OMP emits `toolResult` as its own message role (tool output). We map
+    it to role="user" — the same place Claude's tool_result blocks land
+    after normalization — so chunking and prompt assembly treat tool
+    output identically across sources. OMP records no git branch, so
+    `git_branch` stays None."""
+    p = Path(path)
+    messages: list[NormalizedMessage] = []
+    session_id: str | None = None
+    cwd: str | None = None
+    model: str | None = None
+    timestamps: list[str] = []
+    text_bytes_for_estimate: list[str] = []
+
+    for obj in _iter_jsonl(p):
+        etype = obj.get("type")
+        ts = obj.get("timestamp")
+        if isinstance(ts, str):
+            timestamps.append(ts)
+
+        # Session metadata: id + cwd live on the `session` event; the
+        # model only appears on `model_change` events.
+        if etype == "session":
+            if session_id is None and isinstance(obj.get("id"), str):
+                session_id = obj["id"]
+            if cwd is None and isinstance(obj.get("cwd"), str):
+                cwd = obj["cwd"]
+            continue
+        if etype == "model_change":
+            if model is None and isinstance(obj.get("model"), str):
+                model = obj["model"]
+            continue
+        if etype in _OMP_SKIP_TYPES:
+            continue
+
+        if etype != "message":
+            continue
+        msg = obj.get("message")
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+
+        if role == "user":
+            text = _omp_text_blocks(msg.get("content"))
+            if text.strip():
+                messages.append(NormalizedMessage(
+                    role="user", text=text, timestamp=ts or "",
+                ))
+                text_bytes_for_estimate.append(text)
+        elif role == "assistant":
+            text, tcs = _omp_assistant_text(msg)
+            if text.strip() or tcs:
+                messages.append(NormalizedMessage(
+                    role="assistant", text=text, tool_calls=tcs,
+                    timestamp=ts or "",
+                ))
+                text_bytes_for_estimate.append(text)
+        elif role == "toolResult":
+            text = _omp_text_blocks(msg.get("content"))
+            if text.strip():
+                messages.append(NormalizedMessage(
+                    role="user", text=text, timestamp=ts or "",
+                ))
+                text_bytes_for_estimate.append(text)
+
+    if not messages:
+        return None
+
+    return NormalizedSession(
+        session_id=session_id or p.stem,
+        source="omp",
+        # min/max are lexicographic — correct while OMP emits uniform
+        # ISO-8601 '…Z' timestamps (observed on every transcript so far).
+        started_at=min(timestamps) if timestamps else "",
+        ended_at=max(timestamps) if timestamps else "",
+        cwd=cwd,
+        git_branch=None,  # OMP transcripts don't record the branch
+        project_slug=project_slug,
         model=model,
         messages=messages,
         raw_token_estimate=_token_estimate(*text_bytes_for_estimate),

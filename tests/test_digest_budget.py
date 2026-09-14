@@ -254,6 +254,10 @@ class TestIncrementalCLI:
         monkeypatch.setattr(cli_mod, "_brain_root", lambda: brain)
         monkeypatch.setattr(cli_mod, "_projects_root", lambda: projects)
         monkeypatch.setattr(cli_mod, "_codex_root", lambda: codex)
+        # Isolate from the real ~/.omp/agent/sessions too — the
+        # incremental run scans all three sources.
+        monkeypatch.setattr(cli_mod, "_omp_root",
+                            lambda: brain / "no-omp")
 
     def test_summary_line_shape_and_default_limit_is_three(
             self, cli_mod, tmp_path, monkeypatch, capsys):

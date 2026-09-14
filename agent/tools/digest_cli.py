@@ -63,6 +63,10 @@ def _codex_root() -> Path:
     return Path.home() / ".codex"
 
 
+def _omp_root() -> Path:
+    return Path.home() / ".omp" / "agent" / "sessions"
+
+
 # ---------------------------------------------------------------------------
 # Subcommands
 # ---------------------------------------------------------------------------
@@ -99,22 +103,37 @@ def _cmd_backfill(args, *, source_override: str | None = None) -> int:
     if args.dry_run:
         # Walk only — no LLM calls, no writes. Useful sanity check.
         from claude_session_digest_adapter import (  # type: ignore
-            iter_claude_sessions, iter_codex_sessions,
+            iter_claude_sessions, iter_codex_sessions, iter_omp_sessions,
         )
-        n_claude = n_codex = 0
-        if src in ("both", "claude"):
-            for _ns in iter_claude_sessions(_projects_root()):
+        n_claude = n_codex = n_omp = 0
+
+        def _hit_limit() -> bool:
+            return bool(args.limit) and \
+                (n_claude + n_codex + n_omp) >= args.limit
+
+        projects_root = (Path(args.projects_root) if args.projects_root
+                         else _projects_root())
+        codex_root = (Path(args.codex_root) if args.codex_root
+                      else _codex_root())
+        omp_root = (Path(args.omp_root) if args.omp_root
+                    else _omp_root())
+        if src in ("all", "claude"):
+            for _ns in iter_claude_sessions(projects_root):
                 n_claude += 1
-                if args.limit and (n_claude + n_codex) >= args.limit:
+                if _hit_limit():
                     break
-        if src in ("both", "codex") and not (
-            args.limit and (n_claude + n_codex) >= args.limit
-        ):
-            for _ns in iter_codex_sessions(_codex_root()):
+        if src in ("all", "codex") and not _hit_limit():
+            for _ns in iter_codex_sessions(codex_root):
                 n_codex += 1
-                if args.limit and (n_claude + n_codex) >= args.limit:
+                if _hit_limit():
                     break
-        print(f"dry-run: would process claude={n_claude} codex={n_codex}")
+        if src in ("all", "omp") and not _hit_limit():
+            for _ns in iter_omp_sessions(omp_root):
+                n_omp += 1
+                if _hit_limit():
+                    break
+        print(f"dry-run: would process claude={n_claude} "
+              f"codex={n_codex} omp={n_omp}")
         return 0
 
     try:
@@ -133,14 +152,19 @@ def _cmd_backfill(args, *, source_override: str | None = None) -> int:
     if args.limit:
         _wrap_limit(adapter, args.limit)
 
-    projects_root = _projects_root() if src in ("both", "claude") else None
-    codex_root = _codex_root() if src in ("both", "codex") else None
+    projects_root = Path(args.projects_root) if args.projects_root else (
+        _projects_root() if src in ("all", "claude") else None)
+    codex_root = Path(args.codex_root) if args.codex_root else (
+        _codex_root() if src in ("all", "codex") else None)
+    omp_root = Path(args.omp_root) if args.omp_root else (
+        _omp_root() if src in ("all", "omp") else None)
 
     try:
         stats = adapter.backfill(
             brain_root=brain,
             projects_root=projects_root,
             codex_root=codex_root,
+            omp_root=omp_root,
             provider=provider,
             log=print,
         )
@@ -159,9 +183,11 @@ def _cmd_backfill(args, *, source_override: str | None = None) -> int:
 def _wrap_limit(adapter_mod, limit: int) -> None:
     """Decorate the adapter's source iterators to stop after `limit`
     yielded sessions total. Implemented via a shared counter so claude
-    + codex together respect the limit. Used by `backfill --limit N`."""
+    + codex + omp together respect the limit. Used by
+    `backfill --limit N`."""
     original_claude = adapter_mod.iter_claude_sessions
     original_codex = adapter_mod.iter_codex_sessions
+    original_omp = adapter_mod.iter_omp_sessions
     state = {"n": 0}
 
     def _bounded(orig):
@@ -175,6 +201,7 @@ def _wrap_limit(adapter_mod, limit: int) -> None:
 
     adapter_mod.iter_claude_sessions = _bounded(original_claude)
     adapter_mod.iter_codex_sessions = _bounded(original_codex)
+    adapter_mod.iter_omp_sessions = _bounded(original_omp)
 
 
 def _cmd_incremental(args) -> int:
@@ -203,6 +230,7 @@ def _cmd_incremental(args) -> int:
             brain_root=brain,
             projects_root=_projects_root(),
             codex_root=_codex_root(),
+            omp_root=_omp_root(),
             provider=provider,
             log=print,
             limit=args.limit,
@@ -291,8 +319,16 @@ def main(argv: list[str] | None = None) -> int:
     sp_list = sp_sub.add_parser("list")
 
     sb = sub.add_parser("backfill")
-    sb.add_argument("--source", choices=["claude", "codex", "both"],
-                    default="both")
+    sb.add_argument("--source", choices=["claude", "codex", "omp", "all"],
+                    default="all")
+    sb.add_argument("--projects-root", default=None,
+                    help="Override Claude transcripts root "
+                         "(default: ~/.claude/projects)")
+    sb.add_argument("--codex-root", default=None,
+                    help="Override Codex root (default: ~/.codex)")
+    sb.add_argument("--omp-root", default=None,
+                    help="Override OMP sessions root "
+                         "(default: ~/.omp/agent/sessions)")
     sb.add_argument("--limit", type=int, default=0)
     sb.add_argument("--dry-run", action="store_true")
     sb.add_argument("--provider", default=None,

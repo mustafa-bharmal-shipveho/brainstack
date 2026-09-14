@@ -48,6 +48,9 @@ _KNOWN_SOURCES = [
     ("Claude session transcripts",  "~/.claude/projects/*/*.jsonl",
         "claude-sessions",          "memory/episodic/claude-sessions",
         2, "claude_session_adapter.py"),
+    ("OMP session transcripts",     "~/.omp/agent/sessions/*/*.jsonl",
+        "omp-sessions",             "memory/episodic/digests",
+        2, "digest_cli.py (normalized with Claude/Codex sessions)"),
     # tier 3: covered by claude_misc_adapter
     ("Claude plans",                "~/.claude/plans",
         "claude-misc",              "imports/claude/plans",
