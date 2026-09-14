@@ -6,6 +6,8 @@ upstream format quirks. The contract pinned here:
 
   - Claude `~/.claude/projects/<slug>/<uuid>.jsonl` → NormalizedSession
   - Codex  `~/.codex/sessions/.../rollout-*.jsonl`  → NormalizedSession
+  - OMP    `~/.omp/agent/sessions/<slug>/<ts>_<uuid>.jsonl`
+                                                    → NormalizedSession
   - Common fields: session_id, source, started_at, ended_at, cwd,
     git_branch, project_slug, model, messages[], raw_token_estimate
   - NormalizedMessage: role, text (concatenated text+thinking content
@@ -124,6 +126,77 @@ def _codex_rollout_jsonl(tmp_path: Path, session_id: str = "019e-codex") -> Path
          "payload": {"type": "task_complete", "turn_id": "t1"}},
     ]
     path = tmp_path / f"rollout-{session_id}.jsonl"
+    path.write_text("".join(json.dumps(e) + "\n" for e in events))
+    return path
+
+
+def _omp_session_jsonl(tmp_path: Path, session_id: str = "omp-abc") -> Path:
+    """Write a synthetic OMP session jsonl with a representative mix of
+    entry types. Mirrors the real schema (title/session/model_change
+    metadata events, then message events whose content blocks are
+    text/thinking/toolCall, plus toolResult-role messages and custom
+    harness events). No real-world identifiers."""
+    events = [
+        {"type": "title", "v": 1, "title": "Synthetic session",
+         "source": "auto", "updatedAt": "2026-05-01T12:00:20Z"},
+        {"type": "session", "version": 3, "id": session_id,
+         "timestamp": "2026-05-01T12:00:00Z", "cwd": "/tmp/work",
+         "title": "Synthetic session", "titleSource": "auto"},
+        {"type": "model_change", "id": "mc1", "parentId": None,
+         "timestamp": "2026-05-01T12:00:01Z",
+         "model": "synthetic/model-1", "resolvedModelIsFallback": False},
+        {"type": "thinking_level_change", "id": "tl1", "parentId": "mc1",
+         "timestamp": "2026-05-01T12:00:01Z",
+         "thinkingLevel": "high", "configured": None},
+        {"type": "message", "id": "m1", "parentId": "tl1",
+         "timestamp": "2026-05-01T12:00:02Z",
+         "message": {"role": "user",
+                     "content": [{"type": "text",
+                                  "text": "Why is the sync job failing?"}],
+                     "attribution": "user"}},
+        {"type": "custom", "customType": "tool_execution_start",
+         "data": {"toolCallId": "grep_0", "toolName": "grep",
+                  "startedAt": "2026-05-01T12:00:03Z",
+                  "intent": "Searching for the sync config"},
+         "id": "c1", "parentId": "m1",
+         "timestamp": "2026-05-01T12:00:03Z"},
+        {"type": "message", "id": "m2", "parentId": "c1",
+         "timestamp": "2026-05-01T12:00:04Z",
+         "message": {"role": "assistant",
+                     "content": [
+                         {"type": "thinking",
+                          "thinking": "Check the sync config first."},
+                         {"type": "text",
+                          "text": "Let me look at the sync config."},
+                         {"type": "toolCall", "id": "grep_0",
+                          "name": "grep",
+                          "arguments": {"pattern": "sync",
+                                        "path": "/tmp/work"}},
+                     ]}},
+        {"type": "message", "id": "m3", "parentId": "m2",
+         "timestamp": "2026-05-01T12:00:05Z",
+         "message": {"role": "toolResult", "toolCallId": "grep_0",
+                     "toolName": "grep",
+                     "content": [{"type": "text",
+                                  "text": "sync.sh:42: rsync failed"}]}},
+        {"type": "message", "id": "m4", "parentId": "m3",
+         "timestamp": "2026-05-01T12:00:10Z",
+         "message": {"role": "assistant",
+                     "content": [{"type": "text",
+                                  "text": "Found it — rsync fails at "
+                                          "line 42."}]}},
+        {"type": "custom_message",
+         "customType": "mid-run-todo-nudge",
+         "id": "cm1", "parentId": "m4",
+         "timestamp": "2026-05-01T12:00:11Z"},
+        {"type": "ttsr_injection", "id": "ti1", "parentId": "cm1",
+         "timestamp": "2026-05-01T12:00:12Z",
+         "injectedRules": ["ts-no-any"]},
+        {"type": "title_change", "id": "tc1", "parentId": "ti1",
+         "timestamp": "2026-05-01T12:00:15Z",
+         "title": "Synthetic session", "source": "auto"},
+    ]
+    path = tmp_path / f"2026-05-01T12-00-00-000Z_{session_id}.jsonl"
     path.write_text("".join(json.dumps(e) + "\n" for e in events))
     return path
 
@@ -300,6 +373,114 @@ class TestNormalizeCodex:
         s = normalize_mod.normalize_codex_session(path)
         assert s is not None
         assert len(s.messages) == 2
+
+
+# ---------------------------------------------------------------------------
+# OMP normalization
+# ---------------------------------------------------------------------------
+
+class TestNormalizeOMP:
+    def test_returns_session_with_required_fields(self, normalize_mod,
+                                                  tmp_path):
+        path = _omp_session_jsonl(tmp_path)
+        s = normalize_mod.normalize_omp_session(path, project_slug="proj-x")
+        assert s is not None
+        assert s.session_id == "omp-abc"
+        assert s.source == "omp"
+        assert s.project_slug == "proj-x"
+        assert s.cwd == "/tmp/work"
+        assert s.git_branch is None  # OMP doesn't record the branch
+        assert s.model == "synthetic/model-1"
+        assert s.started_at == "2026-05-01T12:00:00Z"
+        assert s.ended_at == "2026-05-01T12:00:15Z"
+        assert s.raw_token_estimate > 0
+
+    def test_messages_have_correct_roles_and_order(self, normalize_mod,
+                                                   tmp_path):
+        """user prompt → assistant (thinking+text+toolCall) → toolResult
+        (mapped to user, same as Claude tool_result) → assistant."""
+        path = _omp_session_jsonl(tmp_path)
+        s = normalize_mod.normalize_omp_session(path, project_slug="p")
+        roles = [m.role for m in s.messages]
+        assert roles == ["user", "assistant", "user", "assistant"]
+
+    def test_assistant_text_concatenates_text_and_thinking(self,
+                                                           normalize_mod,
+                                                           tmp_path):
+        path = _omp_session_jsonl(tmp_path)
+        s = normalize_mod.normalize_omp_session(path, project_slug="p")
+        a1 = s.messages[1]
+        assert "Check the sync config first." in a1.text
+        assert "Let me look at the sync config." in a1.text
+
+    def test_assistant_tool_calls_captured(self, normalize_mod, tmp_path):
+        """OMP `toolCall` blocks normalize to the Claude tool_use shape
+        ({id, name, input}) so prompt assembly is source-agnostic."""
+        path = _omp_session_jsonl(tmp_path)
+        s = normalize_mod.normalize_omp_session(path, project_slug="p")
+        a1 = s.messages[1]
+        assert len(a1.tool_calls) == 1
+        tc = a1.tool_calls[0]
+        assert tc["id"] == "grep_0"
+        assert tc["name"] == "grep"
+        assert tc["input"]["pattern"] == "sync"
+
+    def test_tool_result_content_preserved_as_user_text(self, normalize_mod,
+                                                        tmp_path):
+        """OMP toolResult messages carry tool output — often where the
+        actionable finding lives. Dropping them would steal signal; they
+        normalize to role="user" exactly like Claude tool_result blocks."""
+        path = _omp_session_jsonl(tmp_path)
+        s = normalize_mod.normalize_omp_session(path, project_slug="p")
+        tr = s.messages[2]
+        assert tr.role == "user"
+        assert "rsync failed" in tr.text
+
+    def test_skips_non_conversation_events(self, normalize_mod, tmp_path):
+        """title/session/model_change/thinking_level_change/title_change/
+        custom/custom_message/ttsr_injection are metadata, not turns."""
+        path = _omp_session_jsonl(tmp_path)
+        s = normalize_mod.normalize_omp_session(path, project_slug="p")
+        assert len(s.messages) == 4
+
+    def test_tolerates_malformed_json_lines(self, normalize_mod, tmp_path):
+        path = _omp_session_jsonl(tmp_path)
+        path.write_text(path.read_text() + "{not valid json\n")
+        s = normalize_mod.normalize_omp_session(path, project_slug="p")
+        assert s is not None
+        assert len(s.messages) == 4
+
+    def test_metadata_only_session_returns_none(self, normalize_mod,
+                                                tmp_path):
+        """An OMP session opened and abandoned before the first prompt
+        (session + model_change events only) is not digest-able."""
+        path = tmp_path / "meta-only.jsonl"
+        path.write_text(
+            json.dumps({"type": "session", "version": 3,
+                        "id": "meta-only",
+                        "timestamp": "2026-05-01T12:00:00Z",
+                        "cwd": "/tmp/work"}) + "\n"
+            + json.dumps({"type": "model_change", "id": "mc1",
+                          "timestamp": "2026-05-01T12:00:01Z",
+                          "model": "synthetic/model-1"}) + "\n"
+        )
+        s = normalize_mod.normalize_omp_session(path, project_slug="p")
+        assert s is None
+
+    def test_session_id_falls_back_to_file_stem(self, normalize_mod,
+                                                tmp_path):
+        """A transcript missing the `session` event (truncated head)
+        still gets a stable id from its file name."""
+        path = tmp_path / "2026-05-01T12-00-00-000Z_orphan.jsonl"
+        path.write_text(json.dumps({
+            "type": "message", "id": "m1",
+            "timestamp": "2026-05-01T12:00:02Z",
+            "message": {"role": "user",
+                        "content": [{"type": "text", "text": "hello"}]},
+        }) + "\n")
+        s = normalize_mod.normalize_omp_session(path, project_slug="p")
+        assert s is not None
+        assert s.session_id == "2026-05-01T12-00-00-000Z_orphan"
 
 
 # ---------------------------------------------------------------------------

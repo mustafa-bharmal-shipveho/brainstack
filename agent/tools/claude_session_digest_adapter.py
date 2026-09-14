@@ -6,8 +6,9 @@ and a markdown file with YAML front-matter for browse + git sync).
 
 Architecture (matches the approved plan):
 
-    1. Walk sessions (Claude `~/.claude/projects/<slug>/<uuid>.jsonl`
-       and Codex `~/.codex/sessions/.../rollout-*.jsonl`).
+    1. Walk sessions (Claude `~/.claude/projects/<slug>/<uuid>.jsonl`,
+       Codex `~/.codex/sessions/.../rollout-*.jsonl`, and OMP
+       `~/.omp/agent/sessions/<slug>/<timestamp>_<uuid>.jsonl`).
     2. Dedup via content-SHA sidecar at
        memory/episodic/digests/_imported.jsonl. Re-runs are no-ops
        when nothing changed.
@@ -52,6 +53,7 @@ from _session_normalize import (  # type: ignore
     NormalizedSession,
     normalize_claude_session,
     normalize_codex_session,
+    normalize_omp_session,
 )
 import _digest_render as digest_render  # type: ignore
 from llm_providers import LLMProvider, resolve_provider  # type: ignore
@@ -227,6 +229,40 @@ def iter_codex_sessions(
         yield ns
 
 
+def iter_omp_sessions(
+    omp_root: Path,
+    log: Callable[[str], None] = lambda s: None,
+) -> Iterator[NormalizedSession]:
+    """Yield NormalizedSession for every <slug>/<timestamp>_<uuid>.jsonl
+ under `omp_root`. Same skip rules as the Claude walker: sessions with no
+ conversational turns and unparseable files are skipped, but skips are
+ counted and logged so silent schema drift is visible. Output order is
+ deterministic."""
+    if not omp_root.is_dir():
+        return
+    unparseable = 0
+    for slug_dir in sorted(omp_root.iterdir()):
+        if not slug_dir.is_dir():
+            continue
+        for jsonl in sorted(slug_dir.glob("*.jsonl")):
+            try:
+                ns = normalize_omp_session(jsonl,
+                                           project_slug=slug_dir.name)
+            except Exception as exc:
+                unparseable += 1
+                log(f"iter_omp_sessions: skipping unparseable {jsonl.name}: {exc}")
+                continue
+            if ns is None:
+                continue
+            # OMP file names are "<timestamp>_<uuid>.jsonl", not
+            # "<sid>.jsonl", so the path can't be reconstructed from
+            # slug + session_id — stash it like iter_codex_sessions.
+            ns.__dict__["_source_path"] = jsonl
+            yield ns
+    if unparseable:
+        log(f"iter_omp_sessions: {unparseable} OMP session file(s) failed to parse under {omp_root}")
+
+
 # ---------------------------------------------------------------------------
 # Sidecar (content-SHA dedup)
 # ---------------------------------------------------------------------------
@@ -281,8 +317,9 @@ def _file_sha256(path: Path) -> str:
 
 def _session_source_path(ns: NormalizedSession,
                           claude_root: Path | None) -> Path | None:
-    """Recover the on-disk path for a session. iter_codex_sessions
-    stashes it; for Claude we reconstruct from project_slug + sid."""
+    """Recover the on-disk path for a session. iter_codex_sessions and
+    iter_omp_sessions stash it; for Claude we reconstruct from
+    project_slug + sid."""
     p = ns.__dict__.get("_source_path")
     if isinstance(p, Path):
         return p
@@ -502,6 +539,7 @@ def backfill(
     brain_root: Path,
     projects_root: Path | None,
     codex_root: Path | None,
+    omp_root: Path | None = None,
     provider: LLMProvider | None = None,
     log: Callable[[str], None] = lambda s: None,
     limit: int | None = None,
@@ -653,6 +691,12 @@ def backfill(
         if codex_root is not None:
             codex_root = Path(codex_root)
             for ns in iter_codex_sessions(codex_root):
+                sp = _session_source_path(ns, claude_root=None)
+                _process(ns, sp)
+
+        if omp_root is not None:
+            omp_root = Path(omp_root)
+            for ns in iter_omp_sessions(omp_root, log=log):
                 sp = _session_source_path(ns, claude_root=None)
                 _process(ns, sp)
 

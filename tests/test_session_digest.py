@@ -202,6 +202,44 @@ def _codex_rollout(tmp_path: Path, sid: str = "codex-s1") -> Path:
     return path
 
 
+def _omp_session(slug_dir: Path, sid: str = "omp-s1",
+                 n_turns: int = 2) -> Path:
+    """Synthetic OMP session under <slug>/<timestamp>_<uuid>.jsonl
+    matching the real on-disk layout."""
+    slug_dir.mkdir(parents=True, exist_ok=True)
+    path = slug_dir / f"2026-05-01T12-00-00-000Z_{sid}.jsonl"
+    events = [
+        {"type": "session", "version": 3, "id": sid,
+         "timestamp": "2026-05-01T12:00:00Z", "cwd": "/tmp/work",
+         "title": "Synthetic OMP session", "titleSource": "auto"},
+        {"type": "model_change", "id": "mc1", "parentId": None,
+         "timestamp": "2026-05-01T12:00:01Z",
+         "model": "synthetic/model-1", "resolvedModelIsFallback": False},
+    ]
+    for i in range(n_turns):
+        events.append({
+            "type": "message", "id": f"u{i}", "parentId": None,
+            "timestamp": f"2026-05-01T12:0{i}:02Z",
+            "message": {"role": "user",
+                        "content": [{"type": "text",
+                                     "text": f"User message {i} about "
+                                             "the topic"}]},
+        })
+        events.append({
+            "type": "message", "id": f"a{i}", "parentId": f"u{i}",
+            "timestamp": f"2026-05-01T12:0{i}:30Z",
+            "message": {"role": "assistant",
+                        "content": [
+                            {"type": "text",
+                             "text": f"Assistant reply {i}"},
+                            {"type": "toolCall", "id": f"bash_{i}",
+                             "name": "bash",
+                             "arguments": {"command": "ls"}}]},
+        })
+    path.write_text("".join(json.dumps(e) + "\n" for e in events))
+    return path
+
+
 # ---------------------------------------------------------------------------
 # Discovery + idempotency (sidecar)
 # ---------------------------------------------------------------------------
@@ -285,6 +323,62 @@ class TestDiscoveryAndIdempotency:
         assert s2["digests_written"] == 0
         assert s2["skipped_idempotent"] == 1
         # Provider was only called once total
+        assert len(provider.calls) == 1
+
+    def test_iter_omp_sessions_finds_session_files(self, adapter_mod,
+                                                   tmp_path):
+        omp_root = tmp_path / ".omp" / "agent" / "sessions"
+        slug = "-tmp-work"
+        _omp_session(omp_root / slug, "omp-s1")
+        _omp_session(omp_root / slug, "omp-s2")
+        found = list(adapter_mod.iter_omp_sessions(omp_root=omp_root))
+        sids = sorted([s.session_id for s in found])
+        assert sids == ["omp-s1", "omp-s2"]
+        for s in found:
+            assert s.source == "omp"
+            # project_slug is set from the parent dir name
+            assert s.project_slug == slug
+
+    def test_omp_backfill_writes_both_surfaces(self, adapter_mod,
+                                               tmp_path):
+        """Equal coverage for OMP sessions: walking, normalization,
+        digest, dual write must work the same as Claude. Origin is
+        namespaced `session.digest.omp`."""
+        brain = tmp_path / "brain"
+        omp_root = tmp_path / "omp"
+        _omp_session(omp_root / "-tmp-work", "omp-s1")
+        provider = FakeProvider()
+        stats = adapter_mod.backfill(
+            brain_root=brain, projects_root=None, codex_root=None,
+            omp_root=omp_root, provider=provider,
+        )
+        assert stats["digests_written"] == 1
+        ep = brain / "memory" / "episodic" / "digests" / "AGENT_LEARNINGS.jsonl"
+        assert ep.exists()
+        line = json.loads(ep.read_text().strip())
+        assert line["origin"] == "session.digest.omp"
+        md_dir = brain / "memory" / "semantic" / "digests"
+        assert len(list(md_dir.glob("*.md"))) == 1
+
+    def test_omp_sidecar_dedups_second_run(self, adapter_mod, tmp_path):
+        """OMP file names are <timestamp>_<uuid>.jsonl (not <sid>.jsonl),
+        so the source-path stash is what lets the sidecar SHA dedup
+        work. A second run must be a complete no-op."""
+        brain = tmp_path / "brain"
+        omp_root = tmp_path / "omp"
+        _omp_session(omp_root / "-tmp-work", "omp-s1")
+        provider = FakeProvider()
+        s1 = adapter_mod.backfill(
+            brain_root=brain, projects_root=None, codex_root=None,
+            omp_root=omp_root, provider=provider,
+        )
+        s2 = adapter_mod.backfill(
+            brain_root=brain, projects_root=None, codex_root=None,
+            omp_root=omp_root, provider=provider,
+        )
+        assert s1["digests_written"] == 1
+        assert s2["digests_written"] == 0
+        assert s2["skipped_idempotent"] == 1
         assert len(provider.calls) == 1
 
     def test_codex_backfill_writes_both_surfaces(self, adapter_mod,
