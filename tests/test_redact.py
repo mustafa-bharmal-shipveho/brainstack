@@ -526,3 +526,48 @@ def test_url_alone_still_does_not_false_positive(tmp_path):
     assert result.returncode == 0, (
         f"URL alone should pass; stdout: {result.stdout}"
     )
+
+
+# ----- New Relic user keys (NRAK-) -----
+
+
+def test_new_relic_user_key_blocks(tmp_path):
+    """NRAK- + 27 [A-Z0-9] chars must be flagged by the scanner."""
+    f = tmp_path / "nr.env"
+    f.write_text("NEW_RELIC_LICENSE = NRAK-" + "A" * 27 + "\n")
+    result = run_redact(tmp_path)
+    assert result.returncode != 0
+    assert "new_relic_user_key" in result.stdout
+
+
+def test_new_relic_user_key_in_builtin_patterns():
+    """The pattern must be builtin (shared with redact_jsonl scrubbing), not private."""
+    sys.path.insert(0, str(REPO_ROOT / "agent" / "tools"))
+    from redact import BUILTIN_PATTERNS  # noqa: E402
+
+    names = [name for name, _ in BUILTIN_PATTERNS]
+    assert "new_relic_user_key" in names
+
+
+def test_new_relic_user_key_length_floor(tmp_path):
+    """NRAK- needs at least 27 [A-Z0-9] chars; longer future variants must still match."""
+    sys.path.insert(0, str(REPO_ROOT / "agent" / "tools"))
+    from redact import BUILTIN_PATTERNS  # noqa: E402
+
+    pattern = dict(BUILTIN_PATTERNS)["new_relic_user_key"]
+    assert pattern.search("NRAK-" + "A" * 26) is None
+    assert pattern.search("NRAK-" + "a" * 27) is None
+    assert pattern.search("NRAK-" + "A" * 27)
+    assert pattern.search("NRAK-" + "A" * 28)
+
+
+def test_new_relic_user_key_with_example_word_still_blocked(tmp_path):
+    """A real NRAK key padded with the word EXAMPLE must NOT be suppressed as a
+    documentation placeholder — the same guarantee AWS keys get from
+    VENDOR_CREDENTIAL_SHAPES. Regression for the review finding that NRAK was
+    missing from that tuple."""
+    f = tmp_path / "leak.txt"
+    f.write_text("NR_KEY=NRAK-" + "A" * 20 + "EXAMPLE\n")
+    result = run_redact(tmp_path)
+    assert result.returncode != 0
+    assert "leak.txt" in result.stdout

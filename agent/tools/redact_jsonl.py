@@ -221,10 +221,21 @@ def process_jsonl(path: Path, patterns: list, dry_run: bool, entropy_threshold: 
     return lines_changed, total_hits
 
 
+def _scrubbable_jsonl_name(name: str) -> bool:
+    return (name.endswith(".jsonl") or ".jsonl." in name) and not name.endswith(
+        ".lock"
+    )
+
+
 def find_jsonls(target: Path) -> list[Path]:
     if target.is_file():
-        return [target] if target.suffix == ".jsonl" else []
-    return sorted(target.rglob("*.jsonl"))
+        return [target] if _scrubbable_jsonl_name(target.name) else []
+    return sorted(
+        p
+        for p in target.rglob("*")
+        if p.is_file()
+        and _scrubbable_jsonl_name(p.name)
+    )
 
 
 def main() -> int:
