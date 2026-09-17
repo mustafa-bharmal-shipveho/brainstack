@@ -731,9 +731,12 @@ def test_large_tracked_files_threshold_is_exclusive_at_50mib(make_env, tmp_path:
 # ---------- log_sizes --------------------------------------------------
 
 
-def test_log_sizes_warn_over_20mb_includes_rolled_and_namespaces(
+def test_log_sizes_mixed_current_and_rolled_oversize_warns(
     make_env, tmp_path: Path
 ):
+    """Mixed current + rolled oversize is a WARN: the CURRENT stream drives
+    the status (its writer/importer is live, so rotation is the fix), while
+    the rolled sibling is only pending decay-archive."""
     env = make_env(tmp_path)
     brain = env.brain_root
     # Over threshold: one ROLLED event log and one NAMESPACED episodic file.
@@ -751,6 +754,101 @@ def test_log_sizes_warn_over_20mb_includes_rolled_and_namespaces(
     assert "exceed 20 MB" in res.evidence
     assert res.evidence.count("events.log") == 1
     assert res.evidence.count("AGENT_LEARNINGS") == 1
+
+
+def test_log_sizes_rolled_only_oversize_passes_with_decay_archive_note(
+    make_env, tmp_path: Path
+):
+    """Rolled siblings (`<stem>.<YYYY-MM-DD>[.N]<suffix>`) are already rotated:
+    they no longer grow, so an oversize ROLLED-only brain is a PASS — but the
+    evidence must still name the files and say they are pending decay-archive
+    (DECAY_DAYS=90). Regression: these used to WARN with an `install.sh
+    --upgrade` fix, which is meaningless for already-rotated files."""
+    env = make_env(tmp_path)
+    brain = env.brain_root
+    _sparse(brain / "runtime" / "logs" / "events.log.2026-09-03.jsonl", 30 * MB)
+    _sparse(brain / "memory" / "episodic" / "AGENT_LEARNINGS.2026-09-08.jsonl", 25 * MB)
+    # Both current streams under threshold.
+    _sparse(brain / "runtime" / "logs" / "events.log.jsonl", 1 * MB)
+    _sparse(brain / "memory" / "episodic" / "AGENT_LEARNINGS.jsonl", 1 * MB)
+
+    res = health.check_log_sizes(env)
+
+    assert res.status == "PASS"
+    assert "events.log.2026-09-03.jsonl" in res.evidence
+    assert "AGENT_LEARNINGS.2026-09-08.jsonl" in res.evidence
+    assert "decay" in res.evidence
+    assert "DECAY_DAYS=90" in res.evidence
+
+
+def test_log_sizes_rolled_only_fix_never_says_install_sh_upgrade(
+    make_env, tmp_path: Path
+):
+    """The rolled-only PASS must not carry the rotation fix text: those files
+    already rotated, so `./install.sh --upgrade (adds rotation)` is the wrong
+    advice and would hide a real importer problem if it ever fired here."""
+    env = make_env(tmp_path)
+    _sparse(
+        env.brain_root / "runtime" / "logs" / "events.log.2026-09-03.jsonl", 30 * MB
+    )
+
+    res = health.check_log_sizes(env)
+
+    assert "install.sh --upgrade" not in res.fix
+
+
+def test_log_sizes_current_oversize_warns_rolls_on_next_write(
+    make_env, tmp_path: Path
+):
+    """An oversize CURRENT stream file still warns, but the fix must say the
+    file rolls on next write to its stream — and that if it does not, that
+    stream's writer/importer is broken — instead of pointing at an upgrade."""
+    env = make_env(tmp_path)
+    _sparse(env.brain_root / "runtime" / "logs" / "events.log.jsonl", 30 * MB)
+
+    res = health.check_log_sizes(env)
+
+    assert res.status == "WARN"
+    assert "install.sh --upgrade" not in res.fix
+    assert "rolls on next write" in res.fix
+    assert "broken" in res.fix
+
+
+def test_log_sizes_double_rolled_sibling_classifies_as_rolled(
+    make_env, tmp_path: Path
+):
+    """A same-day double roll (`…2026-09-08.1.jsonl`) matches the anchored
+    `<stem>.<date>[.N]<suffix>` shape, so it is a rolled sibling too —
+    oversize-but-double-rolled alone must not flip the status to WARN."""
+    env = make_env(tmp_path)
+    brain = env.brain_root
+    _sparse(
+        brain / "memory" / "episodic" / "AGENT_LEARNINGS.2026-09-08.1.jsonl", 30 * MB
+    )
+    _sparse(brain / "memory" / "episodic" / "AGENT_LEARNINGS.jsonl", 1 * MB)
+
+    res = health.check_log_sizes(env)
+
+    assert res.status == "PASS"
+    assert "AGENT_LEARNINGS.2026-09-08.1.jsonl" in res.evidence
+
+
+def test_log_sizes_stem_sharing_non_roll_classifies_as_current(
+    make_env, tmp_path: Path
+):
+    """`AGENT_LEARNINGS_imported.jsonl` shares the stem but is NOT a rolled
+    sibling (the middle segment is not a date), so it is a current stream
+    file: oversize means WARN with the rolls-on-next-write fix."""
+    env = make_env(tmp_path)
+    brain = env.brain_root
+    _sparse(brain / "memory" / "episodic" / "AGENT_LEARNINGS_imported.jsonl", 30 * MB)
+    _sparse(brain / "memory" / "episodic" / "AGENT_LEARNINGS.jsonl", 1 * MB)
+
+    res = health.check_log_sizes(env)
+
+    assert res.status == "WARN"
+    assert "install.sh --upgrade" not in res.fix
+    assert "rolls on next write" in res.fix
 
 
 def test_log_sizes_verb_agrees_with_one_file(make_env, tmp_path: Path):

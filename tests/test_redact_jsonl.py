@@ -199,3 +199,68 @@ def test_pem_block_scrubbed(tmp_path):
     assert result.returncode == 1
     rows = read_jsonl(f)
     assert "BEGIN RSA PRIVATE KEY" not in rows[0]["key"]
+
+
+# ----- .jsonl.* suffix files (bak files) must be scrubbed -----
+
+
+def test_dir_walk_scrubs_bak_suffix(tmp_path):
+    """AGENT_LEARNINGS.jsonl.preCodexFix.bak must be scrubbed alongside .jsonl.
+
+    Regression: a real New Relic key survived 4 months in a .bak file because
+    the directory walk only matched *.jsonl.
+    """
+    secret = "AKIA" + "B" * 16
+    for name in ("AGENT_LEARNINGS.jsonl", "AGENT_LEARNINGS.jsonl.preCodexFix.bak"):
+        write_jsonl(tmp_path / name, [{"note": "leak", "key": secret}])
+
+    result = run(str(tmp_path), "--brain-root", str(tmp_path / "no-brain"))
+
+    for name in ("AGENT_LEARNINGS.jsonl", "AGENT_LEARNINGS.jsonl.preCodexFix.bak"):
+        rows = read_jsonl(tmp_path / name)
+        assert "[REDACTED:" in rows[0]["key"], f"{name} was not scrubbed"
+
+
+def test_explicit_bak_file_target_is_scrubbed(tmp_path):
+    """An explicit path ending in .jsonl.<suffix> must be treated as a target."""
+    secret = "AKIA" + "B" * 16
+    f = tmp_path / "AGENT_LEARNINGS.jsonl.preCodexFix.bak"
+    write_jsonl(f, [{"key": secret}])
+
+    result = run(str(f), "--brain-root", str(tmp_path / "no-brain"))
+
+    rows = read_jsonl(f)
+    assert "[REDACTED:" in rows[0]["key"], (
+        "explicit .jsonl.* target was silently dropped (no candidates)"
+    )
+
+
+def test_lock_file_untouched(tmp_path):
+    """*.lock files must be excluded from the directory walk — including names
+    that also contain .jsonl. (stream.jsonl.lock exercises the explicit
+    .lock-exclusion branch, not just the .jsonl name filter)."""
+    secret = "AKIA" + "B" * 16
+    write_jsonl(tmp_path / "log.jsonl", [{"key": secret}])
+    lock = tmp_path / "something.lock"
+    lock.write_text('{"lock": "' + secret + '"}\n')
+    jsonl_lock = tmp_path / "stream.jsonl.lock"
+    jsonl_lock.write_text('{"lock": "' + secret + '"}\n')
+
+    result = run(str(tmp_path), "--brain-root", str(tmp_path / "no-brain"))
+
+    assert lock.read_text() == '{"lock": "' + secret + '"}\n'
+    assert "something.lock" not in result.stdout
+    assert jsonl_lock.read_text() == '{"lock": "' + secret + '"}\n'
+    assert "stream.jsonl.lock" not in result.stdout
+
+
+def test_non_jsonl_names_untouched(tmp_path):
+    """Non-jsonl names like notes.md must be left alone."""
+    notes = tmp_path / "notes.md"
+    notes.write_text("AKIA" + "B" * 16 + "\n")
+    write_jsonl(tmp_path / "log.jsonl", [{"key": "AKIA" + "B" * 16}])
+
+    result = run(str(tmp_path), "--brain-root", str(tmp_path / "no-brain"))
+
+    assert notes.read_text() == "AKIA" + "B" * 16 + "\n"
+    assert "notes.md" not in result.stdout

@@ -71,6 +71,12 @@ BUILTIN_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("openai_project", re.compile(r"\bsk-proj-[A-Za-z0-9_-]{20,}\b")),
     ("anthropic_key", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{40,}\b")),
 
+    # ---- New Relic ----
+    # {27,} not {27}: today's user keys are 27 chars after the prefix, but a
+    # longer future variant must still match — a false negative hides a leak,
+    # a false positive only costs a review.
+    ("new_relic_user_key", re.compile(r"\bNRAK-[A-Z0-9]{27,}\b")),
+
     # ---- Twilio / SendGrid / Heroku / NPM ----
     ("twilio_account_sid", re.compile(r"\bAC[a-f0-9]{32}\b")),
     ("twilio_auth_token", re.compile(r"\bSK[a-f0-9]{32}\b")),
@@ -416,6 +422,7 @@ VENDOR_CREDENTIAL_SHAPES = (
     re.compile(r"glpat-[A-Za-z0-9_\-]{20,}"),                # GitLab
     re.compile(r"AIza[0-9A-Za-z_\-]{35}"),                   # Google API
     re.compile(r"[sr]k_(?:live|test)_[0-9A-Za-z]{10,}"),     # Stripe
+    re.compile(r"NRAK-[A-Z0-9]{27,}"),                       # New Relic user key
 )
 
 

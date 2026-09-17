@@ -378,9 +378,26 @@ def check_large_tracked_files(env: HealthEnv) -> CheckResult:
     )
 
 
+# Mirrored from agent/memory/decay.py — a separate deploy tree that recall/
+# must not import (same rule as the `_rolled_pattern` copies). Display text
+# only; keep in sync with DECAY_DAYS there.
+_DECAY_DAYS = 90
+
+
 def check_log_sizes(env: HealthEnv) -> CheckResult:
-    """Any log/episodic file over `LOG_WARN_BYTES` (rolled or current)."""
-    from recall.stats import _log_files
+    """Log/episodic file sizes, classified by stream state.
+
+    Each oversize file is either a ROLLED sibling
+    (`<stem>.<YYYY-MM-DD>[.N]<suffix>`, matched by `_is_rolled_sibling` in
+    recall/stats.py — already rotated, pending decay-archive with
+    `DECAY_DAYS=90`) or a CURRENT stream file (still being written). Status
+    is driven by CURRENT files only: oversize current → WARN with a fix
+    saying the file rolls on next write to its stream, and that if it does
+    not, that stream's writer/importer is broken — check the launchd
+    agents. Oversize rolled siblings alone → PASS, with the evidence still
+    naming them and noting they are pending decay-archive.
+    """
+    from recall.stats import _is_rolled_sibling
 
     brain = env.brain_root
     episodic = brain / "memory" / "episodic"
@@ -403,25 +420,66 @@ def check_log_sizes(env: HealthEnv) -> CheckResult:
 
     candidates: dict = {}
     for base in bases:
-        for path in _log_files(base):
-            if path.is_file():
-                candidates[str(path)] = path
-
-    sized: list = []
-    for path in candidates.values():
+        # Same loose stream glob `_log_files` uses, but every match is kept
+        # and classified below — a stem-sharing non-roll (e.g.
+        # `AGENT_LEARNINGS_imported.jsonl`) is a CURRENT stream file, not a
+        # rolled sibling, so it must not be filtered out here.
+        suffix = ".jsonl" if base.name.endswith(".jsonl") else ""
+        stem = base.name[: len(base.name) - len(suffix)] if suffix else base.name
         try:
-            sized.append((_log_label(path, brain), path.stat().st_size))
+            matches = sorted(base.parent.glob(f"{stem}*{suffix}"))
+        except OSError:
+            matches = []
+        for path in matches:
+            if path.is_file():
+                candidates[str(path)] = (path, stem, suffix)
+
+    limit_mb = LOG_WARN_BYTES // _MB
+    oversize: list = []
+    any_current = False
+    for path, stem, suffix in candidates.values():
+        try:
+            size = path.stat().st_size
         except OSError:
             continue
+        if size <= LOG_WARN_BYTES:
+            continue
+        entry = (_log_label(path, brain), size)
+        oversize.append(entry)
+        if not _is_rolled_sibling(path.name, stem, suffix):
+            any_current = True
 
-    return _size_threshold_result(
-        "log_sizes", sized,
-        limit_bytes=LOG_WARN_BYTES,
-        noun="log file(s)",
-        over_status="WARN",
-        over_suffix=" (rolls on next write after upgrade)",
-        fix="./install.sh --upgrade (adds rotation); "
-            "rolled files land beside the current one",
+    if not oversize:
+        # Tolerate OSError the same way the oversize loop above does — a file
+        # deleted between glob and stat must not fail the whole health check.
+        largest = 0
+        for p, _s, _sx in candidates.values():
+            try:
+                if p.is_file():
+                    largest = max(largest, p.stat().st_size)
+            except OSError:
+                continue
+        return CheckResult(
+            "log_sizes", "PASS",
+            f"{len(candidates)} log file(s), largest {largest / _MB:.1f} MB "
+            f"(limit {limit_mb} MB)",
+        )
+
+    oversize.sort(key=lambda t: t[1], reverse=True)
+    listed = ", ".join(f"{label} {size / _MB:.1f} MB" for label, size in oversize)
+    if not any_current:
+        # Rolled siblings only: already rotated, pending decay-archive.
+        evidence = (
+            f"{listed} exceed{_verb_s(len(oversize))} {limit_mb} MB "
+            f"(pending decay-archive, DECAY_DAYS={_DECAY_DAYS})"
+        )
+        return CheckResult("log_sizes", "PASS", evidence)
+
+    evidence = f"{listed} exceed{_verb_s(len(oversize))} {limit_mb} MB"
+    return CheckResult(
+        "log_sizes", "WARN", evidence,
+        fix="the file rolls on next write to its stream; if it does not, "
+            "that stream's writer/importer is broken — check launchd agents",
     )
 
 
