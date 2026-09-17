@@ -35,3 +35,18 @@ def _no_live_daemon_socket(tmp_path, monkeypatch):
     a machine without the daemon installed sees.
     """
     monkeypatch.setenv("RECALL_DAEMON_SOCKET", str(tmp_path / "no-daemon.sock"))
+
+
+@pytest.fixture(autouse=True)
+def _no_live_launchd(monkeypatch):
+    """Quarantine the developer's live launchd domain from every test.
+
+    launchd labels are per-USER, not per-HOME: a test that fakes HOME and
+    then runs an install path without this flag bootstraps a tmp-HOME plist
+    into the real gui/<uid> domain (incident 2026-09: com.brainstack.
+    auto-migrate pointed into a dead pytest tmpdir for weeks, exit 2 hourly).
+    `make test-ci` exports the same var; this fixture makes bare local
+    `pytest` runs safe too. Tests that verify the guard itself opt out
+    per-test with monkeypatch.delenv("BRAINSTACK_SKIP_LAUNCHCTL").
+    """
+    monkeypatch.setenv("BRAINSTACK_SKIP_LAUNCHCTL", "1")

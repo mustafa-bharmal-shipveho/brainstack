@@ -400,6 +400,7 @@ def install_plist(
     launchctl_bin: LaunchctlInvoker = "launchctl",
     uid: Optional[int] = None,
     dry_run: bool = False,
+    skip_launchctl: bool = False,
 ) -> InstallResult:
     """Write the plist to `plist_dir`, then `launchctl bootout` (tolerated)
     and `bootstrap` against `gui/<uid>`. Calls `kickstart` to fire the
@@ -446,29 +447,34 @@ def install_plist(
     plist_path.write_bytes(plist_bytes)
 
     # bootout — tolerate "not loaded" (typically returncode 36 on macOS).
-    bootout = _run_launchctl(launchctl_bin, [
-        "bootout", f"gui/{uid}/{LABEL}",
-    ])
-    # bootstrap — must succeed.
-    bootstrap = _run_launchctl(launchctl_bin, [
-        "bootstrap", f"gui/{uid}", str(plist_path),
-    ])
-    if bootstrap.returncode != 0:
-        raise RuntimeError(
-            f"launchctl bootstrap failed (rc={bootstrap.returncode}):\n"
-            f"stdout: {bootstrap.stdout}\nstderr: {bootstrap.stderr}"
-        )
-    # kickstart — fire first run immediately so the user sees something.
-    kickstart = _run_launchctl(launchctl_bin, [
-        "kickstart", "-k", f"gui/{uid}/{LABEL}",
-    ])
+    bootout_rc = bootstrap_rc = kickstart_rc = 0
+    if not skip_launchctl:
+        bootout = _run_launchctl(launchctl_bin, [
+            "bootout", f"gui/{uid}/{LABEL}",
+        ])
+        bootout_rc = bootout.returncode
+        # bootstrap — must succeed.
+        bootstrap = _run_launchctl(launchctl_bin, [
+            "bootstrap", f"gui/{uid}", str(plist_path),
+        ])
+        bootstrap_rc = bootstrap.returncode
+        if bootstrap.returncode != 0:
+            raise RuntimeError(
+                f"launchctl bootstrap failed (rc={bootstrap.returncode}):\n"
+                f"stdout: {bootstrap.stdout}\nstderr: {bootstrap.stderr}"
+            )
+        # kickstart — fire first run immediately so the user sees something.
+        kickstart = _run_launchctl(launchctl_bin, [
+            "kickstart", "-k", f"gui/{uid}/{LABEL}",
+        ])
+        kickstart_rc = kickstart.returncode
     return InstallResult(
         plist_path=plist_path,
         label=LABEL,
         backed_up_path=backup_path,
-        bootout_returncode=bootout.returncode,
-        bootstrap_returncode=bootstrap.returncode,
-        kickstart_returncode=kickstart.returncode,
+        bootout_returncode=bootout_rc,
+        bootstrap_returncode=bootstrap_rc,
+        kickstart_returncode=kickstart_rc,
         dry_run=False,
     )
 
@@ -477,12 +483,22 @@ def remove_plist(
     plist_dir: Path,
     launchctl_bin: LaunchctlInvoker = "launchctl",
     uid: Optional[int] = None,
+    skip_launchctl: bool = False,
 ) -> dict:
-    """`launchctl bootout` + delete the plist. Tolerates 'not loaded' errors."""
+    """`launchctl bootout` + delete the plist. Tolerates 'not loaded' errors.
+
+    With `skip_launchctl=True` the bootout is NOT attempted: if the label
+    was actually loaded, launchd keeps the stale registration until the next
+    non-skip install/remove (or logout). Correct for hermetic tests — just
+    don't mistake the rc=0 in the result for "unloaded from launchd".
+    """
     if uid is None:
         uid = _euid()
     plist_path = plist_dir / f"{LABEL}.plist"
-    bootout = _run_launchctl(launchctl_bin, ["bootout", f"gui/{uid}/{LABEL}"])
+    bootout_rc = 0
+    if not skip_launchctl:
+        bootout = _run_launchctl(launchctl_bin, ["bootout", f"gui/{uid}/{LABEL}"])
+        bootout_rc = bootout.returncode
     removed = False
     if plist_path.exists():
         plist_path.unlink()
@@ -490,7 +506,7 @@ def remove_plist(
     return {
         "plist_path": str(plist_path),
         "removed": removed,
-        "bootout_returncode": bootout.returncode,
+        "bootout_returncode": bootout_rc,
     }
 
 
@@ -588,6 +604,7 @@ def main(
     if scheduler == "auto":
         scheduler = detect_scheduler()
     skip_systemctl = os.environ.get("BRAINSTACK_SKIP_SYSTEMCTL") == "1"
+    skip_launchctl = os.environ.get("BRAINSTACK_SKIP_LAUNCHCTL") == "1"
 
     if args.cmd == "remove":
         if scheduler == "systemd":
@@ -600,6 +617,7 @@ def main(
             result = remove_plist(
                 plist_dir=Path(args.plist_dir),
                 launchctl_bin=launchctl_bin,
+                skip_launchctl=skip_launchctl,
             )
         else:
             # No scheduler on this platform: best-effort file cleanup only.
@@ -748,6 +766,7 @@ def main(
         plist_bytes=plist_bytes,
         plist_dir=plist_dir,
         launchctl_bin=launchctl_bin,
+        skip_launchctl=skip_launchctl,
     )
     print(json.dumps({
         "config_path": str(brain_root / _CONFIG_FILENAME),
