@@ -135,6 +135,18 @@ class RankingConfig:
     # 0.0 = effectively exclude, 1.0 = no penalty. 0.5 halves the score.
     needs_review_penalty: float = 0.5
 
+    # How to treat memories SUPERSEDED by a newer version (status: superseded,
+    # a superseded_by pointer, stance: superseded, or type: claim-stale — see
+    # recall.frontmatter.temporal_meta). A superseded memory is known-stale,
+    # so it must not outrank its successor on embedding similarity alone.
+    #   - "demote":  keep, but multiply its score by `superseded_penalty`
+    #                (default — archaeology over old versions still works)
+    #   - "exclude": drop superseded memories from results entirely
+    #   - "ignore":  no special handling (pre-Phase-2 behavior)
+    superseded_policy: str = "demote"
+    # Score multiplier applied to superseded memories under "demote".
+    superseded_penalty: float = 0.5
+
     # Whether `recall query` runs LLM query expansion when neither --expand
     # nor --no-expand is passed. Expansion costs one LLM CLI round-trip per
     # query (measured ~5-20 s with a cold claude/codex CLI), so it is
@@ -659,6 +671,8 @@ def _config_from_dict(data: dict) -> Config:
             rerank_n=int(ranking_raw.get("rerank_n", 20)),
             needs_review_policy=str(ranking_raw.get("needs_review_policy", "demote")),
             needs_review_penalty=float(ranking_raw.get("needs_review_penalty", 0.5)),
+            superseded_policy=str(ranking_raw.get("superseded_policy", "demote")),
+            superseded_penalty=float(ranking_raw.get("superseded_penalty", 0.5)),
             expand_default=bool(ranking_raw.get("expand_default", False)),
         )
     else:
@@ -673,6 +687,8 @@ def _config_from_dict(data: dict) -> Config:
             rerank_n=int(ranking_raw.get("rerank_n", 20)),
             needs_review_policy=str(ranking_raw.get("needs_review_policy", "demote")),
             needs_review_penalty=float(ranking_raw.get("needs_review_penalty", 0.5)),
+            superseded_policy=str(ranking_raw.get("superseded_policy", "demote")),
+            superseded_penalty=float(ranking_raw.get("superseded_penalty", 0.5)),
             expand_default=bool(ranking_raw.get("expand_default", False)),
         )
     auto_recall_raw = data.get("auto_recall") or {}

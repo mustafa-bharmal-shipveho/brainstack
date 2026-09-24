@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(BASE, "memory"))
 
 from review_state import mark_graduated
 from validate import heuristic_check
-from render_lessons import append_lesson, render_lessons, load_lessons
+from render_lessons import append_lesson, render_lessons, load_lessons, update_lesson
 
 # Default candidates/semantic locations match the v0.1 layout. The
 # `--namespace` flag (or BRAIN_ROOT env) overrides these at CLI time so
@@ -57,6 +57,38 @@ def _lesson_id(candidate):
     # Fallback for older candidate dicts without `id`
     claim = (candidate.get("claim") or "").strip().lower()
     return "lesson_" + hashlib.md5(claim.encode()).hexdigest()[:12]
+
+
+def _write_lesson_markdown(lesson, semantic_dir):
+    """Write memory/semantic/lessons/<lesson_id>.md for a graduated lesson.
+
+    One indexable doc per lesson, carrying the same temporal frontmatter as
+    the lessons.jsonl row (status / valid_from / supersedes / superseded_by)
+    so recall's temporal policy and trace can reason about it. Free-text
+    values are json.dumps-quoted: a JSON string is a valid YAML
+    double-quoted scalar, so an embedded ": " cannot corrupt the block.
+    """
+    lessons_dir = os.path.join(semantic_dir, "lessons")
+    os.makedirs(lessons_dir, exist_ok=True)
+    claim = (lesson.get("claim") or "").strip()
+    desc = claim.splitlines()[0][:120] if claim else lesson["id"]
+    fm_lines = [
+        f"name: {json.dumps(lesson['id'])}",
+        f"description: {json.dumps(desc)}",
+        "type: lesson",
+        "source: graduate",
+        f"status: {json.dumps(lesson.get('status') or 'accepted')}",
+        f"valid_from: {json.dumps(lesson.get('valid_from') or lesson.get('accepted_at') or '')}",
+    ]
+    if lesson.get("supersedes"):
+        fm_lines.append(f"supersedes: {json.dumps(lesson['supersedes'])}")
+    if lesson.get("source_candidate"):
+        fm_lines.append(f"source_candidate: {json.dumps(lesson['source_candidate'])}")
+    body = "---\n" + "\n".join(fm_lines) + "\n---\n\n" + claim + "\n"
+    path = os.path.join(lessons_dir, f"{lesson['id']}.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(body)
+    return path
 
 
 def main():
@@ -114,6 +146,14 @@ def main():
         sys.exit(1)
     with open(cand_path) as f:
         cand = json.load(f)
+
+    # A staged supersession proposal (kind="supersession", written by the
+    # dream-cycle detector) already names the lesson it replaces — default
+    # the flag from the candidate so the reviewer does not retype it.
+    # An explicit --supersedes always wins.
+    if not args.supersedes and cand.get("kind") == "supersession" and cand.get("supersedes"):
+        args.supersedes = cand["supersedes"]
+        print(f"note: --supersedes defaulted from candidate: {args.supersedes}")
 
     lesson_id = _lesson_id(cand)
 
@@ -230,10 +270,29 @@ def main():
         "support_count": 0,
         "contradiction_count": 0,
         "supersedes": args.supersedes,
+        "valid_from": accepted_at,
+        "superseded_by": None,
         "source_candidate": args.candidate_id,
     }
     append_lesson(lesson, SEMANTIC)
+
+    # Accepted supersession flips the OLD row to status=superseded with a
+    # superseded_by back-pointer, so ranking and trace can see it (the new
+    # row's supersedes alone is only visible at render time).
+    if args.supersedes:
+        update_lesson(
+            args.supersedes, SEMANTIC,
+            status="superseded",
+            superseded_by=lesson_id,
+            valid_until=accepted_at,
+        )
+
     md_path = render_lessons(SEMANTIC)
+
+    # Companion markdown: one indexable doc per lesson (recall otherwise
+    # only sees the combined LESSONS.md blob). Carries the same temporal
+    # frontmatter as the jsonl row.
+    _write_lesson_markdown(lesson, SEMANTIC)
 
     # Semantic writes survived — now move the candidate file.
     mark_graduated(

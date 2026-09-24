@@ -16,7 +16,7 @@ from __future__ import annotations
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import yaml
 
@@ -112,3 +112,98 @@ def parse_path(path: Path) -> ParsedFile:
 def normalize_unicode(text: str) -> str:
     """NFC-normalize for consistent comparison across HFS+ NFD vs other-FS NFC."""
     return unicodedata.normalize("NFC", text)
+
+
+# ---------------------------------------------------------------------------
+# Temporal validity (Phase 2)
+#
+# `temporal_meta` is the single normalization point for the temporal fields a
+# memory doc may carry: status / valid_from / valid_until / superseded_by /
+# supersedes. It is a *view* over the frontmatter dict — ParsedFile is
+# unchanged, and docs written before these fields existed still parse to
+# sensible defaults (status="current", unbounded validity). It never raises.
+# ---------------------------------------------------------------------------
+
+# Canonical temporal status domain. Explicit `status:` values are aliased into
+# it; anything unrecognized becomes "unknown" (never an error).
+_STATUS_ALIASES = {
+    "current": "current",
+    "accepted": "current",  # lessons.jsonl-style status on markdown
+    "staged": "staged",
+    "provisional": "staged",
+    "needs_review": "staged",
+    "superseded": "superseded",
+    "stale": "stale",
+}
+
+
+@dataclass(frozen=True)
+class TemporalMeta:
+    """Normalized temporal view over a doc's frontmatter."""
+
+    status: str  # current | staged | superseded | stale | unknown
+    valid_from: Optional[str] = None  # ISO-8601 or None
+    valid_until: Optional[str] = None
+    superseded_by: Optional[str] = None
+    supersedes: Optional[str] = None
+
+
+def parse_iso_datetime(value: Any) -> Optional[str]:
+    """Coerce a YAML-loaded value to an ISO-8601 string; garbage → None."""
+    import datetime as _dt
+
+    if value is None:
+        return None
+    if isinstance(value, _dt.datetime):
+        return value.isoformat()
+    if isinstance(value, _dt.date):
+        return value.isoformat()
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            # fromisoformat parses both dates and datetimes; PyYAML emits "Z"
+            # only in strings, which older parsers reject, so normalize it.
+            _dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return text
+    return None
+
+
+def _str_or_none(value: Any) -> Optional[str]:
+    return value if isinstance(value, str) and value else None
+
+
+def temporal_meta(frontmatter: dict[str, Any] | None) -> TemporalMeta:
+    """Normalize temporal fields from a frontmatter dict. Never raises.
+
+    Defaults for missing keys (the backwards-compat contract):
+    - no `status`, no `needs_review` → status="current"
+    - `needs_review` truthy, no `status` → status="staged"
+    - `stance: superseded` or `type: claim-stale` → status="superseded"
+    - no `valid_from` → None (unbounded past, not a parse error)
+    """
+    if not isinstance(frontmatter, dict):
+        frontmatter = {}
+
+    raw_status = frontmatter.get("status")
+    if isinstance(raw_status, str) and raw_status:
+        status = _STATUS_ALIASES.get(raw_status, "unknown")
+    elif raw_status is not None:
+        status = "unknown"  # present but not a usable string
+    elif frontmatter.get("stance") == "superseded" or frontmatter.get("type") == "claim-stale":
+        status = "superseded"
+    elif frontmatter.get("needs_review"):
+        status = "staged"
+    else:
+        status = "current"
+
+    return TemporalMeta(
+        status=status,
+        valid_from=parse_iso_datetime(frontmatter.get("valid_from")),
+        valid_until=parse_iso_datetime(frontmatter.get("valid_until")),
+        superseded_by=_str_or_none(frontmatter.get("superseded_by")),
+        supersedes=_str_or_none(frontmatter.get("supersedes")),
+    )

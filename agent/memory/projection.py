@@ -68,6 +68,25 @@ def _stance_to_type(stance: str) -> str:
     return "claim-stale"
 
 
+def _stance_to_status(stance: str) -> str:
+    """Map ClaimRecord.stance → temporal `status` (see recall.frontmatter)."""
+    if stance == claims.STANCE_CURRENT:
+        return "current"
+    if stance == claims.STANCE_TOMBSTONE:
+        return "stale"
+    return "superseded"
+
+
+def _epoch_to_iso(epoch: Any) -> Optional[str]:
+    """source_ts_epoch (float) → ISO-8601 UTC string; garbage → None."""
+    import datetime as _dt
+
+    try:
+        return _dt.datetime.fromtimestamp(float(epoch), tz=_dt.timezone.utc).isoformat()
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
 def _render_yaml_value(v: Any) -> str:
     """Tiny stdlib-only YAML value renderer.
 
@@ -109,6 +128,8 @@ def _render_claim_markdown(rec: claims.ClaimRecord) -> bytes:
         "source_ts_epoch": rec.source_ts_epoch,
         "superseded_by": rec.superseded_by,
         "stance": rec.stance,
+        "status": _stance_to_status(rec.stance),
+        "valid_from": _epoch_to_iso(rec.source_ts_epoch),
         "claim_id": rec.claim_id,
         "value_normalized": rec.value_normalized,
         # `name` and `description` are used by recall/sources.py to

@@ -26,7 +26,7 @@
     },
     "status": {
       "type": "string",
-      "enum": ["accepted", "provisional", "rejected", "legacy"],
+      "enum": ["accepted", "provisional", "rejected", "legacy", "superseded"],
       "description": "Lifecycle state. `legacy` is reserved for entries auto-migrated from pre-restructure LESSONS.md bullets."
     },
     "accepted_at": {"type": "string", "format": "date-time"},
@@ -46,6 +46,20 @@
     "supersedes": {
       "type": ["string", "null"],
       "description": "Lesson id this entry replaces. Renders the old lesson with strikethrough."
+    },
+    "valid_from": {
+      "type": "string",
+      "format": "date-time",
+      "description": "[brainstack extension] When this lesson version became current. Absent on pre-Phase-2 rows means unbounded past (not a parse error)."
+    },
+    "valid_until": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "[brainstack extension] When this lesson stopped being current — set when it is superseded. Null/absent while still current."
+    },
+    "superseded_by": {
+      "type": ["string", "null"],
+      "description": "[brainstack extension] Id of the lesson that replaced this one (inverse of `supersedes`, which lives on the new row). Set on the old row when a supersession is accepted."
     },
     "source_candidate": {"type": ["string", "null"]},
 

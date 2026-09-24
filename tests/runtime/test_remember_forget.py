@@ -339,3 +339,36 @@ class TestReviewGate:
         assert result.exit_code != 0 or result.output.strip(), (
             "expected a non-zero exit or an explanatory message"
         )
+
+
+class TestTemporalStamps:
+    """write_lesson stamps temporal-validity fields (Phase 2)."""
+
+    def test_staged_write_stamps_valid_from_but_no_status(self, brain: Path) -> None:
+        from recall.frontmatter import parse_iso_datetime
+
+        path = write_lesson(
+            "prefer placeholder identifiers like Acme in fixtures",
+            brain_root=brain,
+        )
+        fm = _frontmatter_of(path)
+        # YAML may coerce the unquoted ISO timestamp to datetime; normalize.
+        valid_from = parse_iso_datetime(fm.get("valid_from"))
+        assert valid_from is not None
+        # Stamped at write time, equal to `created`.
+        assert valid_from == parse_iso_datetime(fm.get("created"))
+        # Staged lessons keep needs_review; no explicit status yet.
+        assert "status" not in fm
+        assert fm.get("needs_review") is True
+
+    def test_reviewed_write_stamps_status_current(self, brain: Path) -> None:
+        from recall.frontmatter import parse_iso_datetime
+
+        path = write_lesson(
+            "prefer placeholder identifiers like Acme in fixtures",
+            brain_root=brain,
+            reviewed=True,
+        )
+        fm = _frontmatter_of(path)
+        assert fm.get("status") == "current"
+        assert parse_iso_datetime(fm.get("valid_from")) == parse_iso_datetime(fm.get("created"))

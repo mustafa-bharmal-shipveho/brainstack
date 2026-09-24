@@ -162,6 +162,87 @@ def _find_prior(slug, candidates_dir):
     return {}, None
 
 
+def write_supersession_candidates(proposals, candidates_dir):
+    """Stage supersession proposals as kind="supersession" candidates.
+
+    Same lifecycle rules as write_candidates, minus the LESSONS.md
+    exact-duplicate claim check: a supersession's claim is SUPPOSED to
+    look like the lesson it replaces — the reviewer decides, the
+    prefilter's duplicate gate doesn't apply here (graduate.py carves
+    the superseded lesson out of its own duplicate check the same way).
+
+    Prior lookup via _find_prior:
+      - staged already: refresh the staged decision, keep original
+        staged_at. Not counted as newly written.
+      - rejected previously: re-stage ONLY when new evidence arrived
+        since the last decision (same contract as write_candidates).
+      - graduated previously: skip — the supersession is already
+        recorded in lessons.jsonl.
+
+    This function NEVER touches lessons.jsonl or LESSONS.md — staging
+    only; applying a supersession is graduate.py's job, gated on a
+    human decision.
+    """
+    if not proposals:
+        return 0
+    os.makedirs(candidates_dir, exist_ok=True)
+    written = 0
+    for p in proposals:
+        slug = p.id
+        prev, prev_loc = _find_prior(slug, candidates_dir)
+
+        if prev_loc == "graduated":
+            continue
+
+        if prev_loc == "staged":
+            # Record the re-detection without resetting staged_at.
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            decisions = prev.get("decisions", [])
+            decisions.append({"ts": now, "action": "staged", "reviewer": "auto_dream"})
+            prev["decisions"] = decisions
+            prev["evidence_ids"] = list(p.evidence_ids)
+            prev["provenance"] = p.provenance
+            atomic_write_json(os.path.join(candidates_dir, f"{slug}.json"), prev)
+            continue
+
+        if prev_loc == "rejected":
+            last = (prev.get("decisions") or [])[-1] if prev.get("decisions") else {}
+            prev_evidence = set(last.get("evidence_snapshot", []))
+            if not (set(p.evidence_ids) - prev_evidence):
+                continue
+
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        decisions = prev.get("decisions", [])
+        decisions.append({"ts": now, "action": "staged", "reviewer": "auto_dream"})
+        candidate = {
+            "id": slug,
+            "key": slug,
+            "name": f"supersession_{slug}",
+            "kind": "supersession",
+            "claim": p.claim,
+            "supersedes": p.supersedes,
+            "detection_method": p.detection_method,
+            "provenance": p.provenance,
+            "conditions": list(p.conditions),
+            "evidence_ids": list(p.evidence_ids),
+            "cluster_size": p.cluster_size,
+            "canonical_salience": p.canonical_salience,
+            "origin": "dream.contradiction",
+            "staged_at": prev.get("staged_at") or now,
+            "status": "staged",
+            "decisions": decisions,
+            "rejection_count": prev.get("rejection_count", 0),
+        }
+        atomic_write_json(os.path.join(candidates_dir, f"{slug}.json"), candidate)
+        if prev_loc == "rejected":
+            try:
+                os.remove(os.path.join(candidates_dir, "rejected", f"{slug}.json"))
+            except OSError:
+                pass
+        written += 1
+    return written
+
+
 def write_candidates(patterns, candidates_dir):
     """Stage each pattern as a candidate JSON with lifecycle metadata.
 

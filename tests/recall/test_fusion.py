@@ -139,3 +139,24 @@ class TestPinFirstVariantTop:
             pin_first_variant_top=True,
         )
         assert "a" in [r.document.path for r in out]
+
+
+def test_rrf_winner_can_be_demoted_by_temporal_policy():
+    """Fusion stays policy-blind: a superseded doc that WINS RRF is demoted
+    only after the merge, by apply_temporal_policy (Phase 2)."""
+    from recall.core import apply_temporal_policy
+
+    stale = QueryResult(
+        document=Document(path="stale", source="test", title="stale",
+                          frontmatter={"status": "superseded",
+                                       "superseded_by": "fresh"},
+                          body="", text=""),
+        score=0.0,
+    )
+    fresh = _qr("fresh")
+    # stale ranks #1 in BOTH variants — it wins the merge outright.
+    merged = rrf_merge([[stale, fresh], [stale, fresh]])
+    assert [r.document.path for r in merged] == ["stale", "fresh"]
+
+    demoted = apply_temporal_policy(merged, "demote", 0.5)
+    assert [r.document.path for r in demoted] == ["fresh", "stale"]

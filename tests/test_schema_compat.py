@@ -117,6 +117,9 @@ def test_lessons_jsonl_required_fields_match_upstream():
     declared_fields = set(schema["properties"].keys())
     extension_fields = {
         "why", "how_to_apply", "original_markdown_path",
+        # Temporal-validity extensions (Phase 2): when a lesson version became
+        # current, when it stopped being current, and which lesson replaced it.
+        "valid_from", "valid_until", "superseded_by",
         # Migration-extension fields added when migrating native auto-memory
         # dirs into the brain. See CHANGELOG / lessons.schema.json.
         "name", "type", "source_session_id",
@@ -135,7 +138,8 @@ def test_extension_fields_documented_as_extensions():
     """Extension fields' descriptions explicitly mark them as our additions."""
     schema_path = REPO_ROOT / "schemas" / "lessons.schema.json"
     schema = json.loads(schema_path.read_text())
-    for fname in ["why", "how_to_apply", "original_markdown_path"]:
+    for fname in ["why", "how_to_apply", "original_markdown_path",
+                  "valid_from", "valid_until", "superseded_by"]:
         desc = schema["properties"][fname]["description"]
         assert "[brainstack extension]" in desc, (
             f"Extension field {fname} not marked as extension in schema description"
@@ -146,3 +150,31 @@ def test_extension_fields_documented_as_extensions():
         assert "[brainstack migration extension]" in desc, (
             f"Migration field {fname} not marked as extension in schema description"
         )
+
+
+def test_status_enum_includes_superseded():
+    """`superseded` is a valid lesson status (Phase 2 temporal validity)."""
+    schema_path = REPO_ROOT / "schemas" / "lessons.schema.json"
+    schema = json.loads(schema_path.read_text())
+    enum = schema["properties"]["status"]["enum"]
+    assert "superseded" in enum
+    # Upstream statuses must remain (backwards compatibility).
+    for status in ["accepted", "provisional", "rejected", "legacy"]:
+        assert status in enum
+
+
+def test_temporal_extension_fields_are_optional():
+    """valid_from / valid_until / superseded_by are optional and well-typed."""
+    schema_path = REPO_ROOT / "schemas" / "lessons.schema.json"
+    schema = json.loads(schema_path.read_text())
+    required = set(schema["required"])
+    props = schema["properties"]
+    for fname in ["valid_from", "valid_until", "superseded_by"]:
+        assert fname in props
+        assert fname not in required
+    assert props["valid_from"].get("format") == "date-time"
+    assert props["valid_until"].get("format") == "date-time"
+    assert props["superseded_by"]["type"] == ["string", "null"]
+    # supersedes (on the NEW row) stays; additionalProperties stays open.
+    assert "supersedes" in props
+    assert schema["additionalProperties"] is True

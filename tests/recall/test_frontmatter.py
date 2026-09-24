@@ -126,3 +126,117 @@ class TestParsePath:
     def test_nonexistent_file_raises(self, tmp_path):
         with pytest.raises((FileNotFoundError, OSError)):
             parse_path(tmp_path / "missing.md")
+
+
+class TestParseIsoDatetime:
+    def test_none_returns_none(self):
+        from recall.frontmatter import parse_iso_datetime
+        assert parse_iso_datetime(None) is None
+
+    def test_date_coerced_to_iso(self):
+        import datetime
+
+        from recall.frontmatter import parse_iso_datetime
+        assert parse_iso_datetime(datetime.date(2026, 6, 1)) == "2026-06-01"
+
+    def test_datetime_coerced_to_iso(self):
+        import datetime
+
+        from recall.frontmatter import parse_iso_datetime
+        out = parse_iso_datetime(datetime.datetime(2026, 6, 1, 12, 30, 0))
+        assert out == "2026-06-01T12:30:00"
+
+    def test_valid_iso_string_passes_through(self):
+        from recall.frontmatter import parse_iso_datetime
+        assert parse_iso_datetime("2026-06-01T12:30:00Z") == "2026-06-01T12:30:00Z"
+        assert parse_iso_datetime("2026-06-01") == "2026-06-01"
+
+    def test_garbage_returns_none(self):
+        from recall.frontmatter import parse_iso_datetime
+        assert parse_iso_datetime("not a date") is None
+        assert parse_iso_datetime("") is None
+        assert parse_iso_datetime(12345) is None
+        assert parse_iso_datetime(["2026-06-01"]) is None
+
+
+class TestTemporalMeta:
+    def test_none_frontmatter_defaults_current(self):
+        from recall.frontmatter import temporal_meta
+        meta = temporal_meta(None)
+        assert meta.status == "current"
+        assert meta.valid_from is None
+        assert meta.valid_until is None
+        assert meta.superseded_by is None
+        assert meta.supersedes is None
+
+    def test_empty_frontmatter_defaults_current(self):
+        from recall.frontmatter import temporal_meta
+        meta = temporal_meta({})
+        assert meta.status == "current"
+        assert meta.valid_from is None
+        assert meta.superseded_by is None
+
+    def test_needs_review_without_status_is_staged(self):
+        from recall.frontmatter import temporal_meta
+        assert temporal_meta({"needs_review": True}).status == "staged"
+
+    def test_stance_superseded_alias(self):
+        from recall.frontmatter import temporal_meta
+        assert temporal_meta({"stance": "superseded"}).status == "superseded"
+
+    def test_claim_stale_type_alias(self):
+        from recall.frontmatter import temporal_meta
+        assert temporal_meta({"type": "claim-stale"}).status == "superseded"
+
+    def test_accepted_maps_to_current(self):
+        from recall.frontmatter import temporal_meta
+        assert temporal_meta({"status": "accepted"}).status == "current"
+
+    def test_explicit_status_wins_over_needs_review(self):
+        from recall.frontmatter import temporal_meta
+        assert temporal_meta({"status": "current", "needs_review": True}).status == "current"
+
+    def test_status_values(self):
+        from recall.frontmatter import temporal_meta
+        assert temporal_meta({"status": "current"}).status == "current"
+        assert temporal_meta({"status": "staged"}).status == "staged"
+        assert temporal_meta({"status": "provisional"}).status == "staged"
+        assert temporal_meta({"status": "superseded"}).status == "superseded"
+        assert temporal_meta({"status": "stale"}).status == "stale"
+        assert temporal_meta({"status": "bogus"}).status == "unknown"
+
+    def test_valid_from_missing_is_none(self):
+        from recall.frontmatter import temporal_meta
+        assert temporal_meta({"status": "current"}).valid_from is None
+
+    def test_yaml_datetime_objects_coerced(self):
+        from recall.frontmatter import parse_file_text, temporal_meta
+        text = "---\nstatus: current\nvalid_from: 2026-06-01\n---\nbody\n"
+        parsed = parse_file_text(text)
+        meta = temporal_meta(parsed.frontmatter)
+        assert meta.valid_from == "2026-06-01"
+        assert meta.status == "current"
+
+    def test_garbage_valid_from_is_none(self):
+        from recall.frontmatter import temporal_meta
+        meta = temporal_meta({"valid_from": "whenever"})
+        assert meta.valid_from is None
+
+    def test_supersession_links(self):
+        from recall.frontmatter import temporal_meta
+        meta = temporal_meta({
+            "status": "superseded",
+            "superseded_by": "lesson_new",
+            "valid_until": "2026-06-01T00:00:00Z",
+        })
+        assert meta.superseded_by == "lesson_new"
+        assert meta.valid_until == "2026-06-01T00:00:00Z"
+        meta2 = temporal_meta({"supersedes": "lesson_old"})
+        assert meta2.supersedes == "lesson_old"
+
+    def test_never_raises_on_weird_types(self):
+        from recall.frontmatter import temporal_meta
+        meta = temporal_meta({"status": 42, "superseded_by": ["x"], "valid_until": {}})
+        assert meta.status == "unknown"
+        assert meta.superseded_by is None
+        assert meta.valid_until is None

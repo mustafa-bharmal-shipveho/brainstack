@@ -548,9 +548,12 @@ def upsert_documents(
 
 
 def _build_filter(
-    type_filter: Optional[str], source_filter: Optional[str]
+    type_filter: Optional[str],
+    source_filter: Optional[str],
+    exclude_superseded: bool = False,
 ) -> Optional[models.Filter]:
     must: list[models.FieldCondition] = []
+    must_not: list[models.FieldCondition] = []
     if type_filter is not None:
         must.append(
             models.FieldCondition(
@@ -561,7 +564,26 @@ def _build_filter(
         must.append(
             models.FieldCondition(key="source", match=models.MatchValue(value=source_filter))
         )
-    return models.Filter(must=must) if must else None
+    if exclude_superseded:
+        # Opt-in (ranking.superseded_policy="exclude"): drop superseded docs
+        # at the backend so they never consume candidate-pool slots. Default
+        # off — archaeology over old versions must keep working. Covers the
+        # three forms temporal_meta normalizes: explicit status, claim
+        # stance, and the claim-stale type alias.
+        for key, value in (
+            ("frontmatter.status", "superseded"),
+            ("frontmatter.stance", "superseded"),
+            ("frontmatter.type", "claim-stale"),
+        ):
+            must_not.append(
+                models.FieldCondition(key=key, match=models.MatchValue(value=value))
+            )
+    if not must and not must_not:
+        return None
+    return models.Filter(
+        must=must or None,
+        must_not=must_not or None,
+    )
 
 
 def query_hybrid(
@@ -574,6 +596,7 @@ def query_hybrid(
     dense_model: str = _DENSE_DEFAULT,
     sparse_model: str = _SPARSE_DEFAULT,
     mode: str = "hybrid",
+    exclude_superseded: bool = False,
 ) -> list[QueryResult]:
     """Prefetch dense + sparse, fuse with RRF, return top-k as QueryResult.
 
@@ -594,7 +617,7 @@ def query_hybrid(
     if count(client, collection) == 0:
         return []
 
-    flt = _build_filter(type_filter, source_filter)
+    flt = _build_filter(type_filter, source_filter, exclude_superseded=exclude_superseded)
 
     dense_vec: Optional[list[float]] = None
     if mode in ("hybrid", "dense"):

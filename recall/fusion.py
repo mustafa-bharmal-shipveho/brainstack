@@ -36,6 +36,11 @@ def rrf_merge(
     Docs appearing in multiple variants accumulate score; docs ranked high
     in any one variant get a meaningful contribution.
 
+    Fusion is deliberately policy-blind: demoting needs_review / superseded
+    docs is the CALLER's job (apply_review_policy / apply_temporal_policy
+    after the merge), so an RRF winner that is superseded still wins here
+    and sinks later.
+
     Doc identity is `QueryResult.document.path` (string equality). The
     returned list contains one entry per unique doc, sorted by descending
     fused score. The returned `QueryResult.score` is the RRF fused score

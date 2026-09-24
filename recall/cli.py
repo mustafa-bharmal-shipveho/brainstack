@@ -310,6 +310,16 @@ def _expanded_query(
         getattr(retriever, "_needs_review_policy", "ignore"),
         float(getattr(retriever, "_needs_review_penalty", 0.5)),
     )
+    # Same seam for superseded docs: re-apply the temporal policy so a
+    # superseded memory the encoder likes cannot float back above its
+    # successor.
+    from recall.core import apply_temporal_policy
+
+    rescored = apply_temporal_policy(
+        rescored,
+        getattr(retriever, "_superseded_policy", "ignore"),
+        float(getattr(retriever, "_superseded_penalty", 0.5)),
+    )
     return rescored[:k]
 
 
@@ -482,6 +492,8 @@ def query(
             rerank_n=cfg.ranking.rerank_n,
             needs_review_policy=cfg.ranking.needs_review_policy,
             needs_review_penalty=cfg.ranking.needs_review_penalty,
+            superseded_policy=cfg.ranking.superseded_policy,
+            superseded_penalty=cfg.ranking.superseded_penalty,
             mode=effective_mode,
         )
 
@@ -712,6 +724,8 @@ def eval_command(
             rerank_n=max(cfg.ranking.rerank_n, k),
             needs_review_policy=cfg.ranking.needs_review_policy,
             needs_review_penalty=cfg.ranking.needs_review_penalty,
+            superseded_policy=cfg.ranking.superseded_policy,
+            superseded_penalty=cfg.ranking.superseded_penalty,
         )
         report = run_eval(_StrategyRetriever(retriever, strategy), cases, k=k)
         if details is not None:
@@ -1905,6 +1919,97 @@ def stats(
     typer.echo(render_human(report))
 
 
+def _walk_supersession_chain(
+    start: "Path",
+    *,
+    lessons_dir: "Path",
+    jsonl_lessons: list[dict],
+    max_depth: int = 16,
+) -> list[dict]:
+    """Walk the supersession chain containing `start`, oldest first.
+
+    Forward links come from `superseded_by` (this → successor), backward
+    links from `supersedes` (this → predecessor). Ids resolve against
+    companion markdown stems under `lessons_dir` first, then lessons.jsonl
+    rows (jsonl `accepted` aliases to `current` via temporal_meta). Cycles
+    are broken by a seen-set; `max_depth` bounds pathological chains.
+
+    Each entry: {"id", "status", "valid_from", "where"}. A lesson with no
+    supersession links yields a single-entry chain — callers print the
+    section only when len > 1.
+    """
+    from recall.frontmatter import parse_path, temporal_meta
+
+    def _lookup(lesson_id: str) -> Optional[dict]:
+        md = lessons_dir / f"{lesson_id}.md"
+        if md.is_file():
+            meta = temporal_meta(parse_path(md).frontmatter)
+            return {
+                "id": lesson_id, "status": meta.status,
+                "valid_from": meta.valid_from,
+                "superseded_by": meta.superseded_by,
+                "supersedes": meta.supersedes,
+                "where": "markdown",
+            }
+        row = None
+        for candidate in jsonl_lessons:  # last match wins (jsonl append order)
+            if candidate.get("id") == lesson_id:
+                row = candidate
+        if row is not None:
+            meta = temporal_meta(row)
+            return {
+                "id": lesson_id, "status": meta.status,
+                "valid_from": meta.valid_from,
+                "superseded_by": meta.superseded_by,
+                "supersedes": meta.supersedes,
+                "where": "jsonl",
+            }
+        return None
+
+    start_id = start.stem
+    head = _lookup(start_id)
+    if head is None:
+        head = {"id": start_id, "status": "unknown", "valid_from": None,
+                "superseded_by": None, "supersedes": None, "where": "markdown"}
+
+    # Backward: start → supersedes → … (oldest first after reverse).
+    backward: list[dict] = []
+    seen = {start_id}
+    node = head
+    while node.get("supersedes") and len(backward) < max_depth:
+        prev_id = node["supersedes"]
+        if prev_id in seen:
+            break
+        seen.add(prev_id)
+        prev = _lookup(prev_id)
+        if prev is None:
+            break
+        backward.append(prev)
+        node = prev
+    backward.reverse()
+
+    # Forward: start → superseded_by → …
+    forward: list[dict] = []
+    node = head
+    while node.get("superseded_by") and len(forward) < max_depth:
+        next_id = node["superseded_by"]
+        if next_id in seen:
+            break
+        seen.add(next_id)
+        nxt = _lookup(next_id)
+        if nxt is None:
+            break
+        forward.append(nxt)
+        node = nxt
+
+    chain = backward + [head] + forward
+    # Internal link fields are walk scaffolding, not output.
+    return [
+        {k: e[k] for k in ("id", "status", "valid_from", "where")}
+        for e in chain
+    ]
+
+
 @app.command()
 def trace(
     target: str = typer.Argument(
@@ -1988,11 +2093,14 @@ def trace(
     evidence_ids = fm.get("evidence_ids") or []
     source_candidate = fm.get("source_candidate")
     reviewer = fm.get("reviewer")  # graduate.py rows
+    supersedes = fm.get("supersedes")
+    superseded_by = fm.get("superseded_by")
 
     has_trail = any(
         v not in (None, [], "")
         for v in (source, created_by, provenance, reviewed_by, needs_review,
-                  session_id, evidence_ids, source_candidate, reviewer)
+                  session_id, evidence_ids, source_candidate, reviewer,
+                  supersedes, superseded_by)
     )
 
     typer.echo(f"== trace: {path.stem} ==")
@@ -2037,6 +2145,36 @@ def trace(
         shown = ", ".join(str(e) for e in list(evidence_ids)[:5])
         more = "" if len(evidence_ids) <= 5 else f" (+{len(evidence_ids) - 5} more)"
         typer.echo(f"  evidence_ids: {shown}{more}")
+
+    # Supersession chain: which lesson this one replaced / was replaced by.
+    # Links resolve against companion markdown and lessons.jsonl. Printed
+    # only when the chain has more than this lesson itself, so bare and
+    # unchained lessons keep the old output shape.
+    jsonl_path = brain / "memory" / "semantic" / "lessons.jsonl"
+    jsonl_lessons: list[dict] = []
+    if jsonl_path.is_file():
+        try:
+            jsonl_lessons = [
+                json.loads(line)
+                for line in jsonl_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+        except (OSError, ValueError):
+            jsonl_lessons = []
+    chain = _walk_supersession_chain(
+        path, lessons_dir=lessons_dir, jsonl_lessons=jsonl_lessons
+    )
+    if len(chain) > 1:
+        typer.echo("  supersession chain:")
+        for i, entry in enumerate(chain):
+            vf = (entry.get("valid_from") or "")[:10]
+            vf_part = f"  valid_from={vf}" if vf else ""
+            arrow = (
+                f"  → {chain[i + 1]['id']}" if i + 1 < len(chain) else ""
+            )
+            typer.echo(
+                f"    {entry['id']}  status={entry['status']}{vf_part}{arrow}"
+            )
 
     typer.echo(
         "  note: provenance is self-reported by the writer, not signed. "

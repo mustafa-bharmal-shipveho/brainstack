@@ -476,6 +476,9 @@ class TestRerankOversamplesWithoutReviewPolicy:
             reranker=reranker,
             rerank_n=self.RERANK_N,
             needs_review_policy="ignore",
+            # The cheap fetch_n=k/rerank_n path this class pins requires BOTH
+            # post-merge policies off; superseded demotion also needs depth.
+            superseded_policy="ignore",
         )
 
     def test_rrf_leg_fetches_at_least_rerank_n_when_reranking(self, single_collection):
