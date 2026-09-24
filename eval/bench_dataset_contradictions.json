@@ -1,0 +1,134 @@
+{
+  "corpus": [
+    {
+      "slug": "deploy-old",
+      "title": "Deployment runbook (2025)",
+      "body": "Deployments go through CodeDeploy with blue-green instance groups. The pipeline waits for the old fleet to drain before traffic shifts."
+    },
+    {
+      "slug": "deploy-new",
+      "title": "Deployment runbook (updated June 2026)",
+      "body": "Since 2026-06 deployments run on ECS with rolling updates. CodeDeploy was retired; the pipeline now watches ECS service stabilization instead of instance draining."
+    },
+    {
+      "slug": "linter-old",
+      "title": "Repo tooling notes (2025)",
+      "body": "Python linting uses pylint with the shared config in tools/pylint.ini. Pre-commit runs pylint on changed files."
+    },
+    {
+      "slug": "linter-new",
+      "title": "Repo tooling notes (updated August 2026)",
+      "body": "Since 2026-08 the repo lints with ruff. The pylint config was deleted and pre-commit now runs ruff check on changed files."
+    },
+    {
+      "slug": "datastore-old",
+      "title": "Storage architecture (2025)",
+      "body": "The primary datastore is MongoDB. Services read and write through the shared mongoose models package."
+    },
+    {
+      "slug": "datastore-new",
+      "title": "Storage architecture (updated March 2026)",
+      "body": "PostgreSQL is the primary datastore as of 2026-03, accessed through Kysely migrations. MongoDB remains only for legacy session archives."
+    },
+    {
+      "slug": "standup-old",
+      "title": "Team rituals (2025)",
+      "body": "Daily standup runs at 09:30 UTC in the engineering voice channel."
+    },
+    {
+      "slug": "standup-new",
+      "title": "Team rituals (updated July 2026)",
+      "body": "Since 2026-07 daily standup runs at 16:00 UTC to include the Warsaw team. The 09:30 slot was dropped."
+    },
+    {
+      "slug": "oncall-old",
+      "title": "Incident process (2025)",
+      "body": "Incident paging goes through PagerDuty service rotations with a weekly handoff on Mondays."
+    },
+    {
+      "slug": "oncall-new",
+      "title": "Incident process (updated May 2026)",
+      "body": "Since 2026-05 incident paging runs through Helix with NOC-first triage. PagerDuty is kept read-only for historical reports."
+    },
+    {
+      "slug": "feature-flags",
+      "title": "Feature flags",
+      "body": "Feature flags are managed through the flag SDK; flags default to disabled and roll out by percentage."
+    },
+    {
+      "slug": "vector-store",
+      "title": "Local retrieval notes",
+      "body": "Local memory retrieval uses a hybrid of vector similarity and BM25 keyword ranking fused together."
+    },
+    {
+      "slug": "runbooks",
+      "title": "Runbook index",
+      "body": "Operational runbooks live in the wiki and are indexed by service name and symptom keyword."
+    },
+    {
+      "slug": "ci-notes",
+      "title": "CI pipeline",
+      "body": "CI runs lint on Linux and the hermetic test subset on macOS. Test jobs run on multiple Python versions."
+    }
+  ],
+  "questions": [
+    {
+      "id": "q-deploy",
+      "q": "How do services get deployed to production these days?",
+      "supports": ["deploy-new"],
+      "stale": ["deploy-old"],
+      "answer_substring": "ECS",
+      "stale_answer_substring": "CodeDeploy"
+    },
+    {
+      "id": "q-lint",
+      "q": "Which linter should I configure for the Python repo?",
+      "supports": ["linter-new"],
+      "stale": ["linter-old"],
+      "answer_substring": "ruff",
+      "stale_answer_substring": "pylint"
+    },
+    {
+      "id": "q-datastore",
+      "q": "What database do new services build on?",
+      "supports": ["datastore-new"],
+      "stale": ["datastore-old"],
+      "answer_substring": "PostgreSQL",
+      "stale_answer_substring": "MongoDB"
+    },
+    {
+      "id": "q-standup",
+      "q": "When is the daily standup meeting?",
+      "supports": ["standup-new"],
+      "stale": ["standup-old"],
+      "answer_substring": "16:00",
+      "stale_answer_substring": "09:30"
+    },
+    {
+      "id": "q-oncall",
+      "q": "Where do incident pages come from now?",
+      "supports": ["oncall-new"],
+      "stale": ["oncall-old"],
+      "answer_substring": "Helix",
+      "stale_answer_substring": "PagerDuty"
+    },
+    {
+      "id": "q-flags",
+      "q": "How are feature flags rolled out?",
+      "supports": ["feature-flags"],
+      "answer_substring": "flag SDK"
+    },
+    {
+      "id": "q-retrieval",
+      "q": "How does local memory retrieval rank results?",
+      "supports": ["vector-store"],
+      "answer_substring": "BM25"
+    },
+    {
+      "id": "q-runbooks",
+      "q": "Where do I find the operational runbooks?",
+      "supports": ["runbooks"],
+      "answer_substring": "wiki"
+    }
+  ]
+}

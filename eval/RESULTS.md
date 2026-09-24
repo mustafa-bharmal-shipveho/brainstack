@@ -26,10 +26,54 @@ Reproduce: `make bench` (a few seconds once the embedding model is cached).
   and indirectly-worded questions, including against near-neighbor distractors.
   That is the precondition for recall being useful.
 - It does **not** by itself prove an agent's final answer is better, and it is
-  a small synthetic set, not a public benchmark. The credible next step is
-  **LongMemEval** (multi-session, large, with distractors); the harness already
-  ingests its JSON format via `--dataset`, and running the full public set is
-  on the roadmap. Numbers will be published whatever they say.
+  a small synthetic set, not a public benchmark. **LongMemEval (S and V2) has
+  since been run in full — see the section below.**
+
+<!-- longmemeval:start -->
+## LongMemEval (public benchmark, 2026-09-24)
+
+Full public sets, shipped retrieval config (hybrid BM25+dense bge-base, no
+rerank gate — the gate stays off per the calibration above), run end-to-end
+on this machine. Conversion from the official distributions lives in
+[`longmemeval_convert.py`](longmemeval_convert.py); per-question haystacks
+restrict retrieval to that question's own sessions.
+
+### LongMemEval-S (500 questions, 23,854 sessions)
+
+| metric | value |
+|---|---:|
+| recall@1 | 0.836 |
+| recall@3 | 0.954 |
+| recall@5 | 0.970 |
+| MRR | 0.894 |
+| answer-coverage@5 (raw substring) | 0.466 |
+| answer-coverage@5 (groundable-only) | 0.896 (233/260) |
+
+**The raw coverage number needs its caveat spelled out.** LongMemEval answers
+are often abstractions ("February 14th") that appear verbatim in *no* session
+body — only 260 of 500 answer substrings occur anywhere in their haystack.
+Substring coverage is therefore a floor, not a failure: among questions whose
+answer text exists verbatim in the corpus, top-5 context contains it 89.6% of
+the time. recall@5 = 0.970 means the labeled answer-bearing session is in the
+injected context for 97% of questions (418/500 rank it #1).
+
+Condition A (empty brain) is 0.000 on every metric by construction.
+
+### LongMemEval-V2 small (451 questions, coverage-only)
+
+| metric | value |
+|---|---:|
+| answer-coverage@5 (raw substring) | 0.421 |
+
+V2 ships no `supports` labels, so recall@k is undefined by construction; the
+coverage metric has the same abstraction caveat as above (215/451 answers
+appear verbatim somewhere in the haystack). Reported as a floor.
+
+Reproduce: `python eval/bench_recall_ab.py --dataset eval/data/longmemeval_s_cleaned.json`
+(~4 h on an M4 Pro; the embedding of 23.8k sessions dominates) and
+`python eval/bench_recall_ab.py --dataset eval/data/lme_v2`.
+
+<!-- longmemeval:end -->
 
 <!-- rerank-gate:start -->
 ## Rerank relevance gate (S4)

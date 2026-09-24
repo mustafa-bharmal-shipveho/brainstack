@@ -14,13 +14,30 @@ this measures, on a labeled set, comparing:
 ```bash
 make bench                 # ships a labeled synthetic set (16 docs, 21 questions)
 python eval/bench_recall_ab.py --json
-python eval/bench_recall_ab.py --dataset path/to/longmemeval.json
+python eval/bench_recall_ab.py --dataset eval/data/longmemeval_s_cleaned.json
+python eval/bench_recall_ab.py --dataset eval/bench_dataset_contradictions.json
+python eval/bench_recall_ab.py --dataset eval/data/lme_v2   # LongMemEval-V2 root
+python eval/bench_recall_ab.py --dataset X --limit 50       # cheap smoke of a big set
 ```
 
-Metrics (condition B): recall@1/3/5, MRR, and answer-coverage@5 (the fraction
-of questions whose answer text lands in the top-5 context, a proxy for
-"re-explanation avoided"). Latest numbers and methodology are in
-[`RESULTS.md`](RESULTS.md).
+Metrics (condition B): recall@1/3/5 and MRR over questions with `supports`
+labels; answer-coverage@5 over all questions (the "re-explanation avoided" /
+retrieval-sufficiency proxy); and, on contradiction-labelled sets such as
+`bench_dataset_contradictions.json`, stale-ahead rate (an outdated doc
+outranks the current one) and stale-answer-coverage@5 (the outdated answer
+text reaches the injected context). Latest numbers and methodology are in
+[`RESULTS.md`](RESULTS.md); `--write-results` refreshes the marked block.
+
+`--dataset` accepts three shapes (conversion in `longmemeval_convert.py`):
+native `{corpus, questions}` JSON, LongMemEval v1 JSON (each session becomes
+one doc; each question retrieves within its own haystack), or a prepared
+LongMemEval-V2 data directory (`questions.jsonl` + `trajectories.jsonl` +
+`haystacks/lme_v2_<tier>.json`; V2 has no answer-trajectory labels, so its
+questions are coverage-only). Small labeled sets ship in `eval/`; large
+downloaded benchmarks live in `eval/data/`, which is gitignored — download
+LongMemEval-S from
+`https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned` and V2 from
+`https://huggingface.co/datasets/xiaowu0162/longmemeval-v2`.
 
 ### Honest scope
 
@@ -28,10 +45,10 @@ This is a **retrieval-grounded** benchmark, not an end-to-end task-success
 score with an LLM judge. It proves the right memory is surfaced; it does not by
 itself prove the agent's final answer is better. The shipped set is synthetic
 and small, with distractor documents and indirect phrasing added so the score
-is not a trivial 1.000. The credible public benchmark is **LongMemEval**
-(multi-session, with distractors); the harness ingests its JSON via
-`--dataset`, but running the full public set is tracked in `ROADMAP.md`, not
-done here.
+is not a trivial 1.000. The same code path runs the public **LongMemEval-S**
+(500 questions, per-question haystacks) and **LongMemEval-V2** (451 questions,
+coverage-only) sets; per-run numbers and caveats live in
+[`RESULTS.md`](RESULTS.md).
 
 ## `calibrate_rerank_gate.py`: what should `auto_recall_min_rerank` be?
 
