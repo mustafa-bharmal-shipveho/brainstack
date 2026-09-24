@@ -331,3 +331,50 @@ def test_projection_works_with_synthetic_unknown_producer(tmp_path):
     fm = _read_frontmatter(md)
     assert fm["source"] == "fictitious-future-producer-9000"
     assert fm["type"] == "claim-current"
+
+
+# --- Temporal stamps (Phase 2) ----------------------------------------
+
+
+def test_claim_markdown_stamps_status_and_valid_from(tmp_path):
+    brain = _make_brain(tmp_path)
+    _append_episodic(brain, _event(
+        source="research-notes", event_id="rn:1",
+        source_ts="1700000000.0", body="PS2 launches on 2026-05-20",
+    ))
+    consolidate.run_consolidation(
+        str(brain),
+        extractors=[topic_keys.HeuristicExtractor(topic_keys.ExtractorConfig())],
+    )
+    cid = claims.compute_claim_id("project:ps2", "release-date", "rn:1")
+    md_path = Path(projection._claims_dir(str(brain))) / f"{cid}.md"
+    fm = _read_frontmatter(md_path)
+    assert fm["status"] == "current"
+    # valid_from derives from source_ts_epoch (1700000000.0 → 2023-11-14).
+    assert fm["valid_from"].startswith("2023-11-14T")
+    # Existing fields untouched.
+    assert fm["stance"] == "current"
+    assert fm["type"] == "claim-current"
+
+
+def test_stale_claim_markdown_stamps_superseded_status(tmp_path):
+    brain = _make_brain(tmp_path)
+    _append_episodic(brain, _event(
+        source="research-notes", event_id="rn:1",
+        source_ts="1700000000.0", body="PS2 launches on 2026-05-18",
+    ))
+    _append_episodic(brain, _event(
+        source="research-notes", event_id="rn:2",
+        source_ts="1700000100.0", body="PS2 launches on 2026-05-20",
+    ))
+    consolidate.run_consolidation(
+        str(brain),
+        extractors=[topic_keys.HeuristicExtractor(topic_keys.ExtractorConfig())],
+    )
+    state = claims.materialize_state(claims._claims_path(str(brain)))
+    projection.project_to_markdown_reconcile(state, str(brain), include_stale=True)
+    old = claims.compute_claim_id("project:ps2", "release-date", "rn:1")
+    fm = _read_frontmatter(Path(projection._claims_dir(str(brain))) / f"{old}.md")
+    assert fm["stance"] == "superseded"
+    assert fm["status"] == "superseded"
+    assert fm["valid_from"].startswith("2023-11-14T")

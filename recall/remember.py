@@ -154,11 +154,13 @@ def write_lesson(
         f"created_by: {created_by or 'recall-remember'}",
         f"provenance: {'human-cli' if is_tty else 'agent'}",
         f"created: {now}",
+        f"valid_from: {now}",
     ]
     if sid:
         fm_lines.append(f"session_id: {sid}")
     if reviewed:
         fm_lines.append("reviewed_by: human-cli")
+        fm_lines.append("status: current")
     else:
         fm_lines.append("needs_review: true")
         fm_lines.append("review_reason: unreviewed-remember")

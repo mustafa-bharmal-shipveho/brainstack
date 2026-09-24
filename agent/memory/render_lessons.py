@@ -168,6 +168,55 @@ def remove_lesson(lesson_id, semantic_dir):
     return removed
 
 
+def update_lesson(lesson_id, semantic_dir, **fields):
+    """Update fields on an existing lessons.jsonl row, in place.
+
+    Used by graduate.py when a supersession is accepted: the OLD row flips
+    to status='superseded' with superseded_by=<new id> so ranking and trace
+    can see it (strikethrough alone is render-time only).
+
+    The LAST matching row is updated (matching `_dedupe_by_id` semantics,
+    which keep the latest entry per id); earlier duplicates are left
+    untouched and no second row is appended. Missing id → None. Holds the
+    same exclusive flock as remove_lesson; re-rendering LESSONS.md after
+    is the caller's responsibility.
+
+    Returns the updated lesson dict, or None if not found.
+    """
+    path = os.path.join(semantic_dir, LESSONS_JSONL)
+    if not os.path.exists(path):
+        return None
+    updated = None
+    with _locked_jsonl(path) as f:
+        f.seek(0)
+        lines = []
+        target_idx = None
+        for line in f:
+            line = line.rstrip("\n")
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                lines.append(line)
+                continue
+            if row.get("id") == lesson_id:
+                target_idx = len(lines)  # last match wins
+            lines.append(line)
+        if target_idx is None:
+            return None
+        row = json.loads(lines[target_idx])
+        row.update(fields)
+        lines[target_idx] = json.dumps(row)
+        f.seek(0)
+        f.truncate()
+        for line in lines:
+            f.write(line + "\n")
+        f.flush()
+        updated = row
+    return updated
+
+
 def _bullet_for(lesson, superseded_by):
     claim = lesson.get("claim", "")
     conf = lesson.get("confidence", "?")
@@ -193,9 +242,12 @@ def _bullet_for(lesson, superseded_by):
         extras.append(f"   *How to apply:* {how_to_apply}")
     extras_block = ("\n" + "\n".join(extras)) if extras else ""
 
-    sup_by = superseded_by.get(lid)
-    if sup_by:
-        return f"- ~~{claim}~~  <!-- {ann} superseded_by={sup_by} -->{extras_block}"
+    # Persisted superseded_by (written by update_lesson on human-accepted
+    # supersession) wins over the render-time inverse map.
+    sup_by = lesson.get("superseded_by") or superseded_by.get(lid)
+    if sup_by or status == "superseded":
+        suffix = f" superseded_by={sup_by}" if sup_by else ""
+        return f"- ~~{claim}~~  <!-- {ann}{suffix} -->{extras_block}"
     if status == "provisional":
         return f"- [PROVISIONAL] {claim}  <!-- {ann} -->{extras_block}"
     return f"- {claim}  <!-- {ann} -->{extras_block}"
@@ -214,6 +266,11 @@ def _build_auto_section(lessons):
         sup = L.get("supersedes")
         if sup:
             superseded_by[sup] = L.get("id")
+    # Persisted supersession on the old row (accepted via graduate.py) is
+    # also terminal, even when the new row's supersedes pointer is absent.
+    for L in lessons:
+        if L.get("status") == "superseded" and L.get("superseded_by"):
+            superseded_by.setdefault(L.get("id"), L.get("superseded_by"))
 
     groups = defaultdict(list)
     for L in lessons:

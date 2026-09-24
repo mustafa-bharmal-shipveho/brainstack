@@ -43,6 +43,8 @@ def main():
     for c in items:
         prio = candidate_priority(c)
         print(f"# {c.get('id')}  (priority={prio:.2f})")
+        if c.get("kind") == "supersession" and c.get("supersedes"):
+            print(f"  SUPERSEDES: {c['supersedes']}  (via {c.get('detection_method', '?')})")
         print(f"  claim:      {c.get('claim', '')}")
         print(f"  cluster:    {c.get('cluster_size', '?')} episode(s)")
         print(f"  salience:   {c.get('canonical_salience', 0):.2f}")

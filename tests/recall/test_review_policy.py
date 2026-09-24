@@ -230,3 +230,154 @@ class TestExpandedRerankReviewPolicy:
         assert paths == ["fresh"], (
             f"flagged doc must be excluded from the reranked union, got {paths}"
         )
+
+
+# ---------- superseded / temporal ranking policy (Phase 2) -----------------
+
+
+def _tdoc(path: str, **fm) -> Document:
+    return Document(path=path, source="brain", title=path, frontmatter=fm, body="", text="")
+
+
+def _tqr(path: str, score: float, **fm) -> QueryResult:
+    return QueryResult(document=_tdoc(path, **fm), score=score)
+
+
+class TestIsSuperseded:
+    def test_status_superseded(self):
+        from recall.core import _is_superseded
+        assert _is_superseded(_tdoc("a", status="superseded"))
+
+    def test_superseded_by_pointer(self):
+        from recall.core import _is_superseded
+        assert _is_superseded(_tdoc("a", superseded_by="lesson_new"))
+
+    def test_stance_alias(self):
+        from recall.core import _is_superseded
+        assert _is_superseded(_tdoc("a", stance="superseded"))
+
+    def test_claim_stale_type(self):
+        from recall.core import _is_superseded
+        assert _is_superseded(_tdoc("a", type="claim-stale"))
+
+    def test_missing_frontmatter_is_not_superseded(self):
+        from recall.core import _is_superseded
+        assert not _is_superseded(_tdoc("a"))
+        assert not _is_superseded(Document(path="b", source="brain", title="b",
+                                           frontmatter=None, body="", text=""))
+
+    def test_current_status_is_not_superseded(self):
+        from recall.core import _is_superseded
+        assert not _is_superseded(_tdoc("a", status="current"))
+        assert not _is_superseded(_tdoc("a", status="accepted"))
+
+
+class TestApplyTemporalPolicy:
+    def test_demote_puts_current_ahead_of_superseded(self):
+        from recall.core import apply_temporal_policy
+        old = _tqr("old", 0.9, status="superseded", superseded_by="new")
+        new = _tqr("new", 0.6, status="current")
+        out = apply_temporal_policy([old, new], "demote", 0.5)
+        # 0.9 * 0.5 = 0.45 < 0.6 — the current doc wins despite losing RRF.
+        assert [r.document.path for r in out] == ["new", "old"]
+
+    def test_exclude_drops_superseded(self):
+        from recall.core import apply_temporal_policy
+        old = _tqr("old", 0.9, status="superseded")
+        new = _tqr("new", 0.6, status="current")
+        out = apply_temporal_policy([old, new], "exclude", 0.5)
+        assert [r.document.path for r in out] == ["new"]
+
+    def test_ignore_is_noop(self):
+        from recall.core import apply_temporal_policy
+        old = _tqr("old", 0.9, status="superseded")
+        new = _tqr("new", 0.6)
+        out = apply_temporal_policy([old, new], "ignore", 0.5)
+        assert [r.document.path for r in out] == ["old", "new"]
+
+    def test_missing_frontmatter_is_not_demoted(self):
+        """Back-compat: pre-Phase-2 docs carry no temporal fields and must
+        keep their full score."""
+        from recall.core import apply_temporal_policy
+        plain = _tqr("plain", 0.9)
+        new = _tqr("new", 0.6, status="current")
+        out = apply_temporal_policy([plain, new], "demote", 0.5)
+        assert [r.document.path for r in out] == ["plain", "new"]
+        assert out[0].score == 0.9
+
+    def test_claim_stale_type_is_treated_as_superseded(self):
+        from recall.core import apply_temporal_policy
+        stale = _tqr("stale", 0.9, type="claim-stale")
+        current = _tqr("current", 0.6, type="claim-current")
+        out = apply_temporal_policy([stale, current], "demote", 0.5)
+        assert [r.document.path for r in out] == ["current", "stale"]
+
+    def test_demote_applies_to_rerank_score_sign_safely(self):
+        from recall.core import apply_temporal_policy
+        old = QueryResult(document=_tdoc("old", status="superseded"),
+                          score=0.9, rerank_score=-2.0)
+        new = QueryResult(document=_tdoc("new", status="current"),
+                          score=0.6, rerank_score=-3.0)
+        out = apply_temporal_policy([old, new], "demote", 0.5)
+        # Negative logits: dividing by the penalty moves -2.0 → -4.0 (DOWN).
+        assert [r.document.path for r in out] == ["new", "old"]
+        assert out[1].rerank_score == -4.0
+
+    def test_tie_break_prefers_later_valid_from(self):
+        from recall.core import apply_temporal_policy
+        older = _tqr("older", 0.8, status="current", valid_from="2025-01-01T00:00:00Z")
+        newer = _tqr("newer", 0.8, status="current", valid_from="2026-06-01T00:00:00Z")
+        out = apply_temporal_policy([older, newer], "demote", 0.5)
+        assert [r.document.path for r in out] == ["newer", "older"]
+
+    def test_empty_and_unknown_policy(self):
+        from recall.core import apply_temporal_policy
+        assert apply_temporal_policy([], "demote", 0.5) == []
+        qr = _tqr("a", 0.9, status="superseded")
+        assert apply_temporal_policy([qr], "bogus", 0.5) == [qr]
+
+
+class TestExpandedRerankTemporalPolicy:
+    """`--expand` + cross-encoder rerank must re-apply the temporal policy
+    after the fused-union rerank, same seam as the needs_review policy."""
+
+    def _run_expanded_rerank(self, policy: str):
+        from unittest.mock import MagicMock, patch
+
+        from recall import cli as cli_mod
+
+        stale = _tqr("stale", 0.9, status="superseded")
+        fresh = _tqr("fresh", 0.9, status="current")
+        retriever = _PolicyStubRetriever([stale, fresh], "ignore")
+        retriever._superseded_policy = policy
+        retriever._superseded_penalty = 0.5
+
+        fake_encoder = MagicMock()
+        fake_encoder.rerank.side_effect = lambda q, texts: [1.0 for _ in texts]
+
+        with patch(
+            "recall.expand.expand_query",
+            side_effect=lambda q, n=3, provider=None: [q, f"alt-of-{q}"],
+        ), patch(
+            "recall.qdrant_backend._get_cross_encoder", return_value=fake_encoder
+        ):
+            return cli_mod._expanded_query(
+                retriever,
+                "the question",
+                k=5,
+                expand_n=1,
+                strategy="ranked",
+                rerank_model="any/model",
+            )
+
+    def test_expanded_rerank_reapplies_temporal_policy(self):
+        results = self._run_expanded_rerank("demote")
+        paths = [r.document.path for r in results]
+        assert paths == ["fresh", "stale"], (
+            f"superseded doc must sink below the current equal after the "
+            f"fused rerank, got {paths}"
+        )
+
+    def test_expanded_rerank_exclude_drops_superseded(self):
+        results = self._run_expanded_rerank("exclude")
+        assert [r.document.path for r in results] == ["fresh"]

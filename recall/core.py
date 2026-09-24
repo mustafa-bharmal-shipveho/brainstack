@@ -155,6 +155,95 @@ def apply_review_policy(
     return results
 
 
+def _is_superseded(doc: Document) -> bool:
+    """True if a document has been replaced by a newer version.
+
+    Goes through `recall.frontmatter.temporal_meta` — the single
+    normalization point — so `status: superseded`, a bare `superseded_by`
+    pointer, `stance: superseded`, and `type: claim-stale` all count.
+    Documents with no temporal fields (everything written before Phase 2)
+    are NOT superseded.
+    """
+    from recall.frontmatter import temporal_meta
+
+    meta = temporal_meta(doc.frontmatter)
+    return meta.status == "superseded" or bool(meta.superseded_by)
+
+
+def _valid_from_sort_value(doc: Document) -> float:
+    """valid_from as a sortable epoch; unknown → -inf (sorts last among ties)."""
+    import datetime as _dt
+
+    from recall.frontmatter import temporal_meta
+
+    raw = temporal_meta(doc.frontmatter).valid_from
+    if not raw:
+        return float("-inf")
+    try:
+        dt = _dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return float("-inf")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_dt.timezone.utc)
+    return dt.timestamp()
+
+
+def _temporal_rank_key(r: QueryResult) -> tuple:
+    """_rank_key plus temporal tie-breaks: superseded sinks on equal scores;
+    among non-superseded equals, the later valid_from wins."""
+    primary = r.rerank_score if r.rerank_score is not None else r.score
+    return (
+        -float(primary),
+        _is_superseded(r.document),
+        -_valid_from_sort_value(r.document),
+        r.document.path,
+    )
+
+
+def apply_temporal_policy(
+    results: list[QueryResult], policy: str, penalty: float
+) -> list[QueryResult]:
+    """Down-rank or drop memories superseded by a newer version.
+
+    Mirrors apply_review_policy; call it AFTER the review policy so a doc
+    that is both unreviewed AND superseded is penalized for both.
+
+    - "exclude": superseded memories are removed entirely.
+    - "demote":  RRF `score` is scaled (`score * penalty`) and any
+                 `rerank_score` goes through `_demote_rerank_score`
+                 (sign-safe for negative logits), then results are
+                 re-sorted so the caller's top-k truncation reflects the
+                 penalty. Ties prefer non-superseded docs, then the later
+                 `valid_from`.
+    - anything else ("ignore"): returned unchanged.
+
+    Pure and order-stable for non-superseded inputs; safe to call on any
+    list.
+    """
+    if policy == "ignore" or not results:
+        return results
+    if policy == "exclude":
+        return [r for r in results if not _is_superseded(r.document)]
+    if policy == "demote":
+        adjusted = [
+            QueryResult(
+                document=r.document,
+                score=r.score * penalty,
+                rerank_score=(
+                    _demote_rerank_score(r.rerank_score, penalty)
+                    if r.rerank_score is not None
+                    else None
+                ),
+            )
+            if _is_superseded(r.document)
+            else r
+            for r in results
+        ]
+        adjusted.sort(key=_temporal_rank_key)
+        return adjusted
+    return results
+
+
 # ---------------------------------------------------------------------------
 # HybridRetriever facade
 # ---------------------------------------------------------------------------
@@ -192,6 +281,8 @@ class HybridRetriever:
         rerank_n: int = 20,
         needs_review_policy: str = "demote",
         needs_review_penalty: float = 0.5,
+        superseded_policy: str = "demote",
+        superseded_penalty: float = 0.5,
         mode: str = "hybrid",
         # Legacy kwargs accepted for back-compat; ignored.
         bm25_weight: Optional[float] = None,
@@ -208,6 +299,8 @@ class HybridRetriever:
         self._rerank_n = int(rerank_n)
         self._needs_review_policy = needs_review_policy
         self._needs_review_penalty = float(needs_review_penalty)
+        self._superseded_policy = superseded_policy
+        self._superseded_penalty = float(superseded_penalty)
         # Retrieval mode: "hybrid" (dense + sparse), "dense", or "sparse".
         # Passed through to every backend upsert/query so sparse mode never
         # touches the dense embedder (works before the bge download).
@@ -272,15 +365,19 @@ class HybridRetriever:
         #   * the cross-encoder: it can only reorder what the RRF leg pulled,
         #     so with a k-deep pool `rerank_n` means nothing and a candidate
         #     just below the RRF top-k can never be promoted.
-        # policy=ignore with reranking off is the cheap path; keep it k.
-        if self._needs_review_policy == "ignore":
+        # policy=ignore (both policies) with reranking off is the cheap
+        # path; keep it k.
+        if (self._needs_review_policy == "ignore"
+                and self._superseded_policy == "ignore"):
             fetch_n = max(k, self._rerank_n) if use_rerank else k
         else:
             fetch_n = max(2 * k, self._rerank_n, k + 10)
 
         # RRF leg: over-fetch from EVERY collection. The deeper pull is what
         # lets a demoted needs_review memory be replaced by a fresh one ranked
-        # just below it, rather than leaving a hole.
+        # just below it, rather than leaving a hole. Under
+        # superseded_policy="exclude" the backend pre-filters superseded docs
+        # so they never consume candidate-pool slots.
         merged: list[QueryResult] = []
         for coll in targets:
             merged.extend(
@@ -294,6 +391,7 @@ class HybridRetriever:
                     dense_model=self._dense_model,
                     sparse_model=self._sparse_model,
                     mode=self._mode,
+                    exclude_superseded=self._superseded_policy == "exclude",
                 )
             )
         # Order the merged pool by RRF before the cross-encoder sees it, so
@@ -318,8 +416,12 @@ class HybridRetriever:
             # is still in the `_rank_key` order it was sorted into above, and
             # re-sorting it was a full sort to reach the same list.
             merged.sort(key=_rank_key)
-        # Down-rank / drop needs_review memories, then truncate to k.
+        # Down-rank / drop needs_review memories, then superseded ones
+        # (review policy first — a doc can be both), then truncate to k.
         merged = apply_review_policy(
             merged, self._needs_review_policy, self._needs_review_penalty
+        )
+        merged = apply_temporal_policy(
+            merged, self._superseded_policy, self._superseded_penalty
         )
         return merged[:k]

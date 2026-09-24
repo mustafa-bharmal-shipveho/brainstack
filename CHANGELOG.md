@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+**Temporal validity + review-gated supersession for lessons (Phase 2).**
+
+- Schema: `lessons.jsonl` rows may carry `valid_from` / `valid_until` /
+  `superseded_by`, and `status` gains `superseded`. All optional — pre-existing
+  rows stay valid. Markdown frontmatter gets the same fields, normalized in one
+  place by `recall.frontmatter.temporal_meta` (missing keys read as
+  `status=current`, unbounded validity).
+- Writers stamp going forward: `recall remember` writes `valid_from` (plus
+  `status: current` when `--reviewed`); claim projection emits `status` and
+  `valid_from` derived from `source_ts_epoch`; graduate.py stamps
+  `valid_from=accepted_at` on the new row.
+- Supersession is persisted on human accept only: `graduate.py --supersedes`
+  now flips the OLD row to `status=superseded` with `superseded_by` +
+  `valid_until` (via `render_lessons.update_lesson`, same flock as
+  `remove_lesson`), and writes a per-lesson companion markdown under
+  `memory/semantic/lessons/` so recall indexes one doc per lesson. Candidates
+  of `kind="supersession"` default `--supersedes` from the candidate itself.
+- Dream-cycle contradiction detection is staging-only: the new deterministic
+  `agent/memory/contradictions.py` (slot-conflict via materialized ClaimState,
+  predicate-value clash via the topic_keys library, condition overlap — no LLM,
+  no producer branching) emits `kind="supersession"` candidates onto the
+  existing review queue. REVIEW_QUEUE.md marks them `SUPERSEDES <old_id>` and
+  they sort above equal-size patterns (1.5x priority). Unattended cycles never
+  touch `lessons.jsonl`.
+- Retrieval: superseded docs no longer outrank their successors.
+  `ranking.superseded_policy` (`demote` default | `exclude` | `ignore`) and
+  `ranking.superseded_penalty` (0.5) apply after the needs_review policy in
+  `HybridRetriever.query`, the `--expand` rerank seam, the MCP server, and the
+  daemon; `exclude` also pre-filters at the Qdrant leg
+  (`exclude_superseded=True`). RRF fusion stays policy-blind.
+- `recall trace` renders supersession chains (forward via `superseded_by`,
+  backward via `supersedes`, cycle-safe, resolved against companion markdown
+  and lessons.jsonl), and `provenance_label` carries a `superseded` /
+  `valid_from=` suffix when present.
+
+
 ## v0.8.0 (2026-09-14)
 
 **OMP session ingestion: memory keeps accumulating when your daily driver isn't Claude Code.**

@@ -139,6 +139,16 @@ def provenance_label(frontmatter: dict | None) -> str:
         # Keep just the date portion of ISO timestamps.
         parts.append(str(when)[:10])
 
+    # Temporal suffixes (Phase 2): a superseded doc says so, and valid_from
+    # is shown when it adds information beyond the created/date above.
+    from recall.frontmatter import temporal_meta
+
+    meta = temporal_meta(fm)
+    if meta.status == "superseded":
+        parts.append("superseded")
+    if meta.valid_from and meta.valid_from[:10] != (str(when)[:10] if when else ""):
+        parts.append(f"valid_from={meta.valid_from[:10]}")
+
     if not parts:
         return "none"
     return sanitize_untrusted(", ".join(parts), max_len=120, keep_newlines=False)

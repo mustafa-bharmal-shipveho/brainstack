@@ -114,6 +114,10 @@ def recall_query_handler(
         # the user configured "exclude"/"demote".
         needs_review_policy=cfg.ranking.needs_review_policy,
         needs_review_penalty=cfg.ranking.needs_review_penalty,
+        # Same seam for the temporal policy: a superseded doc must not
+        # outrank its successor over MCP either.
+        superseded_policy=cfg.ranking.superseded_policy,
+        superseded_penalty=cfg.ranking.superseded_penalty,
     )
     results = retriever.query(query, k=k, type_filter=type, source_filter=source)
     return serialize_results(results)

@@ -222,12 +222,17 @@ def candidate_priority(candidate):
 
     Reviewers attack high-priority items first. Older + more-recurrent +
     higher-salience patterns deserve attention ahead of one-offs.
+    Supersession proposals get a 1.5x boost: an active lesson that may be
+    WRONG is more urgent than a new pattern of equal size.
     """
-    return (
+    base = (
         max(1, candidate.get("cluster_size", 1)) *
         max(0.1, candidate.get("canonical_salience", 0.1)) *
         _age_factor(candidate.get("staged_at", ""))
     )
+    if candidate.get("kind") == "supersession":
+        base *= 1.5
+    return base
 
 
 def list_candidates(candidates_dir, status="staged", sort_by="priority"):
@@ -340,8 +345,13 @@ def write_review_queue_summary(candidates_dir, summary_path):
     for cand in pending[:10]:
         prio = candidate_priority(cand)
         claim_preview = (cand.get("claim") or "")[:80]
+        # Supersession proposals name the lesson they would replace so the
+        # reviewer can judge old-vs-new without opening the JSON.
+        sup = ""
+        if cand.get("kind") == "supersession" and cand.get("supersedes"):
+            sup = f"SUPERSEDES {cand['supersedes']} "
         lines.append(
-            f"- **{cand.get('id')}** (priority={prio:.2f}, "
+            f"- **{cand.get('id')}** {sup}(priority={prio:.2f}, "
             f"size={cand.get('cluster_size', '?')}, "
             f"rejections={cand.get('rejection_count', 0)}) "
             f"— {claim_preview}"

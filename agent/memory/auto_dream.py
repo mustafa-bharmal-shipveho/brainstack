@@ -21,7 +21,8 @@ import os
 from archive import archive_stale_workspace
 from cluster import _is_activity_log_claim
 from decay import DECAY_DAYS, decay_old_entries
-from promote import _env_bool, cluster_and_extract, write_candidates
+from promote import (_env_bool, cluster_and_extract, write_candidates,
+                     write_supersession_candidates)
 from review_state import mark_rejected, write_review_queue_summary
 from validate import heuristic_check
 
@@ -368,7 +369,17 @@ def _heuristic_prefilter(candidates_dir, semantic_dir):
                 cand = json.load(f)
         except (OSError, json.JSONDecodeError):
             continue
-        check = heuristic_check(cand, existing)
+        check_target = existing
+        # A supersession proposal is SUPPOSED to look like the lesson it
+        # replaces — carve the target out of the duplicate check exactly
+        # as graduate.py does for --supersedes, or every proposal would be
+        # auto-rejected as an exact duplicate of its own predecessor.
+        if cand.get("kind") == "supersession" and cand.get("supersedes"):
+            check_target = "\n".join(
+                line for line in existing.splitlines()
+                if f"id={cand['supersedes']}" not in line
+            )
+        check = heuristic_check(cand, check_target)
         if not check["passed"]:
             reason = ", ".join(check["reasons"])
             # Record the specific lesson(s) that triggered the duplicate
@@ -379,6 +390,46 @@ def _heuristic_prefilter(candidates_dir, semantic_dir):
                           duplicate_claims=check.get("duplicates", []))
             rejected += 1
     return rejected
+
+
+def _stage_contradiction_proposals(candidates_dir, semantic_dir, review_queue,
+                                   claim_state=None, cycle_id=""):
+    """Detect candidate×lesson contradictions and STAGE proposals only.
+
+    Boundary: this never writes lessons.jsonl / LESSONS.md and never calls
+    graduate.py — applying a supersession is a human-gated action. Runs
+    after consolidation so slot conflicts can read this cycle's
+    materialized ClaimState (already on disk; no LLM is invoked here).
+    Returns the number of proposals newly staged.
+    """
+    import contradictions  # local import — avoids cycles at module init
+    from render_lessons import load_lessons
+    from review_state import list_candidates
+
+    proposals = contradictions.detect_contradictions(
+        list_candidates(candidates_dir, status="staged"),
+        load_lessons(semantic_dir),
+        claim_state=claim_state,
+        cycle_id=cycle_id or datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    )
+    n = write_supersession_candidates(proposals, candidates_dir)
+    if n:
+        try:
+            write_review_queue_summary(candidates_dir, review_queue)
+        except Exception:
+            pass
+    return n
+
+
+def _count_contradiction_proposals(candidates_dir, semantic_dir, extra=()):
+    """dry_run counterpart: how many proposals WOULD be staged. No writes."""
+    import contradictions  # local import — avoids cycles at module init
+    from render_lessons import load_lessons
+    from review_state import list_candidates
+
+    pool = list_candidates(candidates_dir, status="staged") + list(extra)
+    return len(contradictions.detect_contradictions(
+        pool, load_lessons(semantic_dir)))
 
 
 def _refresh_pending_summary(brain_root=None):
@@ -828,6 +879,7 @@ def run_dream_cycle():
     claims_asserted = 0
     llm_calls = 0
     llm_errors = {}
+    cresult = None
     try:
         import consolidate  # local import — avoids cycles at module init
         import topic_keys
@@ -866,6 +918,19 @@ def run_dream_cycle():
     except Exception as exc:  # pragma: no cover — best-effort
         consolidate_summary = f" consolidate_error={exc!r}"
 
+    # Contradiction detection: STAGES supersession proposals on the review
+    # queue — never mutates lessons.jsonl (only human-gated graduate.py
+    # applies a supersession). After consolidation so slot conflicts can
+    # read this cycle's materialized claim state.
+    supersessions_staged = 0
+    try:
+        supersessions_staged = _stage_contradiction_proposals(
+            CANDIDATES, SEMANTIC, REVIEW_QUEUE,
+            claim_state=cresult.final_state if cresult is not None else None,
+        )
+    except Exception as exc:  # pragma: no cover — best-effort
+        consolidate_summary += f" contradictions_error={exc!r}"
+
     lint_summary = _lint_step(_resolve_brain_root(None))
 
     summary = (
@@ -875,6 +940,7 @@ def run_dream_cycle():
         f"burst_skipped={len(burst_telemetry)} "
         f"activity_log_skipped={len(activity_log_telemetry)} "
         f"activity_log_swept={len(swept)}"
+        f" supersessions_staged={supersessions_staged}"
         f"{consolidate_summary}"
         f"{lint_summary}"
     )
@@ -958,6 +1024,12 @@ def run(brain_root=None, namespace="default", dry_run=False):
             result["candidates_written"] = len(promotable)
             result["burst_skipped"] = len(burst_telemetry)
             result["activity_log_skipped"] = len(activity_log_telemetry)
+            # Report what detection WOULD stage; dry_run writes nothing.
+            try:
+                result["supersession_proposals"] = _count_contradiction_proposals(
+                    candidates_dir, semantic_dir, extra=promotable.values())
+            except Exception as exc:
+                result["contradictions_error"] = str(exc)
             return result
 
         staged = write_candidates(promotable, candidates_dir)
@@ -988,6 +1060,7 @@ def run(brain_root=None, namespace="default", dry_run=False):
     # Consolidate observation-shaped episodic events into the claim
     # store. Best-effort: an extraction error here must NOT break the
     # nightly dream cycle.
+    cresult = None
     try:
         import consolidate  # local import — avoids cycles at module init
         import topic_keys
@@ -1006,6 +1079,18 @@ def run(brain_root=None, namespace="default", dry_run=False):
         result["consolidate_projection_written"] = cresult.projection_written
     except Exception as exc:  # pragma: no cover — best-effort
         result["consolidate_error"] = str(exc)
+
+    # Contradiction detection: STAGES supersession proposals on the review
+    # queue — never mutates lessons.jsonl (only human-gated graduate.py
+    # applies a supersession). After consolidation so slot conflicts can
+    # read this cycle's materialized claim state.
+    try:
+        result["supersession_proposals"] = _stage_contradiction_proposals(
+            candidates_dir, semantic_dir, review_queue,
+            claim_state=cresult.final_state if cresult is not None else None,
+        )
+    except Exception as exc:  # pragma: no cover — best-effort
+        result["contradictions_error"] = str(exc)
 
     result["lint_summary"] = _lint_step(_resolve_brain_root(brain_root))
 

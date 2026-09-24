@@ -608,6 +608,8 @@ class RecallDaemon:
             rerank_n=int(rerank_n),
             needs_review_policy=cfg.ranking.needs_review_policy,
             needs_review_penalty=cfg.ranking.needs_review_penalty,
+            superseded_policy=cfg.ranking.superseded_policy,
+            superseded_penalty=cfg.ranking.superseded_penalty,
             mode=effective_mode(cfg),
         )
         return self.retriever

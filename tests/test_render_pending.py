@@ -48,10 +48,11 @@ def _make_candidate(
     cluster_size: int = 3,
     evidence_ids: list[str] | None = None,
     salience: float = 5.0,
+    **extra,
 ) -> dict:
     """Synthetic candidate matching the on-disk schema in
     `agent/memory/candidates/*.json` (see `auto_dream.write_candidates`)."""
-    return {
+    cand = {
         "id": cid,
         "key": f"pattern_{cid}",
         "name": f"pattern_{cid}",
@@ -65,6 +66,8 @@ def _make_candidate(
         "decisions": [],
         "rejection_count": 0,
     }
+    cand.update(extra)
+    return cand
 
 
 def _seed_candidates(brain_root: Path, namespace: str, candidates: list[dict]) -> None:
@@ -1877,3 +1880,38 @@ class TestSyncErrorAndHealthSections:
             "2026-09-04T13:00:01Z health: recall CLI not found; skipped",
         ])
         assert rps._check_sync_status(tmp_path) == "blocked-network"
+
+
+# ---------- Supersession candidates (Phase 2) ---------------------------
+
+
+class TestSupersessionSurfacing:
+    """kind="supersession" proposals ride the existing pending queue."""
+
+    def test_pending_count_includes_supersession_candidates(self, tmp_path: Path):
+        import render_pending_summary
+        _seed_candidates(tmp_path, "default", [
+            _make_candidate("d1"),
+            _make_candidate("sup1", kind="supersession", supersedes="lesson_old"),
+        ])
+        counts = render_pending_summary.count_pending_per_namespace(tmp_path)
+        assert counts["default"] == 2
+
+    def test_review_queue_line_contains_supersedes(self, tmp_path: Path):
+        import review_state
+        cdir = tmp_path / "memory" / "candidates"
+        queue = tmp_path / "memory" / "working" / "REVIEW_QUEUE.md"
+        _seed_candidates(tmp_path, "default", [
+            _make_candidate("sup1", kind="supersession", supersedes="lesson_old"),
+        ])
+        n = review_state.write_review_queue_summary(str(cdir), str(queue))
+        assert n == 1
+        text = queue.read_text()
+        sup_lines = [l for l in text.splitlines() if "sup1" in l]
+        assert sup_lines and "SUPERSEDES lesson_old" in sup_lines[0]
+
+    def test_supersession_priority_boosted_over_equal_pattern(self):
+        import review_state
+        pattern = _make_candidate("p1")
+        proposal = _make_candidate("s1", kind="supersession", supersedes="lesson_old")
+        assert review_state.candidate_priority(proposal) > review_state.candidate_priority(pattern)

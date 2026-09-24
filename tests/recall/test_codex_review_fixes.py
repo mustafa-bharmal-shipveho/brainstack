@@ -103,6 +103,8 @@ def test_mcp_handler_threads_mode(monkeypatch):
             rerank_n = 20
             needs_review_policy = "demote"
             needs_review_penalty = 0.5
+            superseded_policy = "demote"
+            superseded_penalty = 0.5
         sources = []
 
     monkeypatch.setattr(mcp_server, "load_config", lambda: _Cfg())
